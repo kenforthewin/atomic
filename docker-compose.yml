@@ -22,7 +22,7 @@ services:
   proxy:
     image: nginx:1.28-bookworm
     ports:
-      - "8080:80"
+      - "80:8080"
     volumes:
       - ./docker/nginx.conf:/etc/nginx/conf.d/atomic.conf:ro
     networks:
