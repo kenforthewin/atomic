@@ -53,6 +53,16 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let state = self.state.clone();
 
+        // If the server is not yet initialized (encrypted DB waiting for unlock,
+        // or fresh install awaiting setup), return 503 instead of a misleading 401.
+        if !state.manager.is_initialized() {
+            return Box::pin(async {
+                Err(actix_web::error::ErrorServiceUnavailable(
+                    "Server not initialized — complete setup or unlock the database first",
+                ))
+            });
+        }
+
         // Extract the Authorization header
         let raw_token = req
             .headers()
@@ -121,9 +131,9 @@ mod tests {
         let manager = std::sync::Arc::new(
             atomic_core::DatabaseManager::new(temp.path()).unwrap()
         );
-        let (info, raw_token) = manager.registry().create_api_token("test-token").unwrap();
+        let (info, raw_token) = manager.registry().unwrap().create_api_token("test-token").unwrap();
         let (event_tx, _) = broadcast::channel(16);
-        let state = web::Data::new(AppState { manager, event_tx, public_url: None });
+        let state = web::Data::new(AppState { manager, event_tx, public_url: None, log_buffer: crate::log_buffer::LogBuffer::new(10) });
         // Leak the tempdir so the DB stays alive during the test
         std::mem::forget(temp);
         let _ = info;
@@ -200,9 +210,9 @@ mod tests {
         let (state, raw_token) = test_app_state();
 
         // Get the token ID and revoke it
-        let tokens = state.manager.registry().list_api_tokens().unwrap();
+        let tokens = state.manager.registry().unwrap().list_api_tokens().unwrap();
         let token_id = &tokens[0].id;
-        state.manager.registry().revoke_api_token(token_id).unwrap();
+        state.manager.registry().unwrap().revoke_api_token(token_id).unwrap();
 
         let app = actix_test::init_service(
             App::new().service(

@@ -12,7 +12,9 @@ import { useTagsStore } from '../../stores/tags';
 import { useUIStore } from '../../stores/ui';
 import { useTheme } from '../../hooks';
 import { verifyProviderConfigured } from '../../lib/api';
+import { getTransport, switchTransport, switchToLocal, getLocalServerConfig, isDesktopApp } from '../../lib/transport';
 import { isTauri } from '../../lib/platform';
+import { UnlockScreen } from '../onboarding/UnlockScreen';
 
 
 export function Layout() {
@@ -20,6 +22,7 @@ export function Layout() {
   const fetchAtoms = useAtomsStore(s => s.fetchAtoms);
   const fetchTags = useTagsStore(s => s.fetchTags);
   const [isSetupRequired, setIsSetupRequired] = useState<boolean | null>(null); // null = checking
+  const [needsUnlock, setNeedsUnlock] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Command palette state
@@ -93,6 +96,41 @@ export function Layout() {
   useEffect(() => {
     const checkSetup = async () => {
       try {
+        // If the transport has no server configured, check if the server
+        // just needs an unlock (encrypted DB restart) before falling into onboarding.
+        const transport = getTransport();
+        if (!transport.isConnected()) {
+          // Determine the server URL to check — desktop uses local sidecar,
+          // web uses the saved remote config from localStorage.
+          let serverBaseUrl: string | null = null;
+          if (isDesktopApp()) {
+            serverBaseUrl = getLocalServerConfig()?.baseUrl || null;
+          } else {
+            const saved = localStorage.getItem('atomic-server-config');
+            if (saved) {
+              serverBaseUrl = (JSON.parse(saved) as { baseUrl: string }).baseUrl;
+            }
+          }
+
+          if (serverBaseUrl) {
+            try {
+              const resp = await fetch(`${serverBaseUrl.replace(/\/$/, '')}/api/setup/status`);
+              if (resp.ok) {
+                const data = await resp.json();
+                if (data.needs_unlock) {
+                  setNeedsUnlock(true);
+                  setIsSetupRequired(false);
+                  return;
+                }
+              }
+            } catch {
+              // Server unreachable — fall through to onboarding
+            }
+          }
+          setIsSetupRequired(true);
+          return;
+        }
+
         const configured = await verifyProviderConfigured();
         setIsSetupRequired(!configured);
 
@@ -120,11 +158,45 @@ export function Layout() {
     await initializeApp();
   };
 
+  const handleUnlockComplete = async () => {
+    // After unlock, reconnect — desktop uses local sidecar, web uses saved config
+    if (isDesktopApp()) {
+      await switchToLocal();
+    } else {
+      const saved = localStorage.getItem('atomic-server-config');
+      if (saved) {
+        const config = JSON.parse(saved) as { baseUrl: string; authToken: string };
+        await switchTransport(config);
+      }
+    }
+    setNeedsUnlock(false);
+    // Re-check if provider is configured
+    try {
+      const configured = await verifyProviderConfigured();
+      setIsSetupRequired(!configured);
+      if (configured) await initializeApp();
+    } catch {
+      setIsSetupRequired(true);
+    }
+  };
+
   // Show loading while checking
-  if (isSetupRequired === null) {
+  if (isSetupRequired === null && !needsUnlock) {
     return (
       <div className={`flex h-screen items-center justify-center bg-[var(--color-bg-main)] ${isTauri() ? 'pt-[28px]' : ''}`}>
         <span className="text-[var(--color-text-secondary)]">Loading...</span>
+      </div>
+    );
+  }
+
+  // Show standalone unlock screen (not inside onboarding wizard)
+  if (needsUnlock) {
+    const unlockBaseUrl = isDesktopApp()
+      ? (getLocalServerConfig()?.baseUrl || '')
+      : (JSON.parse(localStorage.getItem('atomic-server-config') || '{}').baseUrl || '');
+    return (
+      <div className={`flex h-screen overflow-hidden bg-[var(--color-bg-main)] ${isTauri() ? 'pt-[28px]' : ''}`}>
+        <UnlockScreen baseUrl={unlockBaseUrl} onUnlocked={handleUnlockComplete} />
       </div>
     );
   }

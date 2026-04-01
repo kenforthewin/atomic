@@ -64,6 +64,20 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let state = self.state.clone();
 
+        // If the server is not yet initialized (encrypted DB waiting for unlock,
+        // or fresh install awaiting setup), return 503 instead of a misleading 401.
+        if !state.manager.is_initialized() {
+            return Box::pin(async move {
+                Ok(req.into_response(
+                    HttpResponse::ServiceUnavailable()
+                        .json(serde_json::json!({
+                            "error": "server_not_initialized",
+                            "error_description": "Server not initialized — complete setup or unlock the database first"
+                        })),
+                ).map_into_right_body())
+            });
+        }
+
         let raw_token = req
             .headers()
             .get("Authorization")
@@ -153,12 +167,13 @@ mod tests {
         let manager = std::sync::Arc::new(
             atomic_core::DatabaseManager::new(temp.path()).unwrap()
         );
-        let (_, raw_token) = manager.registry().create_api_token("test-token").unwrap();
+        let (_, raw_token) = manager.registry().unwrap().create_api_token("test-token").unwrap();
         let (event_tx, _) = broadcast::channel::<ServerEvent>(16);
         let state = web::Data::new(AppState {
             manager,
             event_tx,
             public_url: public_url.map(String::from),
+            log_buffer: crate::log_buffer::LogBuffer::new(10),
         });
         std::mem::forget(temp);
         (state, raw_token)
@@ -245,8 +260,8 @@ mod tests {
     async fn test_revoked_token_returns_401() {
         let (state, raw_token) = test_state(Some("https://atomic.example.com"));
 
-        let tokens = state.manager.registry().list_api_tokens().unwrap();
-        state.manager.registry().revoke_api_token(&tokens[0].id).unwrap();
+        let tokens = state.manager.registry().unwrap().list_api_tokens().unwrap();
+        state.manager.registry().unwrap().revoke_api_token(&tokens[0].id).unwrap();
 
         let app = actix_test::init_service(
             App::new().service(

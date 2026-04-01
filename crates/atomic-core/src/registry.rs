@@ -39,6 +39,7 @@ pub struct OAuthCodeInfo {
 pub struct Registry {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
+    passphrase: Option<String>,
 }
 
 impl Registry {
@@ -47,7 +48,16 @@ impl Registry {
     /// If `registry.db` doesn't exist but `atomic.db` does in the data dir,
     /// performs legacy migration (moves atomic.db to databases/default.db,
     /// copies settings/tokens into registry).
+    /// Open or create the registry (unencrypted).
     pub fn open_or_create(data_dir: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
+        Self::open_or_create_encrypted(data_dir, None)
+    }
+
+    /// Open or create the registry with optional encryption.
+    pub fn open_or_create_encrypted(
+        data_dir: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
@@ -60,6 +70,10 @@ impl Registry {
 
         // Open/create registry.db
         let conn = Connection::open(&registry_path)?;
+        // PRAGMA key must come first if encrypted
+        if let Some(ref pp) = passphrase {
+            conn.pragma_update(None, "key", pp)?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; \
              PRAGMA synchronous=NORMAL; \
@@ -85,6 +99,7 @@ impl Registry {
         Ok(Registry {
             conn: Mutex::new(conn),
             data_dir,
+            passphrase,
         })
     }
 
@@ -474,7 +489,11 @@ impl Registry {
     /// Open a new connection to registry.db (for concurrent access in OAuth routes etc.)
     pub fn new_connection(&self) -> Result<Connection, AtomicCoreError> {
         let path = self.data_dir.join("registry.db");
-        Connection::open(&path).map_err(AtomicCoreError::Database)
+        let conn = Connection::open(&path)?;
+        if let Some(ref pp) = self.passphrase {
+            conn.pragma_update(None, "key", pp)?;
+        }
+        Ok(conn)
     }
 
     // ==================== Settings (shared across databases) ====================

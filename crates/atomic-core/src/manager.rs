@@ -8,14 +8,18 @@ use crate::error::AtomicCoreError;
 use crate::registry::{DatabaseInfo, Registry};
 use crate::AtomicCore;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// Manages multiple knowledge-base databases with a shared registry.
 pub struct DatabaseManager {
-    registry: Arc<Registry>,
+    registry: RwLock<Option<Arc<Registry>>>,
     cores: RwLock<HashMap<String, AtomicCore>>,
     active_id: RwLock<String>,
+    /// Optional passphrase for SQLCipher encryption (SQLite only).
+    passphrase: RwLock<Option<String>>,
+    /// Stored so deferred initialization can create databases later.
+    data_dir: PathBuf,
     /// Postgres connection URL, if using Postgres backend.
     /// Stored so `get_core` can create new lightweight cores for different db_ids.
     #[cfg(feature = "postgres")]
@@ -23,18 +27,103 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
-    /// Create a new manager, opening or creating the registry in `data_dir`.
+    /// Create a new manager, opening or creating the registry in `data_dir` (unencrypted).
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
-        let registry = Arc::new(Registry::open_or_create(&data_dir)?);
+        Self::new_encrypted(data_dir, None)
+    }
+
+    /// Create a new manager with optional SQLCipher encryption.
+    pub fn new_encrypted(
+        data_dir: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let registry = Arc::new(Registry::open_or_create_encrypted(
+            &data_dir,
+            passphrase.clone(),
+        )?);
         let default_id = registry.get_default_database_id()?;
 
         Ok(DatabaseManager {
-            registry,
+            registry: RwLock::new(Some(registry)),
             cores: RwLock::new(HashMap::new()),
             active_id: RwLock::new(default_id),
+            passphrase: RwLock::new(passphrase),
+            data_dir,
             #[cfg(feature = "postgres")]
             database_url: None,
         })
+    }
+
+    /// Create a manager in deferred mode — no databases are created yet.
+    /// Call `initialize()` later (e.g. from the setup/claim endpoint) to create them.
+    pub fn new_deferred(data_dir: impl AsRef<Path>) -> Self {
+        DatabaseManager {
+            registry: RwLock::new(None),
+            cores: RwLock::new(HashMap::new()),
+            active_id: RwLock::new("default".to_string()),
+            passphrase: RwLock::new(None),
+            data_dir: data_dir.as_ref().to_path_buf(),
+            #[cfg(feature = "postgres")]
+            database_url: None,
+        }
+    }
+
+    /// Returns true if the manager has been initialized (databases exist).
+    pub fn is_initialized(&self) -> bool {
+        self.registry.read().map(|r| r.is_some()).unwrap_or(false)
+    }
+
+    /// Get the data directory path.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Initialize the manager, creating the registry and databases with an optional passphrase.
+    /// Called during the setup/claim flow when databases were deferred.
+    ///
+    /// Uses the registry write lock to prevent two concurrent requests from both
+    /// initializing with potentially mismatched passphrases (TOCTOU guard).
+    pub fn initialize(&self, passphrase: Option<String>) -> Result<(), AtomicCoreError> {
+        // Acquire the registry write lock FIRST, then check under the lock to
+        // prevent a race where two concurrent requests both see is_initialized() == false.
+        let mut reg = self.registry.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        if reg.is_some() {
+            return Err(AtomicCoreError::Configuration(
+                "Manager already initialized".to_string(),
+            ));
+        }
+
+        let registry = Arc::new(Registry::open_or_create_encrypted(
+            &self.data_dir,
+            passphrase.clone(),
+        )?);
+        let default_id = registry.get_default_database_id()?;
+
+        // Store passphrase
+        {
+            let mut pp = self.passphrase.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+            *pp = passphrase;
+        }
+
+        // Store registry (already holding the write lock)
+        *reg = Some(registry);
+
+        // Update active ID
+        {
+            let mut active = self.active_id.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+            *active = default_id;
+        }
+
+        Ok(())
+    }
+
+    /// Get the registry, returning an error if not yet initialized.
+    fn require_registry(&self) -> Result<Arc<Registry>, AtomicCoreError> {
+        let reg = self.registry.read().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        reg.clone().ok_or_else(|| AtomicCoreError::Configuration(
+            "Server not initialized — complete setup first".to_string(),
+        ))
     }
 
     /// Create a manager that uses Postgres for data storage.
@@ -93,9 +182,11 @@ impl DatabaseManager {
         cores_map.insert(default_id.clone(), core);
 
         Ok(DatabaseManager {
-            registry,
+            registry: RwLock::new(Some(registry)),
             cores: RwLock::new(cores_map),
             active_id: RwLock::new(default_id),
+            passphrase: RwLock::new(None),
+            data_dir: data_dir.as_ref().to_path_buf(),
             #[cfg(feature = "postgres")]
             database_url: Some(database_url.to_string()),
         })
@@ -136,11 +227,11 @@ impl DatabaseManager {
         }
 
         // SQLite path: check registry
-        let databases = self.registry.list_databases()?;
+        let databases = self.require_registry()?.list_databases()?;
         if databases.iter().any(|d| d.id == id_or_name) {
             return Ok(id_or_name.to_string());
         }
-        if let Some(db) = self.registry.find_database_by_name(id_or_name)? {
+        if let Some(db) = self.require_registry()?.find_database_by_name(id_or_name)? {
             return Ok(db.id);
         }
         // Return the original value — let downstream handle not-found
@@ -191,20 +282,25 @@ impl DatabaseManager {
                     }
                     let mut cores = self.cores.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
                     cores.insert(id.to_string(), core.clone());
-                    self.registry.touch_database(id).ok();
+                    if let Err(e) = self.require_registry().and_then(|r| r.touch_database(id)) {
+                        tracing::warn!(db_id = %id, error = %e, "failed to touch database timestamp");
+                    }
                     return Ok(core);
                 }
             }
         }
 
         // SQLite path: load from disk
-        let db_path = self.registry.database_path(id);
-        let core = AtomicCore::open_for_server_with_registry(
+        let registry = self.require_registry()?;
+        let db_path = registry.database_path(id);
+        let pp = self.passphrase.read().map_err(|e| AtomicCoreError::Lock(e.to_string()))?.clone();
+        let core = AtomicCore::open_for_server_encrypted(
             &db_path,
-            Some(Arc::clone(&self.registry)),
+            pp,
+            Some(registry),
         )?;
 
-        self.registry.touch_database(id)?;
+        self.require_registry()?.touch_database(id)?;
 
         let mut cores = self.cores.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
         cores.insert(id.to_string(), core.clone());
@@ -233,7 +329,7 @@ impl DatabaseManager {
                 return Err(AtomicCoreError::NotFound(format!("Database '{}'", id)));
             }
         } else {
-            let databases = self.registry.list_databases()?;
+            let databases = self.require_registry()?.list_databases()?;
             if !databases.iter().any(|d| d.id == id) {
                 return Err(AtomicCoreError::NotFound(format!("Database '{}'", id)));
             }
@@ -241,7 +337,7 @@ impl DatabaseManager {
 
         #[cfg(not(feature = "postgres"))]
         {
-            let databases = self.registry.list_databases()?;
+            let databases = self.require_registry()?.list_databases()?;
             if !databases.iter().any(|d| d.id == id) {
                 return Err(AtomicCoreError::NotFound(format!("Database '{}'", id)));
             }
@@ -255,9 +351,10 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Get a reference to the registry for settings/token/database CRUD.
-    pub fn registry(&self) -> &Arc<Registry> {
-        &self.registry
+    /// Get the registry for settings/token/database CRUD.
+    /// Returns an error if the manager is not yet initialized (deferred mode).
+    pub fn registry(&self) -> Result<Arc<Registry>, AtomicCoreError> {
+        self.require_registry()
     }
 
     /// Create a new database and register it.
@@ -285,13 +382,16 @@ impl DatabaseManager {
             return Ok(info);
         }
 
-        let info = self.registry.create_database(name)?;
+        let registry = self.require_registry()?;
+        let info = registry.create_database(name)?;
 
         // Create the actual SQLite file
-        let db_path = self.registry.database_path(&info.id);
-        let core = AtomicCore::open_for_server_with_registry(
+        let db_path = registry.database_path(&info.id);
+        let pp = self.passphrase.read().map_err(|e| AtomicCoreError::Lock(e.to_string()))?.clone();
+        let core = AtomicCore::open_for_server_encrypted(
             &db_path,
-            Some(Arc::clone(&self.registry)),
+            pp,
+            Some(registry),
         )?;
 
         let mut cores = self.cores.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
@@ -333,7 +433,7 @@ impl DatabaseManager {
         }
 
         // SQLite path: Registry validates it's not the default
-        self.registry.delete_database(id)?;
+        self.require_registry()?.delete_database(id)?;
 
         // Remove from cache
         {
@@ -349,7 +449,7 @@ impl DatabaseManager {
             let active = self.active_id.read().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
             if *active == id {
                 drop(active);
-                let default_id = self.registry.get_default_database_id()?;
+                let default_id = self.require_registry()?.get_default_database_id()?;
                 let mut active =
                     self.active_id.write().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
                 *active = default_id;
@@ -357,7 +457,7 @@ impl DatabaseManager {
         }
 
         // Delete the file
-        let db_path = self.registry.database_path(id);
+        let db_path = self.require_registry()?.database_path(id);
         if db_path.exists() {
             std::fs::remove_file(&db_path).ok();
             // Also remove WAL/SHM
@@ -377,7 +477,7 @@ impl DatabaseManager {
             return Ok((databases, active.clone()));
         }
 
-        let databases = self.registry.list_databases()?;
+        let databases = self.require_registry()?.list_databases()?;
         let active = self.active_id.read().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
         Ok((databases, active.clone()))
     }
@@ -389,7 +489,7 @@ impl DatabaseManager {
             return self.any_storage()?.rename_database_sync(id, name);
         }
 
-        self.registry.rename_database(id, name)
+        self.require_registry()?.rename_database(id, name)
     }
 
     /// Set a database as the new default.
@@ -399,7 +499,7 @@ impl DatabaseManager {
             return self.any_storage()?.set_default_database_sync(id);
         }
 
-        self.registry.set_default_database(id)
+        self.require_registry()?.set_default_database(id)
     }
 
     /// Optimize all loaded cores (call on shutdown).

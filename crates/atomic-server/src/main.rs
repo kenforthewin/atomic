@@ -51,16 +51,16 @@ async fn main() -> std::io::Result<()> {
         }
 
         // Server mode
-        Some(Command::Serve { port, bind, public_url, storage, database_url }) => {
+        Some(Command::Serve { port, bind, public_url, storage, database_url, passphrase }) => {
             // Auto-detect public URL on Fly.io if not explicitly set
             let public_url = public_url.or_else(|| {
                 std::env::var("FLY_APP_NAME").ok().map(|name| format!("https://{name}.fly.dev"))
             });
-            let manager = create_manager(&data_dir, &storage, database_url.as_deref());
+            let manager = create_manager(&data_dir, &storage, database_url.as_deref(), passphrase);
             run_server(manager, &data_dir.display().to_string(), port, &bind, public_url, log_buffer).await
         }
         None => {
-            let manager = create_manager(&data_dir, "sqlite", None);
+            let manager = create_manager(&data_dir, "sqlite", None, None);
             run_server(manager, &data_dir.display().to_string(), 8080, "127.0.0.1", None, log_buffer).await
         }
     }
@@ -71,9 +71,13 @@ fn create_manager(
     data_dir: &std::path::Path,
     storage: &str,
     database_url: Option<&str>,
+    passphrase: Option<String>,
 ) -> atomic_core::DatabaseManager {
     match storage {
         "postgres" => {
+            if passphrase.is_some() {
+                tracing::warn!("--passphrase is ignored in Postgres mode (encryption is managed by Postgres)");
+            }
             let url = database_url.unwrap_or_else(|| {
                 tracing::error!("--database-url is required when --storage=postgres");
                 tracing::error!("Example: --database-url postgres://user:pass@localhost:5432/atomic");
@@ -85,9 +89,41 @@ fn create_manager(
                 .expect("Failed to connect to Postgres")
         }
         _ => {
+            let registry_path = data_dir.join("registry.db");
+            let is_fresh = !registry_path.exists();
+
             tracing::info!(backend = "sqlite", path = %data_dir.display(), "storage backend selected");
-            atomic_core::DatabaseManager::new(data_dir)
-                .expect("Failed to open database manager")
+
+            if let Some(pp) = passphrase {
+                // Explicit passphrase — open/create databases immediately
+                tracing::info!("encryption enabled (SQLCipher)");
+                atomic_core::DatabaseManager::new_encrypted(data_dir, Some(pp))
+                    .expect("Failed to open database manager")
+            } else if is_fresh {
+                // No databases exist yet and no passphrase given — defer creation
+                // until the user completes setup (where they can optionally set a passphrase)
+                tracing::info!("no databases found — waiting for setup");
+                atomic_core::DatabaseManager::new_deferred(data_dir)
+            } else {
+                // Databases exist, no passphrase — try opening unencrypted.
+                // If they're encrypted, start in locked/deferred mode and
+                // serve an unlock endpoint for the UI to provide the passphrase.
+                match atomic_core::DatabaseManager::new_encrypted(data_dir, None) {
+                    Ok(manager) => manager,
+                    Err(e) => {
+                        // SQLCipher returns "file is not a database" when the key is wrong.
+                        // Distinguish this from genuine corruption or permission errors.
+                        let msg = e.to_string();
+                        if msg.contains("not a database") || msg.contains("file is encrypted") {
+                            tracing::info!("database is encrypted — waiting for unlock via UI");
+                            atomic_core::DatabaseManager::new_deferred(data_dir)
+                        } else {
+                            tracing::error!(error = %e, "failed to open database — this may indicate file corruption or a permissions issue");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -161,27 +197,31 @@ async fn run_server(
 ) -> std::io::Result<()> {
     let manager = Arc::new(manager);
 
-    // Get active core for startup tasks
-    let core = manager.active_core().expect("Failed to get active database");
+    // Run startup tasks only if databases are initialized
+    if manager.is_initialized() {
+        let core = manager.active_core().expect("Failed to get active database");
 
-    // Migrate legacy token if present
-    match core.migrate_legacy_token() {
-        Ok(true) => tracing::info!("migrated legacy auth token to new token system"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(error = %e, "failed to migrate legacy token"),
-    }
-
-    // Check token status
-    match core.list_api_tokens() {
-        Ok(tokens) => {
-            let active = tokens.iter().filter(|t| !t.is_revoked).count();
-            if active == 0 {
-                tracing::info!("no API tokens configured — open the web UI to claim this instance or run: atomic-server token create --name default");
-            } else {
-                tracing::info!(count = active, "active API tokens configured");
-            }
+        // Migrate legacy token if present
+        match core.migrate_legacy_token() {
+            Ok(true) => tracing::info!("migrated legacy auth token to new token system"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to migrate legacy token"),
         }
-        Err(e) => tracing::warn!(error = %e, "failed to check tokens"),
+
+        // Check token status
+        match core.list_api_tokens() {
+            Ok(tokens) => {
+                let active = tokens.iter().filter(|t| !t.is_revoked).count();
+                if active == 0 {
+                    tracing::info!("no API tokens configured — open the web UI to claim this instance or run: atomic-server token create --name default");
+                } else {
+                    tracing::info!(count = active, "active API tokens configured");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to check tokens"),
+        }
+    } else {
+        tracing::info!("waiting for setup — visit the web UI to configure this instance");
     }
 
     // Create broadcast channel for WebSocket events (buffer 256 events)
@@ -230,7 +270,7 @@ async fn run_server(
     tracing::info!(bind = bind, port = port, "WebSocket: ws://{}:{}/ws?token=<token>", bind, port);
 
     // Startup recovery: reset stuck atoms and process any pending work for ALL databases
-    {
+    if manager.is_initialized() {
         let (databases, _active_id) = manager.list_databases().unwrap_or_default();
         for db_info in &databases {
             let db_core = match manager.get_core(&db_info.id) {
@@ -331,6 +371,7 @@ async fn run_server(
             // Instance setup (public, no auth — guarded by zero-token check)
             .route("/api/setup/status", web::get().to(routes::setup::setup_status))
             .route("/api/setup/claim", web::post().to(routes::setup::claim_instance))
+            .route("/api/setup/unlock", web::post().to(routes::setup::unlock_instance))
             // OAuth flow (public, no auth)
             .route("/oauth/register", web::post().to(routes::oauth::register))
             .route(

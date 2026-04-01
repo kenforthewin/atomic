@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 # Database — SQLite (always available)
-rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "load_extension"] }
 sqlite-vec = "0.1.6"
 
 # Database — Postgres (feature-gated)

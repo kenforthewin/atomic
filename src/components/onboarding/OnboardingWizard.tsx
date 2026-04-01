@@ -3,7 +3,7 @@ import { Button } from '../ui/Button';
 import { StepIndicator } from './StepIndicator';
 import { useOnboardingState, STEPS } from './useOnboardingState';
 import { useSettingsStore } from '../../stores/settings';
-import { isDesktopApp, getTransport } from '../../lib/transport';
+import { isDesktopApp, isDesktopFreshInstall, getTransport } from '../../lib/transport';
 
 import { WelcomeStep } from './steps/WelcomeStep';
 import { AIProviderStep } from './steps/AIProviderStep';
@@ -27,7 +27,10 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
   const canProceed = (() => {
     switch (currentStepDef.id) {
       case 'welcome': {
-        if (isDesktopApp()) return true;
+        // Desktop existing install: always proceed (already connected)
+        // Desktop fresh install: proceed after claim completes (calls onNext directly)
+        // Web: proceed once transport is connected
+        if (isDesktopApp() && !isDesktopFreshInstall()) return true;
         return getTransport().isConnected();
       }
       case 'ai-provider': {

@@ -12,6 +12,12 @@ pub async fn ws_handler(
     state: web::Data<AppState>,
     query: web::Query<WsQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Reject early if server is not yet initialized (fresh/locked)
+    if !state.manager.is_initialized() {
+        return Ok(HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "server_not_initialized"})));
+    }
+
     // Authenticate via query param
     let core = state.manager.active_core()
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to get database"))?;
@@ -37,7 +43,7 @@ pub async fn ws_handler(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("WebSocket client lagged, skipped {} events", n);
+                    tracing::warn!(skipped = n, "WebSocket client lagged");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

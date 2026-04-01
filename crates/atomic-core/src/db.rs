@@ -13,7 +13,7 @@ const SERVER_READ_POOL_SIZE: usize = 16;
 /// Statement cache capacity per connection (default is 16, too small for our query variety)
 const STMT_CACHE_CAPACITY: usize = 64;
 
-/// Base PRAGMAs applied to every connection
+/// Base PRAGMAs applied to every connection (after PRAGMA key, if encrypted)
 const BASE_PRAGMAS: &str = "\
     PRAGMA journal_mode=WAL; \
     PRAGMA synchronous=NORMAL; \
@@ -22,6 +22,21 @@ const BASE_PRAGMAS: &str = "\
     PRAGMA mmap_size=2147483648; \
     PRAGMA temp_store=MEMORY; \
 ";
+
+/// Apply PRAGMA key (if passphrase is provided) followed by base PRAGMAs.
+/// PRAGMA key MUST be the very first statement on an encrypted database.
+fn apply_connection_pragmas(
+    conn: &Connection,
+    passphrase: Option<&str>,
+    extra_pragmas: &str,
+) -> Result<(), AtomicCoreError> {
+    if let Some(passphrase) = passphrase {
+        // Use a parameterized PRAGMA key to avoid SQL injection
+        conn.pragma_update(None, "key", passphrase)?;
+    }
+    conn.execute_batch(&format!("{}{}", BASE_PRAGMAS, extra_pragmas))?;
+    Ok(())
+}
 
 /// A read-only connection handle — either borrowed from the pool or a temporary connection.
 pub enum ReadConn<'a> {
@@ -46,27 +61,51 @@ pub struct Database {
     /// Avoids contention with the main write connection.
     read_pool: Vec<Mutex<Connection>>,
     pub db_path: PathBuf,
+    /// Optional passphrase for SQLCipher encryption.
+    /// Stored so new connections (read_conn overflow, new_connection) can use it.
+    passphrase: Option<String>,
 }
 
 impl Database {
-    /// Open an existing database
+    /// Open an existing database (unencrypted)
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
-        Self::open_internal(path.as_ref(), false)
+        Self::open_internal(path.as_ref(), false, None)
     }
 
-    /// Open an existing database or create a new one
+    /// Open an existing database or create a new one (unencrypted)
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
-        Self::open_internal(path.as_ref(), true)
+        Self::open_internal(path.as_ref(), true, None)
     }
 
-    fn open_internal(path: &Path, create: bool) -> Result<Self, AtomicCoreError> {
-        Self::open_with_pool_size(path, create, READ_POOL_SIZE)
+    /// Open an existing database with optional encryption
+    pub fn open_encrypted(
+        path: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_internal(path.as_ref(), false, passphrase)
+    }
+
+    /// Open or create a database with optional encryption
+    pub fn open_or_create_encrypted(
+        path: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_internal(path.as_ref(), true, passphrase)
+    }
+
+    fn open_internal(
+        path: &Path,
+        create: bool,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_with_pool_size(path, create, READ_POOL_SIZE, passphrase)
     }
 
     fn open_with_pool_size(
         path: &Path,
         create: bool,
         pool_size: usize,
+        passphrase: Option<String>,
     ) -> Result<Self, AtomicCoreError> {
         // Register sqlite-vec extension
         unsafe {
@@ -84,11 +123,12 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
 
-        // Base PRAGMAs + WAL size limit (64 MB) to prevent unbounded WAL growth
-        conn.execute_batch(&format!(
-            "{} PRAGMA journal_size_limit=67108864;",
-            BASE_PRAGMAS
-        ))?;
+        // PRAGMA key (if encrypted) + base PRAGMAs + WAL size limit
+        apply_connection_pragmas(
+            &conn,
+            passphrase.as_deref(),
+            "PRAGMA journal_size_limit=67108864;",
+        )?;
 
         // Checkpoint any WAL from a previous run to start clean
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -110,7 +150,7 @@ impl Database {
         for _ in 0..pool_size {
             let rc = Connection::open(&db_path)?;
             rc.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-            rc.execute_batch(&format!("{} PRAGMA query_only=ON;", BASE_PRAGMAS))?;
+            apply_connection_pragmas(&rc, passphrase.as_deref(), "PRAGMA query_only=ON;")?;
             read_pool.push(Mutex::new(rc));
         }
 
@@ -118,6 +158,7 @@ impl Database {
             conn: Mutex::new(conn),
             read_pool,
             db_path,
+            passphrase,
         })
     }
 
@@ -132,7 +173,7 @@ impl Database {
         // All pool slots busy — create a temporary connection
         let conn = Connection::open(&self.db_path)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-        conn.execute_batch(&format!("{} PRAGMA query_only=ON;", BASE_PRAGMAS))?;
+        apply_connection_pragmas(&conn, self.passphrase.as_deref(), "PRAGMA query_only=ON;")?;
         Ok(ReadConn::Temp(conn))
     }
 
@@ -143,14 +184,22 @@ impl Database {
         // which applies to all connections opened after that call.
         let conn = Connection::open(&self.db_path)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-        conn.execute_batch(BASE_PRAGMAS)?;
+        apply_connection_pragmas(&conn, self.passphrase.as_deref(), "")?;
         Ok(conn)
     }
 
-    /// Open with a larger read pool sized for server workloads.
+    /// Open with a larger read pool sized for server workloads (unencrypted).
     /// Creates the DB and parent directories if they don't exist.
     pub fn open_for_server(path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
-        Self::open_with_pool_size(path.as_ref(), true, SERVER_READ_POOL_SIZE)
+        Self::open_with_pool_size(path.as_ref(), true, SERVER_READ_POOL_SIZE, None)
+    }
+
+    /// Open for server with optional encryption.
+    pub fn open_for_server_encrypted(
+        path: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_with_pool_size(path.as_ref(), true, SERVER_READ_POOL_SIZE, passphrase)
     }
 
     /// Walk the hot indexes and table pages into the OS + SQLite page caches.
@@ -858,5 +907,101 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM atoms", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "New database should have 0 atoms");
+    }
+
+    #[test]
+    fn test_encrypted_database_roundtrip() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let passphrase = Some("test-passphrase-123".to_string());
+
+        // Create encrypted database and insert data
+        {
+            let db = Database::open_or_create_encrypted(temp_file.path(), passphrase.clone()).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO atoms (id, content, title, snippet, created_at, updated_at)
+                 VALUES ('test-1', 'Hello encrypted world', 'Hello', 'Hello encrypted...', '2024-01-01', '2024-01-01')",
+                [],
+            ).unwrap();
+        }
+
+        // Reopen with same passphrase — should read data back
+        {
+            let db = Database::open_encrypted(temp_file.path(), passphrase).unwrap();
+            let conn = db.conn.lock().unwrap();
+            let content: String = conn
+                .query_row("SELECT content FROM atoms WHERE id = 'test-1'", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(content, "Hello encrypted world");
+        }
+    }
+
+    #[test]
+    fn test_encrypted_database_wrong_passphrase() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        // Create encrypted database
+        {
+            let _db = Database::open_or_create_encrypted(
+                temp_file.path(),
+                Some("correct-passphrase".to_string()),
+            ).unwrap();
+        }
+
+        // Try to open with wrong passphrase — should fail
+        let result = Database::open_encrypted(
+            temp_file.path(),
+            Some("wrong-passphrase".to_string()),
+        );
+        assert!(result.is_err(), "Opening with wrong passphrase should fail");
+    }
+
+    #[test]
+    fn test_encrypted_database_no_passphrase_fails() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        // Create encrypted database
+        {
+            let _db = Database::open_or_create_encrypted(
+                temp_file.path(),
+                Some("my-passphrase".to_string()),
+            ).unwrap();
+        }
+
+        // Try to open without passphrase — should fail
+        let result = Database::open(temp_file.path());
+        assert!(result.is_err(), "Opening encrypted DB without passphrase should fail");
+    }
+
+    #[test]
+    fn test_encrypted_read_pool_and_new_connection() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let passphrase = Some("pool-test-passphrase".to_string());
+
+        let db = Database::open_or_create_encrypted(temp_file.path(), passphrase).unwrap();
+
+        // Insert via write connection
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO atoms (id, content, title, snippet, created_at, updated_at)
+                 VALUES ('pool-1', 'Pool test', 'Pool', 'Pool...', '2024-01-01', '2024-01-01')",
+                [],
+            ).unwrap();
+        }
+
+        // Read via pool connection
+        let read = db.read_conn().unwrap();
+        let content: String = read
+            .query_row("SELECT content FROM atoms WHERE id = 'pool-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "Pool test");
+
+        // Read via new_connection
+        let new_conn = db.new_connection().unwrap();
+        let content: String = new_conn
+            .query_row("SELECT content FROM atoms WHERE id = 'pool-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "Pool test");
     }
 }

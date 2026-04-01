@@ -30,12 +30,35 @@ export class HttpTransport implements Transport {
       .replace(/^http/, 'ws')
       .replace(/\/$/, '')
       + `/ws?token=${encodeURIComponent(this.config.authToken)}`;
+
+    // Check if server is initialized before attempting WebSocket.
+    // A fresh or locked server can't authenticate WS connections,
+    // so skip to avoid a noisy reconnect loop during setup/unlock.
+    const initialized = await this.isServerInitialized();
+    if (!initialized) {
+      this.shouldReconnect = false;
+      return;
+    }
+
     try {
       await this.connectWs();
     } catch {
       // WebSocket failed (stale token, server down, etc.) — don't block app startup.
       // HTTP calls will detect auth issues; reconnect will retry in background.
       this.scheduleReconnect();
+    }
+  }
+
+  private async isServerInitialized(): Promise<boolean> {
+    try {
+      const resp = await fetch(
+        `${this.config.baseUrl.replace(/\/$/, '')}/api/setup/status`,
+      );
+      if (!resp.ok) return false;
+      const data = await resp.json();
+      return !data.needs_setup && !data.needs_unlock;
+    } catch {
+      return false;
     }
   }
 
@@ -169,5 +192,18 @@ export class HttpTransport implements Transport {
     const subs = this.listeners.get(event)!;
     subs.add(callback);
     return () => { subs.delete(callback); };
+  }
+
+  /** Copy all event subscriptions from another transport (used during switchTransport). */
+  transferListenersFrom(other: HttpTransport): void {
+    for (const [event, callbacks] of other.listeners) {
+      if (!this.listeners.has(event)) {
+        this.listeners.set(event, new Set());
+      }
+      const target = this.listeners.get(event)!;
+      for (const cb of callbacks) {
+        target.add(cb);
+      }
+    }
   }
 }

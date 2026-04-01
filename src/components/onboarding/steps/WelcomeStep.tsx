@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Button } from '../../ui/Button';
-import { isDesktopApp, getTransport, switchTransport } from '../../../lib/transport';
+import { isDesktopApp, isDesktopFreshInstall, getTransport, switchTransport, saveDesktopToken, getLocalServerConfig } from '../../../lib/transport';
 import type { OnboardingState, OnboardingAction } from '../useOnboardingState';
 
 interface WelcomeStepProps {
@@ -9,15 +9,21 @@ interface WelcomeStepProps {
   onNext: () => void;
 }
 
-type SetupMode = 'checking' | 'claim' | 'manual';
+type SetupMode = 'checking' | 'claim' | 'unlock' | 'manual';
 
 export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
   const isDesktop = isDesktopApp();
   const [setupMode, setSetupMode] = useState<SetupMode>('checking');
   const [isClaiming, setIsClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
+  const [isUnlocking, setIsUnlocking] = useState(false);
+  const [unlockPassphrase, setUnlockPassphrase] = useState('');
+  const [unlockError, setUnlockError] = useState<string | null>(null);
   const [claimedToken, setClaimedToken] = useState<string | null>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
+  const [passphrase, setPassphrase] = useState('');
+  const [passphraseConfirm, setPassphraseConfirm] = useState('');
+  const [enableEncryption, setEnableEncryption] = useState(false);
 
   // On mount (web mode only), check if we're co-hosted with the server
   useEffect(() => {
@@ -27,13 +33,14 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
     const baseUrl = window.location.origin;
     fetch(`${baseUrl}/api/setup/status`)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`${r.status}`)))
-      .then((data: { needs_setup: boolean }) => {
-        if (data.needs_setup) {
-          dispatch({ type: 'SET_SERVER_URL', value: baseUrl });
+      .then((data: { needs_setup: boolean; needs_unlock: boolean }) => {
+        dispatch({ type: 'SET_SERVER_URL', value: baseUrl });
+        if (data.needs_unlock) {
+          setSetupMode('unlock');
+        } else if (data.needs_setup) {
           setSetupMode('claim');
         } else {
           // Server exists at same origin but is already claimed — pre-fill URL
-          dispatch({ type: 'SET_SERVER_URL', value: baseUrl });
           setSetupMode('manual');
         }
       })
@@ -44,14 +51,26 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
   }, [isDesktop, dispatch]);
 
   const handleClaim = async () => {
+    if (enableEncryption && passphrase !== passphraseConfirm) {
+      setClaimError('Passphrases do not match');
+      return;
+    }
+    if (enableEncryption && passphrase.length < 8) {
+      setClaimError('Passphrase must be at least 8 characters');
+      return;
+    }
     setIsClaiming(true);
     setClaimError(null);
     const baseUrl = state.serverUrl.trim().replace(/\/$/, '');
     try {
+      const claimBody: Record<string, string> = { name: 'default' };
+      if (enableEncryption && passphrase) {
+        claimBody.passphrase = passphrase;
+      }
       const resp = await fetch(`${baseUrl}/api/setup/claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'default' }),
+        body: JSON.stringify(claimBody),
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
@@ -65,6 +84,29 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
       setClaimError(String(e instanceof Error ? e.message : e));
     } finally {
       setIsClaiming(false);
+    }
+  };
+
+  const handleUnlock = async () => {
+    setIsUnlocking(true);
+    setUnlockError(null);
+    const baseUrl = state.serverUrl.trim().replace(/\/$/, '');
+    try {
+      const resp = await fetch(`${baseUrl}/api/setup/unlock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passphrase: unlockPassphrase }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+        throw new Error(err.error || err.hint || `HTTP ${resp.status}`);
+      }
+      // Unlocked — now check if we need to show manual login or already have a token
+      setSetupMode('manual');
+    } catch (e) {
+      setUnlockError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setIsUnlocking(false);
     }
   };
 
@@ -97,6 +139,111 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
       dispatch({ type: 'SET_SERVER_TEST', result: 'error', error: String(e) });
     }
   };
+
+  const handleDesktopClaim = async () => {
+    if (enableEncryption && passphrase !== passphraseConfirm) {
+      setClaimError('Passphrases do not match');
+      return;
+    }
+    if (enableEncryption && passphrase.length < 8) {
+      setClaimError('Passphrase must be at least 8 characters');
+      return;
+    }
+    setIsClaiming(true);
+    setClaimError(null);
+    const baseUrl = getLocalServerConfig()?.baseUrl || `http://127.0.0.1:44380`;
+    try {
+      const claimBody: Record<string, string> = { name: 'default' };
+      if (enableEncryption && passphrase) {
+        claimBody.passphrase = passphrase;
+      }
+      const resp = await fetch(`${baseUrl}/api/setup/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(claimBody),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+        throw new Error(err.error || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      // Save token to disk so it persists across restarts (desktop-managed, never shown to user)
+      await saveDesktopToken(data.token);
+      await switchTransport({ baseUrl, authToken: data.token });
+      onNext();
+    } catch (e) {
+      setClaimError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setIsClaiming(false);
+    }
+  };
+
+  if (isDesktop && isDesktopFreshInstall()) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-center space-y-6 px-8">
+        <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent)]/10 flex items-center justify-center">
+          <svg className="w-8 h-8 text-[var(--color-accent)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
+          </svg>
+        </div>
+
+        <div>
+          <h2 className="text-2xl font-bold text-[var(--color-text-primary)] mb-2">
+            Welcome to Atomic
+          </h2>
+          <p className="text-[var(--color-text-secondary)] max-w-md">
+            Your personal knowledge base that turns freeform notes into a semantically-connected, AI-augmented knowledge graph.
+          </p>
+        </div>
+
+        {/* Encryption option */}
+        <div className="w-full max-w-md space-y-3">
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={enableEncryption}
+              onChange={(e) => setEnableEncryption(e.target.checked)}
+              className="w-4 h-4 rounded border-[var(--color-border)] text-[var(--color-accent)] focus:ring-[var(--color-accent)]"
+            />
+            <div className="text-left">
+              <span className="text-sm font-medium text-[var(--color-text-primary)]">Encrypt database at rest</span>
+              <p className="text-xs text-[var(--color-text-secondary)]">Protects your data with a passphrase using SQLCipher (AES-256)</p>
+            </div>
+          </label>
+
+          {enableEncryption && (
+            <div className="space-y-2 pl-7">
+              <input
+                type="password"
+                value={passphrase}
+                onChange={(e) => setPassphrase(e.target.value)}
+                placeholder="Passphrase (min 8 characters)"
+                className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent text-sm"
+              />
+              <input
+                type="password"
+                value={passphraseConfirm}
+                onChange={(e) => setPassphraseConfirm(e.target.value)}
+                placeholder="Confirm passphrase"
+                className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent text-sm"
+              />
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                You'll need this passphrase every time the app restarts. If you lose it, your data cannot be recovered.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <Button onClick={handleDesktopClaim} disabled={isClaiming || (enableEncryption && (passphrase.length < 8 || passphrase !== passphraseConfirm))}>
+          {isClaiming ? 'Setting up...' : 'Get Started'}
+        </Button>
+
+        {claimError && (
+          <div className="text-sm text-red-500">{claimError}</div>
+        )}
+      </div>
+    );
+  }
 
   if (isDesktop) {
     return (
@@ -245,7 +392,45 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
           </p>
         </div>
 
-        <Button onClick={handleClaim} disabled={isClaiming}>
+        {/* Encryption option */}
+        <div className="w-full max-w-md space-y-3">
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={enableEncryption}
+              onChange={(e) => setEnableEncryption(e.target.checked)}
+              className="w-4 h-4 rounded border-[var(--color-border)] text-[var(--color-accent)] focus:ring-[var(--color-accent)]"
+            />
+            <div className="text-left">
+              <span className="text-sm font-medium text-[var(--color-text-primary)]">Encrypt database at rest</span>
+              <p className="text-xs text-[var(--color-text-secondary)]">Protects your data with a passphrase using SQLCipher (AES-256)</p>
+            </div>
+          </label>
+
+          {enableEncryption && (
+            <div className="space-y-2 pl-7">
+              <input
+                type="password"
+                value={passphrase}
+                onChange={(e) => setPassphrase(e.target.value)}
+                placeholder="Passphrase (min 8 characters)"
+                className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent text-sm"
+              />
+              <input
+                type="password"
+                value={passphraseConfirm}
+                onChange={(e) => setPassphraseConfirm(e.target.value)}
+                placeholder="Confirm passphrase"
+                className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent text-sm"
+              />
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                You'll need this passphrase every time the server restarts. If you lose it, your data cannot be recovered.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <Button onClick={handleClaim} disabled={isClaiming || (enableEncryption && (passphrase.length < 8 || passphrase !== passphraseConfirm))}>
           {isClaiming ? 'Setting up...' : 'Get Started'}
         </Button>
 
@@ -259,6 +444,48 @@ export function WelcomeStep({ state, dispatch, onNext }: WelcomeStepProps) {
         >
           Connect to a different server instead
         </button>
+      </div>
+    );
+  }
+
+  // Encrypted database — needs unlock
+  if (setupMode === 'unlock') {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-center space-y-6 px-8">
+        <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent)]/10 flex items-center justify-center">
+          <svg className="w-8 h-8 text-[var(--color-accent)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+          </svg>
+        </div>
+
+        <div>
+          <h2 className="text-2xl font-bold text-[var(--color-text-primary)] mb-2">
+            Database Locked
+          </h2>
+          <p className="text-[var(--color-text-secondary)] max-w-md">
+            Your database is encrypted. Enter your passphrase to unlock it.
+          </p>
+        </div>
+
+        <div className="w-full max-w-sm space-y-3">
+          <input
+            type="password"
+            value={unlockPassphrase}
+            onChange={(e) => setUnlockPassphrase(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && unlockPassphrase) handleUnlock(); }}
+            placeholder="Passphrase"
+            autoFocus
+            className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent text-sm"
+          />
+
+          <Button onClick={handleUnlock} disabled={isUnlocking || !unlockPassphrase}>
+            {isUnlocking ? 'Unlocking...' : 'Unlock'}
+          </Button>
+
+          {unlockError && (
+            <div className="text-sm text-red-500">{unlockError}</div>
+          )}
+        </div>
       </div>
     );
   }

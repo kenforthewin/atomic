@@ -65,6 +65,12 @@ pub enum Command {
         /// Example: postgres://user:pass@localhost:5432/atomic
         #[arg(long, env = "ATOMIC_DATABASE_URL")]
         database_url: Option<String>,
+
+        /// Passphrase for SQLCipher database encryption (SQLite only).
+        /// When set, all SQLite databases are encrypted at rest.
+        /// Omit for unencrypted databases.
+        #[arg(long, env = "ATOMIC_PASSPHRASE")]
+        passphrase: Option<String>,
     },
 
     /// Manage API tokens

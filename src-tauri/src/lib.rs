@@ -24,39 +24,49 @@ struct SidecarState {
     child: Mutex<Option<SidecarChild>>,
 }
 
+/// Mutable token state — updated by `save_local_token` after claim.
+struct TokenState {
+    token: Mutex<String>,
+    data_dir: std::path::PathBuf,
+}
+
 #[tauri::command]
 fn get_local_server_config(
     config: tauri::State<'_, LocalServerConfig>,
+    token_state: tauri::State<'_, TokenState>,
 ) -> LocalServerConfig {
-    config.inner().clone()
+    let mut cfg = config.inner().clone();
+    // Use the latest token (may have been updated by save_local_token after claim)
+    if let Ok(token) = token_state.token.lock() {
+        cfg.auth_token = token.clone();
+    }
+    cfg
 }
 
-/// Read or create the local server auth token.
-/// Uses the registry (shared across databases) for token management.
-fn ensure_local_token(app_data_dir: &std::path::Path) -> String {
-    let token_file = app_data_dir.join("local_server_token");
-
-    // Try to read existing token
-    if let Ok(token) = std::fs::read_to_string(&token_file) {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return token;
-        }
+/// Save the auth token to disk after a successful claim.
+/// Called by the frontend so the token persists across restarts.
+#[tauri::command]
+fn save_local_token(
+    token: String,
+    token_state: tauri::State<'_, TokenState>,
+) -> Result<(), String> {
+    let token_file = token_state.data_dir.join("local_server_token");
+    std::fs::write(&token_file, &token)
+        .map_err(|e| format!("Failed to write token file: {e}"))?;
+    if let Ok(mut t) = token_state.token.lock() {
+        *t = token;
     }
+    Ok(())
+}
 
-    // Create a new token via the DatabaseManager (opens registry + default db)
-    let manager = atomic_core::DatabaseManager::new(app_data_dir)
-        .expect("Failed to open database manager for token bootstrap");
-
-    let (_info, raw_token) = manager
-        .registry()
-        .create_api_token("desktop")
-        .expect("Failed to create API token");
-
-    std::fs::write(&token_file, &raw_token)
-        .expect("Failed to write local server token file");
-
-    raw_token
+/// Read the cached auth token from disk if it exists.
+/// Does NOT open the database — safe to call regardless of encryption state.
+fn read_cached_token(app_data_dir: &std::path::Path) -> Option<String> {
+    let token_file = app_data_dir.join("local_server_token");
+    std::fs::read_to_string(token_file)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -83,8 +93,10 @@ pub fn run() {
 
             tracing::info!(path = ?app_data_dir, "Data directory");
 
-            // Bootstrap auth token (opens registry/manager)
-            let auth_token = ensure_local_token(&app_data_dir);
+            // Read cached token (does NOT open the database).
+            // On fresh installs or if the file was lost, this returns None.
+            // The frontend will handle claiming/setup via the sidecar's HTTP API.
+            let auth_token = read_cached_token(&app_data_dir).unwrap_or_default();
 
             let base_url = format!("http://127.0.0.1:{}", SIDECAR_PORT);
             let config = LocalServerConfig {
@@ -92,6 +104,10 @@ pub fn run() {
                 auth_token: auth_token.clone(),
             };
             app.manage(config.clone());
+            app.manage(TokenState {
+                token: Mutex::new(auth_token.clone()),
+                data_dir: app_data_dir.clone(),
+            });
 
             // Check if an Atomic server is already running on the port
             let health_url = format!("{}/health", base_url);
@@ -177,6 +193,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_local_server_config,
+            save_local_token,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

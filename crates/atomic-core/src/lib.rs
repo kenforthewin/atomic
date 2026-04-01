@@ -106,7 +106,7 @@ pub struct AtomicCore {
 }
 
 impl AtomicCore {
-    /// Open an existing database
+    /// Open an existing database (unencrypted)
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
         let db = Arc::new(Database::open(db_path)?);
         let storage = storage::StorageBackend::Sqlite(storage::SqliteStorage::new(db));
@@ -125,6 +125,16 @@ impl AtomicCore {
         registry: Option<Arc<registry::Registry>>,
     ) -> Result<Self, AtomicCoreError> {
         let db = Database::open_for_server(db_path)?;
+        Self::seed_and_backfill(db, registry)
+    }
+
+    /// Open for server with optional encryption and registry.
+    pub fn open_for_server_encrypted(
+        db_path: impl AsRef<Path>,
+        passphrase: Option<String>,
+        registry: Option<Arc<registry::Registry>>,
+    ) -> Result<Self, AtomicCoreError> {
+        let db = Database::open_for_server_encrypted(db_path, passphrase)?;
         Self::seed_and_backfill(db, registry)
     }
 
@@ -185,9 +195,18 @@ impl AtomicCore {
         }
     }
 
-    /// Open an existing database or create a new one
+    /// Open an existing database or create a new one (unencrypted)
     pub fn open_or_create(db_path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
         let db = Database::open_or_create(db_path)?;
+        Self::seed_and_backfill(db, None)
+    }
+
+    /// Open or create with optional encryption
+    pub fn open_or_create_encrypted(
+        db_path: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self, AtomicCoreError> {
+        let db = Database::open_or_create_encrypted(db_path, passphrase)?;
         Self::seed_and_backfill(db, None)
     }
 
