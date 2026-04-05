@@ -1,3 +1,5 @@
+.env
+.env.local
 src-tauri/target/
 src-tauri/binaries/
 target/

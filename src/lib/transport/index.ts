@@ -31,9 +31,18 @@ export async function initTransport(): Promise<void> {
     wireConnectionCallback(activeTransport);
     await activeTransport.connect();
   } else {
-    // Web SPA — require explicit config from localStorage or prompt user
+    // Web SPA — env vars take priority, then localStorage, then prompt user
     const saved = localStorage.getItem('atomic-server-config');
-    if (saved) {
+    const envUrl = import.meta.env.VITE_ATOMIC_URL as string | undefined;
+    const envToken = import.meta.env.VITE_ATOMIC_TOKEN as string | undefined;
+
+    if (envUrl && envToken) {
+      const config: HttpTransportConfig = { baseUrl: envUrl.replace(/\/$/, ''), authToken: envToken };
+      activeTransport = new HttpTransport(config);
+      wireConnectionCallback(activeTransport);
+      await activeTransport.connect();
+      localStorage.setItem('atomic-server-config', JSON.stringify(config));
+    } else if (saved) {
       const config: HttpTransportConfig = JSON.parse(saved);
       activeTransport = new HttpTransport(config);
       wireConnectionCallback(activeTransport);
