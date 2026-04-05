@@ -58,6 +58,27 @@ export async function getEmbeddingStatus(atomId: string): Promise<string> {
   return getTransport().invoke('get_embedding_status', { atomId });
 }
 
+// Pipeline status dashboard
+export interface PipelineStatus {
+  pending: number;
+  processing: number;
+  complete: number;
+  failed_count: number;
+  failed: FailedAtom[];
+}
+
+export interface FailedAtom {
+  atom_id: string;
+  title: string;
+  snippet: string;
+  error: string | null;
+  updated_at: string;
+}
+
+export async function getPipelineStatus(): Promise<PipelineStatus> {
+  return getTransport().invoke('get_pipeline_status', {});
+}
+
 // Wiki commands
 export async function getWikiArticle(tagId: string): Promise<any | null> {
   return getTransport().invoke('get_wiki_article', { tagId });

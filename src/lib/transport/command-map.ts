@@ -171,6 +171,10 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: (a) => `/api/atoms/${encodeURIComponent(a.atomId as string)}/embedding-status`,
     transformResponse: (d: any) => d.status as string,
   },
+  get_pipeline_status: {
+    method: 'GET',
+    path: '/api/embeddings/status',
+  },
 
   // ==================== Wiki ====================
   get_all_wiki_articles: {
