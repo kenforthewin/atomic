@@ -122,10 +122,7 @@ export const commands: Command[] = [
     category: 'navigation',
     keywords: ['settings', 'preferences', 'config', 'options', 'setup'],
     icon: SettingsIcon,
-    action: () => {
-      // Settings modal is managed separately, we'll emit a custom event
-      window.dispatchEvent(new CustomEvent('open-settings'));
-    },
+    action: () => useUIStore.getState().setViewMode('settings'),
   },
 
   // Atom commands
@@ -198,6 +195,26 @@ export const commands: Command[] = [
   },
 
   // Utility commands
+  {
+    id: 'open-event-log',
+    label: 'Open event log',
+    category: 'utility',
+    keywords: ['event', 'log', 'console', 'debug', 'events', 'stream', 'monitor'],
+    icon: SettingsIcon,
+    action: () => {
+      window.dispatchEvent(new CustomEvent('open-event-log'));
+    },
+  },
+  {
+    id: 'open-pipeline-status',
+    label: 'Pipeline Status',
+    category: 'utility',
+    keywords: ['pipeline', 'embedding', 'status', 'queue', 'failed', 'processing', 'stuck'],
+    icon: SettingsIcon,
+    action: () => {
+      window.dispatchEvent(new CustomEvent('open-pipeline-status'));
+    },
+  },
   {
     id: 'retry-failed-embeddings',
     label: 'Retry failed embeddings',

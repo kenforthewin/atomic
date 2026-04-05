@@ -4,9 +4,10 @@ import { MainView } from './MainView';
 import { RightDrawer } from './RightDrawer';
 import { LoadingIndicator } from '../ui/LoadingIndicator';
 import { ServerConnectionStatus } from '../ui/ServerConnectionStatus';
-import { SettingsModal } from '../settings/SettingsModal';
 import { OnboardingWizard } from '../onboarding';
 import { CommandPalette } from '../command-palette';
+import { EventLogModal } from '../event-log';
+import { PipelineStatus } from '../pipeline';
 import { useAtomsStore } from '../../stores/atoms';
 import { useTagsStore } from '../../stores/tags';
 import { useUIStore } from '../../stores/ui';
@@ -21,7 +22,8 @@ export function Layout() {
   const fetchAtoms = useAtomsStore(s => s.fetchAtoms);
   const fetchTags = useTagsStore(s => s.fetchTags);
   const [isSetupRequired, setIsSetupRequired] = useState<boolean | null>(null); // null = checking
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [eventLogOpen, setEventLogOpen] = useState(false);
+  const [pipelineStatusOpen, setPipelineStatusOpen] = useState(false);
 
   // Command palette state
   const commandPaletteOpen = useUIStore((state) => state.commandPaletteOpen);
@@ -78,9 +80,23 @@ export function Layout() {
 
   // Listen for custom settings event from command palette
   useEffect(() => {
-    const handleOpenSettings = () => setSettingsOpen(true);
+    const handleOpenSettings = () => useUIStore.getState().setViewMode('settings');
     window.addEventListener('open-settings', handleOpenSettings);
     return () => window.removeEventListener('open-settings', handleOpenSettings);
+  }, []);
+
+  // Listen for custom event log event from command palette
+  useEffect(() => {
+    const handleOpenEventLog = () => setEventLogOpen(true);
+    window.addEventListener('open-event-log', handleOpenEventLog);
+    return () => window.removeEventListener('open-event-log', handleOpenEventLog);
+  }, []);
+
+  // Listen for pipeline status event from command palette
+  useEffect(() => {
+    const handleOpenPipelineStatus = () => setPipelineStatusOpen(true);
+    window.addEventListener('open-pipeline-status', handleOpenPipelineStatus);
+    return () => window.removeEventListener('open-pipeline-status', handleOpenPipelineStatus);
   }, []);
 
   // Listen for auth expiry (stale/revoked token) and transition to setup mode
@@ -94,16 +110,16 @@ export function Layout() {
   useEffect(() => {
     const checkSetup = async () => {
       try {
-        const configured = await verifyProviderConfigured();
+        // Skip onboarding if env vars provided a connection
+        const envConfigured = !!(import.meta.env.VITE_ATOMIC_URL && import.meta.env.VITE_ATOMIC_TOKEN);
+        const configured = envConfigured || await verifyProviderConfigured();
         setIsSetupRequired(!configured);
 
         if (configured) {
-          // Only initialize app if provider is configured
           await initializeApp();
         }
       } catch (error) {
         console.error('Failed to check provider configuration:', error);
-        // If check fails, show setup anyway
         setIsSetupRequired(true);
       }
     };
@@ -151,9 +167,13 @@ export function Layout() {
         onClose={closeCommandPalette}
         initialQuery={commandPaletteInitialQuery}
       />
-      <SettingsModal
-        isOpen={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+      <EventLogModal
+        isOpen={eventLogOpen}
+        onClose={() => setEventLogOpen(false)}
+      />
+      <PipelineStatus
+        isOpen={pipelineStatusOpen}
+        onClose={() => setPipelineStatusOpen(false)}
       />
     </div>
   );

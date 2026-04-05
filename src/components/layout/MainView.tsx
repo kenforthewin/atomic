@@ -4,6 +4,7 @@ import { AtomGrid } from '../atoms/AtomGrid';
 import { AtomList } from '../atoms/AtomList';
 import { FilterBar } from '../atoms/FilterBar';
 import { SigmaCanvas } from '../canvas/SigmaCanvas';
+import { SettingsPage } from '../settings/SettingsPage';
 import { FAB } from '../ui/FAB';
 import { useAtomsStore } from '../../stores/atoms';
 import { useUIStore } from '../../stores/ui';
@@ -102,7 +103,7 @@ export function MainView() {
     // - Hybrid: highlight the search query (prioritize keywords over chunk)
     const isSearch = useAtomsStore.getState().semanticSearchResults !== null;
     if (!isSearch) {
-      openDrawer('viewer', atomId);
+      openDrawer('editor', atomId);
       return;
     }
     const mode = useAtomsStore.getState().searchMode;
@@ -156,6 +157,15 @@ export function MainView() {
 
   // Display count: totalCount from server when not searching, results length when searching
   const displayCount = isSemanticSearch ? displayAtoms.length : totalCount;
+
+  // Settings is a full-page view that replaces the main content
+  if (viewMode === 'settings') {
+    return (
+      <main className="flex-1 flex flex-col h-full bg-[var(--color-bg-main)] overflow-hidden">
+        <SettingsPage />
+      </main>
+    );
+  }
 
   return (
     <main className="flex-1 flex flex-col h-full bg-[var(--color-bg-main)] overflow-hidden">

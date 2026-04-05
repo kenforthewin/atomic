@@ -1,5 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { createPortal } from 'react-dom';
+import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { Button } from '../ui/Button';
 
@@ -15,11 +14,11 @@ import { ConnectionStatus } from '../ui/ConnectionStatus';
 import { useSettingsStore } from '../../stores/settings';
 import { useAtomsStore } from '../../stores/atoms';
 import { useTagsStore } from '../../stores/tags';
+import { useUIStore } from '../../stores/ui';
 import { THEMES, Theme } from '../../hooks/useTheme';
 import { FONTS, Font } from '../../hooks/useFont';
 import {
   getAvailableLlmModels,
-  getOpenRouterEmbeddingModels,
   testOllamaConnection,
   testOpenAICompatConnection,
   getOllamaModels,
@@ -35,7 +34,6 @@ import {
   deleteFeed,
   pollFeed,
   type AvailableModel,
-  type OpenRouterEmbeddingModel,
   type OllamaModel,
   type ImportResult,
   type McpConfig,
@@ -54,13 +52,38 @@ import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../
 
 type SettingsTab = 'general' | 'ai' | 'connection' | 'feeds' | 'integrations' | 'databases';
 
-const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-  { id: 'general', label: 'General' },
-  { id: 'ai', label: 'AI Models' },
-  { id: 'connection', label: 'Connection' },
-  { id: 'feeds', label: 'Feeds' },
-  { id: 'integrations', label: 'Integrations' },
-  { id: 'databases', label: 'Databases' },
+const SETTINGS_TABS: { id: SettingsTab; label: string; icon: React.ReactNode }[] = [
+  { id: 'general', label: 'General', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+    </svg>
+  ) },
+  { id: 'ai', label: 'AI Models', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+    </svg>
+  ) },
+  { id: 'connection', label: 'Connection', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
+    </svg>
+  ) },
+  { id: 'feeds', label: 'Feeds', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 5c7.18 0 13 5.82 13 13M6 11a7 7 0 017 7m-6 0a1 1 0 11-2 0 1 1 0 012 0z" />
+    </svg>
+  ) },
+  { id: 'integrations', label: 'Integrations', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z" />
+    </svg>
+  ) },
+  { id: 'databases', label: 'Databases', icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+    </svg>
+  ) },
 ];
 
 function DatabasesTab() {
@@ -241,12 +264,10 @@ function DatabasesTab() {
   );
 }
 
-interface SettingsModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-}
+export function SettingsPage() {
+  const viewMode = useUIStore(s => s.viewMode);
+  const goBack = useUIStore(s => s.goBack);
 
-export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const settings = useSettingsStore(s => s.settings);
   const fetchSettings = useSettingsStore(s => s.fetchSettings);
   const setSetting = useSettingsStore(s => s.setSetting);
@@ -295,9 +316,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [autoTaggingEnabled, setAutoTaggingEnabled] = useState(true);
   const [embeddingModel, setEmbeddingModel] = useState('openai/text-embedding-3-small');
   const [taggingModel, setTaggingModel] = useState('openai/gpt-4o-mini');
-  const [wikiModel, setWikiModel] = useState('anthropic/claude-sonnet-4.6');
+  const [wikiModel, setWikiModel] = useState('anthropic/claude-sonnet-4.5');
   const [wikiStrategy, setWikiStrategy] = useState('centroid');
-  const [chatModel, setChatModel] = useState('anthropic/claude-sonnet-4.6');
+  const [chatModel, setChatModel] = useState('anthropic/claude-sonnet-4.5');
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // Re-embedding confirmation
@@ -305,7 +326,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   // OpenRouter model loading
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
-  const [openrouterEmbeddingModels, setOpenrouterEmbeddingModels] = useState<OpenRouterEmbeddingModel[]>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
   // Import state
@@ -371,11 +391,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [pollResult, setPollResult] = useState<FeedPollResult | null>(null);
   const [deletingFeedId, setDeletingFeedId] = useState<string | null>(null);
 
-  const overlayRef = useRef<HTMLDivElement>(null);
-
   // Derived: whether we're connected to a remote (non-local) server
-  // Desktop + local sidecar → false; Desktop + remote override → true; Web → always true
   const isRemoteMode = isDesktopApp() ? !isLocalServer() : true;
+
+  const isOpen = viewMode === 'settings';
 
   // Check Ollama connection
   const checkOllamaConnection = useCallback(async (host: string) => {
@@ -385,7 +404,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       const connected = await testOllamaConnection(host);
       if (connected) {
         setOllamaStatus('connected');
-        // Fetch available models
         setIsLoadingOllamaModels(true);
         const models = await getOllamaModels(host);
         setOllamaModels(models);
@@ -423,11 +441,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   };
 
+  const fetchAtoms = useAtomsStore((state) => state.fetchAtoms);
+  const fetchTags = useTagsStore((state) => state.fetchTags);
+
   const handleConnectServer = async () => {
     try {
       await switchTransport({ baseUrl: serverUrl.trim().replace(/\/$/, ''), authToken: serverToken.trim() });
       setShowChangeServer(false);
-      // Refresh data from new source
       fetchSettings();
       fetchAtoms();
       fetchTags();
@@ -440,7 +460,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const handleDisconnectServer = async () => {
     try {
       await switchToLocal();
-      // Refresh data from local source
       fetchSettings();
       fetchAtoms();
       fetchTags();
@@ -473,7 +492,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setCreatedToken(result);
       setNewTokenName('');
       setTokenCopied(false);
-      // Refresh token list
       await loadApiTokens();
     } catch (e) {
       console.error('Failed to create token:', e);
@@ -485,7 +503,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   // Revoke an API token
   const handleRevokeToken = async (tokenId: string) => {
-    // Check if revoking the current token
     const currentPrefix = serverToken.substring(0, 10);
     const tokenToRevoke = apiTokens.find(t => t.id === tokenId);
     const isCurrentToken = tokenToRevoke && tokenToRevoke.token_prefix === currentPrefix;
@@ -493,12 +510,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     try {
       await revokeApiToken(tokenId);
       if (isCurrentToken) {
-        // Revoking current token — log out
         localStorage.removeItem('atomic-server-config');
         window.location.reload();
         return;
       }
-      // Refresh list
       await loadApiTokens();
     } catch (e) {
       console.error('Failed to revoke token:', e);
@@ -623,6 +638,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   };
 
+  // Load data when settings page becomes active
   useEffect(() => {
     if (isOpen) {
       // Load saved server config, defaulting to current origin
@@ -644,10 +660,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           .then(models => setAvailableModels(models))
           .catch(err => { console.error('Failed to load models:', err); toast.error('Failed to load models', { description: String(err) }); })
           .finally(() => setIsLoadingModels(false));
-        // Fetch curated OpenRouter embedding model registry
-        getOpenRouterEmbeddingModels()
-          .then(models => setOpenrouterEmbeddingModels(models))
-          .catch(err => { console.error('Failed to load embedding models:', err); });
       }
       // Load API tokens when connected to a non-local server
       if (!isLocalServer() && transport.isConnected()) {
@@ -665,7 +677,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   useEffect(() => {
     if (isOpen && activeTab === 'feeds' && getTransport().isConnected()) {
       loadFeeds();
-      // Reset ingest state when switching to feeds tab
       setIngestResult(null);
       setIngestError(null);
       setPollResult(null);
@@ -684,9 +695,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setAutoTaggingEnabled(settings.auto_tagging_enabled !== 'false');
     setEmbeddingModel(settings.embedding_model || 'openai/text-embedding-3-small');
     setTaggingModel(settings.tagging_model || 'openai/gpt-4o-mini');
-    setWikiModel(settings.wiki_model || 'anthropic/claude-sonnet-4.6');
+    setWikiModel(settings.wiki_model || 'anthropic/claude-sonnet-4.5');
     setWikiStrategy(settings.wiki_strategy || 'centroid');
-    setChatModel(settings.chat_model || 'anthropic/claude-sonnet-4.6');
+    setChatModel(settings.chat_model || 'anthropic/claude-sonnet-4.5');
     setOllamaHost(settings.ollama_host || 'http://127.0.0.1:11434');
     setOllamaEmbeddingModel(settings.ollama_embedding_model || 'nomic-embed-text');
     setOllamaLlmModel(settings.ollama_llm_model || 'llama3.2');
@@ -710,35 +721,27 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     return () => clearTimeout(timer);
   }, [isOpen, provider, ollamaHost, checkOllamaConnection]);
 
+  // ESC key to go back
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        onClose();
+        goBack();
       }
     };
 
     if (isOpen) {
       document.addEventListener('keydown', handleEscape);
-      document.body.style.overflow = 'hidden';
     }
 
     return () => {
       document.removeEventListener('keydown', handleEscape);
-      document.body.style.overflow = '';
     };
-  }, [isOpen, onClose]);
+  }, [isOpen, goBack]);
 
-  const handleOverlayClick = (e: React.MouseEvent) => {
-    if (e.target === overlayRef.current) {
-      onClose();
-    }
-  };
-
-  // Auto-save a single setting (non-setup mode only)
+  // Auto-save a single setting
   const autoSave = useCallback(async (key: string, value: string) => {
     try {
       const result = await setSetting(key, value);
-      // Check if a dimension change was detected — prompt user for typed confirmation
       if (result?.dimension_changed) {
         setDimensionChangeInfo({
           old_dim: result.old_dim,
@@ -747,10 +750,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         });
         setReembedConfirmText('');
       }
-      // Show auto-retry info if failed atoms were retried
       if (result?.retried_failed_count > 0) {
         setSaveError(null);
-        // Briefly show a success message
         setReembedResult(result.retried_failed_count);
         setTimeout(() => setReembedResult(null), 5000);
       }
@@ -761,7 +762,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   }, [setSetting]);
 
-  // Handle changes that trigger re-embedding — ask for confirmation
+  // Handle changes that trigger re-embedding
   const handleEmbeddingModelChange = (value: string) => {
     setPendingEmbeddingChange({ key: 'embedding_model', value, label: value.split('/').pop() || value });
   };
@@ -807,11 +808,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   }, []);
 
-  // Handle provider change — test connection automatically
+  // Handle provider change
   const handleProviderChange = async (value: 'openrouter' | 'ollama' | 'openai_compat') => {
     setProvider(value);
     await autoSave('provider', value);
-    // Test connection for new provider
     if (value === 'openrouter' && apiKey.trim()) {
       setIsTesting(true);
       setTestResult(null);
@@ -830,7 +830,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   };
 
-  // API key — local state updates immediately, auto-save on blur
+  // API key handlers
   const handleApiKeyChange = (value: string) => {
     setApiKey(value);
     setTestResult(null);
@@ -840,7 +840,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const handleApiKeyBlur = async () => {
     if (!apiKey.trim()) return;
     await autoSave('openrouter_api_key', apiKey);
-    // Test connection with new key
     setIsTesting(true);
     setTestResult(null);
     setTestError(null);
@@ -879,27 +878,18 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   // Handle Obsidian import
-  const fetchAtoms = useAtomsStore((state) => state.fetchAtoms);
-  const fetchTags = useTagsStore((state) => state.fetchTags);
-
   const handleObsidianImport = async () => {
     setImportResult(null);
     setImportError(null);
 
     try {
-      // Open folder picker dialog
       const selected = await pickDirectory('Select Obsidian Vault');
-
-      if (!selected) {
-        return; // User cancelled or not available in web mode
-      }
+      if (!selected) return;
 
       setIsImporting(true);
-
       const result = await importObsidianVault(selected);
       setImportResult(result);
 
-      // Refresh atoms and tags to show imported content
       if (result.imported > 0) {
         await Promise.all([fetchAtoms(), fetchTags()]);
       }
@@ -922,50 +912,45 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   if (!isOpen) return null;
 
-  return createPortal(
-    <div
-      ref={overlayRef}
-      onClick={handleOverlayClick}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-    >
-      <div className="relative bg-[var(--color-bg-panel)] rounded-lg shadow-xl border border-[var(--color-border)] w-full max-w-2xl mx-4 h-[80vh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-[var(--color-border)]">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">
-                Settings
-              </h2>
-            </div>
-            <button
-              onClick={onClose}
-              className="text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-
-          <div className="flex gap-1 mt-4 -mb-4 px-0">
-              {SETTINGS_TABS.map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`px-3 py-2 text-sm font-medium rounded-t-md transition-colors ${
-                    activeTab === tab.id
-                      ? 'bg-[var(--color-bg-main)] text-[var(--color-text-primary)] border border-b-0 border-[var(--color-border)]'
-                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
+  return (
+    <div className="flex h-full bg-[var(--color-bg-main)]">
+      {/* Left navigation sidebar */}
+      <nav className="w-52 shrink-0 border-r border-[var(--color-border)] bg-[var(--color-bg-panel)] flex flex-col">
+        {/* Back button */}
+        <div className="h-[52px] flex items-center px-3 flex-shrink-0">
+          <button
+            onClick={goBack}
+            className="flex items-center gap-2 text-sm text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors px-2 py-1.5 rounded-md hover:bg-[var(--color-bg-hover)]"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+            Back
+          </button>
         </div>
 
-        {/* Content */}
-        <div className="px-6 py-4 space-y-6 overflow-y-auto flex-1">
+        {/* Tab list */}
+        <div className="flex-1 px-2 py-1 space-y-0.5">
+          {SETTINGS_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm rounded-md transition-colors ${
+                activeTab === tab.id
+                  ? 'bg-[var(--color-bg-hover)] text-[var(--color-text-primary)] font-medium'
+                  : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {/* Content area */}
+      <div className="flex-1 overflow-y-auto p-8 relative">
+        <div className="max-w-3xl mx-auto space-y-6">
               {/* ===== GENERAL TAB ===== */}
               {activeTab === 'general' && (
                 <>
@@ -1073,7 +1058,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         { value: 'openai_compat', label: 'OpenAI Compatible' },
                       ]}
                     />
-                    {/* Connection status — shown inline after provider */}
+                    {/* Connection status */}
                     {provider === 'openrouter' && isTesting && (
                       <div className="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
                         <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
@@ -1135,7 +1120,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         </div>
                       </div>
 
-                      {/* Model Configuration for OpenRouter — always visible */}
+                      {/* Model Configuration for OpenRouter */}
                       <div className="space-y-4 pt-2">
                         <div className="text-sm font-medium text-[var(--color-text-primary)]">Model Configuration</div>
                         <p className="text-xs text-[var(--color-text-secondary)]">
@@ -1150,14 +1135,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                           <p className="text-xs text-[var(--color-text-secondary)]">
                             Used for semantic search
                           </p>
-                          <SearchableSelect
+                          <CustomSelect
                             value={embeddingModel}
                             onChange={handleEmbeddingModelChange}
-                            options={openrouterEmbeddingModels.map(m => ({
-                              id: m.id,
-                              name: `${m.name} (${m.dimension})`,
-                            }))}
-                            placeholder="Select embedding model..."
+                            options={[
+                              { value: 'openai/text-embedding-3-small', label: 'text-embedding-3-small (1536 dim)' },
+                              { value: 'openai/text-embedding-3-large', label: 'text-embedding-3-large (3072 dim)' },
+                            ]}
                           />
                         </div>
 
@@ -1849,7 +1833,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     </div>
                   )}
 
-                  {/* API Tokens Section — remote/web only (auto-managed for local sidecar) */}
+                  {/* API Tokens Section — remote/web only */}
                   {!isLocalServer() && getTransport().isConnected() && (
                     <div className="space-y-3 pt-4 border-t border-[var(--color-border)]">
                       <button
@@ -1948,7 +1932,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             </div>
                           )}
 
-                          {/* Created token display (shown once after creation) */}
+                          {/* Created token display */}
                           {createdToken && (
                             <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-md space-y-2">
                               <div className="text-sm font-medium text-amber-400">
@@ -2213,7 +2197,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               {/* ===== INTEGRATIONS TAB ===== */}
               {activeTab === 'integrations' && (
                 <>
-                  {/* Import Section — desktop + local server only (requires filesystem access) */}
+                  {/* Import Section — desktop + local server only */}
                   {isDesktopApp() && isLocalServer() && (
                     <div className="space-y-3">
                       <div className="space-y-1">
@@ -2275,7 +2259,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     </div>
                   )}
 
-                  {/* MCP Server Setup Section — available when connected */}
+                  {/* MCP Server Setup Section */}
                   {getTransport().isConnected() && (
                     <div className="space-y-3">
                       <button
@@ -2361,7 +2345,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         </div>
 
         {saveError && (
-          <div className="px-6 py-3 border-t border-[var(--color-border)]">
+          <div className="fixed bottom-4 right-4 z-50 px-4 py-3 bg-[var(--color-bg-panel)] border border-red-500/30 rounded-lg shadow-xl">
             <div className="flex items-start gap-2 text-sm text-red-500">
               <svg className="w-4 h-4 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -2373,7 +2357,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
         {/* Re-embedding confirmation dialog */}
         {pendingEmbeddingChange && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/40 rounded-lg">
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
             <div className="bg-[var(--color-bg-panel)] border border-[var(--color-border)] rounded-lg shadow-xl p-6 mx-8 max-w-sm space-y-4">
               <div className="space-y-2">
                 <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">Re-embed all atoms?</h3>
@@ -2390,7 +2374,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           </div>
         )}
       </div>
-    </div>,
-    document.body
+    </div>
   );
 }

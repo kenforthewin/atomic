@@ -4,7 +4,7 @@ import type { CanvasLevel } from '../lib/api';
 import { getCanvasLevel } from '../lib/api';
 
 export type DrawerMode = 'editor' | 'viewer' | 'wiki' | 'chat';
-export type ViewMode = 'grid' | 'list' | 'canvas';
+export type ViewMode = 'grid' | 'list' | 'canvas' | 'settings';
 
 interface DrawerState {
   isOpen: boolean;
@@ -39,6 +39,7 @@ interface UIStore {
   expandedTagIds: Record<string, boolean>;  // Tags that should be expanded in sidebar
   drawerState: DrawerState;
   viewMode: ViewMode;
+  previousViewMode: ViewMode;
   searchQuery: string;
   loadingOperations: LoadingOperation[];
   // Left panel state
@@ -66,6 +67,7 @@ interface UIStore {
   openChatDrawer: (tagId?: string, conversationId?: string) => void;
   closeDrawer: () => void;
   setViewMode: (mode: ViewMode) => void;
+  goBack: () => void;
   setSearchQuery: (query: string) => void;
   addLoadingOperation: (id: string, message: string) => void;
   removeLoadingOperation: (id: string) => void;
@@ -99,6 +101,7 @@ export const useUIStore = create<UIStore>()(
         highlightText: null,
       },
       viewMode: 'grid',
+      previousViewMode: 'grid',
       searchQuery: '',
       loadingOperations: [],
       localGraph: {
@@ -121,7 +124,14 @@ export const useUIStore = create<UIStore>()(
       toggleLeftPanel: () => set((state) => ({ leftPanelOpen: !state.leftPanelOpen })),
       setServerConnected: (connected: boolean) => set({ serverConnected: connected }),
 
-      setSelectedTag: (tagId: string | null) => set({ selectedTagId: tagId }),
+      setSelectedTag: (tagId: string | null) => set((state) => ({
+        selectedTagId: tagId,
+        // Close settings page when a tag is clicked
+        ...(state.viewMode === 'settings' ? {
+          viewMode: state.previousViewMode,
+          ...((state as any)._leftPanelWasOpen ? { leftPanelOpen: true, _leftPanelWasOpen: false } : {}),
+        } : {}),
+      })),
 
       expandTagPath: (tagIds: string[]) =>
         set((state) => {
@@ -201,7 +211,23 @@ export const useUIStore = create<UIStore>()(
           },
         })),
 
-      setViewMode: (mode: ViewMode) => set({ viewMode: mode }),
+      setViewMode: (mode: ViewMode) => set((state) => {
+        const wasSettings = state.viewMode === 'settings';
+        const goingToSettings = mode === 'settings';
+        return {
+          previousViewMode: wasSettings ? state.previousViewMode : state.viewMode,
+          viewMode: mode,
+          // Auto-collapse left panel when entering settings
+          ...(goingToSettings && state.leftPanelOpen ? { leftPanelOpen: false, _leftPanelWasOpen: true } : {}),
+          // Restore left panel when leaving settings
+          ...(!goingToSettings && wasSettings && (state as any)._leftPanelWasOpen ? { leftPanelOpen: true, _leftPanelWasOpen: false } : {}),
+        };
+      }),
+      goBack: () => set((state) => ({
+        viewMode: state.previousViewMode,
+        // Restore left panel if it was open before settings
+        ...((state as any)._leftPanelWasOpen ? { leftPanelOpen: true, _leftPanelWasOpen: false } : {}),
+      })),
 
       setSearchQuery: (query: string) => set({ searchQuery: query }),
 
@@ -302,7 +328,9 @@ export const useUIStore = create<UIStore>()(
     }),
     {
       name: 'atomic-ui-storage',
-      partialize: (state) => ({ viewMode: state.viewMode }),  // Only persist viewMode
+      partialize: (state) => ({
+        viewMode: state.viewMode === 'settings' ? state.previousViewMode : state.viewMode,
+      }),
     }
   )
 );
