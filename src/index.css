@@ -217,9 +217,21 @@ code, pre, kbd, samp, .cm-editor {
   color: var(--success-text) !important;
 }
 
-/* Prevent text selection during drag operations */
+/* Prevent text selection on UI chrome — keep it on content and inputs */
+button, nav, [role="tab"], [role="tablist"], [role="navigation"],
+label, th, summary, .select-none {
+  user-select: none;
+}
+
+/* Legacy class for drag operations */
 .no-select {
   user-select: none;
+}
+
+/* Explicitly allow selection on content elements */
+input, textarea, [contenteditable], pre, code,
+article, .prose, .select-text {
+  user-select: text;
 }
 
 /* Line clamp utilities for command palette */
