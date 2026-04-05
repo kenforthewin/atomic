@@ -7,7 +7,7 @@ interface SettingsStore {
   error: string | null;
   
   fetchSettings: () => Promise<void>;
-  setSetting: (key: string, value: string) => Promise<void>;
+  setSetting: (key: string, value: string) => Promise<any>;
   testOpenRouterConnection: (apiKey: string) => Promise<boolean>;
 }
 
@@ -28,10 +28,11 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
   
   setSetting: async (key: string, value: string) => {
     try {
-      await getTransport().invoke('set_setting', { key, value });
+      const result = await getTransport().invoke('set_setting', { key, value });
       set((state) => ({
         settings: { ...state.settings, [key]: value }
       }));
+      return result;
     } catch (e) {
       set({ error: String(e) });
       throw e;

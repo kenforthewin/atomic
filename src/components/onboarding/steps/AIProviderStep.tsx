@@ -17,6 +17,13 @@ import { isDesktopApp } from '../../../lib/transport';
 import { generatePKCE, openOAuthPopup, exchangeCodeForKey } from '../../../lib/openrouter-oauth';
 import type { OnboardingState, OnboardingAction } from '../useOnboardingState';
 
+function normalizeUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  if (!/^https?:\/\//i.test(trimmed)) return `http://${trimmed}`;
+  return trimmed;
+}
+
 interface AIProviderStepProps {
   state: OnboardingState;
   dispatch: React.Dispatch<OnboardingAction>;
@@ -132,9 +139,11 @@ export function AIProviderStep({ state, dispatch }: AIProviderStepProps) {
   }, [dispatch]);
 
   useEffect(() => {
-    if (state.provider === 'ollama') {
-      checkOllamaConnection(state.ollamaHost);
-    }
+    if (state.provider !== 'ollama') return;
+    const timer = setTimeout(() => {
+      checkOllamaConnection(normalizeUrl(state.ollamaHost));
+    }, 800);
+    return () => clearTimeout(timer);
   }, [state.provider, state.ollamaHost, checkOllamaConnection]);
 
   // Check OpenAI Compatible connection
@@ -311,6 +320,7 @@ export function AIProviderStep({ state, dispatch }: AIProviderStepProps) {
               type="text"
               value={state.ollamaHost}
               onChange={(e) => dispatch({ type: 'SET_OLLAMA_HOST', value: e.target.value })}
+              onBlur={(e) => dispatch({ type: 'SET_OLLAMA_HOST', value: normalizeUrl(e.target.value) })}
               placeholder="http://127.0.0.1:11434"
               className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150 text-sm"
             />
