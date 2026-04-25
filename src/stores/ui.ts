@@ -530,6 +530,7 @@ export const useUIStore = create<UIStore>()(
         chatSidebarOpen: state.chatSidebarOpen,
         chatSidebarWidth: state.chatSidebarWidth,
         chatSidebarConversationId: state.chatSidebarConversationId,
+        expandedTagIds: state.expandedTagIds,
       }),
       // v0 → v1: 'grid' and 'list' were top-level ViewMode values. They're now
       // collapsed into a single 'atoms' view with a separate atomsLayout field.

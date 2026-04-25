@@ -60,6 +60,7 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
   const setSelectedTag = useUIStore(s => s.setSelectedTag);
   const openSearchPalette = useUIStore(s => s.openSearchPalette);
   const expandedTagIds = useUIStore(s => s.expandedTagIds);
+  const expandTagPath = useUIStore(s => s.expandTagPath);
   const fetchAtoms = useAtomsStore(s => s.fetchAtoms);
   const fetchAtomsByTag = useAtomsStore(s => s.fetchAtomsByTag);
 
@@ -155,7 +156,11 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
 
   const handleCreateTag = async () => {
     if (newTagModal.name.trim()) {
-      await createTag(newTagModal.name.trim(), newTagModal.parentId || undefined);
+      const parentId = newTagModal.parentId;
+      await createTag(newTagModal.name.trim(), parentId || undefined);
+      if (parentId) {
+        expandTagPath([parentId]);
+      }
       setNewTagModal({ isOpen: false, parentId: null, name: '' });
     }
   };
