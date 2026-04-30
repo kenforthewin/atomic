@@ -78,6 +78,11 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
     return map;
   }, [flatTags]);
 
+  // Always keep a ref to the latest tagIndexMap so the scroll effect can read
+  // current indices without subscribing to map changes. The ref is updated on
+  // every render (outside any effect), so it is always fresh when the effect fires.
+  const tagIndexMapRef = useRef(tagIndexMap);
+  tagIndexMapRef.current = tagIndexMap;
   const virtualizer = useVirtualizer({
     count: flatTags.length,
     getScrollElement: () => scrollContainerRef.current,
@@ -85,17 +90,23 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
     overscan: 20,
   });
 
-  // Scroll to selected tag
+  // Remeasure virtualizer when tree structure changes (expansion/collapse)
+  useEffect(() => {
+    virtualizer.measure();
+  }, [flatTags, virtualizer]);
+
+  // Scroll to selected tag only when the selection changes. We intentionally
+  // read tagIndexMapRef.current (not tagIndexMap directly) so that accordion
+  // expand/collapse — which rebuilds tagIndexMap but does not change
+  // selectedTagId — does NOT trigger a scroll back to the active tag.
   useEffect(() => {
     if (selectedTagId) {
-      const index = tagIndexMap.get(selectedTagId);
+      const index = tagIndexMapRef.current.get(selectedTagId);
       if (index !== undefined) {
-        setTimeout(() => {
-          virtualizer.scrollToIndex(index, { align: 'auto', behavior: 'smooth' });
-        }, 50);
+        virtualizer.scrollToIndex(index, { align: 'center', behavior: 'smooth' });
       }
     }
-  }, [selectedTagId, tagIndexMap, virtualizer]);
+  }, [selectedTagId, virtualizer]);
 
   const [contextMenu, setContextMenu] = useState<{
     position: { x: number; y: number } | null;
