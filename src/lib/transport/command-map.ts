@@ -724,8 +724,21 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: (a) => `/api/health/fix/${encodeURIComponent(a.check as string)}/${encodeURIComponent(a.item_id as string)}`,
     argsMode: 'body',
   },
+  health_contradiction_summary: {
+    method: 'POST',
+    path: (a) => `/api/health/contradiction-summary/${encodeURIComponent(a.atom_a as string)}/${encodeURIComponent(a.atom_b as string)}`,
+  },
   health_check_single: {
     method: 'POST' as const,
     path: (a: Record<string, unknown>) => `/api/health/check/${encodeURIComponent(a.check_name as string)}`,
+  },
+  health_strip_boilerplate: {
+    method: 'POST' as const,
+    path: (a: Record<string, unknown>) => `/api/health/strip-boilerplate/${encodeURIComponent(String(a.atom_id))}${a.dry_run ? '?dry_run=true' : ''}`,
+  },
+  health_fix_batch: {
+    method: 'POST' as const,
+    path: () => `/api/health/fix/batch`,
+    argsMode: 'body' as const,
   },
 };

@@ -224,3 +224,188 @@ pub async fn merge_duplicate_pair(
         ],
     }))
 }
+
+
+/// Apply a user-edited merge. Caller provides final content; no LLM call.
+/// Deletes the loser atom, merges tags into winner, updates winner content.
+pub async fn apply_edited_merge(
+    core: &AtomicCore,
+    winner_id: &str,
+    loser_id: &str,
+    content: &str,
+) -> Result<FixAction, AtomicCoreError> {
+    let Some(winner) = core.get_atom(winner_id).await? else {
+        return Err(AtomicCoreError::NotFound(format!("atom {winner_id} not found")));
+    };
+    let Some(loser) = core.get_atom(loser_id).await? else {
+        return Err(AtomicCoreError::NotFound(format!("atom {loser_id} not found")));
+    };
+    if content.trim().is_empty() {
+        return Err(AtomicCoreError::Validation("edited content empty".into()));
+    }
+
+    let before_state = json!([
+        { "id": winner.atom.id, "content": winner.atom.content, "source_url": winner.atom.source_url, "tag_ids": winner.tags.iter().map(|t| t.id.clone()).collect::<Vec<_>>() },
+        { "id": loser.atom.id, "content": loser.atom.content, "source_url": loser.atom.source_url, "tag_ids": loser.tags.iter().map(|t| t.id.clone()).collect::<Vec<_>>() },
+    ]);
+
+    let loser_tag_ids: Vec<String> = loser.tags.iter().map(|t| t.id.clone()).collect();
+    if !loser_tag_ids.is_empty() {
+        let _ = core.storage().link_tags_to_atom_impl(&winner.atom.id, &loser_tag_ids).await;
+    }
+
+    let upd = crate::UpdateAtomRequest {
+        content: content.to_string(),
+        source_url: winner.atom.source_url.clone(),
+        published_at: None,
+        tag_ids: None,
+    };
+    core.update_atom(&winner.atom.id, upd, |_| {}).await?;
+    core.delete_atom(&loser.atom.id).await?;
+
+    let fix_id = audit::log_fix(
+        core,
+        "content_overlap",
+        "merge_with_edited_content",
+        "high",
+        Some(&[winner.atom.id.clone(), loser.atom.id.clone()]),
+        None,
+        before_state,
+        json!({ "kept_id": winner.atom.id, "deleted_id": loser.atom.id, "content_length": content.len() }),
+        None,
+        None,
+    ).await?;
+
+    Ok(FixAction {
+        id: fix_id,
+        check: "content_overlap".to_string(),
+        action: "merge_with_edited_content".to_string(),
+        count: 1,
+        details: vec![format!("Kept: {}", winner.atom.id), format!("Deleted: {}", loser.atom.id)],
+    })
+}
+
+/// Ask the LLM to summarise the conflict between two atoms in one sentence.
+pub async fn contradiction_summary(
+    core: &AtomicCore,
+    atom_a_id: &str,
+    atom_b_id: &str,
+) -> Result<String, AtomicCoreError> {
+    let Some(a) = core.get_atom(atom_a_id).await? else {
+        return Err(AtomicCoreError::NotFound(format!("atom {atom_a_id} not found")));
+    };
+    let Some(b) = core.get_atom(atom_b_id).await? else {
+        return Err(AtomicCoreError::NotFound(format!("atom {atom_b_id} not found")));
+    };
+    let prompt = format!(
+        "Two knowledge base atoms may contradict each other. Write ONE sentence \
+         (<= 25 words) describing what they disagree about. If they don't disagree, \
+         reply exactly: NO_CONFLICT.\n\n\
+         ATOM A:\n{}\n\n\
+         ATOM B:\n{}\n\n\
+         One-sentence summary:",
+        a.atom.content, b.atom.content,
+    );
+    let settings = core.get_settings_map().await.unwrap_or_default();
+    let provider_config = ProviderConfig::from_settings(&settings);
+    let llm = create_llm_provider(&provider_config).map_err(|e| {
+        AtomicCoreError::Configuration(format!("LLM provider unavailable: {e}"))
+    })?;
+    let model = settings.get("chat_model").cloned()
+        .or_else(|| settings.get("wiki_model").cloned())
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+    let messages = vec![Message::user(prompt)];
+    let config = LlmConfig::new(model).with_params(
+        crate::providers::types::GenerationParams::new().with_max_tokens(128),
+    );
+    let response = llm.complete(&messages, &config).await?;
+    Ok(response.content.trim().to_string())
+}
+
+/// Ask the LLM to strip template boilerplate from an atom, keeping only unique content.
+/// Returns the rewritten content. When dry_run=true, no writes happen.
+pub async fn strip_boilerplate_atom(
+    core: &AtomicCore,
+    atom_id: &str,
+    dry_run: bool,
+) -> Result<(String, Option<FixAction>), AtomicCoreError> {
+    let Some(atom) = core.get_atom(atom_id).await? else {
+        return Err(AtomicCoreError::NotFound(format!("atom {atom_id} not found")));
+    };
+    let prompt = format!(
+        "You are editing a knowledge base note. The note may contain boilerplate template \
+         sections (headers, field labels, empty placeholders) that are not unique to this topic. \
+         Remove all boilerplate; keep only the content that is specific to this note's subject. \
+         Preserve all factual information. If the whole note is boilerplate, reply exactly: EMPTY. \
+         Do not add commentary.\n\n\
+         NOTE:\n{}\n\n\
+         Rewritten note:",
+        atom.atom.content
+    );
+    let settings = core.get_settings_map().await.unwrap_or_default();
+    let provider_config = ProviderConfig::from_settings(&settings);
+    let llm = create_llm_provider(&provider_config).map_err(|e| {
+        AtomicCoreError::Configuration(format!("LLM provider unavailable: {e}"))
+    })?;
+    let model = settings
+        .get("wiki_model")
+        .cloned()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+    let messages = vec![Message::user(prompt.clone())];
+    let config = LlmConfig::new(model).with_params(
+        crate::providers::types::GenerationParams::new().with_max_tokens(4096),
+    );
+    let response = llm.complete(&messages, &config).await?;
+    let new_content = response.content.trim().to_string();
+
+    if new_content == "EMPTY" {
+        return Err(AtomicCoreError::Validation(
+            "LLM reports atom is entirely boilerplate; refusing to clear it".into(),
+        ));
+    }
+    if new_content.is_empty() {
+        return Err(AtomicCoreError::Validation("LLM returned empty content".into()));
+    }
+
+    if dry_run {
+        return Ok((new_content, None));
+    }
+
+    let before_state = json!({
+        "id": atom.atom.id,
+        "content": atom.atom.content,
+        "source_url": atom.atom.source_url,
+    });
+    let upd = crate::UpdateAtomRequest {
+        content: new_content.clone(),
+        source_url: atom.atom.source_url.clone(),
+        published_at: None,
+        tag_ids: None,
+    };
+    core.update_atom(&atom.atom.id, upd, |_| {}).await?;
+
+    let fix_id = audit::log_fix(
+        core,
+        "boilerplate_pollution",
+        "strip_boilerplate",
+        "medium",
+        Some(&[atom.atom.id.clone()]),
+        None,
+        before_state,
+        json!({"new_length": new_content.len()}),
+        Some(&prompt),
+        Some(&new_content),
+    )
+    .await?;
+
+    Ok((
+        new_content.clone(),
+        Some(FixAction {
+            id: fix_id,
+            check: "boilerplate_pollution".to_string(),
+            action: "strip_boilerplate".to_string(),
+            count: 1,
+            details: vec![format!("Stripped boilerplate from {}", atom.atom.id)],
+        }),
+    ))
+}

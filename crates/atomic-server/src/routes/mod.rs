@@ -361,4 +361,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/health/history", web::get().to(health::get_health_history));
     cfg.route("/health/fixes/recent", web::get().to(health::get_recent_fixes));
     cfg.route("/health/check/{check_name}", web::post().to(health::compute_single_check));
+    cfg.route("/health/contradiction-summary/{atom_a}/{atom_b}", web::post().to(health::contradiction_summary_handler));
+    cfg.route("/health/fix/batch", web::post().to(health::apply_manual_fix_batch));
+    cfg.route("/health/strip-boilerplate/{atom_id}", web::post().to(health::strip_boilerplate_handler));
 }

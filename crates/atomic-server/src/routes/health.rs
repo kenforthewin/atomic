@@ -101,33 +101,249 @@ pub async fn apply_manual_fix(
     body: web::Json<ManualFixRequest>,
 ) -> HttpResponse {
     let (check, item_id) = path.into_inner();
+    match apply_manual_fix_impl(&db, &check, &item_id, body.into_inner()).await {
+        Ok(v) => HttpResponse::Ok().json(v),
+        Err(e) => crate::error::error_response(e),
+    }
+}
 
-    match (check.as_str(), body.action.as_str()) {
-        ("duplicate_detection", "merge_with_llm") => {
-            // item_id is expected to be "atomA_atomB" (hyphen-separated)
-            let parts: Vec<&str> = item_id.splitn(2, '_').collect();
-            if parts.len() != 2 {
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "item_id must be 'atomA_id_atomB_id' for merge"
-                }));
-            }
-            let atom_a = parts[0];
-            let atom_b = parts[1];
-            let dry_run = false;
+async fn apply_manual_fix_impl(
+    db: &Db,
+    check: &str,
+    item_id: &str,
+    req: ManualFixRequest,
+) -> Result<serde_json::Value, atomic_core::error::AtomicCoreError> {
+    use atomic_core::error::AtomicCoreError;
+    let core = &db.0;
+
+    match (check, req.action.as_str()) {
+        // === Existing: content-overlap LLM merge ===
+        ("duplicate_detection" | "content_overlap", "merge_with_llm") => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            let (atom_a, atom_b) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                let legacy: Vec<&str> = item_id.splitn(2, '_').collect();
+                if legacy.len() != 2 {
+                    return Err(AtomicCoreError::Validation(
+                        "item_id must be 'atom_a__atom_b' for pair actions".into(),
+                    ));
+                }
+                (legacy[0], legacy[1])
+            };
             match atomic_core::health::llm_fixes::merge_duplicate_pair(
-                &db.0, atom_a, atom_b, dry_run,
+                core, atom_a, atom_b, req.dry_run,
             )
             .await
             {
-                Ok(Some(action)) => HttpResponse::Ok().json(action),
-                Ok(None) => HttpResponse::Ok().json(serde_json::json!({"status": "no_op"})),
-                Err(e) => crate::error::error_response(e),
+                Ok(Some(action)) => Ok(serde_json::to_value(action).unwrap_or_default()),
+                Ok(None) => Ok(serde_json::json!({"status": "no_op"})),
+                Err(e) => Err(e),
             }
         }
-        _ => HttpResponse::BadRequest().json(serde_json::json!({
-            "error": format!("unsupported check '{}' or action '{}'", check, body.action)
-        })),
+
+        // === Content overlap: keep_a / keep_b (archive the loser) ===
+        ("content_overlap" | "duplicate_detection", action @ ("keep_a" | "keep_b")) => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            if parts.len() != 2 {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'atom_a__atom_b'".into(),
+                ));
+            }
+            let (a, b) = (parts[0], parts[1]);
+            let loser = if action == "keep_a" { b } else { a };
+            core.delete_atom(loser).await?;
+            let key = pair_key(a, b);
+            let _ = core
+                .dismiss_health_item("content_overlap", &key, "resolved_other", None)
+                .await;
+            Ok(serde_json::json!({"status": "ok"}))
+        }
+
+        // === Dismiss actions (all reviewable checks) ===
+        (check_name, action @ ("dismiss" | "mark_intentional" | "ignore_pair" | "defer")) => {
+            let reason = match action {
+                "mark_intentional" => "intentional_no_source",
+                "ignore_pair" => "ignored_pair",
+                "defer" => "deferred",
+                _ => "resolved_other",
+            };
+            let expires_at = if action == "defer" {
+                let exp = chrono::Utc::now() + chrono::Duration::days(7);
+                Some(exp.to_rfc3339())
+            } else {
+                None
+            };
+            core
+                .dismiss_health_item(check_name, item_id, reason, expires_at.as_deref())
+                .await?;
+            Ok(serde_json::json!({"status": "dismissed"}))
+        }
+
+        // === Content quality: add source URL ===
+        ("content_quality", "add_source") => {
+            let url = match req.url.as_deref() {
+                Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+                _ => {
+                    return Err(AtomicCoreError::Validation(
+                        "url is required for add_source".into(),
+                    ))
+                }
+            };
+            match core.get_atom(item_id).await? {
+                Some(atom) => {
+                    let tag_ids: Vec<String> = atom.tags.iter().map(|t| t.id.clone()).collect();
+                    let upd = atomic_core::UpdateAtomRequest {
+                        content: atom.atom.content.clone(),
+                        source_url: Some(url),
+                        published_at: atom.atom.published_at.clone(),
+                        tag_ids: Some(tag_ids),
+                    };
+                    core.update_atom(item_id, upd, |_| {}).await?;
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
+                None => Err(AtomicCoreError::NotFound("atom not found".into())),
+            }
+        }
+
+        // === Tag health: move_under (reparent rootless tag) ===
+        ("tag_health", "move_under") => {
+            let parent_id = match req.parent_id.as_deref() {
+                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                _ => {
+                    return Err(AtomicCoreError::Validation(
+                        "parent_id is required for move_under".into(),
+                    ))
+                }
+            };
+            match core.get_tag_by_id(item_id).await? {
+                Some((name, _)) => {
+                    core.update_tag(item_id, &name, Some(&parent_id)).await?;
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
+                None => Err(AtomicCoreError::NotFound("tag not found".into())),
+            }
+        }
+
+        // === Tag health: merge (winner becomes into_tag_id, loser is item_id) ===
+        ("tag_health", "merge") => {
+            let winner_id = match req.into_tag_id.as_deref() {
+                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                _ => {
+                    return Err(AtomicCoreError::Validation(
+                        "into_tag_id is required for merge".into(),
+                    ))
+                }
+            };
+            let winner_name = match core.get_tag_by_id(&winner_id).await? {
+                Some((name, _)) => name,
+                None => return Err(AtomicCoreError::NotFound("target tag not found".into())),
+            };
+            let loser_name = match core.get_tag_by_id(item_id).await? {
+                Some((name, _)) => name,
+                None => return Err(AtomicCoreError::NotFound("source tag not found".into())),
+            };
+            let merges = vec![compaction::TagMerge {
+                winner_name,
+                loser_name,
+                reason: "manual_review_merge".to_string(),
+            }];
+            core.apply_tag_merges(&merges).await?;
+            Ok(serde_json::json!({"status": "ok"}))
+        }
+
+        // === Boilerplate: re-embed ===
+        ("boilerplate_pollution", "reembed") => {
+            core.retry_embedding(item_id, |_| {}).await?;
+            Ok(serde_json::json!({"status": "ok"}))
+        }
+
+        // === Content overlap: merge_with_edited_content ===
+        ("content_overlap" | "duplicate_detection", "merge_with_edited_content") => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            if parts.len() != 2 {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'atom_a__atom_b'".into(),
+                ));
+            }
+            let winner = match req.winner_atom_id.as_deref() {
+                Some(w) if !w.is_empty() => w.to_string(),
+                _ => return Err(AtomicCoreError::Validation("winner_atom_id required".into())),
+            };
+            let loser = match req.loser_atom_id.as_deref() {
+                Some(l) if !l.is_empty() => l.to_string(),
+                _ => return Err(AtomicCoreError::Validation("loser_atom_id required".into())),
+            };
+            let content = match req.content.as_deref() {
+                Some(c) if !c.trim().is_empty() => c.to_string(),
+                _ => return Err(AtomicCoreError::Validation("content required".into())),
+            };
+            let action = atomic_core::health::llm_fixes::apply_edited_merge(core, &winner, &loser, &content).await?;
+            let key = atomic_core::health::pair_key(parts[0], parts[1]);
+            let _ = core.dismiss_health_item("content_overlap", &key, "resolved_other", None).await;
+            Ok(serde_json::to_value(action).unwrap_or_default())
+        }
+
+        _ => Err(AtomicCoreError::Validation(format!(
+            "unsupported check '{}' or action '{}'",
+            check, req.action
+        ))),
     }
+}
+
+// ==================== POST /api/health/fix/batch ====================
+
+#[derive(Debug, Deserialize)]
+pub struct BatchFixItem {
+    pub check: String,
+    pub item_id: String,
+    pub action: String,
+    #[serde(default)] pub url: Option<String>,
+    #[serde(default)] pub parent_id: Option<String>,
+    #[serde(default)] pub into_tag_id: Option<String>,
+    #[serde(default)] pub content: Option<String>,
+    #[serde(default)] pub winner_atom_id: Option<String>,
+    #[serde(default)] pub loser_atom_id: Option<String>,
+    #[serde(default)] pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchFixRequest {
+    pub items: Vec<BatchFixItem>,
+}
+
+pub async fn apply_manual_fix_batch(
+    db: Db,
+    body: web::Json<BatchFixRequest>,
+) -> HttpResponse {
+    let req = body.into_inner();
+    let mut results = Vec::with_capacity(req.items.len());
+    for item in req.items {
+        let single = ManualFixRequest {
+            action: item.action.clone(),
+            url: item.url,
+            parent_id: item.parent_id,
+            into_tag_id: item.into_tag_id,
+            content: item.content,
+            winner_atom_id: item.winner_atom_id,
+            loser_atom_id: item.loser_atom_id,
+            dry_run: item.dry_run,
+        };
+        match apply_manual_fix_impl(&db, &item.check, &item.item_id, single).await {
+            Ok(_) => results.push(serde_json::json!({
+                "check": item.check,
+                "item_id": item.item_id,
+                "ok": true
+            })),
+            Err(e) => results.push(serde_json::json!({
+                "check": item.check,
+                "item_id": item.item_id,
+                "ok": false,
+                "error": e.to_string()
+            })),
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({"results": results}))
 }
 
 // ==================== POST /api/health/undo/{fix_id} ====================
@@ -224,6 +440,43 @@ pub async fn compute_single_check(
     let check_name = path.into_inner();
     match health::compute_single_check(&db.0, &check_name).await {
         Ok((_name, result)) => HttpResponse::Ok().json(result),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+// ==================== POST /api/health/contradiction-summary/{atom_a}/{atom_b} ====================
+
+pub async fn contradiction_summary_handler(
+    db: Db,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (a, b) = path.into_inner();
+    match atomic_core::health::llm_fixes::contradiction_summary(&db.0, &a, &b).await {
+        Ok(summary) => HttpResponse::Ok().json(serde_json::json!({"summary": summary})),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+// ==================== POST /api/health/strip-boilerplate/{atom_id} ====================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StripBoilerplateQuery {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+pub async fn strip_boilerplate_handler(
+    db: Db,
+    path: web::Path<String>,
+    query: web::Query<StripBoilerplateQuery>,
+) -> HttpResponse {
+    let atom_id = path.into_inner();
+    match atomic_core::health::llm_fixes::strip_boilerplate_atom(&db.0, &atom_id, query.dry_run).await {
+        Ok((content, action)) => HttpResponse::Ok().json(serde_json::json!({
+            "content": content,
+            "action": action,
+            "dry_run": query.dry_run
+        })),
         Err(e) => crate::error::error_response(e),
     }
 }
