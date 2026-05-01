@@ -1,11 +1,13 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
   X, GitMerge, Link, Loader2, CheckCircle,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, RefreshCw,
 } from 'lucide-react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { getTransport } from '../../../lib/transport';
 import { useTagsStore } from '../../../stores/tags';
+import { useDatabasesStore } from '../../../stores/databases';
 import { NoSourceRow } from './review/NoSourceRow';
 import { TagRootlessRow } from './review/TagRootlessRow';
 import { BoilerplateAtomRow } from './review/BoilerplateAtomRow';
@@ -54,6 +56,36 @@ interface RootlessTag {
   atom_count: number;
 }
 
+// ==================== localStorage helpers ====================
+
+function todayKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+}
+
+interface ResolvedRecord {
+  date: string;
+  counts: Record<string, number>;
+}
+
+function loadResolved(dbId: string): ResolvedRecord {
+  try {
+    const raw = localStorage.getItem(`health-resolved:${dbId}`);
+    if (!raw) return { date: todayKey(), counts: {} };
+    const parsed = JSON.parse(raw) as ResolvedRecord;
+    if (parsed.date !== todayKey()) return { date: todayKey(), counts: {} };
+    return parsed;
+  } catch {
+    return { date: todayKey(), counts: {} };
+  }
+}
+
+function saveResolved(dbId: string, rec: ResolvedRecord): void {
+  try {
+    localStorage.setItem(`health-resolved:${dbId}`, JSON.stringify(rec));
+  } catch { /* ignore quota errors */ }
+}
+
 // ==================== Helpers ====================
 
 function sourceLabel(source?: string): string {
@@ -65,6 +97,82 @@ function similarityLabel(s: number): { text: string; color: string } {
   if (s >= 0.80) return { text: `${(s * 100).toFixed(0)}% overlap`, color: 'text-orange-400' };
   if (s >= 0.65) return { text: `${(s * 100).toFixed(0)}% overlap`, color: 'text-yellow-400' };
   return { text: `${(s * 100).toFixed(0)}% overlap`, color: 'text-gray-400' };
+}
+
+// ==================== Tab header ====================
+
+function TabHeader({
+  label,
+  scannedAt,
+  rescanning,
+  onRescan,
+  resolvedToday,
+  initialQueueSize,
+}: {
+  label: string;
+  scannedAt: string | undefined;
+  rescanning: boolean;
+  onRescan: () => void;
+  resolvedToday: number;
+  initialQueueSize: number;
+}) {
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!scannedAt) return;
+    const id = window.setInterval(() => forceTick(n => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, [scannedAt]);
+
+  const rel = useMemo(() => {
+    if (!scannedAt) return 'not scanned yet';
+    const delta = Date.now() - new Date(scannedAt).getTime();
+    const mins = Math.round(delta / 60_000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  }, [scannedAt]);
+
+  const progressPct = initialQueueSize > 0
+    ? Math.min(100, Math.round((resolvedToday / initialQueueSize) * 100))
+    : 0;
+
+  return (
+    <div className="flex items-center justify-between gap-3 pb-2 border-b border-white/5">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-300 font-medium truncate">{label}</span>
+          {resolvedToday > 0 && (
+            <span className="text-xs text-green-400">• {resolvedToday} resolved today</span>
+          )}
+        </div>
+        {initialQueueSize > 0 && resolvedToday > 0 && (
+          <div className="mt-1.5 h-1 bg-[#2a2a2a] rounded overflow-hidden">
+            <div
+              className="h-full bg-green-500/60 transition-all duration-500"
+              style={{ width: `${progressPct}%` }}
+            />
+          </div>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onRescan}
+        disabled={rescanning}
+        className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 bg-[#2a2a2a] border border-white/5 transition-colors disabled:opacity-40"
+        title="Re-run this check against current data"
+      >
+        {rescanning
+          ? <Loader2 className="w-3 h-3 animate-spin" />
+          : <RefreshCw className="w-3 h-3" />}
+        <span>{rescanning ? 'Scanning…' : 'Re-scan'}</span>
+      </button>
+      {scannedAt && !rescanning && (
+        <span className="shrink-0 text-xs text-gray-600">{rel}</span>
+      )}
+    </div>
+  );
 }
 
 // ==================== Overlap pair row ====================
@@ -223,6 +331,54 @@ function ActionBtn({
       {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : icon}
       {label}
     </button>
+  );
+}
+
+// ==================== Virtualized pair list ====================
+
+function VirtualizedPairList({
+  pairs,
+  onApply,
+}: {
+  pairs: OverlapPair[];
+  onApply: (pair: OverlapPair, action: PairAction) => Promise<void>;
+}) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: pairs.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 140,
+    overscan: 5,
+    gap: 8,
+  });
+
+  return (
+    <div ref={parentRef} className="max-h-[calc(100vh-280px)] overflow-auto">
+      <div
+        style={{
+          height: virtualizer.getTotalSize(),
+          width: '100%',
+          position: 'relative',
+        }}
+      >
+        {virtualizer.getVirtualItems().map(vi => (
+          <div
+            key={vi.key}
+            data-index={vi.index}
+            ref={virtualizer.measureElement}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              transform: `translateY(${vi.start}px)`,
+            }}
+          >
+            <PairRow pair={pairs[vi.index]} onApply={onApply} />
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -397,7 +553,7 @@ function ContentQualitySection({ data, onResolved }: { data: Record<string, unkn
           {visible.length} atom{visible.length !== 1 ? 's' : ''} missing a source URL
         </p>
         <p className="text-xs text-gray-400 leading-relaxed">
-          Add a source URL for each, or Mark intentional if the atom doesn’t have one
+          Add a source URL for each, or Mark intentional if the atom doesn't have one
           (e.g. meeting notes, personal writing).
         </p>
       </div>
@@ -462,7 +618,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
             {similarCount} similar-name pair{similarCount !== 1 ? 's' : ''}
           </p>
           <p className="text-xs text-gray-500 leading-relaxed">
-            Tags with near-identical names (e.g. “React” and “ReactJS”) may be duplicates.
+            Tags with near-identical names (e.g. "React" and "ReactJS") may be duplicates.
             Review and merge from the tag tree if needed. (Inline merge coming in Phase C.)
           </p>
         </div>
@@ -488,7 +644,56 @@ interface Props {
   onResolved: () => void;
 }
 
-export function HealthReviewModal({ report, checkName, onClose, onResolved }: Props) {
+export function HealthReviewModal({ report: initialReport, checkName, onClose, onResolved }: Props) {
+  const [report, setReport] = useState(initialReport);
+  const [lastScannedAt, setLastScannedAt] = useState<Record<string, string>>({});
+  const [rescanning, setRescanning] = useState<string | null>(null);
+
+  // Re-sync when prop changes (e.g. widget fetched a new full report)
+  useEffect(() => {
+    setReport(initialReport);
+  }, [initialReport]);
+
+  const dbId = useDatabasesStore(s => s.activeId) ?? 'default';
+  const [resolvedByTab, setResolvedByTab] = useState<Record<string, number>>(() => loadResolved(dbId).counts);
+
+  const bumpResolved = useCallback((check: string) => {
+    setResolvedByTab(prev => {
+      const next = { ...prev, [check]: (prev[check] ?? 0) + 1 };
+      saveResolved(dbId, { date: todayKey(), counts: next });
+      return next;
+    });
+  }, [dbId]);
+
+  const resolvedCount = useMemo(
+    () => Object.values(resolvedByTab).reduce((a, b) => a + b, 0),
+    [resolvedByTab],
+  );
+
+  const rescanTab = useCallback(async (checkNameToScan: string) => {
+    setRescanning(checkNameToScan);
+    try {
+      const result = await getTransport().invoke<{
+        status: string;
+        score: number;
+        auto_fixable: boolean;
+        requires_review: boolean;
+        fix_action?: unknown;
+        data: Record<string, unknown>;
+      }>('health_check_single', { check_name: checkNameToScan });
+
+      setReport(prev => ({
+        ...prev,
+        checks: { ...prev.checks, [checkNameToScan]: result },
+      }));
+      setLastScannedAt(prev => ({ ...prev, [checkNameToScan]: new Date().toISOString() }));
+    } catch (e) {
+      console.error('Re-scan failed:', e);
+    } finally {
+      setRescanning(null);
+    }
+  }, []);
+
   const overlapPairs: OverlapPair[] =
     (report.checks['content_overlap']?.data?.pairs as OverlapPair[]) ?? [];
   const boilerplateAtoms: BoilerplateEntry[] =
@@ -506,6 +711,16 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
     (report.checks['tag_health']?.data ?? null) as Record<string, unknown> | null;
   const rootlessCount = (tagHealthData?.rootless_tags as number) ?? 0;
 
+  // Snapshot initial queue sizes once per report load for progress bar
+  const initialSizes = useMemo(() => ({
+    content_overlap: overlapPairs.length + (resolvedByTab['content_overlap'] ?? 0),
+    boilerplate_pollution: boilerplateAtoms.length + (resolvedByTab['boilerplate_pollution'] ?? 0),
+    contradiction_detection: contradictionCount + (resolvedByTab['contradiction_detection'] ?? 0),
+    content_quality: noSourceCount + (resolvedByTab['content_quality'] ?? 0),
+    tag_health: rootlessCount + (resolvedByTab['tag_health'] ?? 0),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), []); // intentionally empty deps — snapshot on mount only
+
   const tabs = [
     ...(overlapPairs.length > 0        ? [{ key: 'content_overlap',        label: 'Content overlap', count: overlapPairs.length }] : []),
     ...(boilerplateAtoms.length > 0    ? [{ key: 'boilerplate_pollution',    label: 'Boilerplate',     count: boilerplateAtoms.length }] : []),
@@ -516,8 +731,6 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
 
   const [selectedTab, setSelectedTab] = useState<string | null>(checkName ?? null);
   const activeTab = tabs.find(t => t.key === selectedTab)?.key ?? tabs[0]?.key ?? null;
-
-  const [resolvedCount, setResolvedCount] = useState(0);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -531,7 +744,7 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
 
   const applyPairFix = useCallback(async (pair: OverlapPair, action: PairAction) => {
     if (action === 'keep_both') {
-      setResolvedCount(n => n + 1);
+      bumpResolved('content_overlap');
       return;
     }
     const itemId = `${pair.atom_a.id}_${pair.atom_b.id}`;
@@ -540,9 +753,9 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
       item_id: itemId,
       action,
     });
-    setResolvedCount(n => n + 1);
+    bumpResolved('content_overlap');
     onResolved();
-  }, [onResolved]);
+  }, [onResolved, bumpResolved]);
 
   return createPortal(
     <div
@@ -596,32 +809,82 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
 
           {activeTab === 'content_overlap' && (
             <>
+              <TabHeader
+                label="Content overlap"
+                scannedAt={lastScannedAt['content_overlap']}
+                rescanning={rescanning === 'content_overlap'}
+                onRescan={() => rescanTab('content_overlap')}
+                resolvedToday={resolvedByTab['content_overlap'] ?? 0}
+                initialQueueSize={initialSizes['content_overlap'] ?? 0}
+              />
               <p className="text-xs text-gray-500 leading-relaxed">
                 Atoms from different sources with 55–85% similarity and at least 2 shared tags.
                 These likely cover the same topic from different angles.
                 Use <strong className="text-gray-300">Keep both</strong> for complementary perspectives,{' '}
                 <strong className="text-gray-300">Merge</strong> for true duplicates.
               </p>
-              {overlapPairs.map(pair => (
-                <PairRow key={pair.pair_id} pair={pair} onApply={applyPairFix} />
-              ))}
+              {overlapPairs.length > 50
+                ? <VirtualizedPairList pairs={overlapPairs} onApply={applyPairFix} />
+                : overlapPairs.map(pair => (
+                    <PairRow key={pair.pair_id} pair={pair} onApply={applyPairFix} />
+                  ))}
             </>
           )}
 
           {activeTab === 'boilerplate_pollution' && (
-            <BoilerplateSection atoms={boilerplateAtoms} onResolved={() => setResolvedCount(n => n + 1)} />
+            <>
+              <TabHeader
+                label="Boilerplate"
+                scannedAt={lastScannedAt['boilerplate_pollution']}
+                rescanning={rescanning === 'boilerplate_pollution'}
+                onRescan={() => rescanTab('boilerplate_pollution')}
+                resolvedToday={resolvedByTab['boilerplate_pollution'] ?? 0}
+                initialQueueSize={initialSizes['boilerplate_pollution'] ?? 0}
+              />
+              <BoilerplateSection atoms={boilerplateAtoms} onResolved={() => bumpResolved('boilerplate_pollution')} />
+            </>
           )}
 
           {activeTab === 'contradiction_detection' && contradictionData && (
-            <ContradictionSection data={contradictionData} />
+            <>
+              <TabHeader
+                label="Contradictions"
+                scannedAt={lastScannedAt['contradiction_detection']}
+                rescanning={rescanning === 'contradiction_detection'}
+                onRescan={() => rescanTab('contradiction_detection')}
+                resolvedToday={resolvedByTab['contradiction_detection'] ?? 0}
+                initialQueueSize={initialSizes['contradiction_detection'] ?? 0}
+              />
+              <ContradictionSection data={contradictionData} />
+            </>
           )}
 
           {activeTab === 'content_quality' && contentQualityData && (
-            <ContentQualitySection data={contentQualityData} onResolved={() => setResolvedCount(n => n + 1)} />
+            <>
+              <TabHeader
+                label="No source"
+                scannedAt={lastScannedAt['content_quality']}
+                rescanning={rescanning === 'content_quality'}
+                onRescan={() => rescanTab('content_quality')}
+                resolvedToday={resolvedByTab['content_quality'] ?? 0}
+                initialQueueSize={initialSizes['content_quality'] ?? 0}
+              />
+              <ContentQualitySection data={contentQualityData} onResolved={() => bumpResolved('content_quality')} />
+            </>
           )}
 
           {activeTab === 'tag_health' && tagHealthData && (
-            <TagHealthSection data={tagHealthData} onResolved={() => setResolvedCount(n => n + 1)} />
+            <>
+              <TabHeader
+                label="Tag structure"
+                scannedAt={lastScannedAt['tag_health']}
+                rescanning={rescanning === 'tag_health'}
+                onRescan={() => rescanTab('tag_health')}
+                resolvedToday={resolvedByTab['tag_health'] ?? 0}
+                initialQueueSize={initialSizes['tag_health'] ?? 0}
+              />
+              <TagHealthSection data={tagHealthData} onResolved={() => bumpResolved('tag_health')} />
+            </>
           )}
 
         </div>
