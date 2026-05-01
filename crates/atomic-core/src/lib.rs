@@ -521,6 +521,7 @@ impl AtomicCore {
             .await
     }
 
+
     // ==================== Settings ====================
     //
     // Resolution model (see `settings::WORKSPACE_ONLY_KEYS` and
@@ -2171,6 +2172,13 @@ impl AtomicCore {
         tag_id: &str,
     ) -> Result<Option<(String, Option<String>)>, AtomicCoreError> {
         self.storage.get_tag_by_id_sync(tag_id).await
+    }
+
+    /// Get the most recent un-applied tag proposal, if any.
+    pub async fn get_latest_tag_proposal(
+        &self,
+    ) -> Result<Option<crate::health::TagProposal>, AtomicCoreError> {
+        self.storage.get_latest_tag_proposal_sync().await
     }
 
     /// Persist a health dismissal (insert or update).

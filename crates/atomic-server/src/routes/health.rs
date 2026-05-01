@@ -790,7 +790,7 @@ pub async fn apply_tag_proposal(
 
 /// GET /api/health/tag-proposal/latest
 pub async fn get_latest_tag_proposal(db: Db) -> HttpResponse {
-    match db.0.storage().get_latest_tag_proposal_sync().await {
+    match db.0.get_latest_tag_proposal().await {
         Ok(Some(proposal)) => HttpResponse::Ok().json(proposal),
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "no pending proposal"})),
         Err(e) => crate::error::error_response(e),

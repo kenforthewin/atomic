@@ -1180,4 +1180,95 @@ impl SqliteStorage {
         tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(total)
     }
+    /// Persist a new tag proposal.
+    pub(crate) fn save_tag_proposal_impl(
+        &self,
+        proposal: &crate::health::TagProposal,
+    ) -> Result<(), AtomicCoreError> {
+        let actions_json = serde_json::to_string(&proposal.actions)
+            .map_err(|e| AtomicCoreError::Validation(e.to_string()))?;
+        let mut conn = self.db.conn.lock().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let tx = conn.transaction().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO tag_proposals (id, summary, actions_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![proposal.id, proposal.summary, actions_json, proposal.generated_at],
+        )?;
+        tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a proposal by ID.
+    pub(crate) fn get_tag_proposal_impl(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::health::TagProposal>, AtomicCoreError> {
+        let conn = self.db.read_conn()?;
+        let result = conn.query_row(
+            "SELECT id, summary, actions_json, created_at FROM tag_proposals WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        );
+        match result {
+            Ok((id, summary, actions_json, generated_at)) => {
+                let actions: Vec<crate::health::TagProposalAction> =
+                    serde_json::from_str(&actions_json)
+                        .map_err(|e| AtomicCoreError::Validation(e.to_string()))?;
+                Ok(Some(crate::health::TagProposal { id, summary, actions, generated_at }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AtomicCoreError::DatabaseOperation(e.to_string())),
+        }
+    }
+
+    /// Load the latest un-applied proposal.
+    pub(crate) fn get_latest_tag_proposal_impl(
+        &self,
+    ) -> Result<Option<crate::health::TagProposal>, AtomicCoreError> {
+        let conn = self.db.read_conn()?;
+        let result = conn.query_row(
+            "SELECT id, summary, actions_json, created_at FROM tag_proposals WHERE applied_at IS NULL ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        );
+        match result {
+            Ok((id, summary, actions_json, generated_at)) => {
+                let actions: Vec<crate::health::TagProposalAction> =
+                    serde_json::from_str(&actions_json)
+                        .map_err(|e| AtomicCoreError::Validation(e.to_string()))?;
+                Ok(Some(crate::health::TagProposal { id, summary, actions, generated_at }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AtomicCoreError::DatabaseOperation(e.to_string())),
+        }
+    }
+
+    /// Mark a proposal as applied.
+    pub(crate) fn mark_tag_proposal_applied_impl(
+        &self,
+        id: &str,
+    ) -> Result<(), AtomicCoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.db.conn.lock().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let tx = conn.transaction().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        tx.execute(
+            "UPDATE tag_proposals SET applied_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(())
+    }
 }

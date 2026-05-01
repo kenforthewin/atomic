@@ -817,7 +817,7 @@ mod llm_tests {
     use crate::AtomicCore;
     use crate::health::llm_fixes;
 
-    fn open_core_with_llm(mock_url: &str) -> (AtomicCore, TempDir) {
+    async fn open_core_with_llm(mock_url: &str) -> (AtomicCore, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let core = AtomicCore::open_or_create(dir.path().join("llm_test.db")).unwrap();
         // Point the core's LLM provider at the mock server via openai_compat.
@@ -829,7 +829,7 @@ mod llm_tests {
         ] {
             core.storage()
                 .set_setting_sync(k, v)
-                .expect("set setting");
+                .await.expect("set setting");
         }
         (core, dir)
     }
@@ -862,7 +862,7 @@ mod llm_tests {
             .mount(&server)
             .await;
 
-        let (core, _dir) = open_core_with_llm(&server.uri());
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
         let atom_a = core.create_atom(crate::CreateAtomRequest {
             content: "Rust ownership rules".to_string(),
             source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
@@ -894,7 +894,7 @@ mod llm_tests {
             .mount(&server)
             .await;
 
-        let (core, _dir) = open_core_with_llm(&server.uri());
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
         let atom_a = core.create_atom(crate::CreateAtomRequest {
             content: "The sky is blue".to_string(),
             source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
@@ -937,5 +937,43 @@ mod llm_tests {
         assert_eq!(fa.id, "dry_run");
         assert_eq!(fa.check, "contradiction_detection");
         assert_eq!(fa.action, "merge_with_llm");
+    }
+
+    #[tokio::test]
+    async fn test_propose_tag_restructure_parses_and_persists() {
+        let proposal_json = r#"{
+  "summary": "Merge near-duplicate technology tags.",
+  "actions": [
+    {"kind": "merge", "from_id": "t1", "into_id": "t2", "from_name": "rust-lang", "into_name": "rust", "reason": "same concept"},
+    {"kind": "rename", "tag_id": "t3", "old_name": "ML", "new_name": "machine-learning", "reason": "spell out abbreviation"}
+  ]
+}"#;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(proposal_json)),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+
+        let proposal = llm_fixes::propose_tag_restructure(&core)
+            .await
+            .expect("propose_tag_restructure");
+
+        assert_eq!(proposal.summary, "Merge near-duplicate technology tags.");
+        assert_eq!(proposal.actions.len(), 2);
+
+        // Verify it was persisted.
+        let latest = core
+            .get_latest_tag_proposal()
+            .await
+            .expect("get_latest_tag_proposal")
+            .expect("should have a pending proposal");
+        assert_eq!(latest.id, proposal.id);
+        assert_eq!(latest.actions.len(), 2);
     }
 }
