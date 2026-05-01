@@ -384,6 +384,70 @@ async fn apply_manual_fix_impl(
             Ok(serde_json::to_value(action).unwrap_or_default())
         }
 
+        // === Broken internal links: auto_resolve ===
+        ("broken_internal_links", "auto_resolve") => {
+            let link_raw = match req.content.as_deref() {
+                Some(c) if !c.trim().is_empty() => c.to_string(),
+                _ => return Err(AtomicCoreError::Validation("content (link_raw) is required for auto_resolve".into())),
+            };
+            let link_text = req.url.as_deref().unwrap_or("").to_string();
+            let outcome = atomic_core::health::llm_fixes::auto_resolve_broken_link(
+                core, item_id, &link_raw, &link_text,
+            ).await?;
+            Ok(serde_json::to_value(&outcome).unwrap_or_default())
+        }
+
+        // === Content overlap / duplicate: verify with LLM ===
+        ("content_overlap" | "duplicate_detection", "verify_with_llm") => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            let (atom_a, atom_b) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'atom_a__atom_b' for verify_with_llm".into(),
+                ));
+            };
+            let (is_duplicate, reason) =
+                atomic_core::health::llm_fixes::verify_overlap_pair(core, atom_a, atom_b).await?;
+            Ok(serde_json::json!({"is_duplicate": is_duplicate, "reason": reason}))
+        }
+
+        // === Contradiction detection: verify with LLM ===
+        ("contradiction_detection", "verify_with_llm") => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            let (atom_a, atom_b) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'atom_a__atom_b' for verify_with_llm".into(),
+                ));
+            };
+            let (is_real, reason) =
+                atomic_core::health::llm_fixes::verify_contradiction_pair(core, atom_a, atom_b).await?;
+            Ok(serde_json::json!({"is_contradiction": is_real, "reason": reason}))
+        }
+
+        // === Contradiction detection: merge with LLM ===
+        ("contradiction_detection", "merge_with_llm") => {
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            let (atom_a, atom_b) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'atom_a__atom_b' for merge_with_llm".into(),
+                ));
+            };
+            match atomic_core::health::llm_fixes::merge_contradicting_pair(
+                core, atom_a, atom_b, req.dry_run,
+            )
+            .await
+            {
+                Ok(Some(action)) => Ok(serde_json::to_value(action).unwrap_or_default()),
+                Ok(None) => Ok(serde_json::json!({"status": "no_op"})),
+                Err(e) => Err(e),
+            }
+        }
+
         _ => Err(AtomicCoreError::Validation(format!(
             "unsupported check '{}' or action '{}'",
             check, req.action
@@ -607,6 +671,128 @@ pub async fn broken_link_suggest_handler(
             }).collect();
             HttpResponse::Ok().json(serde_json::json!({ "suggestions": suggestions }))
         }
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct AutoResolveAllQuery {
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
+pub async fn broken_links_auto_resolve_all(
+    db: Db,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    let max = body
+        .get("max")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(25);
+    match atomic_core::health::llm_fixes::auto_resolve_all_broken_links(&db.0, max).await {
+        Ok(result) => HttpResponse::Ok().json(result),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+// ==================== POST /api/health/verify/{check} ====================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct VerifyBatchBody {
+    pub item_ids: Vec<String>,
+    pub max: Option<u32>,
+}
+
+pub async fn verify_batch_handler(
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<VerifyBatchBody>,
+) -> HttpResponse {
+    let check = path.into_inner();
+    let body = body.into_inner();
+    let limit = body.max.unwrap_or(50) as usize;
+    let ids: Vec<String> = body.item_ids.into_iter().take(limit).collect();
+    let core = &db.0;
+
+    let mut checked = 0u32;
+    let mut kept = 0u32;
+    let mut dismissed_ids: Vec<String> = Vec::new();
+
+    for item_id in &ids {
+        let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (atom_a, atom_b) = (parts[0], parts[1]);
+        checked += 1;
+        let result = match check.as_str() {
+            "content_overlap" | "duplicate_detection" => {
+                atomic_core::health::llm_fixes::verify_overlap_pair(core, atom_a, atom_b)
+                    .await
+                    .map(|(is_dup, _)| is_dup)
+            }
+            "contradiction_detection" => {
+                atomic_core::health::llm_fixes::verify_contradiction_pair(core, atom_a, atom_b)
+                    .await
+                    .map(|(is_real, _)| is_real)
+            }
+            _ => break,
+        };
+        match result {
+            Ok(true) => kept += 1,
+            Ok(false) => dismissed_ids.push(item_id.clone()),
+            Err(_) => {}
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "checked": checked,
+        "kept": kept,
+        "dismissed_ids": dismissed_ids,
+    }))
+}
+
+// ==================== Tag proposal handlers ====================
+
+/// POST /api/health/tag-proposal — generate a new LLM proposal.
+pub async fn create_tag_proposal(db: Db) -> HttpResponse {
+    match atomic_core::health::llm_fixes::propose_tag_restructure(&db.0).await {
+        Ok(proposal) => HttpResponse::Ok().json(proposal),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ApplyTagProposalRequest {
+    #[serde(default)]
+    pub accepted_indices: Vec<usize>,
+}
+
+/// POST /api/health/tag-proposal/{proposal_id}/apply
+pub async fn apply_tag_proposal(
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<ApplyTagProposalRequest>,
+) -> HttpResponse {
+    let proposal_id = path.into_inner();
+    match atomic_core::health::llm_fixes::apply_tag_proposal(
+        &db.0,
+        &proposal_id,
+        &body.accepted_indices,
+    )
+    .await
+    {
+        Ok(actions) => HttpResponse::Ok().json(actions),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+/// GET /api/health/tag-proposal/latest
+pub async fn get_latest_tag_proposal(db: Db) -> HttpResponse {
+    match db.0.storage().get_latest_tag_proposal_sync().await {
+        Ok(Some(proposal)) => HttpResponse::Ok().json(proposal),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "no pending proposal"})),
         Err(e) => crate::error::error_response(e),
     }
 }

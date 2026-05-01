@@ -803,3 +803,139 @@ mod integration_tests {
         assert_eq!(updated.atom.content, expected, "link should be rewritten to atom://");
     }
 }
+
+#[cfg(test)]
+mod llm_tests {
+    //! Unit tests for `verify_overlap_pair`, `verify_contradiction_pair`, and
+    //! `merge_contradicting_pair`.  Each test spins up a `wiremock::MockServer`
+    //! acting as an OpenAI-compatible endpoint, configures the core settings to
+    //! use it, then asserts the expected behaviour without a real LLM.
+
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use crate::AtomicCore;
+    use crate::health::llm_fixes;
+
+    fn open_core_with_llm(mock_url: &str) -> (AtomicCore, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let core = AtomicCore::open_or_create(dir.path().join("llm_test.db")).unwrap();
+        // Point the core's LLM provider at the mock server via openai_compat.
+        for (k, v) in [
+            ("provider", "openai_compat"),
+            ("openai_compat_base_url", mock_url),
+            ("openai_compat_llm_model", "test-model"),
+            ("wiki_model", "test-model"),
+        ] {
+            core.storage()
+                .set_setting_sync(k, v)
+                .expect("set setting");
+        }
+        (core, dir)
+    }
+
+    fn chat_completion_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1699000000u64,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        })
+    }
+
+    #[tokio::test]
+    async fn test_verify_overlap_pair_false_positive_is_dismissed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(
+                    r#"{"duplicate": false, "reason": "different topics"} "#,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri());
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "Rust ownership rules".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "Python GIL internals".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        let (is_dup, reason) =
+            llm_fixes::verify_overlap_pair(&core, &atom_a.atom.id, &atom_b.atom.id)
+                .await
+                .expect("verify_overlap_pair");
+
+        assert!(!is_dup, "should report not duplicate");
+        assert!(!reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_verify_contradiction_pair_false_positive_is_dismissed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(
+                    r#"{"contradiction": false, "reason": "no conflict found"} "#,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri());
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "The sky is blue".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "Water is H2O".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        let (is_real, reason) =
+            llm_fixes::verify_contradiction_pair(&core, &atom_a.atom.id, &atom_b.atom.id)
+                .await
+                .expect("verify_contradiction_pair");
+
+        assert!(!is_real, "should report no real contradiction");
+        assert!(!reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_merge_contradicting_pair_dry_run_no_llm() {
+        // dry_run returns immediately without calling LLM
+        let dir = TempDir::new().expect("tempdir");
+        let core = AtomicCore::open_or_create(dir.path().join("merge_test.db")).unwrap();
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "Speed of light is 300,000 km/s".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "Speed of light is 299,792 km/s".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        let action = llm_fixes::merge_contradicting_pair(
+            &core, &atom_a.atom.id, &atom_b.atom.id, true,
+        )
+        .await
+        .expect("merge_contradicting_pair dry_run");
+
+        let fa = action.expect("dry_run returns Some(FixAction)");
+        assert_eq!(fa.id, "dry_run");
+        assert_eq!(fa.check, "contradiction_detection");
+        assert_eq!(fa.action, "merge_with_llm");
+    }
+}

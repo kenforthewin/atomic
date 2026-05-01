@@ -365,4 +365,9 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/health/fix/batch", web::post().to(health::apply_manual_fix_batch));
     cfg.route("/health/strip-boilerplate/{atom_id}", web::post().to(health::strip_boilerplate_handler));
     cfg.route("/health/broken-link-suggest", web::get().to(health::broken_link_suggest_handler));
+    cfg.route("/health/broken-links/auto-resolve-all", web::post().to(health::broken_links_auto_resolve_all));
+    cfg.route("/health/verify/{check}", web::post().to(health::verify_batch_handler));
+    cfg.route("/health/tag-proposal", web::post().to(health::create_tag_proposal));
+    cfg.route("/health/tag-proposal/latest", web::get().to(health::get_latest_tag_proposal));
+    cfg.route("/health/tag-proposal/{proposal_id}/apply", web::post().to(health::apply_tag_proposal));
 }

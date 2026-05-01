@@ -740,9 +740,33 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'GET' as const,
     path: (args: Record<string, unknown>) => `/api/health/broken-link-suggest?q=${encodeURIComponent(String(args.q))}&limit=${args.limit ?? 5}`,
   },
+  health_broken_links_auto_resolve_all: {
+    method: 'POST' as const,
+    path: '/api/health/broken-links/auto-resolve-all',
+    argsMode: 'body' as const,
+  },
   health_fix_batch: {
     method: 'POST' as const,
     path: () => `/api/health/fix/batch`,
+    argsMode: 'body' as const,
+  },
+  health_verify_batch: {
+    method: 'POST' as const,
+    path: (a: Record<string, unknown>) => `/api/health/verify/${encodeURIComponent(String(a.check))}`,
+    argsMode: 'body' as const,
+  },
+  health_tag_proposal_create: {
+    method: 'POST' as const,
+    path: '/api/health/tag-proposal',
+    argsMode: 'body' as const,
+  },
+  health_tag_proposal_latest: {
+    method: 'GET' as const,
+    path: '/api/health/tag-proposal/latest',
+  },
+  health_tag_proposal_apply: {
+    method: 'POST' as const,
+    path: (a: Record<string, unknown>) => `/api/health/tag-proposal/${encodeURIComponent(String(a.proposal_id))}/apply`,
     argsMode: 'body' as const,
   },
 };
