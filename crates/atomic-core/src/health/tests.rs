@@ -738,4 +738,68 @@ mod integration_tests {
         );
         assert_eq!(check2.data["broken_count"].as_i64().unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn test_suggest_atoms_by_query_source_url_exact() {
+        let (core, _dir) = open_core();
+
+        // Atom A with known source_url
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "# Bravo Notes\n\nContent here".to_string(),
+            source_url: Some("vault://notes/bravo.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create A").expect("A created");
+
+        // Atom B — no source_url
+        core.create_atom(crate::CreateAtomRequest {
+            content: "# Other Atom".to_string(),
+            source_url: None,
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create B");
+
+        let results = core
+            .suggest_atoms_for_broken_link("bravo.md", 5)
+            .await
+            .expect("suggest");
+
+        assert!(!results.is_empty(), "should return at least one result");
+        let top = &results[0];
+        assert_eq!(top.0, atom_a.atom.id, "top hit should be atom A");
+        assert!((top.3 - 1.0f32).abs() < 0.01, "score should be 1.0 for exact suffix match");
+    }
+
+    #[tokio::test]
+    async fn test_relink_broken_link_rewrites_markdown() {
+        let (core, _dir) = open_core();
+
+        // Atom A — the target
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "# Bravo Notes".to_string(),
+            source_url: Some("vault://notes/bravo.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create A").expect("A created");
+
+        // Atom C — has the broken link
+        let atom_c = core.create_atom(crate::CreateAtomRequest {
+            content: "see [bravo](./bravo.md) for details".to_string(),
+            source_url: Some("vault://notes/c.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create C").expect("C created");
+
+        fixes::relink_broken_link(&core, &atom_c.atom.id, "[bravo](./bravo.md)", &atom_a.atom.id)
+            .await
+            .expect("relink_broken_link");
+
+        let updated = core.get_atom(&atom_c.atom.id).await.expect("get C").expect("C exists");
+        let expected = format!("see [bravo](atom://{}) for details", atom_a.atom.id);
+        assert_eq!(updated.atom.content, expected, "link should be rewritten to atom://");
+    }
 }

@@ -484,7 +484,7 @@ struct BrokenLinkItem {
     links: Vec<BrokenLinkDetail>,
 }
 
-fn title_preview(content: &str) -> String {
+pub(crate) fn title_preview(content: &str) -> String {
     for line in content.lines() {
         let clean = line.trim().trim_start_matches('#').trim();
         if !clean.is_empty() {

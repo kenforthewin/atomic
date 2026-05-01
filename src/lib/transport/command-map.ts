@@ -736,6 +736,10 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'POST' as const,
     path: (a: Record<string, unknown>) => `/api/health/strip-boilerplate/${encodeURIComponent(String(a.atom_id))}${a.dry_run ? '?dry_run=true' : ''}`,
   },
+  health_broken_link_suggest: {
+    method: 'GET' as const,
+    path: (args: Record<string, unknown>) => `/api/health/broken-link-suggest?q=${encodeURIComponent(String(args.q))}&limit=${args.limit ?? 5}`,
+  },
   health_fix_batch: {
     method: 'POST' as const,
     path: () => `/api/health/fix/batch`,

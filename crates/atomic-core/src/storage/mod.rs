@@ -333,6 +333,23 @@ impl StorageBackend {
         }
     }
 
+
+    pub(crate) async fn suggest_atoms_by_query_sync(
+        &self,
+        q: String,
+        limit: i32,
+    ) -> Result<Vec<(String, String, Option<String>, f32)>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.suggest_atoms_by_query_impl(&q, limit))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(vec![]),
+        }
+    }
     pub(crate) async fn get_tag_by_id_sync(
         &self,
         tag_id: &str,

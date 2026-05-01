@@ -509,6 +509,18 @@ impl AtomicCore {
         &self.storage
     }
 
+    /// Suggest atom candidates for a broken link query.
+    /// Returns vec of (atom_id, title, source_url, score).
+    pub async fn suggest_atoms_for_broken_link(
+        &self,
+        q: &str,
+        limit: i32,
+    ) -> Result<Vec<(String, String, Option<String>, f32)>, crate::error::AtomicCoreError> {
+        self.storage
+            .suggest_atoms_by_query_sync(q.to_string(), limit)
+            .await
+    }
+
     // ==================== Settings ====================
     //
     // Resolution model (see `settings::WORKSPACE_ONLY_KEYS` and

@@ -681,6 +681,84 @@ pub async fn remove_broken_link(
     })
 }
 
+/// Relink a broken link in an atom to a target atom via `atom://` URI.
+pub async fn relink_broken_link(
+    core: &AtomicCore,
+    atom_id: &str,
+    link_raw: &str,
+    target_atom_id: &str,
+) -> Result<FixAction, AtomicCoreError> {
+    let atom = core
+        .get_atom(atom_id)
+        .await?
+        .ok_or_else(|| AtomicCoreError::NotFound(format!("atom {} not found", atom_id)))?;
+
+    let target = core
+        .get_atom(target_atom_id)
+        .await?
+        .ok_or_else(|| AtomicCoreError::NotFound(format!("target atom {} not found", target_atom_id)))?;
+
+    let content = &atom.atom.content;
+
+    // Build replacement: markdown form [display_text](atom://<target_id>).
+    let display_text = if let Some(text) = parse_markdown_link_text(link_raw) {
+        text
+    } else if let Some(name) = parse_wikilink_name(link_raw) {
+        name
+    } else {
+        link_raw.to_string()
+    };
+    let new_link = format!("[{}](atom://{})", display_text, target_atom_id);
+    let new_content = content.replacen(link_raw, &new_link, 1);
+
+    let before_state = serde_json::json!([{
+        "id": atom_id,
+        "content": content,
+        "source_url": atom.atom.source_url,
+    }]);
+    let after_state = serde_json::json!([{
+        "id": atom_id,
+        "content": new_content,
+        "source_url": atom.atom.source_url,
+    }]);
+
+    let tag_ids: Vec<String> = atom.tags.iter().map(|t| t.id.clone()).collect();
+    let upd = crate::UpdateAtomRequest {
+        content: new_content.clone(),
+        source_url: atom.atom.source_url.clone(),
+        published_at: atom.atom.published_at.clone(),
+        tag_ids: Some(tag_ids),
+    };
+    core.update_atom(atom_id, upd, |_| {}).await?;
+
+    let target_title = crate::health::title_preview(&target.atom.content);
+    let id = audit::log_fix(
+        core,
+        "broken_internal_links",
+        "relink",
+        "medium",
+        Some(&[atom_id.to_string()]),
+        None,
+        before_state,
+        after_state,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    Ok(FixAction {
+        id,
+        check: "broken_internal_links".to_string(),
+        action: "relink".to_string(),
+        count: 1,
+        details: vec![format!(
+            "Relinked '{}' in atom {} → atom://{} ('{}')",
+            link_raw, atom_id, target_atom_id, target_title
+        )],
+    })
+}
+
 /// Extract display text from `[text](url)` markdown link.
 fn parse_markdown_link_text(s: &str) -> Option<String> {
     if !s.starts_with('[') {

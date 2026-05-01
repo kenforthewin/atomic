@@ -370,6 +370,20 @@ async fn apply_manual_fix_impl(
             Ok(serde_json::to_value(action).unwrap_or_default())
         }
 
+        // === Broken internal links: relink ===
+        ("broken_internal_links", "relink") => {
+            let link_raw = match req.content.as_deref() {
+                Some(c) if !c.trim().is_empty() => c.to_string(),
+                _ => return Err(AtomicCoreError::Validation("content (link_raw) is required for relink".into())),
+            };
+            let target_atom_id = match req.into_tag_id.as_deref() {
+                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => return Err(AtomicCoreError::Validation("into_tag_id (target_atom_id) is required for relink".into())),
+            };
+            let action = atomic_core::health::fixes::relink_broken_link(core, item_id, &link_raw, &target_atom_id).await?;
+            Ok(serde_json::to_value(action).unwrap_or_default())
+        }
+
         _ => Err(AtomicCoreError::Validation(format!(
             "unsupported check '{}' or action '{}'",
             check, req.action
@@ -563,6 +577,36 @@ pub async fn strip_boilerplate_handler(
             "action": action,
             "dry_run": query.dry_run
         })),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+// ==================== GET /api/health/broken-link-suggest ====================
+
+#[derive(Deserialize)]
+pub struct BrokenLinkSuggestQuery {
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<i32>,
+}
+
+pub async fn broken_link_suggest_handler(
+    db: Db,
+    query: web::Query<BrokenLinkSuggestQuery>,
+) -> HttpResponse {
+    let limit = query.limit.unwrap_or(5).min(20).max(1);
+    match db.0.suggest_atoms_for_broken_link(&query.q, limit).await {
+        Ok(rows) => {
+            let suggestions: Vec<serde_json::Value> = rows.into_iter().map(|(atom_id, title, source_url, score)| {
+                serde_json::json!({
+                    "atom_id": atom_id,
+                    "title": title,
+                    "source_url": source_url,
+                    "score": score,
+                })
+            }).collect();
+            HttpResponse::Ok().json(serde_json::json!({ "suggestions": suggestions }))
+        }
         Err(e) => crate::error::error_response(e),
     }
 }

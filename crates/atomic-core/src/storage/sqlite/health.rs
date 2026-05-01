@@ -856,6 +856,129 @@ impl SqliteStorage {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Suggest atom candidates for a broken link query.
+    /// Searches by source_url suffix, title prefix/contains, and content LIKE.
+    /// Returns vec of (atom_id, title, source_url, score) sorted by score desc.
+    pub(crate) fn suggest_atoms_by_query_impl(
+        &self,
+        q: &str,
+        limit: i32,
+    ) -> Result<Vec<(String, String, Option<String>, f32)>, AtomicCoreError> {
+        if q.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.db.read_conn()?;
+        let mut results: Vec<(String, String, Option<String>, f32)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Normalize query: strip extension, directory prefixes, replace hyphens/underscores with spaces.
+        let normalized = {
+            let no_ext = q.trim_end_matches(|c: char| c != '/' && c != '.' && c != '\\');
+            let no_ext = if let Some(pos) = q.rfind('.') {
+                if pos > 0 && !q[..pos].contains('/') || q[..pos].contains('/') {
+                    &q[..pos]
+                } else {
+                    q
+                }
+            } else {
+                q
+            };
+            let no_dir = if let Some(pos) = no_ext.rfind('/') {
+                &no_ext[pos + 1..]
+            } else {
+                no_ext
+            };
+            let no_prefix = no_dir.trim_start_matches('.').trim_start_matches('/');
+            no_prefix.replace('-', " ").replace('_', " ").to_lowercase()
+        };
+        let nq = normalized.as_str();
+
+        // 1. Exact source_url suffix match (score 1.0)
+        {
+            let suffix_pat = format!("%{}", q);
+            let mut stmt = conn.prepare(
+                "SELECT id, content, source_url FROM atoms WHERE source_url LIKE ?1 ESCAPE '\\' LIMIT 20",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![suffix_pat], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?;
+            for row in rows.flatten() {
+                let (id, content, src) = row;
+                if seen.insert(id.clone()) {
+                    let title = extract_title_preview(&content);
+                    results.push((id, title, src, 1.0f32));
+                }
+            }
+        }
+
+        // 2a. Title prefix match (score 0.8) — first non-empty line starts with nq
+        {
+            let prefix_pat = format!("{}%", nq);
+            let prefix_pat_hash = format!("# {}%", nq);
+            let mut stmt = conn.prepare(
+                "SELECT id, content, source_url FROM atoms
+                  WHERE LOWER(SUBSTR(TRIM(content), 1, 80)) LIKE ?1 ESCAPE '\\'
+                     OR LOWER(SUBSTR(TRIM(content), 1, 80)) LIKE ?2 ESCAPE '\\'
+                  LIMIT 40",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![prefix_pat, prefix_pat_hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?;
+            for row in rows.flatten() {
+                let (id, content, src) = row;
+                if seen.insert(id.clone()) {
+                    let title = extract_title_preview(&content);
+                    results.push((id, title, src, 0.8f32));
+                }
+            }
+        }
+
+        // 2b. Title contains match (score 0.6)
+        {
+            let contains_pat = format!("%{}%", nq);
+            let mut stmt = conn.prepare(
+                "SELECT id, content, source_url FROM atoms
+                  WHERE LOWER(SUBSTR(TRIM(content), 1, 80)) LIKE ?1 ESCAPE '\\'
+                  LIMIT 40",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![contains_pat], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?;
+            for row in rows.flatten() {
+                let (id, content, src) = row;
+                if seen.insert(id.clone()) {
+                    let title = extract_title_preview(&content);
+                    results.push((id, title, src, 0.6f32));
+                }
+            }
+        }
+
+        // 3. Fuzzy content LIKE on first 80 chars (score 0.4)
+        {
+            let contains_pat = format!("%{}%", nq);
+            let mut stmt = conn.prepare(
+                "SELECT id, content, source_url FROM atoms
+                  WHERE LOWER(SUBSTR(content, 1, 80)) LIKE ?1 ESCAPE '\\'
+                  LIMIT 40",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![contains_pat], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?;
+            for row in rows.flatten() {
+                let (id, content, src) = row;
+                if seen.insert(id.clone()) {
+                    let title = extract_title_preview(&content);
+                    results.push((id, title, src, 0.4f32));
+                }
+            }
+        }
+
+        // Sort by score desc, truncate to limit.
+        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit.max(1).min(20) as usize);
+        Ok(results)
+    }
 }
 
 
