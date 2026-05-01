@@ -96,6 +96,21 @@ impl MockAiServer {
         self.counters.embedding_requests.store(0, Ordering::Relaxed);
         self.counters.chat_requests.store(0, Ordering::Relaxed);
     }
+
+    /// Mount a higher-priority chat-completion handler that returns a fixed `content`.
+    /// Because wiremock matches later-mounted mocks first, this overrides the default
+    /// `ChatResponder` for all subsequent requests.
+    pub async fn mock_chat_completion(&self, content: impl Into<String>) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(FixedChatResponder {
+                content: content.into(),
+                counters: Arc::clone(&self.counters),
+            })
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
 }
 
 /// Bag-of-words style unit-vector embedder. Two texts sharing words land at
@@ -222,6 +237,29 @@ impl Respond for ChatResponder {
                     "finish_reason": "stop",
                 }
             ],
+        }))
+    }
+}
+
+struct FixedChatResponder {
+    content: String,
+    counters: Arc<MockAiCounters>,
+}
+
+impl Respond for FixedChatResponder {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": self.content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         }))
     }
 }
