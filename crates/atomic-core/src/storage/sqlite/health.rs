@@ -871,3 +871,99 @@ pub(crate) fn source_prefix(url: &Option<String>) -> String {
     }
     u.clone()
 }
+
+// ==================== Dismissal methods ====================
+
+impl SqliteStorage {
+    /// Get a tag by ID. Returns (name, parent_id).
+    pub(crate) fn get_tag_by_id_impl(
+        &self,
+        tag_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, AtomicCoreError> {
+        let conn = self.db.read_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, parent_id FROM tags WHERE id = ?1",
+        )?;
+        let result = stmt
+            .query_map(params![tag_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .next()
+            .transpose()?;
+        Ok(result)
+    }
+
+    /// List currently active dismissals for a check. Returns (item_key, reason) pairs.
+    pub(crate) fn list_dismissed_keys_impl(
+        &self,
+        check_name: &str,
+    ) -> Result<Vec<(String, String)>, AtomicCoreError> {
+        let conn = self.db.read_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT item_key, reason FROM health_dismissals
+             WHERE check_name = ?1
+               AND (expires_at IS NULL OR expires_at > ?2)",
+        )?;
+        let rows = stmt
+            .query_map(params![check_name, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or update a dismissal (upsert on unique index).
+    pub(crate) fn dismiss_health_item_impl(
+        &self,
+        check_name: &str,
+        item_key: &str,
+        reason: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), AtomicCoreError> {
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = conn
+            .transaction()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO health_dismissals (id, check_name, item_key, reason, dismissed_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(check_name, item_key) DO UPDATE SET
+                 reason = excluded.reason,
+                 dismissed_at = excluded.dismissed_at,
+                 expires_at = excluded.expires_at",
+            params![id, check_name, item_key, reason, now, expires_at],
+        )?;
+        tx.commit()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn undismiss_health_item_impl(
+        &self,
+        check_name: &str,
+        item_key: &str,
+    ) -> Result<(), AtomicCoreError> {
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM health_dismissals WHERE check_name = ?1 AND item_key = ?2",
+            params![check_name, item_key],
+        )?;
+        tx.commit()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(())
+    }
+}

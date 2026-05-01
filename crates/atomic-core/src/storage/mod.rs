@@ -332,6 +332,86 @@ impl StorageBackend {
             StorageBackend::Postgres(_) => Ok(None),
         }
     }
+
+    pub(crate) async fn get_tag_by_id_sync(
+        &self,
+        tag_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let tag_id = tag_id.to_string();
+                tokio::task::spawn_blocking(move || s.get_tag_by_id_impl(&tag_id))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn list_dismissed_keys_sync(
+        &self,
+        check_name: &str,
+    ) -> Result<Vec<(String, String)>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let check_name = check_name.to_string();
+                tokio::task::spawn_blocking(move || s.list_dismissed_keys_impl(&check_name))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn dismiss_health_item_sync(
+        &self,
+        check_name: &str,
+        item_key: &str,
+        reason: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let check_name = check_name.to_string();
+                let item_key = item_key.to_string();
+                let reason = reason.to_string();
+                let expires_at = expires_at.map(String::from);
+                tokio::task::spawn_blocking(move || {
+                    s.dismiss_health_item_impl(&check_name, &item_key, &reason, expires_at.as_deref())
+                })
+                .await
+                .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn undismiss_health_item_sync(
+        &self,
+        check_name: &str,
+        item_key: &str,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let check_name = check_name.to_string();
+                let item_key = item_key.to_string();
+                tokio::task::spawn_blocking(move || {
+                    s.undismiss_health_item_impl(&check_name, &item_key)
+                })
+                .await
+                .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
     pub(crate) async fn count_chunk_hash_occurrences_sync(
         &self,
         hashes: &[String],

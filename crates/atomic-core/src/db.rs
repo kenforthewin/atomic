@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 17;
+    const LATEST_VERSION: i32 = 18;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -858,12 +858,36 @@ impl Database {
 
         // --- V16 → V17: content_hash column on atom_chunks for boilerplate detection ---
         if version < 17 {
+            // ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite; ignore the error
+            // if the column was already added (e.g. during a test migration re-run).
+            let _ = conn.execute(
+                "ALTER TABLE atom_chunks ADD COLUMN content_hash TEXT",
+                [],
+            );
             conn.execute_batch(
                 r#"
-                ALTER TABLE atom_chunks ADD COLUMN content_hash TEXT;
                 CREATE INDEX IF NOT EXISTS idx_atom_chunks_content_hash
                     ON atom_chunks(content_hash);
                 PRAGMA user_version = 17;
+                "#,
+            )?;
+        }
+
+        // --- V17 → V18: persistent dismissals for the review queue ---
+        if version < 18 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS health_dismissals (
+                    id TEXT PRIMARY KEY,
+                    check_name TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    dismissed_at TEXT NOT NULL,
+                    expires_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_health_dismissals_lookup
+                    ON health_dismissals(check_name, item_key);
+                PRAGMA user_version = 18;
                 "#,
             )?;
         }

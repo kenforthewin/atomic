@@ -315,6 +315,21 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
         }
     }
 
+    // Apply persistent dismissals to review-producing checks
+    let reviewable = ["content_overlap", "contradiction_detection", "boilerplate_pollution", "content_quality", "tag_health"];
+    for check_name in reviewable {
+        let dismissed_pairs = core.storage().list_dismissed_keys_sync(check_name).await.unwrap_or_default();
+        if dismissed_pairs.is_empty() {
+            continue;
+        }
+        let dismissed: std::collections::HashSet<String> =
+            dismissed_pairs.into_iter().map(|(k, _)| k).collect();
+        if let Some(result) = checks.get_mut(check_name) {
+            apply_dismissals(check_name, result, &dismissed);
+        }
+    }
+
+
     // Aggregate score
     let overall_score = aggregate_score(&checks);
     let overall_status = HealthStatus::from_score(overall_score).as_str().to_string();
@@ -370,7 +385,7 @@ pub async fn compute_single_check(
     core: &AtomicCore,
     check_name: &str,
 ) -> Result<(String, HealthCheckResult), AtomicCoreError> {
-    let result = match check_name {
+    let mut result = match check_name {
         // Async check — requires per-atom DB lookups
         "broken_internal_links" => compute_link_check(core).await?,
         // Sync checks — fetch raw data once, dispatch to the appropriate fn
@@ -407,6 +422,15 @@ pub async fn compute_single_check(
             )))
         }
     };
+    // Apply persistent dismissals
+    if matches!(check_name, "content_overlap" | "contradiction_detection" | "boilerplate_pollution" | "content_quality" | "tag_health") {
+        let dismissed_pairs = core.storage().list_dismissed_keys_sync(check_name).await.unwrap_or_default();
+        if !dismissed_pairs.is_empty() {
+            let dismissed: std::collections::HashSet<String> =
+                dismissed_pairs.into_iter().map(|(k, _)| k).collect();
+            apply_dismissals(check_name, &mut result, &dismissed);
+        }
+    }
     Ok((check_name.to_string(), result))
 }
 
@@ -707,5 +731,114 @@ pub async fn run_fix(
 }
 
 
+
+
+/// Build a stable item key for a pair. Sorts atom IDs lexicographically so
+/// key ordering is independent of which atom is A vs B.
+pub fn pair_key(a: &str, b: &str) -> String {
+    if a <= b {
+        format!("{}__{}", a, b)
+    } else {
+        format!("{}__{}", b, a)
+    }
+}
+
+/// Filter a check result's JSON data to exclude dismissed entries.
+pub(crate) fn apply_dismissals(
+    check_name: &str,
+    result: &mut HealthCheckResult,
+    dismissed_keys: &std::collections::HashSet<String>,
+) {
+    if dismissed_keys.is_empty() {
+        return;
+    }
+
+    use serde_json::Value;
+    let data = &mut result.data;
+
+    match check_name {
+        "content_overlap" => {
+            if let Some(pairs) = data.get_mut("pairs").and_then(Value::as_array_mut) {
+                pairs.retain(|p| {
+                    let a = p.get("atom_a").and_then(|o| o.get("id")).and_then(Value::as_str).unwrap_or("");
+                    let b = p.get("atom_b").and_then(|o| o.get("id")).and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(&pair_key(a, b))
+                });
+                let new_count = pairs.len();
+                if let Some(c) = data.get_mut("count") {
+                    *c = Value::from(new_count);
+                }
+                if let Some(c) = data.get_mut("cross_source_overlaps") {
+                    *c = Value::from(new_count);
+                }
+            }
+        }
+        "contradiction_detection" => {
+            if let Some(pairs) = data.get_mut("pairs").and_then(Value::as_array_mut) {
+                pairs.retain(|p| {
+                    let a = p.get("atom_a").and_then(|o| o.get("id")).and_then(Value::as_str).unwrap_or("");
+                    let b = p.get("atom_b").and_then(|o| o.get("id")).and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(&pair_key(a, b))
+                });
+                let new_count = pairs.len();
+                if let Some(c) = data.get_mut("potential_contradictions") {
+                    *c = Value::from(new_count);
+                }
+                if new_count == 0 {
+                    result.requires_review = false;
+                }
+            }
+        }
+        "boilerplate_pollution" => {
+            if let Some(arr) = data.get_mut("affected_atoms").and_then(Value::as_array_mut) {
+                arr.retain(|entry| {
+                    let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(id)
+                });
+                let new_count = arr.len();
+                if let Some(c) = data.get_mut("count") {
+                    *c = Value::from(new_count);
+                }
+                if new_count == 0 {
+                    result.requires_review = false;
+                }
+            }
+        }
+        "content_quality" => {
+            if let Some(ns) = data
+                .pointer_mut("/issues/no_source/atoms")
+                .and_then(Value::as_array_mut)
+            {
+                ns.retain(|entry| {
+                    let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(id)
+                });
+                let new_count = ns.len();
+                if let Some(c) = data.pointer_mut("/issues/no_source/count") {
+                    *c = Value::from(new_count);
+                }
+                if new_count == 0 {
+                    result.requires_review = false;
+                }
+            }
+        }
+        "tag_health" => {
+            if let Some(arr) = data.get_mut("rootless_tag_list").and_then(Value::as_array_mut) {
+                arr.retain(|t| {
+                    let id = t.get("id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(id)
+                });
+                let new_count = arr.len();
+                if let Some(c) = data.get_mut("rootless_tags") {
+                    *c = Value::from(new_count);
+                }
+                if new_count == 0 {
+                    result.requires_review = false;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 #[cfg(test)]
 mod tests;

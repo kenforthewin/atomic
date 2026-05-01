@@ -1,10 +1,14 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import {
   X, GitMerge, Link, Loader2, CheckCircle,
-  ChevronDown, ChevronUp, RefreshCw,
+  ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { getTransport } from '../../../lib/transport';
+import { useTagsStore } from '../../../stores/tags';
+import { NoSourceRow } from './review/NoSourceRow';
+import { TagRootlessRow } from './review/TagRootlessRow';
+import { BoilerplateAtomRow } from './review/BoilerplateAtomRow';
 
 // ==================== Types ====================
 
@@ -224,21 +228,17 @@ function ActionBtn({
 
 // ==================== Boilerplate section ====================
 
-function BoilerplateSection({ atoms }: { atoms: BoilerplateEntry[] }) {
-  const [reembedStatus, setReembedStatus] = useState<Record<string, 'idle' | 'loading' | 'done' | 'error'>>({});
+function BoilerplateSection({ atoms, onResolved }: { atoms: BoilerplateEntry[]; onResolved: () => void }) {
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const visible = atoms.filter(a => !removed.has(a.id));
 
-  const reembed = async (atomId: string) => {
-    setReembedStatus(prev => ({ ...prev, [atomId]: 'loading' }));
-    try {
-      await getTransport().invoke('retry_embedding', { atomId });
-      setReembedStatus(prev => ({ ...prev, [atomId]: 'done' }));
-    } catch {
-      setReembedStatus(prev => ({ ...prev, [atomId]: 'error' }));
-    }
+  const handleResolved = (id: string) => {
+    setRemoved(prev => new Set(prev).add(id));
+    onResolved();
   };
 
-  if (atoms.length === 0) {
-    return <p className="text-xs text-gray-500 text-center py-8">No boilerplate pollution detected — all clear</p>;
+  if (visible.length === 0) {
+    return <p className="text-xs text-gray-500 text-center py-8">No boilerplate pollution — all clear</p>;
   }
 
   return (
@@ -246,55 +246,15 @@ function BoilerplateSection({ atoms }: { atoms: BoilerplateEntry[] }) {
       <div className="bg-[#1e1a00] border border-yellow-900/30 rounded p-3 space-y-1.5">
         <p className="text-xs text-yellow-300/90 font-medium">Embedding quality issue</p>
         <p className="text-xs text-gray-400 leading-relaxed">
-          These {atoms.length} atom{atoms.length !== 1 ? 's' : ''} share identical boilerplate
-          sections that dominate their embeddings. Re-embedding will automatically strip the
-          shared sections from the semantic index while preserving your original content.
-          After re-embedding, run a fresh health check to see the updated score.
+          These {visible.length} atom{visible.length !== 1 ? 's' : ''} have near-identical semantic edges.
+          Their unique content is drowned out by shared template text. Edit the atoms to make unique
+          content more prominent, then Re-embed to refresh their vectors.
         </p>
       </div>
       <div className="space-y-2">
-        {atoms
-          .slice()
-          .sort((a, b) => b.clone_count - a.clone_count)
-          .map(atom => {
-            const status = reembedStatus[atom.id] ?? 'idle';
-            return (
-              <div
-                key={atom.id}
-                className="flex items-center gap-3 p-2.5 bg-[#1e1e1e] rounded border border-white/5"
-              >
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs text-gray-200 truncate">
-                    {atom.title || <span className="text-gray-500 italic">Untitled atom</span>}
-                  </p>
-                  <p className="text-xs text-gray-600 mt-0.5">
-                    {atom.clone_count} near-identical edge{atom.clone_count !== 1 ? 's' : ''}
-                  </p>
-                </div>
-                <div className="shrink-0">
-                  {status === 'done' ? (
-                    <span className="flex items-center gap-1 text-xs text-green-500">
-                      <CheckCircle className="w-3 h-3" /> Re-queued — boilerplate will be stripped
-                    </span>
-                  ) : status === 'error' ? (
-                    <span className="text-xs text-red-400">Failed</span>
-                  ) : (
-                    <button
-                      disabled={status === 'loading'}
-                      onClick={() => reembed(atom.id)}
-                      title="Reset embedding so it will be re-processed on next pipeline run"
-                      className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 bg-[#2a2a2a] border border-white/5 transition-colors disabled:opacity-40"
-                    >
-                      {status === 'loading'
-                        ? <Loader2 className="w-3 h-3 animate-spin" />
-                        : <RefreshCw className="w-3 h-3" />}
-                      Strip & re-embed
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+        {visible.slice().sort((a, b) => b.clone_count - a.clone_count).map(atom => (
+          <BoilerplateAtomRow key={atom.id} atom={atom} onResolved={handleResolved} />
+        ))}
       </div>
     </div>
   );
@@ -411,16 +371,22 @@ function ContradictionSection({ data }: { data: Record<string, unknown> }) {
 
 // ==================== Content quality (no-source) section ====================
 
-function ContentQualitySection({ data }: { data: Record<string, unknown> }) {
+function ContentQualitySection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
   const issues = data.issues as Record<string, {
     count: number;
     atoms?: Array<{ id: string; title: string; created_at?: string } | string>;
   }> | undefined;
 
   const noSourceItems = (issues?.no_source?.atoms ?? []) as Array<{ id: string; title: string; created_at?: string }>;
-  const noSourceCount = issues?.no_source?.count ?? noSourceItems.length;
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const visible = noSourceItems.filter(a => !removed.has(a.id));
 
-  if (noSourceCount === 0) {
+  const handleResolved = (id: string) => {
+    setRemoved(prev => new Set(prev).add(id));
+    onResolved();
+  };
+
+  if (visible.length === 0) {
     return <p className="text-xs text-gray-500 text-center py-8">No unsourced atoms — all clear</p>;
   }
 
@@ -428,32 +394,16 @@ function ContentQualitySection({ data }: { data: Record<string, unknown> }) {
     <div className="space-y-3">
       <div className="bg-[#1a1a1a] border border-white/5 rounded p-3 space-y-1.5">
         <p className="text-xs text-gray-300 font-medium">
-          {noSourceCount} atom{noSourceCount !== 1 ? 's' : ''} missing a source URL
+          {visible.length} atom{visible.length !== 1 ? 's' : ''} missing a source URL
         </p>
         <p className="text-xs text-gray-400 leading-relaxed">
-          These atoms have no <code className="text-gray-300 bg-[#2a2a2a] px-1 rounded">source_url</code>{' '}
-          and no URL or{' '}
-          <code className="text-gray-300 bg-[#2a2a2a] px-1 rounded">Source:</code> line in their content.
-          Open each atom in the editor and add a source URL to resolve.
+          Add a source URL for each, or Mark intentional if the atom doesn’t have one
+          (e.g. meeting notes, personal writing).
         </p>
       </div>
       <div className="space-y-1.5">
-        {noSourceItems.map(atom => (
-          <div
-            key={atom.id}
-            className="flex items-center gap-3 p-2.5 bg-[#1e1e1e] rounded border border-white/5"
-          >
-            <div className="flex-1 min-w-0">
-              <p className="text-xs text-gray-200 truncate">
-                {atom.title || <span className="italic text-gray-500">Untitled atom</span>}
-              </p>
-              {atom.created_at && (
-                <p className="text-xs text-gray-600 mt-0.5">
-                  Created {new Date(atom.created_at).toLocaleDateString()}
-                </p>
-              )}
-            </div>
-          </div>
+        {visible.map(atom => (
+          <NoSourceRow key={atom.id} atom={atom} onResolved={handleResolved} />
         ))}
       </div>
     </div>
@@ -462,41 +412,46 @@ function ContentQualitySection({ data }: { data: Record<string, unknown> }) {
 
 // ==================== Tag health (rootless) section ====================
 
-function TagHealthSection({ data }: { data: Record<string, unknown> }) {
+function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
   const rootlessList = (data.rootless_tag_list as RootlessTag[] | undefined) ?? [];
-  const rootlessCount = (data.rootless_tags as number) ?? rootlessList.length;
   const similarCount = (data.similar_name_pairs as number) ?? 0;
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const visible = rootlessList.filter(t => !removed.has(t.id));
+
+  const allTags = useTagsStore(s => s.tags);
+  const parentOptions = useMemo(() => {
+    const rootlessIds = new Set(rootlessList.map(t => t.id));
+    return allTags
+      .filter(t => !rootlessIds.has(t.id))
+      .map(t => ({ id: t.id, name: t.name }));
+  }, [allTags, rootlessList]);
+
+  const handleResolved = (id: string) => {
+    setRemoved(prev => new Set(prev).add(id));
+    onResolved();
+  };
 
   return (
     <div className="space-y-4">
-      {rootlessList.length > 0 && (
+      {visible.length > 0 && (
         <div className="space-y-2">
           <div className="bg-[#1a1a1a] border border-white/5 rounded p-3 space-y-1">
             <p className="text-xs text-gray-300 font-medium">
-              {rootlessCount} root-level tag{rootlessCount !== 1 ? 's' : ''} with no parent
+              {visible.length} root-level tag{visible.length !== 1 ? 's' : ''} with no parent
             </p>
             <p className="text-xs text-gray-500 leading-relaxed">
-              These tags sit at the top level. Consider nesting them under a relevant
-              category to keep the tag tree navigable.
+              Pick a parent to nest them under, or Dismiss to leave at root.
             </p>
           </div>
           <div className="space-y-1.5">
-            {rootlessList
-              .slice()
-              .sort((a, b) => b.atom_count - a.atom_count)
-              .map(tag => (
-                <div
-                  key={tag.id}
-                  className="flex items-center justify-between p-2.5 bg-[#1e1e1e] rounded border border-white/5"
-                >
-                  <div className="min-w-0">
-                    <p className="text-xs text-gray-200 truncate font-medium">{tag.name}</p>
-                    <p className="text-xs text-gray-600 mt-0.5">
-                      {tag.atom_count} atom{tag.atom_count !== 1 ? 's' : ''}
-                    </p>
-                  </div>
-                </div>
-              ))}
+            {visible.slice().sort((a, b) => b.atom_count - a.atom_count).map(tag => (
+              <TagRootlessRow
+                key={tag.id}
+                tag={tag}
+                parentOptions={parentOptions}
+                onResolved={handleResolved}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -507,13 +462,13 @@ function TagHealthSection({ data }: { data: Record<string, unknown> }) {
             {similarCount} similar-name pair{similarCount !== 1 ? 's' : ''}
           </p>
           <p className="text-xs text-gray-500 leading-relaxed">
-            Tags with near-identical names (e.g. "React" and "ReactJS") may be duplicates.
-            Review and merge in the tag tree if needed.
+            Tags with near-identical names (e.g. “React” and “ReactJS”) may be duplicates.
+            Review and merge from the tag tree if needed. (Inline merge coming in Phase C.)
           </p>
         </div>
       )}
 
-      {rootlessList.length === 0 && similarCount === 0 && (
+      {visible.length === 0 && similarCount === 0 && (
         <p className="text-xs text-gray-500 text-center py-8">Tag structure is healthy — all clear</p>
       )}
     </div>
@@ -654,7 +609,7 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
           )}
 
           {activeTab === 'boilerplate_pollution' && (
-            <BoilerplateSection atoms={boilerplateAtoms} />
+            <BoilerplateSection atoms={boilerplateAtoms} onResolved={() => setResolvedCount(n => n + 1)} />
           )}
 
           {activeTab === 'contradiction_detection' && contradictionData && (
@@ -662,11 +617,11 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
           )}
 
           {activeTab === 'content_quality' && contentQualityData && (
-            <ContentQualitySection data={contentQualityData} />
+            <ContentQualitySection data={contentQualityData} onResolved={() => setResolvedCount(n => n + 1)} />
           )}
 
           {activeTab === 'tag_health' && tagHealthData && (
-            <TagHealthSection data={tagHealthData} />
+            <TagHealthSection data={tagHealthData} onResolved={() => setResolvedCount(n => n + 1)} />
           )}
 
         </div>

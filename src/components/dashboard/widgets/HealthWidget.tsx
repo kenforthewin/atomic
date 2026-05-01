@@ -127,7 +127,7 @@ const CHECK_DESCRIPTIONS: Record<string, (data: Record<string, unknown>) => stri
   },
   boilerplate_pollution: (d) => {
     const count = d.count as number ?? 0;
-    return `${count} atom${count !== 1 ? 's' : ''} share identical boilerplate text that drowns out their unique content in embeddings — click Re-embed to strip it from the semantic index`;
+    return `${count} atom${count !== 1 ? 's' : ''} have near-identical semantic edges — their embeddings can’t be distinguished in search. Usually caused by shared template structure in the content.`;
   },
   broken_internal_links: (d) => {
     const n = (d.broken_count as number) ?? 0;

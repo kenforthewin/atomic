@@ -9,8 +9,9 @@
 
 use crate::db_extractor::Db;
 use actix_web::{web, HttpResponse};
+use atomic_core::compaction;
 use atomic_core::health::{
-    self, audit, FixRequest, FixResponse, HealthCheckResult, HealthReport,
+    self, audit, pair_key, FixRequest, FixResponse, HealthCheckResult, HealthReport,
 };
 use atomic_core::health::audit::{HealthFixLog, StoredHealthReport};
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,16 @@ use utoipa::ToSchema;
 /// Request body for the per-item fix endpoint.
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct ManualFixRequest {
-    /// "merge", "keep_both", "delete_one", "merge_with_llm"
     pub action: String,
-    /// For merge/delete operations: which atom to keep.
-    pub keep_atom_id: Option<String>,
-    /// "keep_newer", "keep_longer", "llm"
-    pub merge_strategy: Option<String>,
+    // Optional per-action fields
+    pub url: Option<String>,
+    pub parent_id: Option<String>,
+    pub into_tag_id: Option<String>,
+    pub content: Option<String>,
+    pub winner_atom_id: Option<String>,
+    pub loser_atom_id: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Query params for history endpoint.
