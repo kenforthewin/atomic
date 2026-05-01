@@ -331,6 +331,11 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
                 "id": t.id,
                 "name": t.name,
                 "atom_count": t.atom_count
+            })).collect::<Vec<_>>(),
+            "similar_name_pair_list": raw.similar_name_pairs_list.iter().map(|(a_id, a_name, b_id, b_name)| json!({
+                "pair_id": format!("{}__{}", a_id, b_id),
+                "a_id": a_id, "a_name": a_name,
+                "b_id": b_id, "b_name": b_name,
             })).collect::<Vec<_>>()
         }),
     }

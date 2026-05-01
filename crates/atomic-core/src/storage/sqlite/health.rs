@@ -70,6 +70,8 @@ pub struct HealthRawData {
     pub single_atom_tags: i32,
     pub rootless_tags: i32,
     pub similar_name_pair_count: i32,
+    /// Similar tag name pairs — (id_a, name_a, id_b, name_b).
+    pub similar_name_pairs_list: Vec<(String, String, String, String)>,
 
     // — duplicate detection (similarity >= 0.92) —
     pub duplicate_pairs: Vec<DuplicatePair>,
@@ -353,15 +355,16 @@ impl SqliteStorage {
             raw.rootless_tags = raw.rootless_tag_list.len() as i32;
         }
 
-        // Similar name pairs: fetch all tag names and compare in Rust
+        // Similar name pairs: fetch all tag (id, name) and compare in Rust
         {
-            let mut stmt = conn.prepare("SELECT name FROM tags WHERE atom_count > 0")?;
+            let mut stmt = conn.prepare("SELECT id, name FROM tags WHERE atom_count > 0")?;
             let mut rows = stmt.query([])?;
-            let mut names: Vec<String> = Vec::new();
+            let mut id_names: Vec<(String, String)> = Vec::new();
             while let Some(row) = rows.next()? {
-                names.push(row.get(0)?);
+                id_names.push((row.get(0)?, row.get(1)?));
             }
-            raw.similar_name_pair_count = count_similar_name_pairs(&names);
+            raw.similar_name_pairs_list = collect_similar_name_pairs(&id_names);
+            raw.similar_name_pair_count = raw.similar_name_pairs_list.len() as i32;
         }
 
         // ---- content overlap detection (Tier 3) ----
@@ -828,22 +831,27 @@ impl SqliteStorage {
 
 // ==================== Helpers ====================
 
-/// Count tag name pairs where one is a prefix/substring of the other.
-fn count_similar_name_pairs(names: &[String]) -> i32 {
-    let mut count = 0i32;
-    for (i, a) in names.iter().enumerate() {
-        for b in names.iter().skip(i + 1) {
-            let la = a.to_lowercase();
-            let lb = b.to_lowercase();
+/// Collect similar tag name pairs — one is a prefix/substring of the other.
+fn collect_similar_name_pairs(tags: &[(String, String)]) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    for (i, (a_id, a_name)) in tags.iter().enumerate() {
+        for (b_id, b_name) in tags.iter().skip(i + 1) {
+            let la = a_name.to_lowercase();
+            let lb = b_name.to_lowercase();
             if la == lb {
-                continue; // exact duplicate (already handled)
+                continue; // exact duplicate (already handled elsewhere)
             }
             if la.contains(lb.as_str()) || lb.contains(la.as_str()) {
-                count += 1;
+                // canonical order: smaller id first, for stable pair_id
+                if a_id <= b_id {
+                    out.push((a_id.clone(), a_name.clone(), b_id.clone(), b_name.clone()));
+                } else {
+                    out.push((b_id.clone(), b_name.clone(), a_id.clone(), a_name.clone()));
+                }
             }
         }
     }
-    count
+    out
 }
 
 /// Extract first ~60 chars as a title preview.
@@ -973,5 +981,50 @@ impl SqliteStorage {
         tx.commit()
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(())
+    }
+
+    /// Delete stale dismissal rows: expired TTL, orphaned atom refs, orphaned tag refs.
+    pub(crate) fn gc_dismissals_impl(&self) -> Result<u64, AtomicCoreError> {
+        let mut conn = self.db.conn.lock().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = conn.transaction().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        let mut total: u64 = 0;
+
+        // 1. Expired dismissals (defer TTL passed)
+        total += tx.execute(
+            "DELETE FROM health_dismissals WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now],
+)? as u64;
+
+        // 2a. Per-atom checks
+        total += tx.execute(
+            "DELETE FROM health_dismissals
+             WHERE check_name IN ('boilerplate_pollution', 'content_quality')
+               AND item_key NOT IN (SELECT id FROM atoms)",
+            [],
+)? as u64;
+
+        // 2b. tag_health dismissals pointing at deleted tags
+        total += tx.execute(
+            "DELETE FROM health_dismissals
+             WHERE check_name = 'tag_health'
+               AND item_key NOT IN (SELECT id FROM tags)",
+            [],
+)? as u64;
+
+        // 2c. Pair-keyed checks — delete if either half atom is gone
+        total += tx.execute(
+            "DELETE FROM health_dismissals
+             WHERE check_name IN ('content_overlap', 'contradiction_detection')
+               AND (
+                 instr(item_key, '__') = 0
+                 OR substr(item_key, 1, instr(item_key, '__') - 1) NOT IN (SELECT id FROM atoms)
+                 OR substr(item_key, instr(item_key, '__') + 2) NOT IN (SELECT id FROM atoms)
+               )",
+            [],
+)? as u64;
+
+        tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(total)
     }
 }

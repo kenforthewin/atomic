@@ -883,12 +883,14 @@ function ContentQualitySection({ data, onResolved }: { data: Record<string, unkn
 
 function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
   const rootlessList = (data.rootless_tag_list as RootlessTag[] | undefined) ?? [];
-  const similarCount = (data.similar_name_pairs as number) ?? 0;
+  const similarPairs = (data.similar_name_pair_list as Array<{ pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }> | undefined) ?? [];
   const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const [removedPairs, setRemovedPairs] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const visible = rootlessList.filter(t => !removed.has(t.id));
+  const visiblePairs = similarPairs.filter(p => !removedPairs.has(p.pair_id));
 
   const allTags = useTagsStore(s => s.tags);
   const parentOptions = useMemo(() => {
@@ -904,15 +906,39 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
     onResolved();
   };
 
+  const mergeInto = async (p: { pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }, winner_id: string) => {
+    await getTransport().invoke('apply_health_item_fix', {
+      check: 'tag_health',
+      item_id: p.pair_id,
+      action: 'merge_tags',
+      into_tag_id: winner_id,
+    });
+    setRemovedPairs(prev => new Set(prev).add(p.pair_id));
+    onResolved();
+  };
+
+  const ignorePair = async (p: { pair_id: string }) => {
+    await getTransport().invoke('apply_health_item_fix', {
+      check: 'tag_health',
+      item_id: p.pair_id,
+      action: 'dismiss',
+    });
+    setRemovedPairs(prev => new Set(prev).add(p.pair_id));
+    onResolved();
+  };
+
   const bulkDismiss = async () => {
     setBusy(true);
     setProgress(0);
     try {
-      const items = Array.from(selected).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
+      const tagItems = Array.from(selected).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
+      const pairItems = Array.from(selected).filter(id => id.includes('__')).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
+      const items = [...tagItems, ...pairItems.filter(pi => !tagItems.find(ti => ti.item_id === pi.item_id))];
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setProgress(okIds.size);
-      setRemoved(prev => { const next = new Set(prev); okIds.forEach(id => next.add(id)); return next; });
+      setRemoved(prev => { const next = new Set(prev); okIds.forEach(id => { if (!id.includes('__')) next.add(id); }); return next; });
+      setRemovedPairs(prev => { const next = new Set(prev); okIds.forEach(id => { if (id.includes('__')) next.add(id); }); return next; });
       okIds.forEach(() => onResolved());
       setSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
@@ -958,6 +984,47 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
         </div>
       )}
 
+      {visiblePairs.length > 0 && (
+        <div className="space-y-2 pb-12">
+          <div className="bg-[#1a1a1a] border border-white/5 rounded p-3 space-y-1">
+            <p className="text-xs text-gray-300 font-medium">
+              {visiblePairs.length} similar-name pair{visiblePairs.length !== 1 ? 's' : ''}
+            </p>
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Tags with near-identical names may be duplicates. Merge to keep one, or Ignore to dismiss.
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            {visiblePairs.map(p => (
+              <label key={p.pair_id} className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  checked={selected.has(p.pair_id)}
+                  onChange={e => {
+                    setSelected(prev => { const n = new Set(prev); if (e.target.checked) n.add(p.pair_id); else n.delete(p.pair_id); return n; });
+                  }}
+                  className="mt-3 peer h-3.5 w-3.5 rounded border border-white/20 bg-[#161616] checked:bg-purple-600 checked:border-purple-600 focus:outline-none shrink-0"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between py-2">
+                    <div>
+                      <span className="text-xs text-gray-300">{p.a_name}</span>
+                      <span className="text-xs text-gray-600 mx-1">~</span>
+                      <span className="text-xs text-gray-300">{p.b_name}</span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <button onClick={() => mergeInto(p, p.a_id)} className="px-2 py-1 rounded text-xs text-white bg-purple-600 hover:bg-purple-500">Keep {p.a_name}</button>
+                      <button onClick={() => mergeInto(p, p.b_id)} className="px-2 py-1 rounded text-xs text-white bg-purple-600 hover:bg-purple-500">Keep {p.b_name}</button>
+                      <button onClick={() => ignorePair(p)} className="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 bg-[#2a2a2a] border border-white/5">Ignore</button>
+                    </div>
+                  </div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
       {selected.size > 0 && (
         <div className="sticky bottom-0 -mx-5 px-5 py-2 bg-[#1a1a1a] border-t border-white/10 flex items-center justify-between">
           <span className="text-xs text-gray-400">{selected.size} selected</span>
@@ -970,19 +1037,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
         </div>
       )}
 
-      {similarCount > 0 && (
-        <div className="bg-[#1a1a1a] border border-white/5 rounded p-3 space-y-1">
-          <p className="text-xs text-gray-300 font-medium">
-            {similarCount} similar-name pair{similarCount !== 1 ? 's' : ''}
-          </p>
-          <p className="text-xs text-gray-500 leading-relaxed">
-            Tags with near-identical names (e.g. “React” and “ReactJS”) may be duplicates.
-            Review and merge from the tag tree if needed. (Inline merge coming in Phase C.)
-          </p>
-        </div>
-      )}
-
-      {visible.length === 0 && similarCount === 0 && (
+      {visible.length === 0 && visiblePairs.length === 0 && (
         <p className="text-xs text-gray-500 text-center py-8">Tag structure is healthy — all clear</p>
       )}
     </div>
@@ -1068,6 +1123,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
   const tagHealthData: Record<string, unknown> | null =
     (report.checks['tag_health']?.data ?? null) as Record<string, unknown> | null;
   const rootlessCount = (tagHealthData?.rootless_tags as number) ?? 0;
+  const similarPairsCount = (tagHealthData?.similar_name_pairs as number) ?? 0;
 
   // Snapshot initial queue sizes once per report load for progress bar
   const initialSizes = useMemo(() => ({
@@ -1075,7 +1131,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     boilerplate_pollution: boilerplateAtoms.length + (resolvedByTab['boilerplate_pollution'] ?? 0),
     contradiction_detection: contradictionCount + (resolvedByTab['contradiction_detection'] ?? 0),
     content_quality: noSourceCount + (resolvedByTab['content_quality'] ?? 0),
-    tag_health: rootlessCount + (resolvedByTab['tag_health'] ?? 0),
+    tag_health: rootlessCount + similarPairsCount + (resolvedByTab['tag_health'] ?? 0),
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), []); // intentionally empty deps — snapshot on mount only
 
@@ -1084,7 +1140,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     ...(boilerplateAtoms.length > 0    ? [{ key: 'boilerplate_pollution',    label: 'Boilerplate',     count: boilerplateAtoms.length }] : []),
     ...(contradictionCount > 0         ? [{ key: 'contradiction_detection', label: 'Contradictions',  count: contradictionCount }] : []),
     ...(noSourceCount > 0              ? [{ key: 'content_quality',         label: 'No source',       count: noSourceCount }] : []),
-    ...(rootlessCount > 0              ? [{ key: 'tag_health',              label: 'Tag structure',   count: rootlessCount }] : []),
+    ...(rootlessCount > 0 || similarPairsCount > 0 ? [{ key: 'tag_health', label: 'Tag structure', count: rootlessCount + similarPairsCount }] : []),
   ];
 
   const [selectedTab, setSelectedTab] = useState<string | null>(checkName ?? null);

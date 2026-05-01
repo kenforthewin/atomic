@@ -2185,6 +2185,19 @@ impl AtomicCore {
             .await
     }
 
+    /// GC stale health dismissal rows (expired TTL + orphaned atom/tag refs).
+    pub async fn gc_health_dismissals(&self) -> Result<u64, AtomicCoreError> {
+        self.storage.gc_dismissals_sync().await
+    }
+
+    /// List active dismissals for a check. Returns (item_key, reason) pairs.
+    pub async fn list_dismissed_keys(
+        &self,
+        check_name: &str,
+    ) -> Result<Vec<(String, String)>, AtomicCoreError> {
+        self.storage.list_dismissed_keys_sync(check_name).await
+    }
+
     // ==================== Chat Operations ====================
 
     /// Create a new conversation

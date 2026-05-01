@@ -317,6 +317,22 @@ mod tests {
         assert_eq!(list[0]["atom_count"], 7);
     }
 
+
+    #[test]
+    fn test_tag_health_similar_name_pairs_list() {
+        let mut raw = base_raw();
+        raw.similar_name_pairs_list = vec![
+            ("id-a".to_string(), "Machine Learning".to_string(), "id-b".to_string(), "Learning".to_string()),
+        ];
+        raw.similar_name_pair_count = 1;
+        let result = checks::tag_health(&raw);
+        assert_eq!(result.status, "warning");
+        let pair_list = result.data["similar_name_pair_list"].as_array().unwrap();
+        assert_eq!(pair_list.len(), 1);
+        assert_eq!(pair_list[0]["a_name"], "Machine Learning");
+        assert_eq!(pair_list[0]["b_name"], "Learning");
+        assert_eq!(pair_list[0]["pair_id"], "id-a__id-b");
+    }
     // --- aggregate_score ---
 
     #[test]

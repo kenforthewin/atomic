@@ -31,6 +31,7 @@ pub mod fixes;
 pub mod link_resolution;
 pub mod llm_fixes;
 pub mod task;
+pub mod gc_task;
 
 use crate::error::AtomicCoreError;
 use crate::AtomicCore;
@@ -837,6 +838,16 @@ pub(crate) fn apply_dismissals(
                 }
                 if new_count == 0 {
                     result.requires_review = false;
+                }
+            }
+            if let Some(arr) = data.get_mut("similar_name_pair_list").and_then(Value::as_array_mut) {
+                arr.retain(|p| {
+                    let pair_id = p.get("pair_id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(pair_id)
+                });
+                let new_similar = arr.len();
+                if let Some(c) = data.get_mut("similar_name_pairs") {
+                    *c = Value::from(new_similar);
                 }
             }
         }

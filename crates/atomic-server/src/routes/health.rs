@@ -252,6 +252,44 @@ async fn apply_manual_fix_impl(
             Ok(serde_json::json!({"status": "ok"}))
         }
 
+        // === Tag health: merge_tags (similar-name pair — item_id = "a_id__b_id", winner = into_tag_id) ===
+        ("tag_health", "merge_tags") => {
+            let winner_id = match req.into_tag_id.as_deref() {
+                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                _ => {
+                    return Err(AtomicCoreError::Validation(
+                        "into_tag_id is required for merge_tags".into(),
+                    ))
+                }
+            };
+            let parts: Vec<&str> = item_id.splitn(2, "__").collect();
+            if parts.len() != 2 {
+                return Err(AtomicCoreError::Validation(
+                    "item_id must be 'a_id__b_id' for merge_tags".into(),
+                ));
+            }
+            let (a_id, b_id) = (parts[0], parts[1]);
+            let loser_id = if winner_id == a_id { b_id } else { a_id };
+            let winner_name = match core.get_tag_by_id(&winner_id).await? {
+                Some((name, _)) => name,
+                None => return Err(AtomicCoreError::NotFound("winner tag not found".into())),
+            };
+            let loser_name = match core.get_tag_by_id(loser_id).await? {
+                Some((name, _)) => name,
+                None => return Err(AtomicCoreError::NotFound("loser tag not found".into())),
+            };
+            let merges = vec![compaction::TagMerge {
+                winner_name,
+                loser_name,
+                reason: "similar_name_pair_merge".to_string(),
+            }];
+            core.apply_tag_merges(&merges).await?;
+            // Also dismiss the pair so it doesn't resurface
+            let _ = core
+                .dismiss_health_item("tag_health", item_id, "merged", None)
+                .await;
+            Ok(serde_json::json!({"status": "ok"}))
+        }
         // === Boilerplate: re-embed ===
         ("boilerplate_pollution", "reembed") => {
             core.retry_embedding(item_id, |_| {}).await?;

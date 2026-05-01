@@ -412,6 +412,19 @@ impl StorageBackend {
             StorageBackend::Postgres(_) => Ok(()),
         }
     }
+
+    pub(crate) async fn gc_dismissals_sync(&self) -> Result<u64, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.gc_dismissals_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(0),
+        }
+    }
     pub(crate) async fn count_chunk_hash_occurrences_sync(
         &self,
         hashes: &[String],
