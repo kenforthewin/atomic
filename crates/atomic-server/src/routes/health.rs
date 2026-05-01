@@ -290,6 +290,44 @@ async fn apply_manual_fix_impl(
                 .await;
             Ok(serde_json::json!({"status": "ok"}))
         }
+        // === Tag health: delete_tag (manual review — single-atom non-autotag or any tag) ===
+        ("tag_health", "delete_tag") => {
+            core.delete_tag(item_id, false).await?;
+            audit::log_fix(
+                core,
+                "tag_health",
+                "delete_tag",
+                "low",
+                None,
+                Some(&[item_id.to_string()]),
+                serde_json::json!([{"id": item_id}]),
+                serde_json::json!({"deleted": 1}),
+                None,
+                None,
+            )
+            .await?;
+            Ok(serde_json::json!({"status": "ok"}))
+        }
+
+        // === Tag health: merge_into_parent (reparent a tag) ===
+        ("tag_health", "merge_into_parent") => {
+            let new_parent_id = match req.into_tag_id.as_deref() {
+                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+                _ => {
+                    return Err(AtomicCoreError::Validation(
+                        "into_tag_id is required for merge_into_parent".into(),
+                    ))
+                }
+            };
+            match core.get_tag_by_id(item_id).await? {
+                Some((name, _)) => {
+                    core.update_tag(item_id, &name, Some(&new_parent_id)).await?;
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
+                None => Err(AtomicCoreError::NotFound("tag not found".into())),
+            }
+        }
+
         // === Boilerplate: re-embed ===
         ("boilerplate_pollution", "reembed") => {
             core.retry_embedding(item_id, |_| {}).await?;
@@ -319,6 +357,16 @@ async fn apply_manual_fix_impl(
             let action = atomic_core::health::llm_fixes::apply_edited_merge(core, &winner, &loser, &content).await?;
             let key = atomic_core::health::pair_key(parts[0], parts[1]);
             let _ = core.dismiss_health_item("content_overlap", &key, "resolved_other", None).await;
+            Ok(serde_json::to_value(action).unwrap_or_default())
+        }
+
+        // === Broken internal links: remove-link ===
+        ("broken_internal_links", "remove_link") => {
+            let link_raw = match req.content.as_deref() {
+                Some(c) if !c.trim().is_empty() => c.to_string(),
+                _ => return Err(AtomicCoreError::Validation("content (link_raw) is required for remove_link".into())),
+            };
+            let action = atomic_core::health::fixes::remove_broken_link(core, item_id, &link_raw).await?;
             Ok(serde_json::to_value(action).unwrap_or_default())
         }
 

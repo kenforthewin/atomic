@@ -11,6 +11,7 @@ import { useDatabasesStore } from '../../../stores/databases';
 import { NoSourceRow } from './review/NoSourceRow';
 import { TagRootlessRow } from './review/TagRootlessRow';
 import { BoilerplateAtomRow } from './review/BoilerplateAtomRow';
+import { BrokenLinksSection } from './review/BrokenLinksSection';
 import { sourceTrust, relativeAge } from './review/badges';
 import { lineDiff, type DiffPart } from './review/diffUtil';
 
@@ -884,6 +885,9 @@ function ContentQualitySection({ data, onResolved }: { data: Record<string, unkn
 function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
   const rootlessList = (data.rootless_tag_list as RootlessTag[] | undefined) ?? [];
   const similarPairs = (data.similar_name_pair_list as Array<{ pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }> | undefined) ?? [];
+  const singleAtomTags = (data.single_atom_tag_list as Array<{ id: string; name: string; is_autotag: boolean }> | undefined) ?? [];
+  const [removedSingleAtom, setRemovedSingleAtom] = useState<Set<string>>(new Set());
+  const [mergeTargets, setMergeTargets] = useState<Record<string, string>>({});
   const [removed, setRemoved] = useState<Set<string>>(new Set());
   const [removedPairs, setRemovedPairs] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -891,6 +895,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
   const [progress, setProgress] = useState(0);
   const visible = rootlessList.filter(t => !removed.has(t.id));
   const visiblePairs = similarPairs.filter(p => !removedPairs.has(p.pair_id));
+  const visibleSingleAtomTags = singleAtomTags.filter(t => !removedSingleAtom.has(t.id));
 
   const allTags = useTagsStore(s => s.tags);
   const parentOptions = useMemo(() => {
@@ -924,6 +929,42 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       action: 'dismiss',
     });
     setRemovedPairs(prev => new Set(prev).add(p.pair_id));
+    onResolved();
+  };
+
+  const deleteSingleAtomTag = async (tagId: string) => {
+    await getTransport().invoke('apply_health_item_fix', {
+      check: 'tag_health',
+      item_id: tagId,
+      action: 'delete_tag',
+    });
+    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
+    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
+    onResolved();
+  };
+
+  const mergeSingleAtomTagIntoParent = async (tagId: string) => {
+    const into = mergeTargets[tagId];
+    if (!into) return;
+    await getTransport().invoke('apply_health_item_fix', {
+      check: 'tag_health',
+      item_id: tagId,
+      action: 'merge_into_parent',
+      into_tag_id: into,
+    });
+    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
+    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
+    onResolved();
+  };
+
+  const dismissSingleAtomTag = async (tagId: string) => {
+    await getTransport().invoke('apply_health_item_fix', {
+      check: 'tag_health',
+      item_id: tagId,
+      action: 'dismiss',
+    });
+    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
+    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
     onResolved();
   };
 
@@ -1025,6 +1066,79 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
         </div>
       )}
 
+      {visibleSingleAtomTags.length > 0 && (
+        <div className="space-y-2 pb-12">
+          <div className="bg-[#1a1a1a] border border-white/5 rounded p-3 space-y-1">
+            <p className="text-xs text-gray-300 font-medium">
+              {visibleSingleAtomTags.length} tag{visibleSingleAtomTags.length !== 1 ? 's' : ''} used by only one atom
+            </p>
+            <p className="text-xs text-gray-500 leading-relaxed">
+              These tags are exclusive to a single atom — they may be too narrow. Delete auto-extracted ones or merge into a broader tag.
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            {visibleSingleAtomTags.map(tag => (
+              <label key={tag.id} className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  checked={selected.has(tag.id)}
+                  onChange={e => {
+                    setSelected(prev => { const n = new Set(prev); if (e.target.checked) n.add(tag.id); else n.delete(tag.id); return n; });
+                  }}
+                  className="mt-3 peer h-3.5 w-3.5 rounded border border-white/20 bg-[#161616] checked:bg-purple-600 checked:border-purple-600 focus:outline-none shrink-0"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between py-2 gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-xs text-gray-300 truncate">{tag.name}</span>
+                      {tag.is_autotag && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-purple-900/40 text-purple-300 shrink-0">auto</span>
+                      )}
+                    </div>
+                    <div className="flex gap-1.5 shrink-0">
+                      {tag.is_autotag ? (
+                        <button
+                          onClick={() => deleteSingleAtomTag(tag.id)}
+                          className="px-2 py-1 rounded text-xs text-white bg-purple-600 hover:bg-purple-500"
+                        >
+                          Delete
+                        </button>
+                      ) : (
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={mergeTargets[tag.id] ?? ''}
+                            onChange={e => setMergeTargets(prev => ({ ...prev, [tag.id]: e.target.value }))}
+                            className="text-xs bg-[#2a2a2a] border border-white/10 rounded px-1.5 py-1 text-gray-300 max-w-[140px]"
+                          >
+                            <option value="">Merge into…</option>
+                            {allTags.filter(t => t.id !== tag.id).map(t => (
+                              <option key={t.id} value={t.id}>{t.name}</option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => mergeSingleAtomTagIntoParent(tag.id)}
+                            disabled={!mergeTargets[tag.id]}
+                            className="px-2 py-1 rounded text-xs text-white bg-purple-600 hover:bg-purple-500 disabled:opacity-40"
+                          >
+                            Merge
+                          </button>
+                        </div>
+                      )}
+                      <button
+                        onClick={() => dismissSingleAtomTag(tag.id)}
+                        className="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 bg-[#2a2a2a] border border-white/5"
+                      >
+                        Ignore
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
       {selected.size > 0 && (
         <div className="sticky bottom-0 -mx-5 px-5 py-2 bg-[#1a1a1a] border-t border-white/10 flex items-center justify-between">
           <span className="text-xs text-gray-400">{selected.size} selected</span>
@@ -1037,7 +1151,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
         </div>
       )}
 
-      {visible.length === 0 && visiblePairs.length === 0 && (
+      {visible.length === 0 && visiblePairs.length === 0 && visibleSingleAtomTags.length === 0 && (
         <p className="text-xs text-gray-500 text-center py-8">Tag structure is healthy — all clear</p>
       )}
     </div>
@@ -1124,6 +1238,10 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     (report.checks['tag_health']?.data ?? null) as Record<string, unknown> | null;
   const rootlessCount = (tagHealthData?.rootless_tags as number) ?? 0;
   const similarPairsCount = (tagHealthData?.similar_name_pairs as number) ?? 0;
+  const singleAtomTagCount = (tagHealthData?.single_atom_tags as number) ?? (tagHealthData?.single_atom_tag_list as unknown[] | undefined)?.length ?? 0;
+  const brokenLinksData: Record<string, unknown> | null =
+    (report.checks['broken_internal_links']?.data ?? null) as Record<string, unknown> | null;
+  const brokenLinksCount = (brokenLinksData?.broken_link_list as unknown[] | undefined)?.length ?? (brokenLinksData?.broken_links as number) ?? 0;
 
   // Snapshot initial queue sizes once per report load for progress bar
   const initialSizes = useMemo(() => ({
@@ -1131,7 +1249,8 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     boilerplate_pollution: boilerplateAtoms.length + (resolvedByTab['boilerplate_pollution'] ?? 0),
     contradiction_detection: contradictionCount + (resolvedByTab['contradiction_detection'] ?? 0),
     content_quality: noSourceCount + (resolvedByTab['content_quality'] ?? 0),
-    tag_health: rootlessCount + similarPairsCount + (resolvedByTab['tag_health'] ?? 0),
+    tag_health: rootlessCount + similarPairsCount + singleAtomTagCount + (resolvedByTab['tag_health'] ?? 0),
+    broken_internal_links: brokenLinksCount + (resolvedByTab['broken_internal_links'] ?? 0),
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), []); // intentionally empty deps — snapshot on mount only
 
@@ -1140,7 +1259,8 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     ...(boilerplateAtoms.length > 0    ? [{ key: 'boilerplate_pollution',    label: 'Boilerplate',     count: boilerplateAtoms.length }] : []),
     ...(contradictionCount > 0         ? [{ key: 'contradiction_detection', label: 'Contradictions',  count: contradictionCount }] : []),
     ...(noSourceCount > 0              ? [{ key: 'content_quality',         label: 'No source',       count: noSourceCount }] : []),
-    ...(rootlessCount > 0 || similarPairsCount > 0 ? [{ key: 'tag_health', label: 'Tag structure', count: rootlessCount + similarPairsCount }] : []),
+    ...(rootlessCount > 0 || similarPairsCount > 0 || singleAtomTagCount > 0 ? [{ key: 'tag_health', label: 'Tag structure', count: rootlessCount + similarPairsCount + singleAtomTagCount }] : []),
+    ...(brokenLinksCount > 0 ? [{ key: 'broken_internal_links', label: 'Broken links', count: brokenLinksCount }] : []),
   ];
 
   const [selectedTab, setSelectedTab] = useState<string | null>(checkName ?? null);
@@ -1215,6 +1335,13 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
       const tags = ((tagHealthData as { rootless_tag_list?: Array<{ name: string; atom_count: number }> }).rootless_tag_list) ?? [];
       lines.push(`## Rootless tags (${tags.length})`, '');
       tags.forEach(t => lines.push(`- ${t.name} (${t.atom_count} atoms)`));
+    } else if (activeTab === 'broken_internal_links' && brokenLinksData) {
+      const atoms = (brokenLinksData.broken_link_list as Array<{ atom_id: string; atom_title: string; links: Array<{ raw: string; target: string; kind: string }> }> | undefined) ?? [];
+      lines.push(`## Broken links (${atoms.length})`, '');
+      atoms.forEach(a => {
+        lines.push(`- **${a.atom_title}** (${a.atom_id})`);
+        a.links.forEach(l => lines.push(`  - \`${l.raw}\` → ${l.target} [${l.kind}]`));
+      });
     }
     const md = lines.join('\n');
     try {
@@ -1385,6 +1512,24 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 initialQueueSize={initialSizes['tag_health'] ?? 0}
               />
               <TagHealthSection data={tagHealthData} onResolved={() => bumpResolved('tag_health')} />
+            </>
+          )}
+
+          {activeTab === 'broken_internal_links' && brokenLinksData && (
+            <>
+              <TabHeader
+                label="Broken links"
+                scannedAt={lastScannedAt['broken_internal_links']}
+                rescanning={rescanning === 'broken_internal_links'}
+                onRescan={() => rescanTab('broken_internal_links')}
+                resolvedToday={resolvedByTab['broken_internal_links'] ?? 0}
+                initialQueueSize={initialSizes['broken_internal_links'] ?? 0}
+              />
+              <p className="text-xs text-gray-500 leading-relaxed">
+                Internal links in your atoms that point to atoms that no longer exist.
+                Remove the link or dismiss to ignore.
+              </p>
+              <BrokenLinksSection data={brokenLinksData} onResolved={() => bumpResolved('broken_internal_links')} />
             </>
           )}
 

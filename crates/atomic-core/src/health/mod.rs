@@ -280,6 +280,13 @@ pub struct RootlessTagEntry {
     pub atom_count: i32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SingleAtomTagEntry {
+    pub id: String,
+    pub name: String,
+    pub is_autotag: bool,
+}
+
 // ==================== Orchestrator ====================
 
 /// Check weights. Must sum to 1.0.
@@ -320,7 +327,7 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
     }
 
     // Apply persistent dismissals to review-producing checks
-    let reviewable = ["content_overlap", "contradiction_detection", "boilerplate_pollution", "content_quality", "tag_health"];
+    let reviewable = ["content_overlap", "contradiction_detection", "boilerplate_pollution", "content_quality", "tag_health", "broken_internal_links"];
     for check_name in reviewable {
         let dismissed_pairs = core.storage().list_dismissed_keys_sync(check_name).await.unwrap_or_default();
         if dismissed_pairs.is_empty() {
@@ -461,12 +468,36 @@ async fn store_report(
     core.storage().store_health_report_sync(&stored).await
 }
 
-/// Async health check for broken internal links.
-///
-/// Fetches candidate atoms, extracts internal links, resolves each to a
-/// target source URL, and counts how many could not be resolved to an
-/// existing atom.  Runs outside `health_check_data_sync` because it needs
-/// multiple async DB round-trips.
+/// Per-link detail within a broken atom.
+#[derive(serde::Serialize, Clone)]
+struct BrokenLinkDetail {
+    raw: String,
+    target: String,
+    kind: String,
+}
+
+/// Atom-level summary of broken links.
+#[derive(serde::Serialize, Clone)]
+struct BrokenLinkItem {
+    atom_id: String,
+    atom_title: String,
+    links: Vec<BrokenLinkDetail>,
+}
+
+fn title_preview(content: &str) -> String {
+    for line in content.lines() {
+        let clean = line.trim().trim_start_matches('#').trim();
+        if !clean.is_empty() {
+            return if clean.len() > 80 {
+                format!("{}\u{2026}", &clean[..80])
+            } else {
+                clean.to_string()
+            };
+        }
+    }
+    String::new()
+}
+
 async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, AtomicCoreError> {
     use link_resolution::{extract_internal_links, vault_root};
 
@@ -478,12 +509,13 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
             auto_fixable: false,
             requires_review: false,
             fix_action: None,
-            data: serde_json::json!({ "broken_count": 0, "affected_atoms": 0 }),
+            data: serde_json::json!({ "broken_count": 0, "affected_atoms": 0, "broken_link_list": [], "broken_link_list_truncated": false }),
         });
     }
 
     let mut broken_count = 0i32;
     let mut affected_atoms = 0i32;
+    let mut broken_items: Vec<BrokenLinkItem> = Vec::new();
 
     for (atom_id, content, source_url) in &candidates {
         let links = extract_internal_links(content, source_url.as_deref());
@@ -491,7 +523,6 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
             continue;
         }
 
-        // Collect all candidate source URLs from this atom's links
         let candidate_urls: Vec<String> = links
             .iter()
             .flat_map(|l| l.candidate_source_urls.iter().cloned())
@@ -509,8 +540,8 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
             .map(|s| s.to_string());
 
         let mut atom_broken = false;
+        let mut atom_link_details: Vec<BrokenLinkDetail> = Vec::new();
         for link in &links {
-            // Resolved if any candidate URL matched
             let resolved_by_url = link
                 .candidate_source_urls
                 .iter()
@@ -520,7 +551,6 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
                 continue;
             }
 
-            // For wikilinks, also try the vault-wide name lookup
             let resolved_by_name = if let (Some(name), Some(pfx)) = (&link.wikilink_name, &vault_pfx) {
                 core.storage()
                     .find_atom_by_wikilink_name_sync(name.clone(), pfx.clone())
@@ -534,16 +564,35 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
             if !resolved_by_name {
                 broken_count += 1;
                 atom_broken = true;
+                let kind = if link.wikilink_name.is_some() {
+                    "wikilink".to_string()
+                } else {
+                    "markdown".to_string()
+                };
+                let target = link
+                    .wikilink_name
+                    .as_deref()
+                    .unwrap_or(&link.href)
+                    .to_string();
+                atom_link_details.push(BrokenLinkDetail {
+                    raw: link.original.clone(),
+                    target,
+                    kind,
+                });
             }
         }
         if atom_broken {
             affected_atoms += 1;
+            if broken_items.len() < 50 {
+                broken_items.push(BrokenLinkItem {
+                    atom_id: atom_id.clone(),
+                    atom_title: title_preview(content),
+                    links: atom_link_details,
+                });
+            }
         }
     }
 
-    // Score: proportion of all atoms that are clean of broken links.
-    // Fetch total atom count so a few broken atoms in a large KB
-    // don't collapse the score.
     let total_atoms = core
         .count_atoms()
         .await
@@ -555,16 +604,19 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
         (clean_atoms as f64 / total_atoms as f64 * 100.0) as u32
     };
     let status = if broken_count == 0 { "ok" } else { "warning" };
+    let truncated = affected_atoms > 50;
 
     Ok(HealthCheckResult {
         status: status.to_string(),
         score,
         auto_fixable: broken_count > 0,
-        requires_review: false,
+        requires_review: broken_count > 0,
         fix_action: Some("resolve_internal_links".to_string()),
         data: serde_json::json!({
             "broken_count": broken_count,
             "affected_atoms": affected_atoms,
+            "broken_link_list": broken_items,
+            "broken_link_list_truncated": truncated,
         }),
     })
 }
@@ -667,6 +719,18 @@ pub async fn run_fix(
             }
         }
 
+        if should_run("tag_health") {
+            if let Some(check) = checks.get("tag_health") {
+                if check.auto_fixable && check.status != "ok" {
+                    match fixes::fix_tag_health_single_atom(core, &raw, dry_run).await {
+                        Ok(Some(action)) => actions_taken.push(action),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(error = %e, "tag_health single-atom fix failed"),
+                    }
+                }
+            }
+        }
+
         if should_run("wiki_coverage") {
             if let Some(check) = checks.get("wiki_coverage") {
                 if check.auto_fixable && check.status != "ok" {
@@ -675,6 +739,16 @@ pub async fn run_fix(
                         Ok(None) => {}
                         Err(e) => tracing::warn!(error = %e, "wiki_coverage fix failed"),
                     }
+                }
+            }
+        }
+
+        if should_run("broken_internal_links") {
+            if matches!(checks.get("broken_internal_links"), Some(c) if c.auto_fixable && c.status != "ok") {
+                match fixes::fix_broken_internal_links(core, dry_run).await {
+                    Ok(Some(action)) => actions_taken.push(action),
+                    Ok(None) => tracing::debug!("broken_internal_links: no links to fix"),
+                    Err(e) => tracing::warn!(error = %e, "broken_internal_links fix failed"),
                 }
             }
         }
@@ -692,16 +766,6 @@ pub async fn run_fix(
                         Err(e) => tracing::warn!(error = %e, "source_uniqueness fix failed"),
                     }
                 }
-            }
-        }
-    }
-
-    if matches!(max_tier, FixTier::Medium | FixTier::High) && should_run("broken_internal_links") {
-        if matches!(checks.get("broken_internal_links"), Some(c) if c.auto_fixable && c.status != "ok") {
-            match fixes::fix_broken_internal_links(core, dry_run).await {
-                Ok(Some(action)) => actions_taken.push(action),
-                Ok(None) => tracing::debug!("broken_internal_links: no links to fix"),
-                Err(e) => tracing::warn!(error = %e, "broken_internal_links fix failed"),
             }
         }
     }
@@ -848,6 +912,39 @@ pub(crate) fn apply_dismissals(
                 let new_similar = arr.len();
                 if let Some(c) = data.get_mut("similar_name_pairs") {
                     *c = Value::from(new_similar);
+                }
+            }
+            if let Some(arr) = data.get_mut("single_atom_tag_list").and_then(Value::as_array_mut) {
+                arr.retain(|t| {
+                    let id = t.get("id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(id)
+                });
+                let new_count = arr.len() as i32;
+                if let Some(c) = data.get_mut("single_atom_tags") {
+                    *c = Value::from(new_count);
+                }
+            }
+        }
+        "broken_internal_links" => {
+            if let Some(arr) = data.get_mut("broken_link_list").and_then(Value::as_array_mut) {
+                arr.retain(|entry| {
+                    let id = entry.get("atom_id").and_then(Value::as_str).unwrap_or("");
+                    !dismissed_keys.contains(id)
+                });
+                let new_count = arr.len() as i64;
+                // Recompute broken_count as sum of remaining link counts
+                let new_broken: i64 = arr.iter().map(|entry| {
+                    entry.get("links").and_then(|l| l.as_array()).map_or(0, |v| v.len() as i64)
+                }).sum();
+                if let Some(c) = data.get_mut("affected_atoms") {
+                    *c = Value::from(new_count);
+                }
+                if let Some(c) = data.get_mut("broken_count") {
+                    *c = Value::from(new_broken);
+                }
+                if new_count == 0 {
+                    result.requires_review = false;
+                    result.auto_fixable = false;
                 }
             }
         }

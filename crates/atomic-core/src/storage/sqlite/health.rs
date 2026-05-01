@@ -72,6 +72,8 @@ pub struct HealthRawData {
     pub similar_name_pair_count: i32,
     /// Similar tag name pairs — (id_a, name_a, id_b, name_b).
     pub similar_name_pairs_list: Vec<(String, String, String, String)>,
+    /// Single-atom tags (exactly 1 atom attached), up to 50.
+    pub single_atom_tag_list: Vec<crate::health::SingleAtomTagEntry>,
 
     // — duplicate detection (similarity >= 0.92) —
     pub duplicate_pairs: Vec<DuplicatePair>,
@@ -322,15 +324,43 @@ impl SqliteStorage {
         }
 
         // ---- tag health ----
-        raw.single_atom_tags = conn.query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT t.id FROM tags t
+        // Single-atom tags: fetch list (up to 50) and derive count from it.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name, t.is_autotag_target
+                 FROM tags t
                  JOIN atom_tags at ON t.id = at.tag_id
                  GROUP BY t.id HAVING COUNT(at.atom_id) = 1
-             )",
-            [],
-            |r| r.get(0),
-        )?;
+                 ORDER BY t.name
+                 LIMIT 51",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut truncated = false;
+            while let Some(row) = rows.next()? {
+                if raw.single_atom_tag_list.len() == 50 {
+                    truncated = true;
+                    break;
+                }
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let is_autotag: bool = row.get::<_, i32>(2)? != 0;
+                raw.single_atom_tag_list.push(crate::health::SingleAtomTagEntry { id, name, is_autotag });
+            }
+            raw.single_atom_tags = if truncated {
+                // Count exact total when list was truncated
+                conn.query_row(
+                    "SELECT COUNT(*) FROM (
+                         SELECT t.id FROM tags t
+                         JOIN atom_tags at ON t.id = at.tag_id
+                         GROUP BY t.id HAVING COUNT(at.atom_id) = 1
+                     )",
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                raw.single_atom_tag_list.len() as i32
+            };
+        }
 
         // Rootless tags: user-created tags with no parent (excludes autotag category roots).
         // is_autotag_target = 1 marks system roots (Topics, People, etc.) — exclude them.

@@ -381,6 +381,70 @@ pub async fn fix_source_uniqueness(
 }
 
 
+/// Delete single-atom tags where `is_autotag_target = true`.  Low tier.
+///
+/// Only removes tags that were produced by the auto-tagger (is_autotag_target = 1)
+/// AND have exactly 1 atom attached.  User-created single-atom tags (is_autotag_target = 0)
+/// are left alone; those require human review.
+pub async fn fix_tag_health_single_atom(
+    core: &AtomicCore,
+    raw: &HealthRawData,
+    dry_run: bool,
+) -> Result<Option<FixAction>, AtomicCoreError> {
+    // Use the pre-fetched list; filter to autotag-only entries.
+    let targets: Vec<_> = raw
+        .single_atom_tag_list
+        .iter()
+        .filter(|t| t.is_autotag)
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(None);
+    }
+
+    let count = targets.len() as i32;
+    let ids: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
+    let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+
+    let before_state = json!(targets
+        .iter()
+        .map(|t| json!({"id": t.id, "name": t.name, "is_autotag": t.is_autotag}))
+        .collect::<Vec<_>>());
+
+    let id = if dry_run {
+        "dry_run".to_string()
+    } else {
+        for tag_id in &ids {
+            if let Err(e) = core.delete_tag(tag_id, false).await {
+                tracing::warn!(tag_id, error = %e, "failed to delete single-atom autotag");
+            }
+        }
+        tracing::info!(count, "tag_health single-atom fix: deleted autotag-only tags");
+
+        audit::log_fix(
+            core,
+            "tag_health",
+            "deleted_single_atom_autotags",
+            "low",
+            None,
+            Some(&ids),
+            before_state,
+            json!({"deleted": count}),
+            None,
+            None,
+        )
+        .await?
+    };
+
+    Ok(Some(FixAction {
+        id,
+        check: "tag_health".to_string(),
+        action: "deleted_single_atom_autotags".to_string(),
+        count,
+        details: names,
+    }))
+}
+
 /// Resolve broken internal links in all atoms to `atom://id` URIs.  Medium tier.
 ///
 /// For each atom with relative markdown links or `[[wikilinks]]`:
@@ -542,4 +606,93 @@ pub async fn fix_broken_internal_links(
         count: fixed_total,
         details,
     }))
+}
+
+/// Strip one unresolved link from an atom's content, replacing it with its
+/// display text (for markdown links) or the name (for wikilinks).
+///
+/// `link_raw` must exactly match the text as it appears in the atom content.
+pub async fn remove_broken_link(
+    core: &AtomicCore,
+    atom_id: &str,
+    link_raw: &str,
+) -> Result<FixAction, AtomicCoreError> {
+    let atom = core
+        .get_atom(atom_id)
+        .await?
+        .ok_or_else(|| AtomicCoreError::NotFound(format!("atom {} not found", atom_id)))?;
+
+    let content = &atom.atom.content;
+
+    // Determine replacement text.
+    let replacement = if let Some(inner) = parse_markdown_link_text(link_raw) {
+        inner
+    } else if let Some(name) = parse_wikilink_name(link_raw) {
+        name
+    } else {
+        tracing::warn!(link_raw = %link_raw, "remove_broken_link: unrecognised link format, replacing with empty string");
+        String::new()
+    };
+
+    let new_content = content.replacen(link_raw, &replacement, 1);
+
+    // Record before state for undo.
+    let before_state = serde_json::json!([{
+        "id": atom_id,
+        "content": content,
+        "source_url": atom.atom.source_url,
+    }]);
+    let after_state = serde_json::json!([{
+        "id": atom_id,
+        "content": new_content,
+        "source_url": atom.atom.source_url,
+    }]);
+
+    let tag_ids: Vec<String> = atom.tags.iter().map(|t| t.id.clone()).collect();
+    let upd = crate::UpdateAtomRequest {
+        content: new_content,
+        source_url: atom.atom.source_url.clone(),
+        published_at: atom.atom.published_at.clone(),
+        tag_ids: Some(tag_ids),
+    };
+    core.update_atom(atom_id, upd, |_| {}).await?;
+
+    let id = audit::log_fix(
+        core,
+        "broken_internal_links",
+        "remove_link",
+        "medium",
+        Some(&[atom_id.to_string()]),
+        None,
+        before_state,
+        after_state,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    Ok(FixAction {
+        id,
+        check: "broken_internal_links".to_string(),
+        action: "remove_link".to_string(),
+        count: 1,
+        details: vec![format!("Removed link '{}' from atom {}", link_raw, atom_id)],
+    })
+}
+
+/// Extract display text from `[text](url)` markdown link.
+fn parse_markdown_link_text(s: &str) -> Option<String> {
+    if !s.starts_with('[') {
+        return None;
+    }
+    let close_bracket = s.find("](")?;
+    Some(s[1..close_bracket].to_string())
+}
+
+/// Extract name from `[[name]]` or `[[name|alias]]` wikilink.
+fn parse_wikilink_name(s: &str) -> Option<String> {
+    let inner = s.strip_prefix("[[")?.strip_suffix("]]")? ;
+    let name = inner.split('|').next().unwrap_or(inner).trim();
+    Some(name.to_string())
 }

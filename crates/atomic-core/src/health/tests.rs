@@ -540,4 +540,202 @@ mod tests {
         assert!(!result.requires_review);
         assert_eq!(result.data["count"], 0);
     }
+
+    // --- tag_health: single_atom_tag_list ---
+
+    #[test]
+    fn test_tag_health_single_atom_tag_list() {
+        use crate::health::SingleAtomTagEntry;
+        let mut raw = base_raw();
+        // Tag A: 1 atom, autotag=true
+        raw.single_atom_tag_list.push(SingleAtomTagEntry {
+            id: "tag-a".to_string(),
+            name: "AutoTag".to_string(),
+            is_autotag: true,
+        });
+        // Tag B: 1 atom, autotag=false (user-created)
+        raw.single_atom_tag_list.push(SingleAtomTagEntry {
+            id: "tag-b".to_string(),
+            name: "UserTag".to_string(),
+            is_autotag: false,
+        });
+        raw.single_atom_tags = 2;
+
+        let result = checks::tag_health(&raw);
+
+        // Expect the list in JSON data
+        let list = result.data["single_atom_tag_list"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["id"], "tag-a");
+        assert_eq!(list[0]["is_autotag"], true);
+        assert_eq!(list[1]["id"], "tag-b");
+        assert_eq!(list[1]["is_autotag"], false);
+    }
+
+    #[test]
+    fn test_tag_health_auto_fixable_requires_autotag_threshold() {
+        use crate::health::SingleAtomTagEntry;
+        let mut raw = base_raw();
+        // Only 2 autotag single-atom tags — below threshold of 3
+        for i in 0..2 {
+            raw.single_atom_tag_list.push(SingleAtomTagEntry {
+                id: format!("tag-{}", i),
+                name: format!("Tag{}", i),
+                is_autotag: true,
+            });
+        }
+        raw.single_atom_tags = 2;
+        let result = checks::tag_health(&raw);
+        // auto_fixable = false because count <= 3
+        assert!(!result.auto_fixable);
+
+        // Now add enough to exceed threshold
+        let mut raw2 = base_raw();
+        for i in 0..4 {
+            raw2.single_atom_tag_list.push(SingleAtomTagEntry {
+                id: format!("tag-{}", i),
+                name: format!("Tag{}", i),
+                is_autotag: true,
+            });
+        }
+        raw2.single_atom_tags = 4;
+        let result2 = checks::tag_health(&raw2);
+        assert!(result2.auto_fixable);
+    }
+
+    #[test]
+    fn test_apply_dismissals_filters_single_atom_tag_list() {
+        use crate::health::{apply_dismissals, HealthCheckResult, SingleAtomTagEntry};
+        use std::collections::HashSet;
+
+        let mut raw = base_raw();
+        raw.single_atom_tag_list.push(SingleAtomTagEntry { id: "tag-x".to_string(), name: "X".to_string(), is_autotag: false });
+        raw.single_atom_tag_list.push(SingleAtomTagEntry { id: "tag-y".to_string(), name: "Y".to_string(), is_autotag: true });
+        raw.single_atom_tags = 2;
+        let mut result = checks::tag_health(&raw);
+
+        let mut dismissed = HashSet::new();
+        dismissed.insert("tag-x".to_string());
+        apply_dismissals("tag_health", &mut result, &dismissed);
+
+        let list = result.data["single_atom_tag_list"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], "tag-y");
+        // Count updated
+        assert_eq!(result.data["single_atom_tags"], 1);
+    }
+    // --- requires_review covers similar too ---
+
+    #[test]
+    fn test_tag_health_requires_review_when_similar() {
+        let mut raw = base_raw();
+        raw.similar_name_pairs_list = vec![(
+            "id-a".to_string(), "AI".to_string(),
+            "id-b".to_string(), "Artificial Intelligence".to_string(),
+        )];
+        raw.similar_name_pair_count = 1;
+        let result = checks::tag_health(&raw);
+        assert!(result.requires_review);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use tempfile::TempDir;
+    use crate::AtomicCore;
+    use crate::health::{compute_health, fixes};
+
+    fn open_core() -> (AtomicCore, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let core = AtomicCore::open_or_create(dir.path().join("health_test.db")).unwrap();
+        (core, dir)
+    }
+
+    #[tokio::test]
+    async fn test_broken_link_check_detects_unresolved_markdown_link() {
+        let (core, _dir) = open_core();
+
+        // Atom A — exists with a known source URL
+        core.create_atom(crate::CreateAtomRequest {
+            content: "Alpha content".to_string(),
+            source_url: Some("vault://notes/alpha.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create atom A");
+
+        // Atom B — has a broken link to ./bravo.md which doesn't exist
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "see [bravo](./bravo.md) for more".to_string(),
+            source_url: Some("vault://notes/beta.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create atom B").expect("atom B created");
+
+        let report = compute_health(&core).await.expect("compute_health");
+        let link_check = report.checks.get("broken_internal_links").expect("check present");
+
+        assert_eq!(link_check.status, "warning", "should be warning");
+        let list = link_check.data["broken_link_list"].as_array().expect("broken_link_list array");
+        assert_eq!(list.len(), 1, "one atom with broken link");
+        assert_eq!(list[0]["atom_id"].as_str().unwrap(), atom_b.atom.id);
+        let links = list[0]["links"].as_array().expect("links array");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["raw"].as_str().unwrap(), "[bravo](./bravo.md)");
+        assert_eq!(links[0]["kind"].as_str().unwrap(), "markdown");
+    }
+
+    #[tokio::test]
+    async fn test_remove_broken_link_strips_markdown_link() {
+        let (core, _dir) = open_core();
+
+        let atom = core.create_atom(crate::CreateAtomRequest {
+            content: "see [bravo](./bravo.md) for details".to_string(),
+            source_url: Some("vault://notes/beta.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create atom").expect("atom created");
+
+        fixes::remove_broken_link(&core, &atom.atom.id, "[bravo](./bravo.md)")
+            .await
+            .expect("remove_broken_link");
+
+        let updated = core.get_atom(&atom.atom.id).await.expect("get_atom").expect("atom exists");
+        assert_eq!(updated.atom.content, "see bravo for details");
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_broken_link_filters_from_check() {
+        let (core, _dir) = open_core();
+
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "see [bravo](./bravo.md)".to_string(),
+            source_url: Some("vault://notes/beta.md".to_string()),
+            published_at: None,
+            tag_ids: vec![],
+            skip_if_source_exists: false,
+        }, |_| {}).await.expect("create atom").expect("atom created");
+
+        // Verify it appears as broken first
+        let report = compute_health(&core).await.expect("compute_health");
+        let check = report.checks.get("broken_internal_links").expect("check");
+        assert_eq!(check.status, "warning");
+
+        // Dismiss the atom
+        core.dismiss_health_item("broken_internal_links", &atom_b.atom.id, "ignored_broken_links", None)
+            .await
+            .expect("dismiss");
+
+        // Re-run — broken_link_list for B should be filtered out
+        let report2 = compute_health(&core).await.expect("compute_health 2");
+        let check2 = report2.checks.get("broken_internal_links").expect("check2");
+        let list2 = check2.data["broken_link_list"].as_array().expect("list");
+        assert!(
+            list2.iter().all(|e| e["atom_id"].as_str().unwrap() != atom_b.atom.id),
+            "dismissed atom should be filtered out"
+        );
+        assert_eq!(check2.data["broken_count"].as_i64().unwrap(), 0);
+    }
 }

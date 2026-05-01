@@ -317,11 +317,18 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
     let score = (100u32).saturating_sub(issues * 10);
     let status = if issues == 0 { "ok" } else { "warning" };
 
+    // auto_fixable only when there are auto-tag single-atom tags above the threshold.
+    // fix_tag_health_single_atom targets is_autotag=true entries only.
+    let autotag_single = raw.single_atom_tag_list.iter().filter(|t| t.is_autotag).count() as i32;
+    let auto_fixable = autotag_single > 3;
+
+    let single_atom_truncated = raw.single_atom_tags > raw.single_atom_tag_list.len() as i32;
+
     HealthCheckResult {
         status: status.to_string(),
         score,
-        auto_fixable: similar > 0,
-        requires_review: rootless > 0,
+        auto_fixable,
+        requires_review: rootless > 0 || similar > 0 || single > 3,
         fix_action: None,
         data: json!({
             "single_atom_tags": single,
@@ -336,7 +343,13 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
                 "pair_id": format!("{}__{}", a_id, b_id),
                 "a_id": a_id, "a_name": a_name,
                 "b_id": b_id, "b_name": b_name,
-            })).collect::<Vec<_>>()
+            })).collect::<Vec<_>>(),
+            "single_atom_tag_list": raw.single_atom_tag_list.iter().map(|t| json!({
+                "id": t.id,
+                "name": t.name,
+                "is_autotag": t.is_autotag,
+            })).collect::<Vec<_>>(),
+            "single_atom_tag_list_truncated": single_atom_truncated,
         }),
     }
 }
