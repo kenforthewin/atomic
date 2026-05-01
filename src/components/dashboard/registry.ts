@@ -2,7 +2,9 @@ import type { FC } from 'react';
 import { BriefingWidget } from './widgets/BriefingWidget';
 import { ActivityWidget } from './widgets/ActivityWidget';
 import { NewWikisWidget } from './widgets/NewWikisWidget';
+import { RecentWikisWidget } from './widgets/RecentWikisWidget';
 import { RevisionsWidget } from './widgets/RevisionsWidget';
+import { HealthPanel } from './widgets/HealthWidget';
 
 export type WidgetSpan = 'full' | 'half';
 
@@ -13,8 +15,10 @@ export interface DashboardWidget {
 }
 
 export const dashboardWidgets: DashboardWidget[] = [
-  { id: 'briefing', span: 'full', Component: BriefingWidget },
-  { id: 'activity', span: 'half', Component: ActivityWidget },
-  { id: 'new-wikis', span: 'half', Component: NewWikisWidget },
-  { id: 'revisions', span: 'full', Component: RevisionsWidget },
+  { id: 'briefing',      span: 'full', Component: BriefingWidget },
+  { id: 'activity',     span: 'half', Component: ActivityWidget },
+  { id: 'new-wikis',   span: 'half', Component: NewWikisWidget },
+  { id: 'recent-wikis', span: 'half', Component: RecentWikisWidget },
+  { id: 'revisions',   span: 'half', Component: RevisionsWidget },
+  { id: 'health',      span: 'full', Component: HealthPanel },
 ];

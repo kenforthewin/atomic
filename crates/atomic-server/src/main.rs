@@ -447,6 +447,9 @@ async fn run_server(
             registry.register(Arc::new(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,
             ));
+            registry.register(Arc::new(
+                atomic_core::health::task::HealthMaintenanceTask,
+            ));
             let registry = Arc::new(registry);
 
             let mut interval = tokio::time::interval(Duration::from_secs(15));

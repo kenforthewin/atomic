@@ -169,6 +169,14 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::feeds::poll_feed,
         // Logs
         routes::logs::get_logs,
+        // Health
+        routes::health::get_health_knowledge,
+        routes::health::run_health_fix,
+        routes::health::apply_manual_fix,
+        routes::health::undo_health_fix,
+        routes::health::get_health_history,
+        routes::health::get_recent_fixes,
+        routes::health::compute_single_check,
     ),
     components(schemas(
         // Core types
@@ -284,6 +292,20 @@ pub use utoipa_scalar::{Scalar, Servable};
         atomic_core::CreateFeedRequest,
         atomic_core::UpdateFeedRequest,
         error::ApiErrorResponse,
+        // Health
+        atomic_core::health::HealthReport,
+        atomic_core::health::HealthCheckResult,
+        atomic_core::health::HealthStatus,
+        atomic_core::health::FixRequest,
+        atomic_core::health::FixResponse,
+        atomic_core::health::FixAction,
+        atomic_core::health::SkippedFix,
+        atomic_core::health::DuplicatePair,
+        atomic_core::health::WikiGap,
+        atomic_core::health::WikiStaleEntry,
+        atomic_core::health::audit::StoredHealthReport,
+        atomic_core::health::audit::HealthFixLog,
+        routes::health::ManualFixRequest,
     )),
     tags(
         (name = "atoms", description = "Atom CRUD operations"),
@@ -307,6 +329,7 @@ pub use utoipa_scalar::{Scalar, Servable};
         (name = "briefings", description = "Daily briefing generation and history"),
         (name = "logs", description = "Server log access"),
         (name = "oauth", description = "OAuth 2.0 endpoints for remote MCP clients"),
+        (name = "health", description = "Knowledge base health checks and auto-remediation"),
     ),
     security(
         ("bearer_auth" = []),

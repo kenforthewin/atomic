@@ -130,6 +130,210 @@ impl StorageBackend {
     }
 }
 
+impl StorageBackend {
+    // ==================== Health dispatch methods ====================
+    // These are not part of the Storage trait — health is an internal concern.
+    // Postgres returns an error for all health operations (not yet supported).
+
+    pub(crate) async fn health_check_data_sync(
+        &self,
+    ) -> Result<crate::storage::sqlite::health::HealthRawData, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.health_check_data_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
+                "health checks not yet supported on Postgres storage".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn store_health_report_sync(
+        &self,
+        report: &crate::health::audit::StoredHealthReport,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let report = report.clone();
+                tokio::task::spawn_blocking(move || s.store_health_report_impl(&report))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn get_latest_health_report_sync(
+        &self,
+    ) -> Result<Option<crate::health::HealthReport>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.get_latest_health_report_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_health_reports_sync(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::health::audit::StoredHealthReport>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.get_health_reports_impl(limit))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(vec![]),
+        }
+    }
+
+    pub(crate) async fn log_fix_action_sync(
+        &self,
+        log: &crate::health::audit::HealthFixLog,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let log = log.clone();
+                tokio::task::spawn_blocking(move || s.log_fix_action_impl(&log))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn get_fix_log_sync(
+        &self,
+        fix_id: &str,
+    ) -> Result<Option<crate::health::audit::HealthFixLog>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let fix_id = fix_id.to_string();
+                tokio::task::spawn_blocking(move || s.get_fix_log_impl(&fix_id))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_recent_fixes_sync(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::health::audit::HealthFixLog>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.get_recent_fixes_impl(limit))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(vec![]),
+        }
+    }
+
+    pub(crate) async fn mark_fix_undone_sync(&self, fix_id: &str) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let fix_id = fix_id.to_string();
+                tokio::task::spawn_blocking(move || s.mark_fix_undone_impl(&fix_id))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn reset_skipped_untagged_to_pending_sync(
+        &self,
+    ) -> Result<i32, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || {
+                    s.reset_skipped_untagged_to_pending_impl()
+                })
+                .await
+                .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(0),
+        }
+    }
+
+    // ==================== Link resolution dispatch ====================
+
+    pub(crate) async fn get_link_candidate_atoms_sync(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.get_link_candidate_atoms_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(vec![]),
+        }
+    }
+
+    pub(crate) async fn find_atoms_by_source_urls_sync(
+        &self,
+        urls: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, String>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.find_atoms_by_source_urls_impl(&urls))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(std::collections::HashMap::new()),
+        }
+    }
+
+    pub(crate) async fn find_atom_by_wikilink_name_sync(
+        &self,
+        name: String,
+        vault_prefix: String,
+    ) -> Result<Option<(String, String)>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || {
+                    s.find_atom_by_wikilink_name_impl(&name, &vault_prefix)
+                })
+                .await
+                .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+}
+
 // ==================== Async dispatch methods ====================
 //
 // Each method dispatches to either the SqliteStorage sync helper

@@ -42,6 +42,7 @@ pub mod executor;
 pub mod export;
 pub mod extraction;
 pub mod graph_maintenance;
+pub mod health;
 pub mod import;
 pub mod ingest;
 pub mod manager;
@@ -3570,6 +3571,50 @@ impl AtomicCore {
     /// Useful for backfilling after this feature is added to an existing database.
     pub async fn recompute_all_tag_embeddings(&self) -> Result<i32, AtomicCoreError> {
         self.storage.recompute_all_tag_embeddings_sync().await
+    }
+
+    // ==================== Health ====================
+
+    /// Compute a full health report across all 10 checks.
+    pub async fn compute_health(&self) -> Result<crate::health::HealthReport, AtomicCoreError> {
+        crate::health::compute_health(self).await
+    }
+
+    /// Run auto-fixes up to the requested tier. Returns a `FixResponse` with
+    /// actions taken, skipped issues, and the new score.
+    pub async fn run_health_fix(
+        &self,
+        req: &crate::health::FixRequest,
+    ) -> Result<crate::health::FixResponse, AtomicCoreError> {
+        crate::health::run_fix(self, req).await
+    }
+
+    /// Undo a previously applied fix by its log ID.
+    pub async fn undo_health_fix(&self, fix_id: &str) -> Result<(), AtomicCoreError> {
+        crate::health::audit::undo(self, fix_id).await
+    }
+
+    /// Fetch the most recently stored health report without recomputing.
+    pub async fn get_latest_health_report(
+        &self,
+    ) -> Result<Option<crate::health::HealthReport>, AtomicCoreError> {
+        self.storage.get_latest_health_report_sync().await
+    }
+
+    /// Fetch recent stored health reports for trend display.
+    pub async fn get_health_reports(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::health::audit::StoredHealthReport>, AtomicCoreError> {
+        self.storage.get_health_reports_sync(limit).await
+    }
+
+    /// Fetch recent fix log entries (most recent first).
+    pub async fn get_recent_health_fixes(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::health::audit::HealthFixLog>, AtomicCoreError> {
+        self.storage.get_recent_fixes_sync(limit).await
     }
 }
 

@@ -40,6 +40,8 @@ export interface WikiArticleSummary {
   updated_at: string;
   atom_count: number;
   inbound_links: number;
+  /** Live count of atoms added since last generation. Computed server-side via recursive CTE. */
+  new_atoms_available: number;
 }
 
 export interface WikiLink {

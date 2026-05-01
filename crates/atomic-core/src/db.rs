@@ -816,6 +816,46 @@ impl Database {
             conn.execute_batch("PRAGMA user_version = 16;")?;
         }
 
+        // --- V16 → V17: Knowledge health tables ---
+        if version < 17 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS health_reports (
+                    id TEXT PRIMARY KEY,
+                    computed_at TEXT NOT NULL,
+                    overall_score INTEGER NOT NULL,
+                    check_scores TEXT NOT NULL,
+                    atom_count INTEGER NOT NULL,
+                    auto_fixes_applied INTEGER NOT NULL DEFAULT 0,
+                    report_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_health_reports_computed
+                    ON health_reports(computed_at DESC);
+
+                CREATE TABLE IF NOT EXISTS health_fix_log (
+                    id TEXT PRIMARY KEY,
+                    check_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    tier TEXT NOT NULL,
+                    atom_ids TEXT,
+                    tag_ids TEXT,
+                    before_state TEXT NOT NULL DEFAULT '{}',
+                    after_state TEXT NOT NULL DEFAULT '{}',
+                    llm_prompt TEXT,
+                    llm_response TEXT,
+                    executed_at TEXT NOT NULL,
+                    undone_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_health_fix_log_executed
+                    ON health_fix_log(executed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_health_fix_log_check
+                    ON health_fix_log(check_name);
+
+                PRAGMA user_version = 17;
+                "#,
+            )?;
+        }
+
         // --- Triggers (recreated every startup to stay current) ---
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS atom_tags_insert_count;

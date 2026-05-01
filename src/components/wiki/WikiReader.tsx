@@ -116,6 +116,10 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
     overlayNavigate({ type: 'wiki', tagId: targetTagId, tagName: targetTagName });
   };
 
+  if (isGenerating) {
+    return <WikiGenerating tagName={tagName} atomCount={articleStatus?.current_atom_count || 0} />;
+  }
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full text-[var(--color-text-secondary)]">
@@ -133,10 +137,6 @@ export function WikiReader({ tagId, tagName, highlightText }: WikiReaderProps) {
         </button>
       </div>
     );
-  }
-
-  if (isGenerating) {
-    return <WikiGenerating tagName={tagName} atomCount={articleStatus?.current_atom_count || 0} />;
   }
 
   if (!currentArticle) {

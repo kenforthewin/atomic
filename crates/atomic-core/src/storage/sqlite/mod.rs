@@ -14,6 +14,7 @@ mod search;
 mod settings;
 mod tags;
 mod wiki;
+pub(crate) mod health;
 
 use crate::db::Database;
 use crate::storage::traits::*;

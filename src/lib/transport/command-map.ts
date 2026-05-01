@@ -694,4 +694,38 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'GET',
     path: '/api/logs',
   },
+
+  // ==================== Health ====================
+  get_health_knowledge: {
+    method: 'GET',
+    path: '/api/health/knowledge',
+  },
+  run_health_fix: {
+    method: 'POST',
+    path: '/api/health/fix',
+    argsMode: 'body',
+  },
+  undo_health_fix: {
+    method: 'POST',
+    path: (a) => `/api/health/undo/${encodeURIComponent(a.fixId as string)}`,
+  },
+  get_health_history: {
+    method: 'GET',
+    path: '/api/health/history',
+    argsMode: 'query',
+  },
+  get_recent_health_fixes: {
+    method: 'GET',
+    path: '/api/health/fixes/recent',
+    argsMode: 'query',
+  },
+  apply_health_item_fix: {
+    method: 'POST',
+    path: (a) => `/api/health/fix/${encodeURIComponent(a.check as string)}/${encodeURIComponent(a.item_id as string)}`,
+    argsMode: 'body',
+  },
+  health_check_single: {
+    method: 'POST' as const,
+    path: (a: Record<string, unknown>) => `/api/health/check/${encodeURIComponent(a.check_name as string)}`,
+  },
 };

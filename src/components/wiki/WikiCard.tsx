@@ -99,7 +99,8 @@ export const WikiCard = memo(function WikiCard(props: WikiCardProps) {
     return prev.article.id === next.article.id
       && prev.article.updated_at === next.article.updated_at
       && prev.article.atom_count === next.article.atom_count
-      && prev.article.inbound_links === next.article.inbound_links;
+      && prev.article.inbound_links === next.article.inbound_links
+      && prev.article.new_atoms_available === next.article.new_atoms_available;
   }
   if (prev.type === 'suggestion' && next.type === 'suggestion') {
     return prev.suggestion.tag_id === next.suggestion.tag_id

@@ -1,21 +1,9 @@
 import { useMemo } from 'react';
 import { Section } from '../Section';
 import { useWikiStore } from '../../../stores/wiki';
-import { useTagsStore, type TagWithCount } from '../../../stores/tags';
 import { useUIStore } from '../../../stores/ui';
 
 const MAX_ITEMS = 5;
-
-function findTag(nodes: TagWithCount[], id: string): TagWithCount | null {
-  for (const n of nodes) {
-    if (n.id === id) return n;
-    if (n.children.length) {
-      const found = findTag(n.children, id);
-      if (found) return found;
-    }
-  }
-  return null;
-}
 
 interface RevisionItem {
   tagId: string;
@@ -25,22 +13,15 @@ interface RevisionItem {
 
 export function RevisionsWidget() {
   const articles = useWikiStore(s => s.articles);
-  const tags = useTagsStore(s => s.tags);
   const openWikiReader = useUIStore(s => s.openWikiReader);
 
   const items = useMemo<RevisionItem[]>(() => {
-    const results: RevisionItem[] = [];
-    for (const a of articles) {
-      const tag = findTag(tags, a.tag_id);
-      if (!tag) continue;
-      const delta = tag.atom_count - a.atom_count;
-      if (delta > 0) {
-        results.push({ tagId: a.tag_id, tagName: a.tag_name, delta });
-      }
-    }
-    return results.sort((x, y) => y.delta - x.delta).slice(0, MAX_ITEMS);
-  }, [articles, tags]);
-
+    return articles
+      .filter(a => a.new_atoms_available > 0)
+      .map(a => ({ tagId: a.tag_id, tagName: a.tag_name, delta: a.new_atoms_available }))
+      .sort((x, y) => y.delta - x.delta)
+      .slice(0, MAX_ITEMS);
+  }, [articles]);
   return (
     <Section label="Revision suggestions">
       {items.length === 0 ? (

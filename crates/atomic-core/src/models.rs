@@ -367,6 +367,10 @@ pub struct WikiArticleSummary {
     pub updated_at: String,
     pub atom_count: i32,
     pub inbound_links: i32,
+    /// Live count of atoms tagged under this tag hierarchy that have been added
+    /// since the article was last generated. Computed server-side via the same
+    /// recursive CTE used by `GET /api/wiki/{tag_id}/status`; never stale.
+    pub new_atoms_available: i32,
 }
 
 /// Inter-article wiki link (cross-reference between wiki articles)

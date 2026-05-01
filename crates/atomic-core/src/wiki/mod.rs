@@ -1176,12 +1176,42 @@ pub fn delete_article(conn: &Connection, tag_id: &str) -> Result<(), String> {
 
 /// Load all wiki articles with tag names for list view, sorted by importance
 pub fn load_all_wiki_articles(conn: &Connection) -> Result<Vec<WikiArticleSummary>, String> {
+    // Use a recursive CTE to compute the live atom count for each wiki article's tag
+    // hierarchy (tag + all descendants). This mirrors get_article_status exactly, so
+    // new_atoms_available here is always consistent with GET /api/wiki/{tag_id}/status.
     let mut stmt = conn
         .prepare(
-            "SELECT w.id, w.tag_id, t.name as tag_name, w.updated_at, w.atom_count,
-                    (SELECT COUNT(*) FROM wiki_links wl WHERE wl.target_tag_id = w.tag_id) as inbound_links
+            "WITH RECURSIVE
+                 -- Expand each wiki-article tag to include all its descendant tags.
+                 -- Seeded only from tags that have a wiki article so the recursion is
+                 -- bounded by the number of articles, not the full tag tree.
+                 tag_tree(root_id, id) AS (
+                     SELECT t.id, t.id
+                     FROM tags t
+                     WHERE EXISTS (SELECT 1 FROM wiki_articles wa WHERE wa.tag_id = t.id)
+                     UNION ALL
+                     SELECT tt.root_id, t.id
+                     FROM tags t
+                     JOIN tag_tree tt ON t.parent_id = tt.id
+                 ),
+                 -- Live atom count per root tag (counts atoms in the entire subtree).
+                 live_counts(tag_id, cnt) AS (
+                     SELECT tt.root_id, COUNT(DISTINCT at.atom_id)
+                     FROM tag_tree tt
+                     JOIN atom_tags at ON at.tag_id = tt.id
+                     GROUP BY tt.root_id
+                 )
+             SELECT
+                 w.id,
+                 w.tag_id,
+                 t.name AS tag_name,
+                 w.updated_at,
+                 w.atom_count,
+                 (SELECT COUNT(*) FROM wiki_links wl WHERE wl.target_tag_id = w.tag_id) AS inbound_links,
+                 MAX(0, COALESCE(lc.cnt, 0) - w.atom_count) AS new_atoms_available
              FROM wiki_articles w
              JOIN tags t ON w.tag_id = t.id
+             LEFT JOIN live_counts lc ON lc.tag_id = w.tag_id
              ORDER BY inbound_links DESC, w.atom_count DESC, w.updated_at DESC",
         )
         .map_err(|e| format!("Failed to prepare wiki articles query: {}", e))?;
@@ -1195,6 +1225,7 @@ pub fn load_all_wiki_articles(conn: &Connection) -> Result<Vec<WikiArticleSummar
                 updated_at: row.get(3)?,
                 atom_count: row.get(4)?,
                 inbound_links: row.get(5)?,
+                new_atoms_available: row.get(6)?,
             })
         })
         .map_err(|e| format!("Failed to query wiki articles: {}", e))?

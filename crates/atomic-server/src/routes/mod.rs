@@ -21,6 +21,7 @@ pub mod settings;
 pub mod setup;
 pub mod utils;
 pub mod wiki;
+pub mod health;
 
 use actix_web::web;
 
@@ -348,4 +349,16 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
 
     // Logs
     cfg.route("/logs", web::get().to(logs::get_logs));
+
+    // Health
+    cfg.route("/health/knowledge", web::get().to(health::get_health_knowledge));
+    cfg.route("/health/fix", web::post().to(health::run_health_fix));
+    cfg.route(
+        "/health/fix/{check}/{item_id}",
+        web::post().to(health::apply_manual_fix),
+    );
+    cfg.route("/health/undo/{fix_id}", web::post().to(health::undo_health_fix));
+    cfg.route("/health/history", web::get().to(health::get_health_history));
+    cfg.route("/health/fixes/recent", web::get().to(health::get_recent_fixes));
+    cfg.route("/health/check/{check_name}", web::post().to(health::compute_single_check));
 }

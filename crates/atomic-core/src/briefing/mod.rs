@@ -103,9 +103,24 @@ pub async fn run_briefing(
     }
 
     // Run the agent loop.
-    let (content, citations) = agentic::generate(core, &since, &new_atoms, total_new)
+    let (mut content, citations) = agentic::generate(core, &since, &new_atoms, total_new)
         .await
         .map_err(AtomicCoreError::Wiki)?;
+
+    // Append health summary when score is concerning
+    if let Ok(report) = crate::health::compute_health(core).await {
+        if report.overall_score < 85 {
+            let health_section = format!(
+                "\n\n## Knowledge Health\n\n\
+                Your knowledge base health score is **{}/100** ({}).\n\n\
+                {} issues can be auto-fixed via the dashboard.",
+                report.overall_score,
+                report.overall_status,
+                report.auto_fixable
+            );
+            content.push_str(&health_section);
+        }
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();

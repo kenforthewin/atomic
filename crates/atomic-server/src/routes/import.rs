@@ -37,7 +37,23 @@ pub async fn import_obsidian_vault(
         .import_obsidian_vault(&body.vault_path, body.max_notes, on_event, on_progress)
         .await
     {
-        Ok(result) => HttpResponse::Ok().json(result),
+        Ok(result) => {
+            // Fire-and-forget health maintenance after bulk import
+            let core = db.0.clone();
+            tokio::spawn(async move {
+                if let Ok(report) = core.compute_health().await {
+                    if report.overall_score < 95 {
+                        let req = atomic_core::health::FixRequest {
+                            checks: None,
+                            mode: "auto".to_string(),
+                            include_medium: false,
+                        };
+                        let _ = core.run_health_fix(&req).await;
+                    }
+                }
+            });
+            HttpResponse::Ok().json(result)
+        }
         Err(e) => crate::error::error_response(e),
     }
 }
