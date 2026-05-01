@@ -332,6 +332,52 @@ impl StorageBackend {
             StorageBackend::Postgres(_) => Ok(None),
         }
     }
+    pub(crate) async fn count_chunk_hash_occurrences_sync(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let hashes = hashes.to_vec();
+                tokio::task::spawn_blocking(move || s.count_chunk_hash_occurrences_impl(&hashes))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(std::collections::HashMap::new()),
+        }
+    }
+
+    pub(crate) async fn delete_vec_chunks_by_ids_sync(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let chunk_ids = chunk_ids.to_vec();
+                tokio::task::spawn_blocking(move || s.delete_vec_chunks_by_ids_impl(&chunk_ids))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn backfill_content_hashes_sync(&self) -> Result<usize, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.backfill_content_hashes_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(0),
+        }
+    }
 }
 
 // ==================== Async dispatch methods ====================

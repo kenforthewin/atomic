@@ -247,17 +247,24 @@ impl SqliteStorage {
         // Insert new chunks and embeddings
         for (index, (chunk_content, embedding_vec)) in chunks.iter().enumerate() {
             let chunk_id = Uuid::new_v4().to_string();
-            let embedding_blob = embedding::f32_vec_to_blob_public(embedding_vec);
+            let hash = crate::boilerplate::content_hash(chunk_content);
+            let embedding_blob = if embedding_vec.is_empty() {
+                None::<Vec<u8>>
+            } else {
+                Some(embedding::f32_vec_to_blob_public(embedding_vec))
+            };
 
             conn.execute(
-                "INSERT INTO atom_chunks (id, atom_id, chunk_index, content, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![&chunk_id, atom_id, index as i32, chunk_content, &embedding_blob],
+                "INSERT INTO atom_chunks (id, atom_id, chunk_index, content, content_hash, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![&chunk_id, atom_id, index as i32, chunk_content, &hash, &embedding_blob],
             )?;
 
-            conn.execute(
-                "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![&chunk_id, &embedding_blob],
-            )?;
+            if let Some(ref blob) = embedding_blob {
+                conn.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![&chunk_id, blob],
+                )?;
+            }
         }
 
         // Incrementally update FTS index
@@ -1170,6 +1177,97 @@ impl SqliteStorage {
             tagging_failed_count,
             tagging_failed,
         })
+    }
+    /// Given a list of content_hash values, return map of hash → count of distinct
+    /// atoms containing a chunk with that hash. Used for boilerplate detection.
+    pub(crate) fn count_chunk_hash_occurrences_impl(
+        &self,
+        hashes: &[String],
+    ) -> StorageResult<std::collections::HashMap<String, i64>> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.db.read_conn()?;
+        let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT content_hash, COUNT(DISTINCT atom_id) as cnt
+             FROM atom_chunks
+             WHERE content_hash IN ({placeholders})
+               AND content_hash IS NOT NULL
+             GROUP BY content_hash"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut map = std::collections::HashMap::new();
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(hashes.iter()),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        for row in rows {
+            let (hash, cnt) = row?;
+            map.insert(hash, cnt);
+        }
+        Ok(map)
+    }
+
+    /// Delete vec_chunks entries for specific chunk IDs.
+    /// Used after boilerplate detection to remove vectors for shared chunks.
+    pub(crate) fn delete_vec_chunks_by_ids_impl(
+        &self,
+        chunk_ids: &[String],
+    ) -> StorageResult<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})");
+        tx.execute(&sql, rusqlite::params_from_iter(chunk_ids.iter()))?;
+        tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Backfill content_hash for all atom_chunks rows that have content but NULL hash.
+    /// Safe to run multiple times (idempotent). Returns number of rows updated.
+    pub(crate) fn backfill_content_hashes_impl(&self) -> StorageResult<usize> {
+        use crate::boilerplate::content_hash;
+        let conn = self.db.read_conn()?;
+        let ids_and_contents: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM atom_chunks WHERE content_hash IS NULL LIMIT 5000",
+            )?;
+            let x = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            x
+        };
+        drop(conn);
+        if ids_and_contents.is_empty() {
+            return Ok(0);
+        }
+        let mut write_conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let tx = write_conn
+            .transaction()
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        let count = ids_and_contents.len();
+        for (id, content) in &ids_and_contents {
+            let hash = content_hash(content);
+            tx.execute(
+                "UPDATE atom_chunks SET content_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, id],
+            )?;
+        }
+        tx.commit().map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(count)
     }
 }
 

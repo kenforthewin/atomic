@@ -226,7 +226,9 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0]["pair_id"], "cp1");
         assert_eq!(pairs[0]["atom_a"]["title"], "Article on Topic X - Version 1");
-        assert_eq!(pairs[0]["similarity"], 0.85);
+        // f32 serializes with limited precision; compare as f64 with tolerance
+        let sim = pairs[0]["similarity"].as_f64().unwrap();
+        assert!((sim - 0.85).abs() < 0.001, "expected ~0.85, got {sim}");
     }
 
     // --- tag_health ---
@@ -316,5 +318,25 @@ mod tests {
         let score = crate::health::aggregate_score(&checks_map);
         // tagging = 0.0 * 0.20 + others = 1.0 * 0.80 → 80
         assert_eq!(score, 80);
+    }
+
+    // --- boilerplate_indices integration ---
+
+    #[test]
+    fn test_boilerplate_filtering_preserves_unique_chunks() {
+        use crate::boilerplate::{boilerplate_indices, content_hash};
+        use std::collections::HashMap;
+        let chunks = vec![
+            "# Privacy Policy\n\nAll rights reserved.".to_string(),
+            "This atom is about machine learning and neural networks.".to_string(),
+            "# Privacy Policy\n\nAll rights reserved.".to_string(),
+        ];
+        let mut counts = HashMap::new();
+        let bp_hash = content_hash("# Privacy Policy\n\nAll rights reserved.");
+        counts.insert(bp_hash, 20i64);
+        let indices = boilerplate_indices(&chunks, &counts, 5);
+        assert!(indices.contains(&0));
+        assert!(!indices.contains(&1));
+        assert!(indices.contains(&2));
     }
 }

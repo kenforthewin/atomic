@@ -582,16 +582,49 @@ async fn process_embedding_only_inner(
         return Ok(());
     }
 
-    // Use adaptive batching so provider batch-size limits (e.g. DashScope's
-    // max 10) are handled by splitting, same as the bulk embedding path.
-    let pending: Vec<PendingChunk> = chunks
+    // ---- Boilerplate filtering ----
+    // Exclude chunks shared across >= threshold distinct atoms from vec_chunks.
+    // They are still saved to atom_chunks (for FTS/display); only embedding is skipped.
+    let threshold = settings_map
+        .get("boilerplate_min_atom_count")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(5);
+    let boilerplate_set: std::collections::HashSet<usize> = if threshold > 0 && !chunks.is_empty() {
+        let hashes: Vec<String> = chunks
+            .iter()
+            .map(|c| crate::boilerplate::content_hash(c))
+            .collect();
+        let counts = storage
+            .count_chunk_hash_occurrences_sync(&hashes)
+            .await
+            .unwrap_or_default();
+        crate::boilerplate::boilerplate_indices(&chunks, &counts, threshold)
+    } else {
+        std::collections::HashSet::new()
+    };
+    if !boilerplate_set.is_empty() {
+        tracing::debug!(
+            atom_id,
+            stripped = boilerplate_set.len(),
+            total = chunks.len(),
+            "Boilerplate filter: excluding shared chunks from embedding"
+        );
+    }
+
+    // Partition chunks: embed only non-boilerplate ones.
+    // Boilerplate chunks are saved to atom_chunks with empty embedding (skipped from vec_chunks).
+    let (embed_chunks, skip_chunks): (Vec<(usize, String)>, Vec<(usize, String)>) = chunks
         .into_iter()
         .enumerate()
+        .partition(|(index, _)| !boilerplate_set.contains(index));
+
+    let pending: Vec<PendingChunk> = embed_chunks
+        .iter()
         .map(|(index, chunk)| PendingChunk {
             atom_id: atom_id.to_string(),
             existing_chunk_id: None,
-            chunk_index: index,
-            content: chunk,
+            chunk_index: *index,
+            content: chunk.clone(),
         })
         .collect();
 
@@ -607,12 +640,16 @@ async fn process_embedding_only_inner(
     }
 
     // Store chunks and embeddings
-    let chunks_with_embeddings: Vec<(String, Vec<f32>)> = embedded
+    // Boilerplate chunks (skip_chunks) are saved with empty vec → atom_chunks only, no vec_chunks.
+    let mut all_chunks_for_save: Vec<(String, Vec<f32>)> = embedded
         .into_iter()
         .map(|(chunk, emb)| (chunk.content, emb))
         .collect();
+    for (_, boilerplate_content) in skip_chunks {
+        all_chunks_for_save.push((boilerplate_content, vec![]));
+    }
     storage
-        .save_chunks_and_embeddings_sync(atom_id, &chunks_with_embeddings)
+        .save_chunks_and_embeddings_sync(atom_id, &all_chunks_for_save)
         .await
         .map_err(|e| format!("Failed to store chunks: {}", e))?;
 
@@ -1708,6 +1745,53 @@ where
         chunks.sort_by_key(|chunk| chunk.chunk_index);
     }
 
+
+    // ---- Boilerplate filtering for re-embed path ----
+    {
+        let threshold = settings_map
+            .get("boilerplate_min_atom_count")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(5);
+        if threshold > 0 {
+            let all_hashes: Vec<String> = {
+                let hash_set: std::collections::HashSet<String> = atom_groups
+                    .iter()
+                    .flat_map(|(_, chunks)| chunks.iter().map(|c| crate::boilerplate::content_hash(&c.content)))
+                    .collect();
+                hash_set.into_iter().collect()
+            };
+            let occurrence_counts = storage
+                .count_chunk_hash_occurrences_sync(&all_hashes)
+                .await
+                .unwrap_or_default();
+            let mut boilerplate_chunk_ids: Vec<String> = Vec::new();
+            for (_, chunks) in &mut atom_groups {
+                let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+                let bp_indices = crate::boilerplate::boilerplate_indices(&texts, &occurrence_counts, threshold);
+                if !bp_indices.is_empty() {
+                    for idx in &bp_indices {
+                        if let Some(chunk) = chunks.get(*idx) {
+                            if let Some(ref id) = chunk.existing_chunk_id {
+                                boilerplate_chunk_ids.push(id.clone());
+                            }
+                        }
+                    }
+                    let kept: Vec<PendingChunk> = chunks
+                        .drain(..)
+                        .enumerate()
+                        .filter(|(i, _)| !bp_indices.contains(i))
+                        .map(|(_, c)| c)
+                        .collect();
+                    *chunks = kept;
+                }
+            }
+            if !boilerplate_chunk_ids.is_empty() {
+                if let Err(e) = storage.delete_vec_chunks_by_ids_sync(&boilerplate_chunk_ids).await {
+                    tracing::warn!(error = %e, "Failed to delete boilerplate vec_chunks entries");
+                }
+            }
+        }
+    }
     let mut chunk_groups: Vec<Vec<(String, Vec<PendingChunk>)>> = Vec::new();
     let mut current_group = Vec::new();
     let mut current_chunk_count = 0usize;

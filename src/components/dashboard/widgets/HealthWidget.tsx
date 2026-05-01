@@ -127,7 +127,7 @@ const CHECK_DESCRIPTIONS: Record<string, (data: Record<string, unknown>) => stri
   },
   boilerplate_pollution: (d) => {
     const count = d.count as number ?? 0;
-    return `${count} atom${count !== 1 ? 's' : ''} share so much template text that semantic search can't distinguish them`;
+    return `${count} atom${count !== 1 ? 's' : ''} share identical boilerplate text that drowns out their unique content in embeddings — click Re-embed to strip it from the semantic index`;
   },
   broken_internal_links: (d) => {
     const n = (d.broken_count as number) ?? 0;

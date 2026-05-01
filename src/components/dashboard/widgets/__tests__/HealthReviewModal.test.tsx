@@ -110,7 +110,7 @@ describe('HealthReviewModal', () => {
         onResolved={onResolved}
       />
     );
-    expect(screen.getByText('Content overlap')).toBeTruthy();
+    // 'Content overlap' tab label only appears when >1 tab; check content instead
     expect(screen.getByText('Article Alpha')).toBeTruthy();
     expect(screen.getByText('Article Beta')).toBeTruthy();
     expect(screen.getByText('72% overlap')).toBeTruthy();
@@ -132,7 +132,7 @@ describe('HealthReviewModal', () => {
     render(
       <HealthReviewModal
         report={report}
-        checkName="boilerplate"
+        checkName="boilerplate_pollution"
         onClose={onClose}
         onResolved={onResolved}
       />
@@ -169,7 +169,7 @@ describe('HealthReviewModal', () => {
         onResolved={onResolved}
       />
     );
-    expect(screen.getByText('Contradictions')).toBeTruthy();
+    // 'Contradictions' tab label only appears when >1 tab; check content instead
     expect(screen.getByText('Topic X Version 1')).toBeTruthy();
     expect(screen.getByText('Topic X Version 2')).toBeTruthy();
     expect(screen.getByText(/85% similarity/)).toBeTruthy();
@@ -199,7 +199,7 @@ describe('HealthReviewModal', () => {
         onResolved={onResolved}
       />
     );
-    expect(screen.getByText('No source')).toBeTruthy();
+    // 'No source' tab label only appears when >1 tab; check content instead
     expect(screen.getByText('Note Without Source')).toBeTruthy();
     expect(screen.getByText('Another Unsourced Note')).toBeTruthy();
     expect(screen.getByText(/1\/15\/2026|Jan 15|15 Jan/)).toBeTruthy();
@@ -226,7 +226,7 @@ describe('HealthReviewModal', () => {
         onResolved={onResolved}
       />
     );
-    expect(screen.getByText('Tag structure')).toBeTruthy();
+    // Tab bar only shows with >1 tab; content still renders
     expect(screen.getByText('Orphaned Category')).toBeTruthy();
     expect(screen.getByText('Floating Topic')).toBeTruthy();
     expect(screen.getByText(/7 atom/)).toBeTruthy();
@@ -260,7 +260,7 @@ describe('HealthReviewModal', () => {
     render(
       <HealthReviewModal
         report={report}
-        checkName="boilerplate"
+        checkName="boilerplate_pollution"
         onClose={onClose}
         onResolved={onResolved}
       />

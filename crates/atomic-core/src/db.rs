@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 16;
+    const LATEST_VERSION: i32 = 17;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -851,6 +851,18 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_health_fix_log_check
                     ON health_fix_log(check_name);
 
+                PRAGMA user_version = 17;
+                "#,
+            )?;
+        }
+
+        // --- V16 → V17: content_hash column on atom_chunks for boilerplate detection ---
+        if version < 17 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE atom_chunks ADD COLUMN content_hash TEXT;
+                CREATE INDEX IF NOT EXISTS idx_atom_chunks_content_hash
+                    ON atom_chunks(content_hash);
                 PRAGMA user_version = 17;
                 "#,
             )?;

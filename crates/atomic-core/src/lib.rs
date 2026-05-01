@@ -30,6 +30,7 @@
 pub mod agent;
 pub(crate) mod atom_links;
 pub mod briefing;
+pub(crate) mod boilerplate;
 pub mod canvas_level;
 pub mod chat;
 pub mod chunking;

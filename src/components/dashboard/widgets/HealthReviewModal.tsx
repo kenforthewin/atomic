@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
   X, GitMerge, Link, Loader2, CheckCircle,
-  ChevronDown, ChevronUp, ExternalLink, RefreshCw,
+  ChevronDown, ChevronUp, RefreshCw,
 } from 'lucide-react';
 import { getTransport } from '../../../lib/transport';
 
@@ -26,12 +26,6 @@ interface AtomDetail {
 type PairAction = 'merge_with_llm' | 'keep_both';
 type PairStatus = 'idle' | 'loading' | 'done' | 'error';
 
-// Atom preview (content_quality + boilerplate)
-interface AtomPreview {
-  id: string;
-  title: string;
-  created_at?: string;
-}
 
 // Boilerplate atom entry
 interface BoilerplateEntry {
@@ -252,9 +246,10 @@ function BoilerplateSection({ atoms }: { atoms: BoilerplateEntry[] }) {
       <div className="bg-[#1e1a00] border border-yellow-900/30 rounded p-3 space-y-1.5">
         <p className="text-xs text-yellow-300/90 font-medium">Embedding quality issue</p>
         <p className="text-xs text-gray-400 leading-relaxed">
-          These {atoms.length} atom{atoms.length !== 1 ? 's' : ''} share identical boilerplate sections
-          that dominate their embeddings — semantic search cannot reliably distinguish them from
-          each other. Edit each atom to remove or uniquify the boilerplate sections, then re-embed.
+          These {atoms.length} atom{atoms.length !== 1 ? 's' : ''} share identical boilerplate
+          sections that dominate their embeddings. Re-embedding will automatically strip the
+          shared sections from the semantic index while preserving your original content.
+          After re-embedding, run a fresh health check to see the updated score.
         </p>
       </div>
       <div className="space-y-2">
@@ -279,7 +274,7 @@ function BoilerplateSection({ atoms }: { atoms: BoilerplateEntry[] }) {
                 <div className="shrink-0">
                   {status === 'done' ? (
                     <span className="flex items-center gap-1 text-xs text-green-500">
-                      <CheckCircle className="w-3 h-3" /> Queued
+                      <CheckCircle className="w-3 h-3" /> Re-queued — boilerplate will be stripped
                     </span>
                   ) : status === 'error' ? (
                     <span className="text-xs text-red-400">Failed</span>
@@ -293,7 +288,7 @@ function BoilerplateSection({ atoms }: { atoms: BoilerplateEntry[] }) {
                       {status === 'loading'
                         ? <Loader2 className="w-3 h-3 animate-spin" />
                         : <RefreshCw className="w-3 h-3" />}
-                      Re-embed
+                      Strip & re-embed
                     </button>
                   )}
                 </div>
@@ -558,7 +553,7 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
 
   const tabs = [
     ...(overlapPairs.length > 0        ? [{ key: 'content_overlap',        label: 'Content overlap', count: overlapPairs.length }] : []),
-    ...(boilerplateAtoms.length > 0    ? [{ key: 'boilerplate',             label: 'Boilerplate',     count: boilerplateAtoms.length }] : []),
+    ...(boilerplateAtoms.length > 0    ? [{ key: 'boilerplate_pollution',    label: 'Boilerplate',     count: boilerplateAtoms.length }] : []),
     ...(contradictionCount > 0         ? [{ key: 'contradiction_detection', label: 'Contradictions',  count: contradictionCount }] : []),
     ...(noSourceCount > 0              ? [{ key: 'content_quality',         label: 'No source',       count: noSourceCount }] : []),
     ...(rootlessCount > 0              ? [{ key: 'tag_health',              label: 'Tag structure',   count: rootlessCount }] : []),
@@ -658,7 +653,7 @@ export function HealthReviewModal({ report, checkName, onClose, onResolved }: Pr
             </>
           )}
 
-          {activeTab === 'boilerplate' && (
+          {activeTab === 'boilerplate_pollution' && (
             <BoilerplateSection atoms={boilerplateAtoms} />
           )}
 
