@@ -6,6 +6,8 @@ import {
 } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { getTransport } from '../../../lib/transport';
+import { runReviewAction } from './review/reviewActions';
+import { toast } from '../../../stores/toasts';
 import { useTagsStore } from '../../../stores/tags';
 import { useDatabasesStore } from '../../../stores/databases';
 import { NoSourceRow } from './review/NoSourceRow';
@@ -201,7 +203,6 @@ function PairRow({
 }) {
   const [status, setStatus] = useState<PairStatus>('idle');
   const [appliedAction, setAppliedAction] = useState<PairAction | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [contents, setContents] = useState<[string, string] | null>(null);
   const [loadingContent, setLoadingContent] = useState(false);
@@ -249,19 +250,18 @@ function PairRow({
   const applyDirect = async (action: 'keep_a' | 'keep_b') => {
     setStatus('loading');
     setAppliedAction(action);
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
+    const ok = await runReviewAction({
+      label: action === 'keep_a' ? 'Keep A' : 'Keep B',
+      command: 'apply_health_item_fix',
+      args: {
         check: 'content_overlap',
         item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
         action,
-      });
-      setStatus('done');
-      onResolve(pair);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Action failed');
-    }
+      },
+    });
+    if (ok === undefined) { setStatus('idle'); setAppliedAction(null); return; }
+    setStatus('done');
+    onResolve(pair);
   };
 
   const applyEditedMerge = async () => {
@@ -272,22 +272,21 @@ function PairRow({
       : [pair.atom_b.id, pair.atom_a.id];
     setStatus('loading');
     setAppliedAction('merge_with_edited_content');
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
+    const ok = await runReviewAction({
+      label: 'Merge atoms',
+      command: 'apply_health_item_fix',
+      args: {
         check: 'content_overlap',
         item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
         action: 'merge_with_edited_content',
         winner_atom_id: winner,
         loser_atom_id: loser,
         content: mergeDraft,
-      });
-      setStatus('done');
-      onResolve(pair);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Merge failed');
-    }
+      },
+    });
+    if (ok === undefined) { setStatus('idle'); setAppliedAction(null); return; }
+    setStatus('done');
+    onResolve(pair);
   };
 
   if (status === 'done') {
@@ -371,9 +370,6 @@ function PairRow({
                 ))}
               </div>
         )}
-
-        {/* Error */}
-        {error && <p className="text-xs text-red-400">{error}</p>}
 
         {/* Actions */}
         <div className="flex gap-1.5 flex-wrap">
@@ -610,11 +606,16 @@ function ContradictionRow({ pair, onDismissed }: { pair: ContradictionPair; onDi
   };
 
   const defer = async () => {
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'contradiction_detection',
-      item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
-      action: 'defer',
+    const ok = await runReviewAction({
+      label: 'Flag for later',
+      command: 'apply_health_item_fix',
+      args: {
+        check: 'contradiction_detection',
+        item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
+        action: 'defer',
+      },
     });
+    if (ok === undefined) return;
     setDismissed(true);
     onDismissed?.();
   };
@@ -655,7 +656,9 @@ function ContradictionRow({ pair, onDismissed }: { pair: ContradictionPair; onDi
                   });
                   setSummary(res.summary);
                 } catch (e) {
-                  setSummary(e instanceof Error ? `Error: ${e.message}` : 'Error loading summary');
+                  toast.error('Summary failed', {
+                    detail: e instanceof Error ? e.message : String(e),
+                  });
                 } finally {
                   setLoadingSummary(false);
                 }
@@ -912,32 +915,34 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
   };
 
   const mergeInto = async (p: { pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }, winner_id: string) => {
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'tag_health',
-      item_id: p.pair_id,
-      action: 'merge_tags',
-      into_tag_id: winner_id,
+    const ok = await runReviewAction({
+      label: 'Merge tags',
+      command: 'apply_health_item_fix',
+      args: { check: 'tag_health', item_id: p.pair_id, action: 'merge_tags', into_tag_id: winner_id },
     });
+    if (ok === undefined) return;
     setRemovedPairs(prev => new Set(prev).add(p.pair_id));
     onResolved();
   };
 
   const ignorePair = async (p: { pair_id: string }) => {
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'tag_health',
-      item_id: p.pair_id,
-      action: 'dismiss',
+    const ok = await runReviewAction({
+      label: 'Ignore tag pair',
+      command: 'apply_health_item_fix',
+      args: { check: 'tag_health', item_id: p.pair_id, action: 'dismiss' },
     });
+    if (ok === undefined) return;
     setRemovedPairs(prev => new Set(prev).add(p.pair_id));
     onResolved();
   };
 
   const deleteSingleAtomTag = async (tagId: string) => {
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'tag_health',
-      item_id: tagId,
-      action: 'delete_tag',
+    const ok = await runReviewAction({
+      label: 'Delete tag',
+      command: 'apply_health_item_fix',
+      args: { check: 'tag_health', item_id: tagId, action: 'delete_tag' },
     });
+    if (ok === undefined) return;
     setRemovedSingleAtom(prev => new Set(prev).add(tagId));
     setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
     onResolved();
@@ -946,23 +951,24 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
   const mergeSingleAtomTagIntoParent = async (tagId: string) => {
     const into = mergeTargets[tagId];
     if (!into) return;
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'tag_health',
-      item_id: tagId,
-      action: 'merge_into_parent',
-      into_tag_id: into,
+    const ok = await runReviewAction({
+      label: 'Merge into parent',
+      command: 'apply_health_item_fix',
+      args: { check: 'tag_health', item_id: tagId, action: 'merge_into_parent', into_tag_id: into },
     });
+    if (ok === undefined) return;
     setRemovedSingleAtom(prev => new Set(prev).add(tagId));
     setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
     onResolved();
   };
 
   const dismissSingleAtomTag = async (tagId: string) => {
-    await getTransport().invoke('apply_health_item_fix', {
-      check: 'tag_health',
-      item_id: tagId,
-      action: 'dismiss',
+    const ok = await runReviewAction({
+      label: 'Dismiss tag',
+      command: 'apply_health_item_fix',
+      args: { check: 'tag_health', item_id: tagId, action: 'dismiss' },
     });
+    if (ok === undefined) return;
     setRemovedSingleAtom(prev => new Set(prev).add(tagId));
     setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
     onResolved();

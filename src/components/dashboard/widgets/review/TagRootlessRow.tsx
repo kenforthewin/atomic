@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react';
 import { EyeOff, Loader2, Check } from 'lucide-react';
 import { applyFix, type RootlessTag, type ItemStatus } from './types';
+import { toast } from '../../../../stores/toasts';
 
 interface TagOption { id: string; name: string; }
 
@@ -13,7 +14,6 @@ export interface TagRootlessRowProps {
 export function TagRootlessRow({ tag, parentOptions, onResolved }: TagRootlessRowProps) {
   const [parentId, setParentId] = useState('');
   const [status, setStatus] = useState<ItemStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
 
   const options = useMemo(
     () => parentOptions.filter(o => o.id !== tag.id),
@@ -22,32 +22,22 @@ export function TagRootlessRow({ tag, parentOptions, onResolved }: TagRootlessRo
 
   const move = async () => {
     if (!parentId) {
-      setError('Pick a parent tag');
+      toast.error('Pick a parent tag');
       return;
     }
     setStatus('saving');
-    setError(null);
-    try {
-      await applyFix('tag_health', tag.id, { action: 'move_under', parent_id: parentId });
-      setStatus('done');
-      setTimeout(() => onResolved(tag.id), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to move tag');
-    }
+    const ok = await applyFix('Move tag under parent', 'tag_health', tag.id, { action: 'move_under', parent_id: parentId });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(tag.id), 400);
   };
 
   const dismiss = async () => {
     setStatus('saving');
-    setError(null);
-    try {
-      await applyFix('tag_health', tag.id, { action: 'dismiss' });
-      setStatus('done');
-      setTimeout(() => onResolved(tag.id), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to dismiss');
-    }
+    const ok = await applyFix('Dismiss rootless tag', 'tag_health', tag.id, { action: 'dismiss' });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(tag.id), 400);
   };
 
   return (
@@ -89,7 +79,6 @@ export function TagRootlessRow({ tag, parentOptions, onResolved }: TagRootlessRo
           </button>
         </div>
       </div>
-      {error && <p className="text-xs text-red-400">{error}</p>}
     </div>
   );
 }

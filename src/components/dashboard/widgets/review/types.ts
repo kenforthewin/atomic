@@ -40,17 +40,16 @@ export function pairKey(a: string, b: string): string {
   return a <= b ? `${a}__${b}` : `${b}__${a}`;
 }
 
-export function applyFix(
+export async function applyFix(
+  label: string,
   check: string,
   itemId: string,
   body: Record<string, unknown>,
-) {
-  // Lazy import to avoid circular
-  return import('../../../../lib/transport').then(({ getTransport }) =>
-    getTransport().invoke('apply_health_item_fix', {
-      check,
-      item_id: itemId,
-      ...body,
-    }),
-  );
+): Promise<unknown | undefined> {
+  const { runReviewAction } = await import('./reviewActions');
+  return runReviewAction({
+    label,
+    command: 'apply_health_item_fix',
+    args: { check, item_id: itemId, ...body },
+  });
 }

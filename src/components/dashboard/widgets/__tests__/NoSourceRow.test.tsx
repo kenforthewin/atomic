@@ -8,6 +8,10 @@ vi.mock('../../../../lib/transport', () => ({
   getTransport: () => ({ invoke }),
 }));
 
+const { mockSonnerError } = vi.hoisted(() => ({ mockSonnerError: vi.fn() }));
+vi.mock('sonner', () => ({
+  toast: Object.assign(vi.fn(), { error: mockSonnerError, success: vi.fn() }),
+}));
 describe('NoSourceRow', () => {
   beforeEach(() => {
     invoke.mockReset();
@@ -52,13 +56,19 @@ describe('NoSourceRow', () => {
     })));
   });
 
-  it('shows error when save fails', async () => {
+  it('surfaces error toast when save fails', async () => {
+    mockSonnerError.mockClear();
     invoke.mockRejectedValueOnce(new Error('nope'));
     const user = userEvent.setup();
     render(<NoSourceRow atom={atom} onResolved={() => {}} />);
     await user.click(screen.getByText('Add source'));
-    await user.type(screen.getByPlaceholderText('https://\u2026'), 'x');
+    await user.type(screen.getByPlaceholderText('https://…'), 'x');
     await user.click(screen.getByText('Save'));
-    await waitFor(() => expect(screen.getByText('nope')).toBeTruthy());
+    await waitFor(() => {
+      expect(mockSonnerError).toHaveBeenCalledWith(
+        'Save source URL failed',
+        expect.objectContaining({ description: 'nope' }),
+      );
+    });
   });
 });

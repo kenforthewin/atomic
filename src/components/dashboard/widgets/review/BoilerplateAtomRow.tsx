@@ -2,7 +2,9 @@ import { useState } from 'react';
 import { RefreshCw, Loader2, Check, Scissors } from 'lucide-react';
 import { applyFix, type BoilerplateEntry, type ItemStatus } from './types';
 import { getTransport } from '../../../../lib/transport';
+import { runReviewAction } from './reviewActions';
 import { lineDiff } from './diffUtil';
+import { toast } from '../../../../stores/toasts';
 
 export interface BoilerplateAtomRowProps {
   atom: BoilerplateEntry;
@@ -11,32 +13,28 @@ export interface BoilerplateAtomRowProps {
 
 export function BoilerplateAtomRow({ atom, onResolved }: BoilerplateAtomRowProps) {
   const [status, setStatus] = useState<ItemStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
   const [stripPreview, setStripPreview] = useState<{ original: string; proposed: string } | null>(null);
   const [stripping, setStripping] = useState(false);
 
   const reembed = async () => {
     setStatus('saving');
-    setError(null);
-    try {
-      await applyFix('boilerplate_pollution', atom.id, { action: 'reembed' });
-      setStatus('done');
-      setTimeout(() => onResolved(atom.id), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to re-embed');
-    }
+    const ok = await applyFix('Re-embed atom', 'boilerplate_pollution', atom.id, { action: 'reembed' });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(atom.id), 400);
   };
 
   const previewStrip = async () => {
     setStripping(true);
-    setError(null);
     try {
       const a = await getTransport().invoke<{ content: string }>('get_atom', { id: atom.id });
       const resp = await getTransport().invoke<{ content: string }>('health_strip_boilerplate', { atom_id: atom.id, dry_run: true });
       setStripPreview({ original: a.content, proposed: resp.content });
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Preview failed');
+      toast.error('Preview strip failed', {
+        detail: e instanceof Error ? e.message : String(e),
+        retry: () => previewStrip(),
+      });
     } finally {
       setStripping(false);
     }
@@ -45,14 +43,14 @@ export function BoilerplateAtomRow({ atom, onResolved }: BoilerplateAtomRowProps
   const applyStrip = async () => {
     if (!stripPreview) return;
     setStripping(true);
-    try {
-      await getTransport().invoke('health_strip_boilerplate', { atom_id: atom.id, dry_run: false });
-      setStatus('done');
-      setTimeout(() => onResolved(atom.id), 400);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Apply failed');
-      setStripping(false);
-    }
+    const ok = await runReviewAction({
+      label: 'Apply strip',
+      command: 'health_strip_boilerplate',
+      args: { atom_id: atom.id, dry_run: false },
+    });
+    if (ok === undefined) { setStripping(false); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(atom.id), 400);
   };
 
   return (
@@ -93,7 +91,6 @@ export function BoilerplateAtomRow({ atom, onResolved }: BoilerplateAtomRowProps
           </button>
         </div>
       </div>
-      {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
       {stripPreview && (
         <div className="mt-2 space-y-2 border-t border-white/5 pt-2">
           <p className="text-xs text-yellow-300/80">Preview — apply to update the atom</p>

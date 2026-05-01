@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ExternalLink, Check, Loader2, EyeOff } from 'lucide-react';
 import type { AtomPreview, ItemStatus } from './types';
 import { applyFix } from './types';
+import { toast } from '../../../../stores/toasts';
 
 export interface NoSourceRowProps {
   atom: AtomPreview;
@@ -12,37 +13,26 @@ export function NoSourceRow({ atom, onResolved }: NoSourceRowProps) {
   const [editing, setEditing] = useState(false);
   const [url, setUrl] = useState('');
   const [status, setStatus] = useState<ItemStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
 
   const save = async () => {
     const trimmed = url.trim();
     if (!trimmed) {
-      setError('Enter a URL');
+      toast.error('Enter a URL');
       return;
     }
     setStatus('saving');
-    setError(null);
-    try {
-      await applyFix('content_quality', atom.id, { action: 'add_source', url: trimmed });
-      setStatus('done');
-      setTimeout(() => onResolved(atom.id), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to save');
-    }
+    const ok = await applyFix('Save source URL', 'content_quality', atom.id, { action: 'add_source', url: trimmed });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(atom.id), 400);
   };
 
   const dismiss = async () => {
     setStatus('saving');
-    setError(null);
-    try {
-      await applyFix('content_quality', atom.id, { action: 'mark_intentional' });
-      setStatus('done');
-      setTimeout(() => onResolved(atom.id), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to dismiss');
-    }
+    const ok = await applyFix('Mark intentional', 'content_quality', atom.id, { action: 'mark_intentional' });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onResolved(atom.id), 400);
   };
 
   const openAtom = () => {
@@ -115,8 +105,6 @@ export function NoSourceRow({ atom, onResolved }: NoSourceRowProps) {
           </button>
         </div>
       )}
-
-      {error && <p className="text-xs text-red-400">{error}</p>}
     </div>
   );
 }

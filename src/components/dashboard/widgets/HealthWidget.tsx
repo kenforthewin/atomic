@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { getTransport } from '../../../lib/transport';
+import { runReviewAction } from './review/reviewActions';
 import {
   RefreshCw, CheckCircle, AlertTriangle, XCircle, Play, Download, HelpCircle,
 } from 'lucide-react';
@@ -419,15 +420,17 @@ export function HealthPanel() {
   const undoLastFix = async () => {
     if (!undoToast) return;
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    const toUndo = [...undoToast.fixIds].reverse();
     setUndoToast(null);
-    try {
-      for (const fixId of [...undoToast.fixIds].reverse()) {
-        await getTransport().invoke('undo_health_fix', { fixId });
-      }
-      await fetchHealth();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Undo failed');
+    for (const fixId of toUndo) {
+      const ok = await runReviewAction({
+        label: 'Undo fix',
+        command: 'undo_health_fix',
+        args: { fixId },
+      });
+      if (ok === undefined) return;
     }
+    await fetchHealth();
   };
 
   // Compute these before early returns so keyboard handler can reference them
