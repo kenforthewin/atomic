@@ -287,6 +287,53 @@ pub struct SingleAtomTagEntry {
     pub is_autotag: bool,
 }
 
+// ==================== Tag Proposal Types ====================
+
+/// One proposed structural change to the tag tree.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TagProposalAction {
+    Merge {
+        from_id: String,
+        into_id: String,
+        from_name: String,
+        into_name: String,
+        reason: String,
+    },
+    Rename {
+        tag_id: String,
+        old_name: String,
+        new_name: String,
+        reason: String,
+    },
+    Reparent {
+        tag_id: String,
+        tag_name: String,
+        new_parent_id: Option<String>,
+        new_parent_name: Option<String>,
+        reason: String,
+    },
+    Delete {
+        tag_id: String,
+        tag_name: String,
+        reason: String,
+    },
+}
+
+/// An LLM-generated proposal to reorganise the tag tree.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TagProposal {
+    /// UUID used to apply the proposal later.
+    pub id: String,
+    /// One-paragraph LLM rationale.
+    pub summary: String,
+    pub actions: Vec<TagProposalAction>,
+    /// RFC-3339 timestamp of generation.
+    pub generated_at: String,
+}
+
 // ==================== Orchestrator ====================
 
 /// Check weights. Must sum to 1.0.

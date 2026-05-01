@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 18;
+    const LATEST_VERSION: i32 = 19;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -888,6 +888,24 @@ impl Database {
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_health_dismissals_lookup
                     ON health_dismissals(check_name, item_key);
                 PRAGMA user_version = 18;
+                "#,
+            )?;
+        }
+
+        // --- V18 → V19: tag_proposals table ---
+        if version < 19 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS tag_proposals (
+                    id TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    actions_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_tag_proposals_created
+                    ON tag_proposals(created_at DESC);
+                PRAGMA user_version = 19;
                 "#,
             )?;
         }

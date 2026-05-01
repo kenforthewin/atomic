@@ -442,6 +442,71 @@ impl StorageBackend {
             StorageBackend::Postgres(_) => Ok(0),
         }
     }
+
+    pub(crate) async fn save_tag_proposal_sync(
+        &self,
+        proposal: crate::health::TagProposal,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.save_tag_proposal_impl(&proposal))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn get_tag_proposal_sync(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::health::TagProposal>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let id = id.to_string();
+                tokio::task::spawn_blocking(move || s.get_tag_proposal_impl(&id))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_latest_tag_proposal_sync(
+        &self,
+    ) -> Result<Option<crate::health::TagProposal>, AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || s.get_latest_tag_proposal_impl())
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn mark_tag_proposal_applied_sync(
+        &self,
+        id: &str,
+    ) -> Result<(), AtomicCoreError> {
+        match self {
+            StorageBackend::Sqlite(s) => {
+                let s = s.clone();
+                let id = id.to_string();
+                tokio::task::spawn_blocking(move || s.mark_tag_proposal_applied_impl(&id))
+                    .await
+                    .map_err(join_err)?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(_) => Ok(()),
+        }
+    }
     pub(crate) async fn count_chunk_hash_occurrences_sync(
         &self,
         hashes: &[String],
