@@ -688,6 +688,7 @@ pub async fn relink_broken_link(
     link_raw: &str,
     target_atom_id: &str,
 ) -> Result<FixAction, AtomicCoreError> {
+    tracing::debug!(atom_id, target_atom_id, link_raw, "relink_broken_link: begin");
     let atom = core
         .get_atom(atom_id)
         .await?
@@ -700,6 +701,13 @@ pub async fn relink_broken_link(
 
     let content = &atom.atom.content;
 
+    // Guard: link_raw must be present in the content.
+    if !content.contains(link_raw) {
+        return Err(AtomicCoreError::Validation(format!(
+            "Link '{link_raw}' not found in atom content; may have been already edited"
+        )));
+    }
+
     // Build replacement: markdown form [display_text](atom://<target_id>).
     let display_text = if let Some(text) = parse_markdown_link_text(link_raw) {
         text
@@ -710,6 +718,12 @@ pub async fn relink_broken_link(
     };
     let new_link = format!("[{}](atom://{})", display_text, target_atom_id);
     let new_content = content.replacen(link_raw, &new_link, 1);
+
+    if new_content == *content {
+        return Err(AtomicCoreError::Validation(format!(
+            "Link '{link_raw}' not found in atom content; may have been already edited"
+        )));
+    }
 
     let before_state = serde_json::json!([{
         "id": atom_id,
@@ -730,6 +744,7 @@ pub async fn relink_broken_link(
         tag_ids: Some(tag_ids),
     };
     core.update_atom(atom_id, upd, |_| {}).await?;
+    tracing::info!(atom_id, target_atom_id, link_raw, new_link = %new_link, "relink_broken_link: success");
 
     let target_title = crate::health::title_preview(&target.atom.content);
     let id = audit::log_fix(

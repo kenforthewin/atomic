@@ -109,7 +109,7 @@ fn extract_markdown_links(content: &str, source_url: Option<&str>) -> Vec<Intern
 
         if is_internal_href(&href) && looks_like_document(&href) {
             // Find the opening `[` to capture display text + full match
-            let (original, display) = scan_back_for_display_text(content, i);
+            let (original, display) = scan_back_for_display_text(content, i, j);
 
             let candidate_source_urls = match source_url {
                 Some(su) => build_href_candidates(&href, su),
@@ -312,11 +312,19 @@ fn candidates_with_and_without_extension(url: &str) -> Vec<String> {
 // ==================== Display-text extraction ====================
 
 /// Scan backwards from the `]` at byte index `bracket_pos` to find the
-/// matching `[`, returning `(full_original_text, display_text)`.
-fn scan_back_for_display_text(content: &str, bracket_pos: usize) -> (String, String) {
+/// Walk backwards from `bracket_pos` (the `]` before `(`) to find the opening
+/// `[`, returning `(full_original_text, display_text)`.
+///
+/// `end_pos` is the position of the closing `)` in `content`, so the full
+/// original span `[display](href…)` can be reconstructed.
+fn scan_back_for_display_text(content: &str, bracket_pos: usize, end_pos: usize) -> (String, String) {
     let bytes = content.as_bytes();
     if bracket_pos == 0 {
-        return (String::new(), String::new());
+        // `]` is at position 0 — no room for `[display]`, reconstruct from end_pos.
+        let original = std::str::from_utf8(&bytes[..end_pos + 1])
+            .unwrap_or("")
+            .to_string();
+        return (original, String::new());
     }
 
     // Walk backwards through the content to find the opening `[`
@@ -339,17 +347,14 @@ fn scan_back_for_display_text(content: &str, bracket_pos: usize) -> (String, Str
         k -= 1;
     }
 
-    // Full match spans from `[` to the `)` that closes the href.
-    // The `)` position is not available here — callers use `original` only
-    // for replacement, so we capture the `[display]` part; the `(href)` part
-    // is appended by the caller when building `original`.
+    // Full match spans from `[` at position `k` to the `)` at `end_pos`.
     let display = std::str::from_utf8(&bytes[k + 1..bracket_pos])
         .unwrap_or("")
         .to_string();
-
-    // We don't have the closing `)` index here, so return empty for `original`
-    // and let the caller reconstruct it.
-    (String::new(), display)
+    let original = std::str::from_utf8(&bytes[k..end_pos + 1])
+        .unwrap_or("")
+        .to_string();
+    (original, display)
 }
 
 // ==================== Replacement ====================
@@ -507,4 +512,25 @@ mod tests {
         let result = apply_link_replacements(content, &resolved);
         assert_eq!(result, "See [Work Tracking](atom://abc123) for details.");
     }
+    #[test]
+    fn test_markdown_link_original_is_populated() {
+        // `original` must be the full `[text](href)` span so callers can use it
+        // for replace operations.  Previously scan_back_for_display_text always
+        // returned String::new() for `original`, causing `content: ""` to be
+        // sent to the server and failing the relink validation.
+        let content = "See [broken link](./missing.md) for details.";
+        let links = extract_internal_links(content, Some("obsidian://vault/index.md"));
+        assert_eq!(links.len(), 1, "one broken link extracted");
+        assert_eq!(links[0].original, "[broken link](./missing.md)");
+    }
+
+    #[test]
+    fn test_markdown_link_at_position_zero_has_original() {
+        // Edge case: link at the very start of content.
+        let content = "[start link](./page.md) is here.";
+        let links = extract_internal_links(content, Some("obsidian://vault/index.md"));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].original, "[start link](./page.md)");
+    }
+
 }

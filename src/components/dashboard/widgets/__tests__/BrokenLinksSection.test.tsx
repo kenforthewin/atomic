@@ -1,11 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, cleanup, act } from '@testing-library/react';
+import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { BrokenLinksSection } from '../review/BrokenLinksSection';
 
 const invoke = vi.fn();
 vi.mock('../../../../lib/transport', () => ({
   getTransport: () => ({ invoke }),
+}));
+
+// Suppress toast errors from sonner (not mounted in test environment)
+vi.mock('sonner', () => ({
+  toast: Object.assign(vi.fn(), {
+    error: vi.fn(),
+    success: vi.fn(),
+  }),
 }));
 
 const makeData = () => ({
@@ -23,15 +31,14 @@ const makeData = () => ({
   ],
 });
 
+// ─── Tests that don't need fake timers ───────────────────────────────────────
 describe('BrokenLinksSection', () => {
   beforeEach(() => {
     invoke.mockReset();
     invoke.mockResolvedValue({ status: 'ok' });
-    vi.useFakeTimers();
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     cleanup();
   });
 
@@ -53,7 +60,7 @@ describe('BrokenLinksSection', () => {
 
   it('dispatches remove_link with correct action and content on Remove link click', async () => {
     const onResolved = vi.fn();
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={onResolved} />);
 
     const removeBtns = screen.getAllByRole('button', { name: /Remove link/ });
@@ -73,7 +80,7 @@ describe('BrokenLinksSection', () => {
   });
 
   it('dispatches dismiss on Ignore click', async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
     const ignoreBtns = screen.getAllByRole('button', { name: /^Ignore$/ });
@@ -92,7 +99,7 @@ describe('BrokenLinksSection', () => {
   });
 
   it('dispatches dismiss on Ignore atom click', async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
     const ignoreAtomBtns = screen.getAllByRole('button', { name: /Ignore atom/ });
@@ -116,7 +123,7 @@ describe('BrokenLinksSection', () => {
   });
 
   it('Link… opens picker with link.target prefilled', async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
     const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
@@ -125,6 +132,19 @@ describe('BrokenLinksSection', () => {
     const input = screen.getByPlaceholderText('Search atoms…') as HTMLInputElement;
     expect(input).toBeTruthy();
     expect(input.value).toBe('Missing Page');
+  });
+});
+
+// ─── Tests that need debounce (200 ms) ─────────────────────────────────────
+// Use real timers — waitFor (default 1 s) covers the 200 ms debounce fine.
+describe('BrokenLinksSection (debounce)', () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockResolvedValue({ status: 'ok' });
+  });
+
+  afterEach(() => {
+    cleanup();
   });
 
   it('shows suggestions after typing query', async () => {
@@ -135,7 +155,7 @@ describe('BrokenLinksSection', () => {
       return Promise.resolve({ status: 'ok' });
     });
 
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
     const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
@@ -145,11 +165,9 @@ describe('BrokenLinksSection', () => {
     await user.clear(input);
     await user.type(input, 'Found');
 
-    await act(async () => { vi.advanceTimersByTime(300); });
-
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith('health_broken_link_suggest', expect.objectContaining({ q: 'Found', limit: 5 }));
-    });
+    }, { timeout: 1000 });
 
     await waitFor(() => {
       expect(screen.getByText('Found Atom')).toBeTruthy();
@@ -164,7 +182,7 @@ describe('BrokenLinksSection', () => {
       return Promise.resolve({ status: 'ok' });
     });
 
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
     const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
@@ -174,9 +192,7 @@ describe('BrokenLinksSection', () => {
     await user.clear(input);
     await user.type(input, 'Found');
 
-    await act(async () => { vi.advanceTimersByTime(300); });
-
-    await waitFor(() => expect(screen.getByText('Found Atom')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('Found Atom')).toBeTruthy(), { timeout: 1000 });
 
     await user.click(screen.getByText('Found Atom'));
 

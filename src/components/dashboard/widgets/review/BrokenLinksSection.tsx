@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Loader2, Check } from 'lucide-react';
-import { getTransport } from '../../../../lib/transport';
 import type { ItemStatus } from './types';
+import { runReviewAction } from './reviewActions';
 
 export interface BrokenLink {
   raw: string;
@@ -31,7 +31,6 @@ interface LinkRowProps {
 
 function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
   const [status, setStatus] = useState<ItemStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
   const [picking, setPicking] = useState(false);
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -42,9 +41,13 @@ function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
     const t = window.setTimeout(async () => {
       setLoading(true);
       try {
-        const resp = await getTransport().invoke<{ suggestions: Suggestion[] }>('health_broken_link_suggest', { q: query.trim(), limit: 5 });
-        setSuggestions(resp.suggestions);
-      } catch { /* swallow */ } finally { setLoading(false); }
+        const resp = await runReviewAction({
+          label: 'Search suggestions',
+          command: 'health_broken_link_suggest',
+          args: { q: query.trim(), limit: 5 },
+        }) as { suggestions: Suggestion[] } | undefined;
+        if (resp) setSuggestions(resp.suggestions);
+      } finally { setLoading(false); }
     }, 200);
     return () => window.clearTimeout(t);
   }, [query, picking]);
@@ -56,57 +59,39 @@ function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
 
   const removeLink = async () => {
     setStatus('saving');
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
-        check: 'broken_internal_links',
-        item_id: atomId,
-        action: 'remove_link',
-        content: link.raw,
-      });
-      setStatus('done');
-      setTimeout(() => onRemoved(), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to remove link');
-    }
+    const ok = await runReviewAction({
+      label: 'Remove link',
+      command: 'apply_health_item_fix',
+      args: { check: 'broken_internal_links', item_id: atomId, action: 'remove_link', content: link.raw },
+    });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onRemoved(), 400);
   };
 
   const dismiss = async () => {
     setStatus('saving');
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
-        check: 'broken_internal_links',
-        item_id: atomId,
-        action: 'dismiss',
-      });
-      setStatus('done');
-      setTimeout(() => onIgnore(), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to dismiss');
-    }
+    const ok = await runReviewAction({
+      label: 'Ignore link',
+      command: 'apply_health_item_fix',
+      args: { check: 'broken_internal_links', item_id: atomId, action: 'dismiss' },
+    });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setTimeout(() => onIgnore(), 400);
   };
 
   const relinkTo = async (targetId: string) => {
     setStatus('saving');
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
-        check: 'broken_internal_links',
-        item_id: atomId,
-        action: 'relink',
-        content: link.raw,
-        into_tag_id: targetId,
-      });
-      setStatus('done');
-      setPicking(false);
-      setTimeout(() => onRemoved(), 400);
-    } catch (e) {
-      setStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to relink');
-    }
+    const ok = await runReviewAction({
+      label: 'Relink',
+      command: 'apply_health_item_fix',
+      args: { check: 'broken_internal_links', item_id: atomId, action: 'relink', content: link.raw, into_tag_id: targetId },
+    });
+    if (ok === undefined) { setStatus('idle'); return; }
+    setStatus('done');
+    setPicking(false);
+    setTimeout(() => onRemoved(), 400);
   };
 
   return (
@@ -184,7 +169,6 @@ function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
           </div>
         </div>
       )}
-      {error && <p className="text-xs text-red-400 mt-1">{error}</p>}
     </div>
   );
 }
@@ -199,25 +183,19 @@ interface AtomRowProps {
 function AtomRow({ atom, selected, onToggleSelect, onResolved }: AtomRowProps) {
   const [removedLinks, setRemovedLinks] = useState<Set<string>>(new Set());
   const [atomStatus, setAtomStatus] = useState<ItemStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
 
   const visibleLinks = atom.links.filter(l => !removedLinks.has(l.raw));
 
   const dismissAtom = async () => {
     setAtomStatus('saving');
-    setError(null);
-    try {
-      await getTransport().invoke('apply_health_item_fix', {
-        check: 'broken_internal_links',
-        item_id: atom.atom_id,
-        action: 'dismiss',
-      });
-      setAtomStatus('done');
-      setTimeout(() => onResolved(atom.atom_id), 400);
-    } catch (e) {
-      setAtomStatus('error');
-      setError(e instanceof Error ? e.message : 'Failed to dismiss atom');
-    }
+    const ok = await runReviewAction({
+      label: 'Ignore atom',
+      command: 'apply_health_item_fix',
+      args: { check: 'broken_internal_links', item_id: atom.atom_id, action: 'dismiss' },
+    });
+    if (ok === undefined) { setAtomStatus('idle'); return; }
+    setAtomStatus('done');
+    setTimeout(() => onResolved(atom.atom_id), 400);
   };
 
   if (atomStatus === 'done') return null;
@@ -266,7 +244,6 @@ function AtomRow({ atom, selected, onToggleSelect, onResolved }: AtomRowProps) {
           ))}
         </div>
       )}
-      {error && <p className="text-xs text-red-400 mt-1">{error}</p>}
     </div>
   );
 }
@@ -308,29 +285,28 @@ export function BrokenLinksSection({ data, onResolved }: Props) {
   const dismissSelected = async () => {
     if (selected.size === 0) return;
     setBulkStatus('saving');
-    try {
-      await Promise.all(
-        [...selected].map(id =>
-          getTransport().invoke('apply_health_item_fix', {
-            check: 'broken_internal_links',
-            item_id: id,
-            action: 'dismiss',
-          }),
-        ),
-      );
-      setBulkStatus('done');
-      setResolvedAtoms(prev => {
-        const next = new Set(prev);
-        selected.forEach(id => next.add(id));
-        return next;
-      });
-      setSelected(new Set());
-      setTimeout(() => {
-        setBulkStatus('idle');
-      }, 400);
-    } catch {
-      setBulkStatus('error');
+    const results = await Promise.all(
+      [...selected].map(id =>
+        runReviewAction({
+          label: 'Ignore selected',
+          command: 'apply_health_item_fix',
+          args: { check: 'broken_internal_links', item_id: id, action: 'dismiss' },
+        }),
+      ),
+    );
+    const anyFailed = results.some(r => r === undefined);
+    if (anyFailed) {
+      setBulkStatus('idle');
+      return;
     }
+    setBulkStatus('done');
+    setResolvedAtoms(prev => {
+      const next = new Set(prev);
+      selected.forEach(id => next.add(id));
+      return next;
+    });
+    setSelected(new Set());
+    setTimeout(() => { setBulkStatus('idle'); }, 400);
   };
 
   if (visibleAtoms.length === 0) {
