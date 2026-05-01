@@ -21,8 +21,8 @@ export interface BoilerplateEntry {
 
 export interface ContradictionPair {
   pair_id: string;
-  atom_a: { id: string; title: string; source?: string };
-  atom_b: { id: string; title: string; source?: string };
+  atom_a: { id: string; title: string; source?: string; created_at?: string };
+  atom_b: { id: string; title: string; source?: string; created_at?: string };
   similarity: number;
   shared_tag_count: number;
 }

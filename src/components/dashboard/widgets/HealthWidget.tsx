@@ -328,6 +328,21 @@ export function HealthPanel() {
     }
   }, []);
 
+  const fetchHealthDebouncedRef = useRef<number | null>(null);
+  const scheduleRefetch = useCallback(() => {
+    if (fetchHealthDebouncedRef.current) {
+      window.clearTimeout(fetchHealthDebouncedRef.current);
+    }
+    fetchHealthDebouncedRef.current = window.setTimeout(() => {
+      fetchHealth();
+      fetchHealthDebouncedRef.current = null;
+    }, 2000);
+  }, [fetchHealth]);
+
+  useEffect(() => () => {
+    if (fetchHealthDebouncedRef.current) window.clearTimeout(fetchHealthDebouncedRef.current);
+  }, []);
+
   useEffect(() => { fetchHealth(); }, [fetchHealth]);
 
   const toggleExpandCheck = useCallback((checkName: string) => {
@@ -704,8 +719,15 @@ export function HealthPanel() {
         <HealthReviewModal
           report={report}
           checkName={showReviewModal}
-          onClose={() => setShowReviewModal(null)}
-          onResolved={fetchHealth}
+          onClose={() => {
+            setShowReviewModal(null);
+            if (fetchHealthDebouncedRef.current) {
+              window.clearTimeout(fetchHealthDebouncedRef.current);
+              fetchHealthDebouncedRef.current = null;
+            }
+            fetchHealth();
+          }}
+          onResolved={scheduleRefetch}
         />
       )}
 

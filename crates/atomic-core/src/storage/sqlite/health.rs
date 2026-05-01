@@ -374,7 +374,8 @@ impl SqliteStorage {
                      se.source_atom_id, se.target_atom_id, se.similarity_score,
                      a1.source_url, a1.content,
                      a2.source_url, a2.content,
-                     COUNT(DISTINCT at_a.tag_id) as shared_tag_count
+                     COUNT(DISTINCT at_a.tag_id) as shared_tag_count,
+                     a1.created_at, a2.created_at
                  FROM semantic_edges se
                  JOIN atoms a1 ON se.source_atom_id = a1.id
                  JOIN atoms a2 ON se.target_atom_id = a2.id
@@ -396,6 +397,8 @@ impl SqliteStorage {
                 let b_source: Option<String> = row.get(5)?;
                 let b_content: String = row.get(6)?;
                 let shared_tag_count: i32 = row.get(7)?;
+                let a_created_at: Option<String> = row.get(8)?;
+                let b_created_at: Option<String> = row.get(9)?;
 
                 // Skip same-corpus pairs — those are template pollution, not content overlap.
                 let prefix_a = source_prefix(&a_source);
@@ -417,6 +420,8 @@ impl SqliteStorage {
                     atom_b_source: b_source,
                     similarity,
                     shared_tag_count,
+                    atom_a_created_at: a_created_at,
+                    atom_b_created_at: b_created_at,
                 });
             }
         }
@@ -452,7 +457,8 @@ impl SqliteStorage {
                      se.source_atom_id, se.target_atom_id, se.similarity_score,
                      a1.source_url, a1.content,
                      a2.source_url, a2.content,
-                     COUNT(DISTINCT at_a.tag_id) as shared_tag_count
+                     COUNT(DISTINCT at_a.tag_id) as shared_tag_count,
+                     a1.created_at, a2.created_at
                  FROM semantic_edges se
                  JOIN atoms a1 ON se.source_atom_id = a1.id
                  JOIN atoms a2 ON se.target_atom_id = a2.id
@@ -474,12 +480,14 @@ impl SqliteStorage {
                 let b_source: Option<String> = row.get(5)?;
                 let b_content: String = row.get(6)?;
                 let shared_tag_count: i32 = row.get(7)?;
+                let a_created_at: Option<String> = row.get(8)?;
+                let b_created_at: Option<String> = row.get(9)?;
                 let a_title = extract_title_preview(&a_content);
                 let b_title = extract_title_preview(&b_content);
                 raw.contradiction_pairs.push(crate::health::ContradictionPairEntry {
                     pair_id: uuid::Uuid::new_v4().to_string(),
-                    atom_a: crate::health::ContradictionAtom { id: a_id, title: a_title, source: a_source },
-                    atom_b: crate::health::ContradictionAtom { id: b_id, title: b_title, source: b_source },
+                    atom_a: crate::health::ContradictionAtom { id: a_id, title: a_title, source: a_source, created_at: a_created_at },
+                    atom_b: crate::health::ContradictionAtom { id: b_id, title: b_title, source: b_source, created_at: b_created_at },
                     similarity,
                     shared_tag_count,
                 });

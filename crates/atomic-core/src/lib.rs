@@ -2153,6 +2153,38 @@ impl AtomicCore {
         Ok(result)
     }
 
+    /// Get a tag name and parent_id by ID.
+    pub async fn get_tag_by_id(
+        &self,
+        tag_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, AtomicCoreError> {
+        self.storage.get_tag_by_id_sync(tag_id).await
+    }
+
+    /// Persist a health dismissal (insert or update).
+    pub async fn dismiss_health_item(
+        &self,
+        check_name: &str,
+        item_key: &str,
+        reason: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), AtomicCoreError> {
+        self.storage
+            .dismiss_health_item_sync(check_name, item_key, reason, expires_at)
+            .await
+    }
+
+    /// Remove a health dismissal.
+    pub async fn undismiss_health_item(
+        &self,
+        check_name: &str,
+        item_key: &str,
+    ) -> Result<(), AtomicCoreError> {
+        self.storage
+            .undismiss_health_item_sync(check_name, item_key)
+            .await
+    }
+
     // ==================== Chat Operations ====================
 
     /// Create a new conversation

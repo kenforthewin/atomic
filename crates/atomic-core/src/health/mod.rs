@@ -207,6 +207,8 @@ pub struct DuplicatePair {
     pub similarity: f32,
     /// Number of tags shared between the two atoms (higher = more likely related).
     pub shared_tag_count: i32,
+    pub atom_a_created_at: Option<String>,
+    pub atom_b_created_at: Option<String>,
 }
 
 /// Tag eligible for wiki that doesn't have one yet.
@@ -253,6 +255,7 @@ pub struct ContradictionAtom {
     pub id: String,
     pub title: String,
     pub source: Option<String>,
+    pub created_at: Option<String>,
 }
 
 /// Pair of high-similarity atoms surfaced for manual contradiction review.

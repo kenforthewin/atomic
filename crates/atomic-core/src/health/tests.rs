@@ -97,6 +97,8 @@ mod tests {
             atom_b_source: Some("https://source2.com/b".to_string()),
             similarity: 0.72,
             shared_tag_count: 3,
+            atom_a_created_at: None,
+            atom_b_created_at: None,
         });
         let result = checks::content_overlap(&raw);
         assert_ne!(result.status, "ok");
@@ -109,6 +111,27 @@ mod tests {
         assert_eq!(pairs[0]["atom_a"]["title"], "Article A");
     }
 
+    #[test]
+    fn test_content_overlap_created_at_in_json() {
+        let mut raw = base_raw();
+        raw.duplicate_pairs.push(DuplicatePair {
+            pair_id: "p2".to_string(),
+            atom_a_id: "a2".to_string(),
+            atom_a_title: "Article A".to_string(),
+            atom_a_source: None,
+            atom_b_id: "b2".to_string(),
+            atom_b_title: "Article B".to_string(),
+            atom_b_source: None,
+            similarity: 0.70,
+            shared_tag_count: 2,
+            atom_a_created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            atom_b_created_at: Some("2026-02-01T00:00:00Z".to_string()),
+        });
+        let result = checks::content_overlap(&raw);
+        let pairs = result.data["pairs"].as_array().unwrap();
+        assert_eq!(pairs[0]["atom_a"]["created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(pairs[0]["atom_b"]["created_at"], "2026-02-01T00:00:00Z");
+    }
     // --- content_quality ---
 
     #[test]
@@ -209,11 +232,13 @@ mod tests {
                 id: "ca1".to_string(),
                 title: "Article on Topic X - Version 1".to_string(),
                 source: Some("https://site1.com/x".to_string()),
+                created_at: None,
             },
             atom_b: ContradictionAtom {
                 id: "cb1".to_string(),
                 title: "Article on Topic X - Version 2".to_string(),
                 source: Some("https://site2.com/x".to_string()),
+                created_at: None,
             },
             similarity: 0.85,
             shared_tag_count: 2,
@@ -231,6 +256,32 @@ mod tests {
         assert!((sim - 0.85).abs() < 0.001, "expected ~0.85, got {sim}");
     }
 
+
+    #[test]
+    fn test_contradiction_created_at_in_json() {
+        let mut raw = base_raw();
+        raw.contradiction_pairs.push(ContradictionPairEntry {
+            pair_id: "cp2".to_string(),
+            atom_a: ContradictionAtom {
+                id: "ca2".to_string(),
+                title: "Topic A".to_string(),
+                source: None,
+                created_at: Some("2026-01-15T00:00:00Z".to_string()),
+            },
+            atom_b: ContradictionAtom {
+                id: "cb2".to_string(),
+                title: "Topic B".to_string(),
+                source: None,
+                created_at: Some("2026-03-15T00:00:00Z".to_string()),
+            },
+            similarity: 0.88,
+            shared_tag_count: 1,
+        });
+        let result = checks::contradiction_detection(&raw);
+        let pairs = result.data["pairs"].as_array().unwrap();
+        assert_eq!(pairs[0]["atom_a"]["created_at"], "2026-01-15T00:00:00Z");
+        assert_eq!(pairs[0]["atom_b"]["created_at"], "2026-03-15T00:00:00Z");
+    }
     // --- tag_health ---
 
     #[test]
@@ -338,5 +389,139 @@ mod tests {
         assert!(indices.contains(&0));
         assert!(!indices.contains(&1));
         assert!(indices.contains(&2));
+    }
+
+    // --- pair_key and apply_dismissals ---
+
+    #[test]
+    fn test_pair_key_sorted() {
+        use crate::health::pair_key;
+        assert_eq!(pair_key("a", "b"), "a__b");
+        assert_eq!(pair_key("b", "a"), "a__b");
+        assert_eq!(pair_key("z1", "z2"), "z1__z2");
+    }
+
+    #[test]
+    fn test_apply_dismissals_filters_content_overlap_pairs() {
+        use crate::health::{apply_dismissals, pair_key, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 60,
+            auto_fixable: false,
+            requires_review: true,
+            fix_action: None,
+            data: serde_json::json!({
+                "count": 2,
+                "cross_source_overlaps": 2,
+                "pairs": [
+                    {"atom_a": {"id": "a1"}, "atom_b": {"id": "b1"}},
+                    {"atom_a": {"id": "a2"}, "atom_b": {"id": "b2"}},
+                ]
+            }),
+        };
+        let mut dismissed = HashSet::new();
+        dismissed.insert(pair_key("a1", "b1"));
+        apply_dismissals("content_overlap", &mut result, &dismissed);
+        let pairs = result.data["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["atom_a"]["id"], "a2");
+        assert_eq!(result.data["count"], 1);
+    }
+
+    #[test]
+    fn test_apply_dismissals_filters_no_source() {
+        use crate::health::{apply_dismissals, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 70,
+            auto_fixable: false,
+            requires_review: true,
+            fix_action: None,
+            data: serde_json::json!({
+                "issues": {
+                    "no_source": {
+                        "count": 2,
+                        "atoms": [
+                            {"id": "a1", "title": "A"},
+                            {"id": "a2", "title": "B"}
+                        ]
+                    }
+                }
+            }),
+        };
+        let mut dismissed = HashSet::new();
+        dismissed.insert("a1".to_string());
+        apply_dismissals("content_quality", &mut result, &dismissed);
+        let atoms = result.data["issues"]["no_source"]["atoms"].as_array().unwrap();
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0]["id"], "a2");
+        assert_eq!(result.data["issues"]["no_source"]["count"], 1);
+    }
+
+    #[test]
+    fn test_apply_dismissals_filters_rootless_tags() {
+        use crate::health::{apply_dismissals, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 80,
+            auto_fixable: false,
+            requires_review: true,
+            fix_action: None,
+            data: serde_json::json!({
+                "rootless_tags": 2,
+                "rootless_tag_list": [
+                    {"id": "t1", "name": "Foo", "atom_count": 3},
+                    {"id": "t2", "name": "Bar", "atom_count": 1}
+                ]
+            }),
+        };
+        let mut dismissed = HashSet::new();
+        dismissed.insert("t1".to_string());
+        apply_dismissals("tag_health", &mut result, &dismissed);
+        let tags = result.data["rootless_tag_list"].as_array().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0]["id"], "t2");
+        assert_eq!(result.data["rootless_tags"], 1);
+    }
+
+    #[test]
+    fn test_apply_dismissals_empty_set_noop() {
+        use crate::health::{apply_dismissals, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 60,
+            auto_fixable: false,
+            requires_review: true,
+            fix_action: None,
+            data: serde_json::json!({"count": 1, "pairs": [{"atom_a": {"id": "a"}, "atom_b": {"id": "b"}}]}),
+        };
+        apply_dismissals("content_overlap", &mut result, &HashSet::new());
+        assert_eq!(result.data["pairs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_apply_dismissals_clears_requires_review_when_empty() {
+        use crate::health::{apply_dismissals, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 60,
+            auto_fixable: false,
+            requires_review: true,
+            fix_action: None,
+            data: serde_json::json!({
+                "count": 1,
+                "affected_atoms": [{"id": "a1", "title": "x", "clone_count": 3}]
+            }),
+        };
+        let mut d = HashSet::new();
+        d.insert("a1".to_string());
+        apply_dismissals("boilerplate_pollution", &mut result, &d);
+        assert!(!result.requires_review);
+        assert_eq!(result.data["count"], 0);
     }
 }

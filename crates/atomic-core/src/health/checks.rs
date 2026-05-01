@@ -352,8 +352,8 @@ pub fn content_overlap(raw: &HealthRawData) -> HealthCheckResult {
         .map(|p: &DuplicatePair| {
             json!({
                 "pair_id": p.pair_id,
-                "atom_a": { "id": p.atom_a_id, "title": p.atom_a_title, "source": p.atom_a_source },
-                "atom_b": { "id": p.atom_b_id, "title": p.atom_b_title, "source": p.atom_b_source },
+                "atom_a": { "id": p.atom_a_id, "title": p.atom_a_title, "source": p.atom_a_source, "created_at": p.atom_a_created_at },
+                "atom_b": { "id": p.atom_b_id, "title": p.atom_b_title, "source": p.atom_b_source, "created_at": p.atom_b_created_at },
                 "similarity": p.similarity,
                 "shared_tag_count": p.shared_tag_count,
                 "available_actions": ["merge_with_llm", "keep_both", "delete_older", "mark_complementary"]
@@ -391,13 +391,13 @@ pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
         data: json!({
             "pairs_checked": raw.contradiction_pairs_checked,
             "potential_contradictions": pair_count,
-            "pairs": raw.contradiction_pairs.iter().map(|p| json!({
-                "pair_id": p.pair_id,
-                "atom_a": { "id": p.atom_a.id, "title": p.atom_a.title, "source": p.atom_a.source },
-                "atom_b": { "id": p.atom_b.id, "title": p.atom_b.title, "source": p.atom_b.source },
-                "similarity": p.similarity,
-                "shared_tag_count": p.shared_tag_count
-            })).collect::<Vec<_>>()
+        "pairs": raw.contradiction_pairs.iter().map(|p| json!({
+            "pair_id": p.pair_id,
+            "atom_a": { "id": p.atom_a.id, "title": p.atom_a.title, "source": p.atom_a.source, "created_at": p.atom_a.created_at },
+            "atom_b": { "id": p.atom_b.id, "title": p.atom_b.title, "source": p.atom_b.source, "created_at": p.atom_b.created_at },
+            "similarity": p.similarity,
+            "shared_tag_count": p.shared_tag_count
+        })).collect::<Vec<_>>()
         }),
     }
 }
