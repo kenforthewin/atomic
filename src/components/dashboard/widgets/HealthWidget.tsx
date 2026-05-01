@@ -1,11 +1,15 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { getTransport } from '../../../lib/transport';
 import {
-  RefreshCw, CheckCircle, AlertTriangle, XCircle, Play,
+  RefreshCw, CheckCircle, AlertTriangle, XCircle, Play, Download, HelpCircle,
 } from 'lucide-react';
 import { HealthReviewModal } from './HealthReviewModal';
 import { HealthCheckRow, getTrend } from './HealthCheckRow';
 import type { HealthCheckResult } from './HealthCheckRow';
+import { HealthConfirmModal } from './HealthConfirmModal';
+import type { PendingFix } from './HealthConfirmModal';
+import { HealthExportModal } from './HealthExportModal';
+import { HealthHelpOverlay } from './HealthHelpOverlay';
 
 // ==================== Types ====================
 
@@ -163,6 +167,7 @@ const CHECK_ORDER = [
   'content_overlap',
   'contradiction_detection',
   'broken_internal_links',
+  'boilerplate_pollution',
 ];
 
 // ==================== Sub-components ====================
@@ -298,6 +303,11 @@ export function HealthPanel() {
   const [lastFix, setLastFix] = useState<FixResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showPending, setShowPending] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [undoToast, setUndoToast] = useState<{ fixIds: string[]; label: string } | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Per-row state
   const [expandedChecks, setExpandedChecks] = useState<Set<string>>(new Set());
@@ -356,9 +366,14 @@ export function HealthPanel() {
     }
   }, []);
 
-  const runFix = async () => {
+  const runFix = () => setShowConfirm(true);
+
+  const applyFix = async () => {
+    setShowConfirm(false);
     setFixing(true);
     setShowPending(false);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoToast(null);
     try {
       const checksToFix = report
         ? CHECK_ORDER.filter(k => {
@@ -372,6 +387,12 @@ export function HealthPanel() {
         checks: checksToFix,
       });
       setLastFix(resp);
+      if (resp.actions_taken.length > 0) {
+        const fixIds = resp.actions_taken.map(a => a.id).filter(Boolean);
+        const label = `Fixed ${resp.actions_taken.reduce((n, a) => n + a.count, 0)} items. Score → ${resp.new_score}/100`;
+        setUndoToast({ fixIds, label });
+        undoTimerRef.current = setTimeout(() => setUndoToast(null), 10_000);
+      }
       await fetchHealth();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Fix failed');
@@ -379,6 +400,53 @@ export function HealthPanel() {
       setFixing(false);
     }
   };
+
+  const undoLastFix = async () => {
+    if (!undoToast) return;
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoToast(null);
+    try {
+      for (const fixId of [...undoToast.fixIds].reverse()) {
+        await getTransport().invoke('undo_health_fix', { fixId });
+      }
+      await fetchHealth();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Undo failed');
+    }
+  };
+
+  // Compute these before early returns so keyboard handler can reference them
+  const issueChecks = report ? getVisibleChecks(report, filter) : [];
+  const pending: PendingFix[] = report ? pendingActions(report, excludedFromFix) : [];
+  const review = report ? reviewItems(report) : [];
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (showConfirm || showExport || showHelp || showReviewModal) return;
+      if (e.key === 'r') {
+        e.preventDefault();
+        fetchHealth();
+      } else if (e.key === 'f' && report && pending.length > 0) {
+        e.preventDefault();
+        setShowConfirm(true);
+      } else if (e.key === 'e' && report) {
+        e.preventDefault();
+        setShowExport(true);
+      } else if (e.key === '?') {
+        e.preventDefault();
+        setShowHelp(v => !v);
+      } else if (e.key >= '1' && e.key <= '9' && issueChecks.length > 0) {
+        const idx = parseInt(e.key, 10) - 1;
+        const checkName = issueChecks[idx];
+        if (checkName) toggleExpandCheck(checkName);
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [fetchHealth, report, pending, showConfirm, showExport, showHelp, showReviewModal, issueChecks, toggleExpandCheck]);
 
   if (loading) {
     return (
@@ -400,9 +468,7 @@ export function HealthPanel() {
   }
 
   const statusColor = STATUS_COLORS[report.overall_status] ?? 'text-gray-400';
-  const issueChecks = getVisibleChecks(report, filter);
-  const pending = pendingActions(report, excludedFromFix);
-  const review = reviewItems(report);
+
 
   return (
     <div className="p-4 bg-[#252525] rounded border border-white/5 space-y-3">
@@ -418,6 +484,22 @@ export function HealthPanel() {
             aria-label="Refresh health checks"
           >
             <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => setShowExport(true)}
+            className="text-gray-500 hover:text-gray-300 transition-colors"
+            title="Export health report (e)"
+            aria-label="Export health report"
+          >
+            <Download className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => setShowHelp(true)}
+            className="text-gray-500 hover:text-gray-300 transition-colors"
+            title="Keyboard shortcuts (?)"
+            aria-label="Show keyboard shortcuts"
+          >
+            <HelpCircle className="w-3.5 h-3.5" />
           </button>
         </div>
         <div className="text-right">
@@ -568,18 +650,53 @@ export function HealthPanel() {
         </div>
       )}
 
-      {/* Last fix result */}
+      {/* Last fix result — score summary only */}
       {lastFix && lastFix.actions_taken.length > 0 && (
-        <div className="border-t border-white/5 pt-2 space-y-1">
-          <p className="text-xs text-gray-500">
-            Last run → score {lastFix.new_score}/100
-          </p>
-          {lastFix.actions_taken.map((a, i) => (
-            <p key={i} className="text-xs text-gray-400">
-              ✓ {FIX_ACTION_LABELS[a.action] ?? a.action.replace(/_/g, ' ')} ({a.count})
-            </p>
-          ))}
+        <div className="border-t border-white/5 pt-2">
+          <p className="text-xs text-gray-500">Last run → score {lastFix.new_score}/100</p>
         </div>
+      )}
+
+      {/* Undo toast */}
+      {undoToast && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-3 bg-[#2d2d2d] border border-white/10 rounded-lg shadow-xl text-xs text-gray-300 animate-in slide-in-from-bottom-2 duration-200">
+          <span>{undoToast.label}</span>
+          <button
+            onClick={undoLastFix}
+            className="px-2 py-1 bg-[#3a3a3a] hover:bg-[#444] rounded text-white transition-colors font-medium"
+          >
+            Undo
+          </button>
+          <button
+            onClick={() => {
+              if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+              setUndoToast(null);
+            }}
+            className="text-gray-500 hover:text-gray-300 transition-colors"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* Modals */}
+      {showConfirm && report && (
+        <HealthConfirmModal
+          pending={pending}
+          currentScore={report.overall_score}
+          onConfirm={applyFix}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+      {showExport && report && (
+        <HealthExportModal
+          report={report}
+          onClose={() => setShowExport(false)}
+        />
+      )}
+      {showHelp && (
+        <HealthHelpOverlay onClose={() => setShowHelp(false)} />
       )}
 
       {/* Review modal */}

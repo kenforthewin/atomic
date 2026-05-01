@@ -227,6 +227,55 @@ pub struct WikiStaleEntry {
     pub new_atom_count: i32,
 }
 
+/// Atom preview for review sections that need title + date without full content.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AtomPreview {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+}
+
+/// Boilerplate-affected atom with clone count for prioritised review.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BoilerplateAtomEntry {
+    pub id: String,
+    pub title: String,
+    /// Number of semantic edges at similarity ≥0.99 from this atom.
+    pub clone_count: i32,
+}
+
+/// Atom stub used inside contradiction pair entries.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContradictionAtom {
+    pub id: String,
+    pub title: String,
+    pub source: Option<String>,
+}
+
+/// Pair of high-similarity atoms surfaced for manual contradiction review.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContradictionPairEntry {
+    pub pair_id: String,
+    pub atom_a: ContradictionAtom,
+    pub atom_b: ContradictionAtom,
+    /// Similarity score 0.0–1.0 (expected range 0.75–0.92 for contradictions).
+    pub similarity: f32,
+    pub shared_tag_count: i32,
+}
+
+/// Rootless tag entry for the tag-health review list.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RootlessTagEntry {
+    pub id: String,
+    pub name: String,
+    pub atom_count: i32,
+}
+
 // ==================== Orchestrator ====================
 
 /// Check weights. Must sum to 1.0.
@@ -656,3 +705,7 @@ pub async fn run_fix(
         new_score,
     })
 }
+
+
+#[cfg(test)]
+mod tests;

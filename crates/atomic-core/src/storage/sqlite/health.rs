@@ -63,7 +63,8 @@ pub struct HealthRawData {
     /// Atom IDs with no markdown heading (`#` at start of line).
     pub no_heading_atoms: Vec<String>,
     /// Atom IDs with null source_url and no "Source:" text in content.
-    pub no_source_atoms: Vec<String>,
+    /// Atom IDs with null source_url and no "Source:" text in content.
+    pub no_source_atoms: Vec<crate::health::AtomPreview>,
 
     // — tag health —
     pub single_atom_tags: i32,
@@ -75,11 +76,17 @@ pub struct HealthRawData {
 
     // — boilerplate pollution (atoms with >= 2 edges at similarity >= 0.99) —
     /// Atom IDs whose embeddings are dominated by shared template text.
-    pub boilerplate_affected_atoms: Vec<String>,
+    /// Atoms whose embeddings are dominated by shared template text.
+    pub boilerplate_affected_atoms: Vec<crate::health::BoilerplateAtomEntry>,
 
     // — contradiction candidates (similarity 0.75..0.92) —
     pub contradiction_pairs_checked: i32,
     pub contradiction_candidate_count: i32,
+
+    /// Pairs of high-similarity atoms for manual contradiction review (similarity 0.80–0.92).
+    pub contradiction_pairs: Vec<crate::health::ContradictionPairEntry>,
+    /// Rootless tags (parent_id IS NULL, not autotag targets) with atom counts.
+    pub rootless_tag_list: Vec<crate::health::RootlessTagEntry>,
 }
 
 impl SqliteStorage {
@@ -293,17 +300,23 @@ impl SqliteStorage {
         }
 
         // No source: null source_url and no http(s):// in content
+        // Return title preview + created_at for better UX (no secondary fetch needed)
         let mut stmt = conn.prepare(
-            "SELECT id FROM atoms
+            "SELECT id, content, created_at FROM atoms
              WHERE source_url IS NULL
                AND content NOT LIKE '%http://%'
                AND content NOT LIKE '%https://%'
                AND content NOT LIKE '%Source:%'
+             ORDER BY updated_at DESC
              LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![LIMIT as i32])?;
         while let Some(row) = rows.next()? {
-            raw.no_source_atoms.push(row.get(0)?);
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let created_at: String = row.get(2)?;
+            let title = extract_title_preview(&content);
+            raw.no_source_atoms.push(crate::health::AtomPreview { id, title, created_at });
         }
 
         // ---- tag health ----
@@ -317,11 +330,28 @@ impl SqliteStorage {
             |r| r.get(0),
         )?;
 
-        raw.rootless_tags = conn.query_row(
-            "SELECT COUNT(*) FROM tags WHERE parent_id IS NULL",
-            [],
-            |r| r.get(0),
-        )?;
+        // Rootless tags: user-created tags with no parent (excludes autotag category roots).
+        // is_autotag_target = 1 marks system roots (Topics, People, etc.) — exclude them.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name, COUNT(at.atom_id) as atom_count
+                 FROM tags t
+                 LEFT JOIN atom_tags at ON t.id = at.tag_id
+                 WHERE t.parent_id IS NULL
+                   AND t.is_autotag_target = 0
+                 GROUP BY t.id
+                 ORDER BY atom_count DESC
+                 LIMIT 50",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let atom_count: i32 = row.get(2)?;
+                raw.rootless_tag_list.push(crate::health::RootlessTagEntry { id, name, atom_count });
+            }
+            raw.rootless_tags = raw.rootless_tag_list.len() as i32;
+        }
 
         // Similar name pairs: fetch all tag names and compare in Rust
         {
@@ -392,31 +422,76 @@ impl SqliteStorage {
         }
 
         // ---- boilerplate pollution (atoms with >= 2 edges at similarity >= 0.99) ----
-        // These atoms can't be distinguished from their peers via semantic search.
+        // Return atom title + clone count so UI can show context and prioritise review.
         {
             let mut stmt = conn.prepare(
-                "SELECT source_atom_id FROM semantic_edges
-                 WHERE similarity_score >= 0.99
-                 GROUP BY source_atom_id
+                "SELECT se.source_atom_id, a.content, COUNT(*) as clone_count
+                 FROM semantic_edges se
+                 JOIN atoms a ON se.source_atom_id = a.id
+                 WHERE se.similarity_score >= 0.99
+                 GROUP BY se.source_atom_id
                  HAVING COUNT(*) >= 2
+                 ORDER BY clone_count DESC
                  LIMIT 50",
             )?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                raw.boilerplate_affected_atoms.push(row.get(0)?);
+                let id: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                let clone_count: i32 = row.get(2)?;
+                let title = extract_title_preview(&content);
+                raw.boilerplate_affected_atoms.push(crate::health::BoilerplateAtomEntry { id, title, clone_count });
             }
         }
 
-        // ---- contradiction candidates (similarity 0.75..0.92) ----
-        raw.contradiction_pairs_checked = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_edges
-             WHERE similarity_score >= 0.75 AND similarity_score < 0.92",
-            [],
-            |r| r.get(0),
-        )?;
-        // For now, surface the count as "candidates" (no LLM check yet)
-        raw.contradiction_candidate_count =
-            (raw.contradiction_pairs_checked / 10).min(10);
+        // ---- contradiction candidates (similarity 0.80..0.92) ----
+        // Surface actual atom pairs for manual review.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT
+                     se.source_atom_id, se.target_atom_id, se.similarity_score,
+                     a1.source_url, a1.content,
+                     a2.source_url, a2.content,
+                     COUNT(DISTINCT at_a.tag_id) as shared_tag_count
+                 FROM semantic_edges se
+                 JOIN atoms a1 ON se.source_atom_id = a1.id
+                 JOIN atoms a2 ON se.target_atom_id = a2.id
+                 LEFT JOIN atom_tags at_a ON a1.id = at_a.atom_id
+                 LEFT JOIN atom_tags at_b ON a2.id = at_b.atom_id AND at_a.tag_id = at_b.tag_id
+                 WHERE se.similarity_score >= 0.80 AND se.similarity_score < 0.92
+                 GROUP BY se.source_atom_id, se.target_atom_id
+                 HAVING COUNT(DISTINCT at_a.tag_id) >= 1
+                 ORDER BY se.similarity_score DESC
+                 LIMIT 20",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let a_id: String = row.get(0)?;
+                let b_id: String = row.get(1)?;
+                let similarity: f32 = row.get(2)?;
+                let a_source: Option<String> = row.get(3)?;
+                let a_content: String = row.get(4)?;
+                let b_source: Option<String> = row.get(5)?;
+                let b_content: String = row.get(6)?;
+                let shared_tag_count: i32 = row.get(7)?;
+                let a_title = extract_title_preview(&a_content);
+                let b_title = extract_title_preview(&b_content);
+                raw.contradiction_pairs.push(crate::health::ContradictionPairEntry {
+                    pair_id: uuid::Uuid::new_v4().to_string(),
+                    atom_a: crate::health::ContradictionAtom { id: a_id, title: a_title, source: a_source },
+                    atom_b: crate::health::ContradictionAtom { id: b_id, title: b_title, source: b_source },
+                    similarity,
+                    shared_tag_count,
+                });
+            }
+            raw.contradiction_pairs_checked = conn.query_row(
+                "SELECT COUNT(*) FROM semantic_edges
+                 WHERE similarity_score >= 0.80 AND similarity_score < 0.92",
+                [],
+                |r| r.get(0),
+            )?;
+            raw.contradiction_candidate_count = raw.contradiction_pairs.len() as i32;
+        }
 
         Ok(raw)
     }

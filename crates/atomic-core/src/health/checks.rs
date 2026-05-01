@@ -297,7 +297,11 @@ pub fn content_quality(raw: &HealthRawData) -> HealthCheckResult {
                 "no_source": {
                     "count": raw.no_source_atoms.len(),
                     "auto_fixable": false,
-                    "atoms": raw.no_source_atoms
+                    "atoms": raw.no_source_atoms.iter().map(|a| json!({
+                        "id": a.id,
+                        "title": a.title,
+                        "created_at": a.created_at
+                    })).collect::<Vec<_>>()
                 }
             }
         }),
@@ -322,7 +326,12 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
         data: json!({
             "single_atom_tags": single,
             "rootless_tags": rootless,
-            "similar_name_pairs": similar
+            "similar_name_pairs": similar,
+            "rootless_tag_list": raw.rootless_tag_list.iter().map(|t| json!({
+                "id": t.id,
+                "name": t.name,
+                "atom_count": t.atom_count
+            })).collect::<Vec<_>>()
         }),
     }
 }
@@ -369,19 +378,26 @@ pub fn content_overlap(raw: &HealthRawData) -> HealthCheckResult {
 }
 
 pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
-    let count = raw.contradiction_candidate_count;
-    let score = (100i32 - count * 10).max(0) as u32;
-    let status = if count == 0 { "ok" } else { "warning" };
+    let pair_count = raw.contradiction_pairs.len() as i32;
+    let score = (100i32 - pair_count * 8).max(0) as u32;
+    let status = if pair_count == 0 { "ok" } else { "warning" };
 
     HealthCheckResult {
         status: status.to_string(),
         score,
         auto_fixable: false,
-        requires_review: count > 0,
+        requires_review: pair_count > 0,
         fix_action: None,
         data: json!({
             "pairs_checked": raw.contradiction_pairs_checked,
-            "potential_contradictions": count
+            "potential_contradictions": pair_count,
+            "pairs": raw.contradiction_pairs.iter().map(|p| json!({
+                "pair_id": p.pair_id,
+                "atom_a": { "id": p.atom_a.id, "title": p.atom_a.title, "source": p.atom_a.source },
+                "atom_b": { "id": p.atom_b.id, "title": p.atom_b.title, "source": p.atom_b.source },
+                "similarity": p.similarity,
+                "shared_tag_count": p.shared_tag_count
+            })).collect::<Vec<_>>()
         }),
     }
 }
@@ -408,7 +424,11 @@ pub fn boilerplate_pollution(raw: &HealthRawData) -> HealthCheckResult {
         fix_action: None,
         data: json!({
             "count": count,
-            "affected_atoms": raw.boilerplate_affected_atoms,
+            "affected_atoms": raw.boilerplate_affected_atoms.iter().map(|a| json!({
+                "id": a.id,
+                "title": a.title,
+                "clone_count": a.clone_count
+            })).collect::<Vec<_>>(),
             "description": "Atoms with >= 2 near-identical edges (similarity >= 0.99). \
                              Shared boilerplate text drowns out unique content in their \
                              embeddings. Semantic search cannot reliably distinguish \
