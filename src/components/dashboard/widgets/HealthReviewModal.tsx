@@ -1529,7 +1529,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 Internal links in your atoms that point to atoms that no longer exist.
                 Remove the link or dismiss to ignore.
               </p>
-              <BrokenLinksSection data={brokenLinksData} onResolved={() => bumpResolved('broken_internal_links')} />
+              <BrokenLinksSection data={brokenLinksData as { broken_link_list: import('./review/BrokenLinksSection').BrokenLinkAtom[] }} onResolved={() => bumpResolved('broken_internal_links')} />
             </>
           )}
 
