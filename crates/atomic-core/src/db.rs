@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 19;
+    const LATEST_VERSION: i32 = 21;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -856,8 +856,8 @@ impl Database {
             )?;
         }
 
-        // --- V16 → V17: content_hash column on atom_chunks for boilerplate detection ---
-        if version < 17 {
+        // --- V17 → V18: content_hash column on atom_chunks for boilerplate detection ---
+        if version < 18 {
             // ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite; ignore the error
             // if the column was already added (e.g. during a test migration re-run).
             let _ = conn.execute(
@@ -868,13 +868,13 @@ impl Database {
                 r#"
                 CREATE INDEX IF NOT EXISTS idx_atom_chunks_content_hash
                     ON atom_chunks(content_hash);
-                PRAGMA user_version = 17;
+                PRAGMA user_version = 18;
                 "#,
             )?;
         }
 
-        // --- V17 → V18: persistent dismissals for the review queue ---
-        if version < 18 {
+        // --- V18 → V19: persistent dismissals for the review queue ---
+        if version < 19 {
             conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS health_dismissals (
@@ -887,13 +887,13 @@ impl Database {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_health_dismissals_lookup
                     ON health_dismissals(check_name, item_key);
-                PRAGMA user_version = 18;
+                PRAGMA user_version = 19;
                 "#,
             )?;
         }
 
-        // --- V18 → V19: tag_proposals table ---
-        if version < 19 {
+        // --- V19 → V20: tag_proposals table ---
+        if version < 20 {
             conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS tag_proposals (
@@ -905,28 +905,28 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_tag_proposals_created
                     ON tag_proposals(created_at DESC);
-                PRAGMA user_version = 19;
+                PRAGMA user_version = 20;
                 "#,
             )?;
         }
 
-        // --- V19 → V20: atoms.is_locked flag ---
+        // --- V20 → V21: atoms.is_locked flag ---
         //
         // Locked atoms are protected from automated mutation by health fixes
         // (strip-boilerplate, auto-merge-duplicate, auto-resolve-contradiction,
         // relink-broken-link). They remain readable and editable through the
         // normal UI. Use for source-of-truth material (books, studies, primary
         // research) where automated "correction" would do more harm than good.
-        if version < 20 {
+        if version < 21 {
             // ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite. Ignore the
             // "duplicate column" error so migration stays idempotent when a
-            // test resets user_version to a pre-V20 value on a DB whose table
+            // test resets user_version to a pre-V21 value on a DB whose table
             // was already migrated by the initial open.
             let _ = conn.execute(
                 "ALTER TABLE atoms ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0",
                 [],
             );
-            conn.execute_batch("PRAGMA user_version = 20;")?;
+            conn.execute_batch("PRAGMA user_version = 21;")?;
         }
 
         // --- Triggers (recreated every startup to stay current) ---
