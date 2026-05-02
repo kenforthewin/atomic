@@ -57,6 +57,95 @@ pub enum CustomRule {
         #[serde(default)]
         invert: bool,
     },
+
+    // ---- Tier 1 ----
+
+    /// Atoms must carry at least one tag from `any_of`. Catches bare dump
+    /// notes. `tag_filter`, when set, restricts the check to atoms already
+    /// carrying that tag.
+    RequireTag {
+        any_of: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+    /// Word-count bounds. 0 on either side means unbounded. Complements the
+    /// char-based `content_quality` check: users can opt in to this per
+    /// category rather than applying a global length heuristic.
+    ContentLength {
+        #[serde(default)]
+        min_words: u32,
+        #[serde(default)]
+        max_words: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+    /// Atoms must contain at least `min_citations` inline citations, where
+    /// a citation is a markdown link `[text](url)` or a wikilink `[[...]]`.
+    CitationCount {
+        #[serde(default)]
+        min_citations: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+    /// Source URL must be on an allowlist or must NOT be on a blocklist of
+    /// domain suffixes. `domains` matches as a suffix so `arxiv.org` covers
+    /// `arxiv.org/abs/...`. Atoms without a source_url are skipped — use
+    /// `RequireSource` to police that separately.
+    SourceDomainMatches {
+        domains: Vec<String>,
+        #[serde(default)]
+        mode: DomainMatchMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+    /// Atoms tagged with `tag` and unmodified for longer than `max_age_days`
+    /// are flagged.
+    StaleAtom {
+        tag: String,
+        max_age_days: u32,
+    },
+
+    // ---- Tier 2 ----
+
+    /// Atoms must NOT carry every tag in `all_of` simultaneously. Models
+    /// mutually-exclusive categories.
+    ForbiddenTagCombo {
+        all_of: Vec<String>,
+    },
+    /// Markdown atoms with content longer than `min_length_chars` must
+    /// contain at least one `#` heading.
+    MissingHeading {
+        #[serde(default = "default_min_heading_len")]
+        min_length_chars: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+    /// Atoms must carry between `min` and `max` (inclusive) total tags.
+    /// 0 = unbounded on that side.
+    TagCardinality {
+        #[serde(default)]
+        min: u32,
+        #[serde(default)]
+        max: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<String>,
+    },
+}
+
+/// How `SourceDomainMatches` interprets the `domains` list.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainMatchMode {
+    /// Flag atoms whose source_url domain is NOT in the list.
+    #[default]
+    Allowlist,
+    /// Flag atoms whose source_url domain IS in the list.
+    Blocklist,
+}
+
+fn default_min_heading_len() -> u32 {
+    120
 }
 
 /// User-defined health check. `id` is a stable uuid so UI edits don't change
@@ -133,6 +222,28 @@ fn evaluate(
         CustomRule::TagRequires { any_of, required } => eval_tag_requires(conn, any_of, required),
         CustomRule::RequireSource { tag_filter } => eval_require_source(conn, tag_filter.as_deref()),
         CustomRule::ContentRegex { pattern, invert } => eval_content_regex(conn, pattern, *invert),
+        CustomRule::RequireTag { any_of, tag_filter } => {
+            eval_require_tag(conn, any_of, tag_filter.as_deref())
+        }
+        CustomRule::ContentLength { min_words, max_words, tag_filter } => {
+            eval_content_length(conn, *min_words, *max_words, tag_filter.as_deref())
+        }
+        CustomRule::CitationCount { min_citations, tag_filter } => {
+            eval_citation_count(conn, *min_citations, tag_filter.as_deref())
+        }
+        CustomRule::SourceDomainMatches { domains, mode, tag_filter } => {
+            eval_source_domain(conn, domains, *mode, tag_filter.as_deref())
+        }
+        CustomRule::StaleAtom { tag, max_age_days } => {
+            eval_stale_atom(conn, tag, *max_age_days)
+        }
+        CustomRule::ForbiddenTagCombo { all_of } => eval_forbidden_combo(conn, all_of),
+        CustomRule::MissingHeading { min_length_chars, tag_filter } => {
+            eval_missing_heading(conn, *min_length_chars, tag_filter.as_deref())
+        }
+        CustomRule::TagCardinality { min, max, tag_filter } => {
+            eval_tag_cardinality(conn, *min, *max, tag_filter.as_deref())
+        }
     }
 }
 
@@ -352,6 +463,397 @@ fn eval_content_regex(
     })
 }
 
+// ==================== Tier 1 ====================
+
+/// Load candidate atoms. When `tag_filter` is `Some`, restricts to atoms
+/// tagged with that tag id; otherwise all atoms. Standardizes the select-
+/// and-iterate boilerplate every evaluator below shares.
+fn for_each_atom<F>(
+    conn: &rusqlite::Connection,
+    tag_filter: Option<&str>,
+    cols: &str,
+    mut consume: F,
+) -> Result<i32, AtomicCoreError>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<bool>,
+{
+    let mut total = 0i32;
+    match tag_filter {
+        Some(tag) => {
+            let sql = format!(
+                "SELECT DISTINCT {cols} FROM atoms a \
+                 JOIN atom_tags at ON at.atom_id = a.id \
+                 WHERE at.tag_id = ?1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params![tag])?;
+            while let Some(row) = rows.next()? {
+                if consume(row)? { total += 1; }
+            }
+        }
+        None => {
+            let sql = format!("SELECT {cols} FROM atoms a");
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if consume(row)? { total += 1; }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn push_flag(flagged: &mut Vec<FlaggedAtom>, id: String, content: &str) {
+    if flagged.len() < MAX_FLAGGED {
+        flagged.push(FlaggedAtom {
+            title_preview: preview(content),
+            id,
+        });
+    }
+}
+
+/// Load `(id, content)` pairs for the candidate atom set. Wrapped as a helper
+/// so evaluators that need the full candidate list (not just a streaming
+/// callback) don't have to juggle statement lifetimes across match arms.
+fn load_candidates_id_content(
+    conn: &rusqlite::Connection,
+    tag_filter: Option<&str>,
+) -> Result<Vec<(String, String)>, AtomicCoreError> {
+    match tag_filter {
+        Some(tag) => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT a.id, a.content FROM atoms a \
+                 JOIN atom_tags at ON at.atom_id = a.id \
+                 WHERE at.tag_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![tag], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        }
+        None => {
+            let mut stmt = conn.prepare("SELECT id, content FROM atoms")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        }
+    }
+}
+
+fn eval_require_tag(
+    conn: &rusqlite::Connection,
+    any_of: &[String],
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    if any_of.is_empty() {
+        return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
+    }
+
+    // Candidate atoms (scoped by tag_filter if present), each with their
+    // full tag-id set. One bulk query, bucket in memory.
+    let mut flagged = Vec::new();
+    let required: std::collections::HashSet<&str> = any_of.iter().map(|s| s.as_str()).collect();
+
+    let candidates: Vec<(String, String)> = load_candidates_id_content(conn, tag_filter)?;
+    let total = candidates.len() as i32;
+
+    if candidates.is_empty() {
+        return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
+    }
+    let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+    let placeholders: String = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT atom_id, tag_id FROM atom_tags WHERE atom_id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut by_atom: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (aid, tid) = row?;
+        by_atom.entry(aid).or_default().push(tid);
+    }
+
+    for (id, content) in candidates {
+        let has_any = by_atom
+            .get(&id)
+            .map(|tags| tags.iter().any(|t| required.contains(t.as_str())))
+            .unwrap_or(false);
+        if !has_any {
+            push_flag(&mut flagged, id, &content);
+        }
+    }
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+/// Fast, allocation-free word count. Treats any run of ASCII whitespace as a
+/// separator — matches `str::split_whitespace` but avoids allocating an
+/// intermediate iterator collection.
+fn word_count(s: &str) -> u32 {
+    s.split_whitespace().count() as u32
+}
+
+fn eval_content_length(
+    conn: &rusqlite::Connection,
+    min_words: u32,
+    max_words: u32,
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    let mut flagged = Vec::new();
+    let total = for_each_atom(conn, tag_filter, "a.id, a.content", |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let n = word_count(&content);
+        let too_short = min_words > 0 && n < min_words;
+        let too_long  = max_words > 0 && n > max_words;
+        if too_short || too_long {
+            push_flag(&mut flagged, id, &content);
+        }
+        Ok(true)
+    })?;
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+/// Count markdown links `[text](url)` plus wikilinks `[[...]]`.
+fn count_citations(content: &str) -> u32 {
+    // Cheap linear scan — no regex allocations per atom.
+    let mut n = 0u32;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            // wikilink: `[[`
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                n += 1;
+                i += 2;
+                continue;
+            }
+            // markdown link: `](` following `[...]`
+            if let Some(close) = content[i..].find("](") {
+                // must not contain a newline between [ and ](
+                if !content[i..i + close].contains('\n') {
+                    n += 1;
+                    i += close + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    n
+}
+
+fn eval_citation_count(
+    conn: &rusqlite::Connection,
+    min_citations: u32,
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    let mut flagged = Vec::new();
+    let total = for_each_atom(conn, tag_filter, "a.id, a.content", |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        if count_citations(&content) < min_citations {
+            push_flag(&mut flagged, id, &content);
+        }
+        Ok(true)
+    })?;
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+/// Parse a URL’s host. Accepts http/https/ftp/etc. Returns None for empty or
+/// malformed URLs — those atoms are skipped (not flagged) since policing the
+/// presence of a URL is `RequireSource`’s job.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = rest.split('/').next()?.split('?').next()?.split('#').next()?;
+    if host.is_empty() { None } else { Some(host.to_lowercase()) }
+}
+
+fn host_matches(host: &str, domains: &[String]) -> bool {
+    domains.iter().any(|d| {
+        let d = d.trim().trim_start_matches("https://").trim_start_matches("http://").to_lowercase();
+        if d.is_empty() { return false; }
+        host == d || host.ends_with(&format!(".{d}"))
+    })
+}
+
+fn eval_source_domain(
+    conn: &rusqlite::Connection,
+    domains: &[String],
+    mode: DomainMatchMode,
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    if domains.is_empty() {
+        return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
+    }
+    let mut flagged = Vec::new();
+    let mut total = 0i32;
+    for_each_atom(conn, tag_filter, "a.id, a.content, a.source_url", |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let source: Option<String> = row.get(2)?;
+        let Some(url) = source.filter(|s| !s.trim().is_empty()) else {
+            return Ok(false); // skip — not in the pool this rule polices
+        };
+        total += 1;
+        let host = match host_of(&url) { Some(h) => h, None => return Ok(false) };
+        let on_list = host_matches(&host, domains);
+        let flag = match mode {
+            DomainMatchMode::Allowlist => !on_list,
+            DomainMatchMode::Blocklist => on_list,
+        };
+        if flag { push_flag(&mut flagged, id, &content); }
+        Ok(false) // already counted manually
+    })?;
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+fn eval_stale_atom(
+    conn: &rusqlite::Connection,
+    tag: &str,
+    max_age_days: u32,
+) -> Result<RawOutcome, AtomicCoreError> {
+    // Compute the RFC3339 cutoff on the Rust side so SQLite string comparison
+    // (lexicographic over RFC3339) gives us the right answer.
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
+    let cutoff_str = cutoff.to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.content FROM atoms a \
+         JOIN atom_tags at ON at.atom_id = a.id \
+         WHERE at.tag_id = ?1",
+    )?;
+    let mut flagged = Vec::new();
+    let mut total = 0i32;
+    let rows = stmt.query_map(params![tag], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    // We fetch content + id, then check updated_at via a second single-stmt
+    // per atom. SQLite handles this trivially for the expected O(tagged-atoms)
+    // sizes; could be inlined with a JOIN on atoms for perf if needed.
+    let mut stale_stmt = conn.prepare(
+        "SELECT COALESCE(updated_at, created_at) FROM atoms WHERE id = ?1",
+    )?;
+    for row in rows {
+        let (id, content) = row?;
+        total += 1;
+        let ts: String = stale_stmt.query_row(params![&id], |r| r.get(0))?;
+        if ts < cutoff_str {
+            push_flag(&mut flagged, id, &content);
+        }
+    }
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+// ==================== Tier 2 ====================
+
+fn eval_forbidden_combo(
+    conn: &rusqlite::Connection,
+    all_of: &[String],
+) -> Result<RawOutcome, AtomicCoreError> {
+    if all_of.len() < 2 {
+        return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
+    }
+    // Every atom is a candidate. Count atoms that carry every required tag.
+    let placeholders: String = std::iter::repeat("?").take(all_of.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT atom_id, COUNT(DISTINCT tag_id) as matched \
+         FROM atom_tags \
+         WHERE tag_id IN ({placeholders}) \
+         GROUP BY atom_id \
+         HAVING matched = ?\
+         ORDER BY atom_id"
+    );
+    // Collect atom ids that have ALL required tags.
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = all_of.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let n = all_of.len() as i64;
+    params_vec.push(&n);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_vec.as_slice(), |row| row.get::<_, String>(0))?;
+    let flagged_ids: Vec<String> = rows.collect::<Result<_, _>>()?;
+
+    // Total considered = atoms that carry any of the tags (the superset we're policing).
+    let total = {
+        let sql = format!(
+            "SELECT COUNT(DISTINCT atom_id) FROM atom_tags WHERE tag_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_row(rusqlite::params_from_iter(all_of.iter()), |row| row.get::<_, i64>(0))
+            .unwrap_or(0) as i32
+    };
+
+    let mut flagged = Vec::new();
+    if !flagged_ids.is_empty() {
+        let placeholders: String = std::iter::repeat("?").take(flagged_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, content FROM atoms WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(flagged_ids.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, content) = row?;
+            push_flag(&mut flagged, id, &content);
+        }
+    }
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+fn eval_missing_heading(
+    conn: &rusqlite::Connection,
+    min_length_chars: u32,
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    let mut flagged = Vec::new();
+    let total = for_each_atom(conn, tag_filter, "a.id, a.content", |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        if (content.chars().count() as u32) < min_length_chars {
+            return Ok(true); // count toward total, but not flagged
+        }
+        let has_heading = content.lines().any(|l| l.trim_start().starts_with('#'));
+        if !has_heading {
+            push_flag(&mut flagged, id, &content);
+        }
+        Ok(true)
+    })?;
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+fn eval_tag_cardinality(
+    conn: &rusqlite::Connection,
+    min: u32,
+    max: u32,
+    tag_filter: Option<&str>,
+) -> Result<RawOutcome, AtomicCoreError> {
+    let candidates: Vec<(String, String)> = load_candidates_id_content(conn, tag_filter)?;
+    let total = candidates.len() as i32;
+    if candidates.is_empty() {
+        return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
+    }
+    let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+    let placeholders: String = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT atom_id, COUNT(*) FROM atom_tags WHERE atom_id IN ({placeholders}) GROUP BY atom_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+    })?;
+    let mut count_by: HashMap<String, u32> = HashMap::new();
+    for row in rows {
+        let (id, n) = row?;
+        count_by.insert(id, n);
+    }
+    let mut flagged = Vec::new();
+    for (id, content) in candidates {
+        let n = count_by.get(&id).copied().unwrap_or(0);
+        let too_few = min > 0 && n < min;
+        let too_many = max > 0 && n > max;
+        if too_few || too_many {
+            push_flag(&mut flagged, id, &content);
+        }
+    }
+    Ok(RawOutcome { total_considered: total, flagged_atoms: flagged })
+}
+
+
 /// Wrap the raw predicate outcome as a `HealthCheckResult` honoring the check's
 /// weight semantics (0 → informational, > 0 → contributes to overall score).
 fn finalize(check: &CustomCheck, raw: RawOutcome) -> HealthCheckResult {
@@ -570,5 +1072,236 @@ mod tests {
         };
         let out = run_all(&storage, &[scored]).unwrap();
         assert!(!out[0].1.informational);
+    }
+
+    // ---- Tier 1 ----
+
+    fn check_with(rule: CustomRule) -> CustomCheck {
+        CustomCheck {
+            id: "c1".into(),
+            label: "l".into(),
+            description: String::new(),
+            enabled: true,
+            weight: 0.0,
+            rule,
+        }
+    }
+
+    #[test]
+    fn require_tag_flags_untagged_atoms() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "tagged", None);
+            insert_atom(&conn, "a2", "bare", None);
+            insert_tag(&conn, "t_topic", "topic");
+            link(&conn, "a1", "t_topic");
+        }
+        let check = check_with(CustomRule::RequireTag {
+            any_of: vec!["t_topic".into()],
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "a2");
+    }
+
+    #[test]
+    fn content_length_flags_too_short_and_too_long() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "one two three four five six", None);  // 6 words, OK
+            insert_atom(&conn, "a2", "tiny", None);                         // 1 word
+            insert_atom(&conn, "a3", &"w ".repeat(50), None);               // 50 words
+        }
+        let check = check_with(CustomRule::ContentLength {
+            min_words: 5,
+            max_words: 30,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 2);
+        let flagged: Vec<&str> = r.data["flagged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert!(flagged.contains(&"a2"));
+        assert!(flagged.contains(&"a3"));
+    }
+
+    #[test]
+    fn citation_count_flags_atoms_with_too_few_links() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "one [link](http://a) and [[wiki]]", None);
+            insert_atom(&conn, "a2", "no citations here at all", None);
+            insert_atom(&conn, "a3", "only [one](http://x) here", None);
+        }
+        let check = check_with(CustomRule::CitationCount {
+            min_citations: 2,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 2);
+        let flagged: Vec<&str> = r.data["flagged"]
+            .as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert!(flagged.contains(&"a2"));
+        assert!(flagged.contains(&"a3"));
+    }
+
+    #[test]
+    fn source_domain_allowlist_flags_off_list_domains() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "paper", Some("https://arxiv.org/abs/1"));
+            insert_atom(&conn, "a2", "blog", Some("https://random.example/post"));
+            insert_atom(&conn, "a3", "no source skipped", None);
+        }
+        let check = check_with(CustomRule::SourceDomainMatches {
+            domains: vec!["arxiv.org".into()],
+            mode: DomainMatchMode::Allowlist,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        // a3 is skipped (no source); a1 on allowlist; a2 off.
+        assert_eq!(r.data["total_considered"], 2);
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "a2");
+    }
+
+    #[test]
+    fn source_domain_blocklist_flags_on_list_domains() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "reddit", Some("https://old.reddit.com/r/x"));
+            insert_atom(&conn, "a2", "arxiv", Some("https://arxiv.org/abs/1"));
+        }
+        let check = check_with(CustomRule::SourceDomainMatches {
+            domains: vec!["reddit.com".into()],
+            mode: DomainMatchMode::Blocklist,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "a1");
+    }
+
+    #[test]
+    fn stale_atom_flags_old_tagged_atoms() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_tag(&conn, "t_draft", "draft");
+            // Old: 30 days ago
+            let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO atoms (id, content, source_url, embedding_status, tagging_status, created_at, updated_at) \
+                 VALUES ('a1', 'stale', NULL, 'complete', 'complete', ?1, ?1)",
+                params![old],
+            ).unwrap();
+            // Fresh: now
+            insert_atom(&conn, "a2", "fresh", None);
+            link(&conn, "a1", "t_draft");
+            link(&conn, "a2", "t_draft");
+        }
+        let check = check_with(CustomRule::StaleAtom {
+            tag: "t_draft".into(),
+            max_age_days: 14,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["total_considered"], 2);
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "a1");
+    }
+
+    // ---- Tier 2 ----
+
+    #[test]
+    fn forbidden_combo_flags_atoms_carrying_all_forbidden_tags() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a1", "both", None);
+            insert_atom(&conn, "a2", "only draft", None);
+            insert_tag(&conn, "t_draft", "draft");
+            insert_tag(&conn, "t_published", "published");
+            link(&conn, "a1", "t_draft");
+            link(&conn, "a1", "t_published");
+            link(&conn, "a2", "t_draft");
+        }
+        let check = check_with(CustomRule::ForbiddenTagCombo {
+            all_of: vec!["t_draft".into(), "t_published".into()],
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "a1");
+    }
+
+    #[test]
+    fn missing_heading_flags_long_atoms_without_heading() {
+        let (storage, _tmp) = make_storage();
+        let long = "x".repeat(200);
+        let with_h = format!("# Title\n{}", "y".repeat(200));
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "short", "too short to flag", None);
+            insert_atom(&conn, "no_h", &long, None);
+            insert_atom(&conn, "has_h", &with_h, None);
+        }
+        let check = check_with(CustomRule::MissingHeading {
+            min_length_chars: 120,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        assert_eq!(r.data["flagged_count"], 1);
+        assert_eq!(r.data["flagged"][0]["id"], "no_h");
+    }
+
+    #[test]
+    fn tag_cardinality_flags_over_and_under_tagged() {
+        let (storage, _tmp) = make_storage();
+        {
+            let conn = storage.db.conn.lock().unwrap();
+            insert_atom(&conn, "a0", "no tags", None);
+            insert_atom(&conn, "a1", "one tag", None);
+            insert_atom(&conn, "a2", "two tags", None);
+            insert_atom(&conn, "a5", "five tags", None);
+            for i in 0..5 {
+                insert_tag(&conn, &format!("t{i}"), &format!("t{i}"));
+            }
+            link(&conn, "a1", "t0");
+            link(&conn, "a2", "t0");
+            link(&conn, "a2", "t1");
+            for i in 0..5 {
+                link(&conn, "a5", &format!("t{i}"));
+            }
+        }
+        let check = check_with(CustomRule::TagCardinality {
+            min: 1,
+            max: 3,
+            tag_filter: None,
+        });
+        let out = run_all(&storage, &[check]).unwrap();
+        let (_, r, _) = &out[0];
+        let flagged: Vec<&str> = r.data["flagged"]
+            .as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert!(flagged.contains(&"a0"));  // under min
+        assert!(flagged.contains(&"a5"));  // over max
+        assert!(!flagged.contains(&"a1"));
+        assert!(!flagged.contains(&"a2"));
     }
 }

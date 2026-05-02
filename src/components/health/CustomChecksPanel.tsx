@@ -12,7 +12,15 @@ import { useTagsStore } from '../../stores/tags';
 type CustomRule =
   | { kind: 'tag_requires'; any_of: string[]; required: string[] }
   | { kind: 'require_source'; tag_filter?: string | null }
-  | { kind: 'content_regex'; pattern: string; invert?: boolean };
+  | { kind: 'content_regex'; pattern: string; invert?: boolean }
+  | { kind: 'require_tag'; any_of: string[]; tag_filter?: string | null }
+  | { kind: 'content_length'; min_words: number; max_words: number; tag_filter?: string | null }
+  | { kind: 'citation_count'; min_citations: number; tag_filter?: string | null }
+  | { kind: 'source_domain_matches'; domains: string[]; mode: 'allowlist' | 'blocklist'; tag_filter?: string | null }
+  | { kind: 'stale_atom'; tag: string; max_age_days: number }
+  | { kind: 'forbidden_tag_combo'; all_of: string[] }
+  | { kind: 'missing_heading'; min_length_chars: number; tag_filter?: string | null }
+  | { kind: 'tag_cardinality'; min: number; max: number; tag_filter?: string | null };
 
 interface CustomCheck {
   id: string;
@@ -182,14 +190,54 @@ export function CustomChecksPanel() {
                   case 'content_regex':
                     rule = { kind, pattern: '', invert: false };
                     break;
+                  case 'require_tag':
+                    rule = { kind, any_of: [], tag_filter: null };
+                    break;
+                  case 'content_length':
+                    rule = { kind, min_words: 0, max_words: 0, tag_filter: null };
+                    break;
+                  case 'citation_count':
+                    rule = { kind, min_citations: 1, tag_filter: null };
+                    break;
+                  case 'source_domain_matches':
+                    rule = { kind, domains: [], mode: 'allowlist', tag_filter: null };
+                    break;
+                  case 'stale_atom':
+                    rule = { kind, tag: '', max_age_days: 14 };
+                    break;
+                  case 'forbidden_tag_combo':
+                    rule = { kind, all_of: [] };
+                    break;
+                  case 'missing_heading':
+                    rule = { kind, min_length_chars: 120, tag_filter: null };
+                    break;
+                  case 'tag_cardinality':
+                    rule = { kind, min: 1, max: 5, tag_filter: null };
+                    break;
                 }
                 mutateRule(check.id, rule);
               }}
               className="bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200"
             >
-              <option value="require_source">Require source URL</option>
-              <option value="tag_requires">Tag requires other tags</option>
-              <option value="content_regex">Content matches regex</option>
+              <optgroup label="Tags">
+                <option value="tag_requires">Tag requires other tags</option>
+                <option value="require_tag">Atoms must carry at least one tag</option>
+                <option value="forbidden_tag_combo">Forbidden tag combination</option>
+                <option value="tag_cardinality">Tag count bounds</option>
+              </optgroup>
+              <optgroup label="Sources">
+                <option value="require_source">Require source URL</option>
+                <option value="source_domain_matches">Source domain allowlist / blocklist</option>
+              </optgroup>
+              <optgroup label="Content">
+                <option value="content_regex">Content matches regex</option>
+                <option value="content_length">Content word-count bounds</option>
+                <option value="citation_count">Minimum inline citations</option>
+                <option value="missing_heading">Missing markdown heading</option>
+              </optgroup>
+              <optgroup label="Workflow">
+                <option value="stale_atom">Stale atom (age + tag)</option>
+              </optgroup>
             </select>
           </div>
 
@@ -288,32 +336,290 @@ function RuleEditor({
     );
   }
 
-  // content_regex
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2">
-        <label className="text-xs text-gray-500 w-16 shrink-0">Pattern:</label>
-        <input
-          type="text"
-          value={rule.pattern}
-          onChange={e => onChange({ ...rule, pattern: e.target.value })}
-          className="flex-1 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200 font-mono"
-          placeholder="\\bTODO\\b"
+  if (rule.kind === 'content_regex') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Pattern:</label>
+          <input
+            type="text"
+            value={rule.pattern}
+            onChange={e => onChange({ ...rule, pattern: e.target.value })}
+            className="flex-1 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200 font-mono"
+            placeholder="\\bTODO\\b"
+          />
+        </div>
+        <label className="flex items-center gap-2 text-xs text-gray-400">
+          <input
+            type="checkbox"
+            checked={rule.invert ?? false}
+            onChange={e => onChange({ ...rule, invert: e.target.checked })}
+          />
+          Flag atoms that do NOT match (invert)
+        </label>
+        {rule.pattern.length > 512 && (
+          <div className="flex items-center gap-1 text-xs text-red-400">
+            <AlertTriangle className="w-3 h-3" /> Pattern too long (max 512)
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (rule.kind === 'require_tag') {
+    return (
+      <div className="space-y-2">
+        <TagMultiPicker
+          label="Require:"
+          selected={rule.any_of}
+          onChange={any_of => onChange({ ...rule, any_of })}
+          tagsById={tagsById}
+          tags={tags}
+        />
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
         />
       </div>
-      <label className="flex items-center gap-2 text-xs text-gray-400">
-        <input
-          type="checkbox"
-          checked={rule.invert ?? false}
-          onChange={e => onChange({ ...rule, invert: e.target.checked })}
-        />
-        Flag atoms that do NOT match (invert)
-      </label>
-      {rule.pattern.length > 512 && (
-        <div className="flex items-center gap-1 text-xs text-red-400">
-          <AlertTriangle className="w-3 h-3" /> Pattern too long (max 512)
+    );
+  }
+
+  if (rule.kind === 'content_length') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Words:</label>
+          <NumberField value={rule.min_words} onChange={v => onChange({ ...rule, min_words: v })} placeholder="min" />
+          <span className="text-xs text-gray-600">to</span>
+          <NumberField value={rule.max_words} onChange={v => onChange({ ...rule, max_words: v })} placeholder="max" />
+          <span className="text-xs text-gray-600">(0 = unbounded)</span>
         </div>
-      )}
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
+        />
+      </div>
+    );
+  }
+
+  if (rule.kind === 'citation_count') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Min:</label>
+          <NumberField value={rule.min_citations} onChange={v => onChange({ ...rule, min_citations: v })} placeholder="1" />
+          <span className="text-xs text-gray-600">inline links or wikilinks</span>
+        </div>
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
+        />
+      </div>
+    );
+  }
+
+  if (rule.kind === 'source_domain_matches') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Mode:</label>
+          <select
+            value={rule.mode}
+            onChange={e => onChange({ ...rule, mode: e.target.value as 'allowlist' | 'blocklist' })}
+            className="bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200"
+          >
+            <option value="allowlist">Allowlist (flag off-list)</option>
+            <option value="blocklist">Blocklist (flag on-list)</option>
+          </select>
+        </div>
+        <DomainListInput
+          domains={rule.domains}
+          onChange={domains => onChange({ ...rule, domains })}
+        />
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
+        />
+      </div>
+    );
+  }
+
+  if (rule.kind === 'stale_atom') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Tag:</label>
+          <select
+            value={rule.tag}
+            onChange={e => onChange({ ...rule, tag: e.target.value })}
+            className="flex-1 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200"
+          >
+            <option value="">— select a tag —</option>
+            {tags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Max age:</label>
+          <NumberField value={rule.max_age_days} onChange={v => onChange({ ...rule, max_age_days: v })} placeholder="14" />
+          <span className="text-xs text-gray-600">days</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (rule.kind === 'forbidden_tag_combo') {
+    return (
+      <TagMultiPicker
+        label="Combo:"
+        selected={rule.all_of}
+        onChange={all_of => onChange({ ...rule, all_of })}
+        tagsById={tagsById}
+        tags={tags}
+      />
+    );
+  }
+
+  if (rule.kind === 'missing_heading') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Min size:</label>
+          <NumberField value={rule.min_length_chars} onChange={v => onChange({ ...rule, min_length_chars: v })} placeholder="120" />
+          <span className="text-xs text-gray-600">chars (shorter atoms skipped)</span>
+        </div>
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
+        />
+      </div>
+    );
+  }
+
+  if (rule.kind === 'tag_cardinality') {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-gray-500 w-16 shrink-0">Tags:</label>
+          <NumberField value={rule.min} onChange={v => onChange({ ...rule, min: v })} placeholder="min" />
+          <span className="text-xs text-gray-600">to</span>
+          <NumberField value={rule.max} onChange={v => onChange({ ...rule, max: v })} placeholder="max" />
+          <span className="text-xs text-gray-600">(0 = unbounded)</span>
+        </div>
+        <TagFilterRow
+          value={rule.tag_filter ?? null}
+          onChange={v => onChange({ ...rule, tag_filter: v })}
+          tags={tags}
+          label="Scope:"
+        />
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function NumberField({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  placeholder?: string;
+}) {
+  return (
+    <input
+      type="number"
+      min={0}
+      value={value}
+      onChange={e => onChange(parseInt(e.target.value || '0', 10) || 0)}
+      placeholder={placeholder}
+      className="w-20 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200"
+    />
+  );
+}
+
+function TagFilterRow({
+  value,
+  onChange,
+  tags,
+  label,
+}: {
+  value: string | null;
+  onChange: (v: string | null) => void;
+  tags: { id: string; name: string }[];
+  label: string;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <label className="text-xs text-gray-500 w-16 shrink-0">{label}</label>
+      <select
+        value={value ?? ''}
+        onChange={e => onChange(e.target.value || null)}
+        className="flex-1 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200"
+      >
+        <option value="">— all atoms —</option>
+        {tags.map(t => (<option key={t.id} value={t.id}>{t.name}</option>))}
+      </select>
+    </div>
+  );
+}
+
+function DomainListInput({
+  domains,
+  onChange,
+}: {
+  domains: string[];
+  onChange: (d: string[]) => void;
+}) {
+  const [draft, setDraft] = useState('');
+  const add = () => {
+    const v = draft.trim().toLowerCase();
+    if (!v || domains.includes(v)) return;
+    onChange([...domains, v]);
+    setDraft('');
+  };
+  return (
+    <div className="flex items-start gap-2">
+      <label className="text-xs text-gray-500 w-16 shrink-0 pt-1">Domains:</label>
+      <div className="flex-1 space-y-1">
+        <div className="flex flex-wrap gap-1">
+          {domains.map(d => (
+            <span key={d} className="inline-flex items-center gap-1 px-2 py-0.5 bg-purple-600/20 border border-purple-600/40 rounded text-xs text-purple-200 font-mono">
+              {d}
+              <button
+                onClick={() => onChange(domains.filter(x => x !== d))}
+                className="text-purple-300/70 hover:text-red-300 text-xs leading-none"
+                aria-label={`Remove ${d}`}
+              >×</button>
+            </span>
+          ))}
+        </div>
+        <div className="flex gap-1">
+          <input
+            type="text"
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+            placeholder="arxiv.org"
+            className="flex-1 bg-[#252525] border border-white/5 rounded px-2 py-1 text-xs text-gray-200 font-mono"
+          />
+          <button
+            onClick={add}
+            className="px-2 py-1 bg-[#2d2d2d] hover:bg-[#3a3a3a] rounded text-xs text-gray-200"
+          >Add</button>
+        </div>
+      </div>
     </div>
   );
 }
