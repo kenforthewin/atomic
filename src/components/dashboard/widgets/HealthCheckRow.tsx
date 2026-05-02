@@ -31,6 +31,11 @@ export interface HealthCheckRowProps {
   onToggleInclude: (name: string) => void;
   trend?: '↑' | '↓' | '→';
   severityBadge?: string;
+  previousScore?: number;
+  lastCheckedAt?: number;
+  disableRun?: boolean;
+  justUpdated?: boolean;
+  examples?: string[];
 }
 
 function ScoreBarMini({ score }: { score: number }) {
@@ -62,14 +67,41 @@ export function HealthCheckRow({
   onToggleInclude,
   trend,
   severityBadge,
+  previousScore,
+  lastCheckedAt,
+  disableRun,
+  justUpdated,
+  examples,
 }: HealthCheckRowProps) {
   const scoreColor =
     check.score >= 90 ? 'text-green-400' :
     check.score >= 70 ? 'text-yellow-400' :
     check.score >= 50 ? 'text-orange-400' : 'text-red-400';
 
+  const severityTitle =
+    check.score >= 86 ? 'Healthy — score 86+' :
+    check.score >= 71 ? 'Needs attention — score 71–85' :
+    check.score >= 41 ? 'Warning — score 41–70' :
+                          'Critical — score below 41';
+
+  const critical = check.score < 41;
+
+  const trendTitle = (() => {
+    if (trend === undefined) return undefined;
+    if (previousScore === undefined) return 'No previous score recorded';
+    const delta = check.score - previousScore;
+    const sign = delta > 0 ? '+' : '';
+    return `Was ${previousScore}, now ${check.score} (${sign}${delta} since last scan)`;
+  })();
+
+  const lastCheckedLabel = lastCheckedAt ? formatRelative(lastCheckedAt) : null;
+
   return (
-    <div className="border-b border-white/5 py-2 last:border-b-0">
+    <div
+      className={`border-b border-white/5 py-2 last:border-b-0 transition-colors ${
+        justUpdated ? 'bg-green-500/5' : ''
+      }`}
+    >
       {/* Header row */}
       <div className="flex items-center gap-2">
         {/* Expand toggle */}
@@ -100,20 +132,31 @@ export function HealthCheckRow({
               'text-gray-600'
             }`}
             aria-label={`Trend: ${trend}`}
+            title={trendTitle}
           >
             {trend}
           </span>
         )}
         {severityBadge && (
-          <span className="text-sm shrink-0" aria-label={`Severity: ${severityBadge}`}>{severityBadge}</span>
+          <span
+            className={`text-sm shrink-0 ${critical ? 'animate-pulse' : ''}`}
+            aria-label={`Severity: ${severityTitle}`}
+            title={severityTitle}
+          >
+            {severityBadge}
+          </span>
         )}
         {/* Action buttons */}
         <div className="flex items-center gap-0.5 shrink-0">
           <button
             onClick={() => onRun(checkName)}
-            disabled={isRunning}
-            className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40 transition-colors rounded hover:bg-white/5"
-            title={`Re-run ${label} check`}
+            disabled={isRunning || disableRun}
+            className="p-1.5 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors rounded hover:bg-white/5"
+            title={
+              disableRun && !isRunning
+                ? 'Global scan in progress…'
+                : `Re-run ${label} check`
+            }
             aria-label={`Re-run ${label} check`}
           >
             {isRunning
@@ -142,6 +185,21 @@ export function HealthCheckRow({
       {/* Expanded detail */}
       {isExpanded && (
         <div className="mt-2 pl-5 space-y-2">
+          {lastCheckedLabel && (
+            <p className="text-[11px] text-gray-600">Last checked: {lastCheckedLabel}</p>
+          )}
+
+          {examples && examples.length > 0 && (
+            <div className="text-xs text-gray-400 space-y-0.5">
+              {examples.slice(0, 2).map((ex, i) => (
+                <div key={i} className="flex items-start gap-1.5">
+                  <span className="text-gray-600 mt-0.5">•</span>
+                  <span className="truncate" title={ex}>{ex}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
           {check.auto_fixable && (
             <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
               <input
@@ -166,4 +224,16 @@ export function HealthCheckRow({
       )}
     </div>
   );
+}
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
 }

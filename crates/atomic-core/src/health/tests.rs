@@ -185,6 +185,7 @@ mod tests {
         assert_eq!(result.status, "ok");
         assert!(!result.requires_review);
         assert_eq!(result.data["count"], 0);
+        assert_eq!(result.score, 100, "clean state must show 100");
     }
 
     #[test]
@@ -204,6 +205,16 @@ mod tests {
         assert_ne!(result.status, "ok");
         assert!(result.requires_review);
         assert_eq!(result.data["count"], 2);
+        assert!(
+            result.score < 100,
+            "score must reflect issues exist (got {})",
+            result.score
+        );
+        assert!(
+            result.score >= 50,
+            "score must stay above floor (got {})",
+            result.score
+        );
         let atoms = result.data["affected_atoms"].as_array().unwrap();
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[0]["id"], "atom-bp-1");

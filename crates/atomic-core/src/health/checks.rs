@@ -430,13 +430,17 @@ pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
 /// This check does NOT affect the overall score (not in CHECK_WEIGHTS).
 /// Fix: re-chunk excluding boilerplate sections, or re-embed with a unique-content prefix.
 pub fn boilerplate_pollution(raw: &HealthRawData) -> HealthCheckResult {
-    let count = raw.boilerplate_affected_atoms.len() as i32;
+    let count = raw.boilerplate_affected_atoms.len() as u32;
     let status = if count == 0 { "ok" } else { "warning" };
+    // Score reflects detection health: 0 affected = 100, degrades ~3/atom, floor at 50.
+    // Does NOT contribute to overall KB score (excluded from CHECK_WEIGHTS),
+    // but row-level score now matches user expectation: if there are issues,
+    // the score should not be 100.
+    let score: u32 = 100u32.saturating_sub(count.saturating_mul(3).min(50)).max(50);
 
     HealthCheckResult {
         status: status.to_string(),
-        // Always 100 — diagnostic only, does not affect overall KB score.
-        score: 100,
+        score,
         auto_fixable: false,
         requires_review: count > 0,
         fix_action: None,

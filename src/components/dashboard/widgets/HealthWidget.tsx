@@ -201,6 +201,57 @@ function pendingActions(report: HealthReport, excluded: Set<string>): { label: s
   return actions;
 }
 
+function manualOnlyCategories(report: HealthReport): { label: string; check: string; reason?: string }[] {
+  const items: { label: string; check: string; reason?: string }[] = [];
+  for (const key of CHECK_ORDER) {
+    const check = report.checks[key];
+    if (!check || check.status === 'ok') continue;
+    if (check.auto_fixable) continue;
+    items.push({
+      label: CHECK_LABELS[key] ?? key,
+      check: key,
+      reason: check.requires_review ? 'manual review only' : 'no auto-fix available',
+    });
+  }
+  return items;
+}
+
+function extractExamples(check: HealthCheckResult): string[] {
+  const d = check.data as Record<string, unknown> | undefined;
+  if (!d) return [];
+  const out: string[] = [];
+  const asEntry = (v: unknown): string | null => {
+    if (typeof v === 'string') return v;
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if (typeof o.title === 'string') return o.title;
+      if (typeof o.label === 'string') return o.label;
+      if (typeof o.name === 'string') return o.name;
+      if (typeof o.a === 'string' && typeof o.b === 'string') return `${o.a} ↔ ${o.b}`;
+      if (typeof o.atom_a_title === 'string' && typeof o.atom_b_title === 'string') {
+        const sim = typeof o.similarity === 'number' ? ` (${Math.round(o.similarity * 100)}% similar)` : '';
+        return `${o.atom_a_title} ↔ ${o.atom_b_title}${sim}`;
+      }
+      if (typeof o.content === 'string') return (o.content as string).slice(0, 80);
+    }
+    return null;
+  };
+  const tryList = (v: unknown): void => {
+    if (!Array.isArray(v)) return;
+    for (const item of v) {
+      if (out.length >= 2) break;
+      const s = asEntry(item);
+      if (s) out.push(s);
+    }
+  };
+  tryList(d.pairs);
+  if (out.length < 2) tryList(d.affected_atoms);
+  if (out.length < 2) tryList(d.samples);
+  if (out.length < 2) tryList(d.items);
+  if (out.length < 2) tryList(d.atoms);
+  return out;
+}
+
 function extractCount(check: HealthCheckResult): number {
   const d = check.data;
   if (typeof d?.count === 'number') return d.count as number;
@@ -317,15 +368,32 @@ export function HealthPanel() {
   // Checks excluded from the batch fix
   const [excludedFromFix, setExcludedFromFix] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER);
+  // Session-scoped baseline: captures the overall score on first load.
+  const [sessionStartScore, setSessionStartScore] = useState<number | null>(null);
+  // Per-check lastCheckedAt (wall clock, millis) and transient pulse set.
+  const [lastCheckedAt, setLastCheckedAt] = useState<Record<string, number>>({});
+  const [recentlyUpdated, setRecentlyUpdated] = useState<Set<string>>(new Set());
+  // Global scan in-flight (refresh all)—disables per-row run buttons.
+  const [globalScanInFlight, setGlobalScanInFlight] = useState(false);
   const fetchHealth = useCallback(async () => {
     try {
       setError(null);
+      setGlobalScanInFlight(true);
       const data = await getTransport().invoke<HealthReport>('get_health_knowledge', {});
       setReport(data);
+      setSessionStartScore(prev => (prev === null ? data.overall_score : prev));
+      // Stamp every check we just received.
+      const now = Date.now();
+      setLastCheckedAt(prev => {
+        const next = { ...prev };
+        for (const k of Object.keys(data.checks)) next[k] = now;
+        return next;
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load health data');
     } finally {
       setLoading(false);
+      setGlobalScanInFlight(false);
     }
   }, []);
 
@@ -375,6 +443,16 @@ export function HealthPanel() {
         if (!prev) return prev;
         return { ...prev, checks: { ...prev.checks, [checkName]: result } };
       });
+      setLastCheckedAt(prev => ({ ...prev, [checkName]: Date.now() }));
+      // Flash the row briefly to signal the update.
+      setRecentlyUpdated(prev => new Set(prev).add(checkName));
+      window.setTimeout(() => {
+        setRecentlyUpdated(prev => {
+          const next = new Set(prev);
+          next.delete(checkName);
+          return next;
+        });
+      }, 1200);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Check failed');
     } finally {
@@ -384,19 +462,21 @@ export function HealthPanel() {
 
   const runFix = () => setShowConfirm(true);
 
-  const applyFix = async () => {
+  const applyFix = async (selectedChecks?: string[]) => {
     setShowConfirm(false);
     setFixing(true);
     setShowPending(false);
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
     setUndoToast(null);
     try {
-      const checksToFix = report
-        ? CHECK_ORDER.filter(k => {
-            const c = report.checks[k];
-            return c && c.status !== 'ok' && c.auto_fixable && !excludedFromFix.has(k);
-          })
-        : undefined;
+      const checksToFix = selectedChecks && selectedChecks.length > 0
+        ? selectedChecks
+        : report
+          ? CHECK_ORDER.filter(k => {
+              const c = report.checks[k];
+              return c && c.status !== 'ok' && c.auto_fixable && !excludedFromFix.has(k);
+            })
+          : undefined;
       const resp = await getTransport().invoke<FixResponse>('run_health_fix', {
         mode: 'auto',
         include_medium: false,
@@ -436,6 +516,7 @@ export function HealthPanel() {
   // Compute these before early returns so keyboard handler can reference them
   const issueChecks = report ? getVisibleChecks(report, filter) : [];
   const pending: PendingFix[] = report ? pendingActions(report, excludedFromFix) : [];
+  const manualOnly = report ? manualOnlyCategories(report) : [];
   const review = report ? reviewItems(report) : [];
 
   // Keyboard shortcuts
@@ -534,6 +615,19 @@ export function HealthPanel() {
             <span className={`text-2xl font-bold ${statusColor}`}>{report.overall_score}</span>
             <span className="text-gray-500 text-sm">/100</span>
           </div>
+          {sessionStartScore !== null && sessionStartScore !== report.overall_score && (() => {
+            const delta = report.overall_score - sessionStartScore;
+            const sign = delta > 0 ? '+' : '';
+            const color = delta > 0 ? 'text-green-400' : 'text-red-400';
+            return (
+              <p
+                className={`text-[11px] ${color} mt-0.5`}
+                title={`Score at session start: ${sessionStartScore}`}
+              >
+                {sign}{delta} today
+              </p>
+            );
+          })()}
         </div>
       </div>
 
@@ -583,6 +677,16 @@ export function HealthPanel() {
               Clear
             </button>
           )}
+          <span
+            className="text-xs text-gray-600 ml-auto"
+            aria-live="polite"
+            title="Visible checks after filtering"
+          >
+            Showing {issueChecks.length} of {CHECK_ORDER.filter(k => {
+              const c = report.checks[k];
+              return c && c.status !== 'ok';
+            }).length} categories
+          </span>
         </div>
       )}
       {/* Per-check rows */}
@@ -608,6 +712,11 @@ export function HealthPanel() {
                 onToggleInclude={toggleIncludeInFix}
                 trend={getTrend(check.score, report.previous_check_scores?.[key])}
                 severityBadge={getSeverityBadge(check.score)}
+                previousScore={report.previous_check_scores?.[key]}
+                lastCheckedAt={lastCheckedAt[key]}
+                disableRun={globalScanInFlight}
+                justUpdated={recentlyUpdated.has(key)}
+                examples={extractExamples(check)}
               />
             );
           })}
@@ -702,6 +811,7 @@ export function HealthPanel() {
       {showConfirm && report && (
         <HealthConfirmModal
           pending={pending}
+          manualOnly={manualOnly}
           currentScore={report.overall_score}
           onConfirm={applyFix}
           onCancel={() => setShowConfirm(false)}
