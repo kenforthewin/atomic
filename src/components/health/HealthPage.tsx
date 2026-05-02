@@ -2,9 +2,8 @@ import { useState } from 'react';
 import { HeartPulse, RefreshCw } from 'lucide-react';
 import { HealthPanel } from '../dashboard/widgets/HealthWidget';
 import { TagStructureTab } from './TagStructureTab';
-import { HealthConfigTab } from './HealthConfigTab';
 
-type HealthTab = 'overview' | 'tags' | 'config';
+type HealthTab = 'overview' | 'tags';
 
 export function HealthPage() {
   const [activeTab, setActiveTab] = useState<HealthTab>('overview');
@@ -39,7 +38,6 @@ export function HealthPage() {
         {([
           ['overview', 'Overview & Review Queue'],
           ['tags', 'Tag Structure'],
-          ['config', 'Configure'],
         ] as const).map(([tab, label]) => (
           <button
             key={tab}
@@ -66,11 +64,6 @@ export function HealthPage() {
         {activeTab === 'tags' && (
           <div className="max-w-4xl mx-auto p-6">
             <TagStructureTab />
-          </div>
-        )}
-        {activeTab === 'config' && (
-          <div className="max-w-4xl mx-auto p-6">
-            <HealthConfigTab onSaved={() => setRefreshKey(k => k + 1)} />
           </div>
         )}
       </div>
