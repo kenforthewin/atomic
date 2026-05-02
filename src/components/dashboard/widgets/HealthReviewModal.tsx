@@ -289,6 +289,46 @@ function PairRow({
     onResolve(pair);
   };
 
+  const verifyWithLlm = async () => {
+    setStatus('loading');
+    setAppliedAction(null);
+    const result = await runReviewAction({
+      label: 'Verify with LLM',
+      command: 'apply_health_item_fix',
+      args: {
+        check: 'content_overlap',
+        item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
+        action: 'verify_with_llm',
+      },
+    }) as { is_duplicate: boolean; reason: string } | undefined;
+    if (result === undefined) { setStatus('idle'); return; }
+    if (!result.is_duplicate) {
+      toast.info('Not a duplicate — dismissed', { detail: result.reason });
+      setStatus('done');
+      onResolve(pair);
+    } else {
+      toast.info('Confirmed duplicate: ' + result.reason);
+      setStatus('idle');
+    }
+  };
+
+  const mergeWithLlm = async () => {
+    setStatus('loading');
+    setAppliedAction('merge_with_llm');
+    const ok = await runReviewAction({
+      label: 'Merge with LLM',
+      command: 'apply_health_item_fix',
+      args: {
+        check: 'content_overlap',
+        item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
+        action: 'merge_with_llm',
+      },
+    });
+    if (ok === undefined) { setStatus('idle'); setAppliedAction(null); return; }
+    setStatus('done');
+    onResolve(pair);
+  };
+
   if (status === 'done') {
     const labels: Record<string, string> = {
       merge_with_llm: 'Merged — LLM synthesised both atoms into one',
@@ -391,11 +431,28 @@ function PairRow({
           />
           <ActionBtn
             icon={<GitMerge className="w-3 h-3" />}
+            label="Merge with LLM"
+            title="LLM merges both atoms into one reconciled document"
+            loading={status === 'loading' && appliedAction === 'merge_with_llm'}
+            disabled={status === 'loading'}
+            onClick={mergeWithLlm}
+          />
+          <ActionBtn
+            icon={<GitMerge className="w-3 h-3" />}
             label="Merge…"
             title="Open an editor to combine both atoms, then delete the loser"
             loading={loadingContent && !expanded}
             disabled={status === 'loading'}
             onClick={openMerge}
+          />
+          <ActionBtn
+            icon={<Check className="w-3 h-3" />}
+            label="Verify with LLM"
+            title="Ask the LLM whether this is a real duplicate"
+            loading={status === 'loading' && appliedAction === null && status === 'loading'}
+            disabled={status === 'loading'}
+            onClick={verifyWithLlm}
+            variant="outline"
           />
         </div>
 
@@ -429,7 +486,7 @@ function ActionBtn({
 }: {
   icon: React.ReactNode; label: string; title: string;
   loading: boolean; disabled: boolean; onClick: () => void;
-  variant?: 'default' | 'danger';
+  variant?: 'default' | 'danger' | 'outline';
 }) {
   return (
     <button
@@ -441,6 +498,8 @@ function ActionBtn({
         'disabled:opacity-40 disabled:cursor-not-allowed',
         variant === 'danger'
           ? 'bg-[#2a1a1a] hover:bg-red-900/30 text-red-400 border border-red-900/20'
+          : variant === 'outline'
+          ? 'border border-purple-600/40 text-purple-400 hover:bg-purple-600/10'
           : 'bg-[#2a2a2a] hover:bg-[#333] text-gray-300 border border-white/5',
       ].join(' ')}
     >
@@ -620,6 +679,54 @@ function ContradictionRow({ pair, onDismissed }: { pair: ContradictionPair; onDi
     onDismissed?.();
   };
 
+  const [verifyingLlm, setVerifyingLlm] = useState(false);
+  const verifyWithLlm = async () => {
+    setVerifyingLlm(true);
+    try {
+      const result = await runReviewAction({
+        label: 'Verify with LLM',
+        command: 'apply_health_item_fix',
+        args: {
+          check: 'contradiction_detection',
+          item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
+          action: 'verify_with_llm',
+        },
+      }) as { is_real: boolean; reason: string } | undefined;
+      if (result === undefined) return;
+      if (!result.is_real) {
+        toast.info('Not a real contradiction — dismissed', { detail: result.reason });
+        setDismissed(true);
+        onDismissed?.();
+      } else {
+        toast.info('Confirmed contradiction: ' + result.reason);
+      }
+    } finally {
+      setVerifyingLlm(false);
+    }
+  };
+
+  const [resolvingLlm, setResolvingLlm] = useState(false);
+  const resolveWithLlm = async () => {
+    setResolvingLlm(true);
+    try {
+      const ok = await runReviewAction({
+        label: 'Resolve with LLM',
+        command: 'apply_health_item_fix',
+        args: {
+          check: 'contradiction_detection',
+          item_id: `${pair.atom_a.id <= pair.atom_b.id ? pair.atom_a.id : pair.atom_b.id}__${pair.atom_a.id <= pair.atom_b.id ? pair.atom_b.id : pair.atom_a.id}`,
+          action: 'merge_with_llm',
+        },
+      });
+      if (ok === undefined) return;
+      toast.success('Contradiction resolved — atoms merged by LLM');
+      setDismissed(true);
+      onDismissed?.();
+    } finally {
+      setResolvingLlm(false);
+    }
+  };
+
   const simPct = Math.round(pair.similarity * 100);
   const simColor = simPct >= 88 ? 'text-orange-400' : 'text-yellow-400';
 
@@ -670,6 +777,26 @@ function ContradictionRow({ pair, onDismissed }: { pair: ContradictionPair; onDi
               {loadingSummary ? 'Summarising…' : summary ? 'Summary below' : 'Summarise'}
             </button>
             <button onClick={defer} className="hover:text-gray-300" title="Hide this pair for 7 days">Flag for later</button>
+            <button
+              onClick={verifyWithLlm}
+              disabled={verifyingLlm || resolvingLlm}
+              className="hover:text-gray-300 disabled:opacity-40 inline-flex items-center gap-1"
+              title="Ask LLM if this is a real contradiction"
+              aria-label="Verify with LLM"
+            >
+              {verifyingLlm ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+              Verify (LLM)
+            </button>
+            <button
+              onClick={resolveWithLlm}
+              disabled={verifyingLlm || resolvingLlm}
+              className="text-purple-400 hover:text-purple-300 disabled:opacity-40 inline-flex items-center gap-1 font-medium"
+              title="LLM merges both atoms into one reconciled document"
+              aria-label="Resolve with LLM"
+            >
+              {resolvingLlm ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+              Resolve (LLM)
+            </button>
             <button
               onClick={toggleExpand}
               className="flex items-center gap-0.5 hover:text-gray-400 transition-colors"
@@ -1315,6 +1442,47 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     }
   };
 
+  const [verifyOverlapBusy, setVerifyOverlapBusy] = useState(false);
+  const verifyAllOverlap = async () => {
+    const allPairIds = visibleOverlapPairs.map(p => p.pair_id);
+    if (allPairIds.length === 0) return;
+    setVerifyOverlapBusy(true);
+    try {
+      const resp = await getTransport().invoke<{ checked: number; kept: number; dismissed_ids: string[] }>(
+        'health_verify_batch',
+        { check: 'content_overlap', item_ids: allPairIds, max: 25 },
+      );
+      const dismissedSet = new Set(resp.dismissed_ids);
+      setOverlapRemoved(prev => { const next = new Set(prev); dismissedSet.forEach(id => next.add(id)); return next; });
+      resp.dismissed_ids.forEach(() => { bumpResolved('content_overlap'); onResolved(); });
+      toast.info(`Verified ${resp.checked}, dismissed ${resp.dismissed_ids.length} false positive${resp.dismissed_ids.length !== 1 ? 's' : ''}.`);
+      rescanTab('content_overlap');
+    } catch (err) {
+      toast.error('Verify all failed', { detail: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setVerifyOverlapBusy(false);
+    }
+  };
+
+  const [verifyContradictionBusy, setVerifyContradictionBusy] = useState(false);
+  const verifyAllContradictions = async () => {
+    const contradictionPairs = (contradictionData?.pairs as ContradictionPair[] | undefined) ?? [];
+    const allPairIds = contradictionPairs.map((p: ContradictionPair) =>`${p.atom_a.id <= p.atom_b.id ? p.atom_a.id : p.atom_b.id}__${p.atom_a.id <= p.atom_b.id ? p.atom_b.id : p.atom_a.id}`);
+    if (allPairIds.length === 0) return;
+    setVerifyContradictionBusy(true);
+    try {
+      const resp = await getTransport().invoke<{ checked: number; kept: number; dismissed_ids: string[] }>(
+        'health_verify_batch',
+        { check: 'contradiction_detection', item_ids: allPairIds, max: 25 },
+      );
+      toast.info(`Verified ${resp.checked}, dismissed ${resp.dismissed_ids.length} false positive${resp.dismissed_ids.length !== 1 ? 's' : ''}.`);
+      rescanTab('contradiction_detection');
+    } catch (err) {
+      toast.error('Verify all contradictions failed', { detail: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setVerifyContradictionBusy(false);
+    }
+  };
   // Markdown export
   const [copiedFlash, setCopiedFlash] = useState(false);
   const copyAsMarkdown = async () => {
@@ -1429,6 +1597,17 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 Use <strong className="text-gray-300">Keep both</strong> for complementary perspectives,{' '}
                 <strong className="text-gray-300">Merge</strong> for true duplicates.
               </p>
+              <div className="flex justify-end pb-1">
+                <button
+                  onClick={verifyAllOverlap}
+                  disabled={verifyOverlapBusy || visibleOverlapPairs.length === 0}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-purple-600/40 text-purple-400 hover:bg-purple-600/10 rounded transition-colors disabled:opacity-40"
+                  aria-label="Verify all overlap pairs with LLM"
+                >
+                  {verifyOverlapBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                  {verifyOverlapBusy ? 'Verifying…' : 'Verify all pairs (LLM)'}
+                </button>
+              </div>
               <div className="relative pb-12">
                 <div className="space-y-2">
                   {visibleOverlapPairs.length > 50
@@ -1489,6 +1668,17 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 resolvedToday={resolvedByTab['contradiction_detection'] ?? 0}
                 initialQueueSize={initialSizes['contradiction_detection'] ?? 0}
               />
+              <div className="flex justify-end pb-1">
+                <button
+                  onClick={verifyAllContradictions}
+                  disabled={verifyContradictionBusy}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-purple-600/40 text-purple-400 hover:bg-purple-600/10 rounded transition-colors disabled:opacity-40"
+                  aria-label="Verify all contradictions with LLM"
+                >
+                  {verifyContradictionBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                  {verifyContradictionBusy ? 'Verifying…' : 'Verify all contradictions (LLM)'}
+                </button>
+              </div>
               <ContradictionSection data={contradictionData} onResolved={() => bumpResolved('contradiction_detection')} />
             </>
           )}

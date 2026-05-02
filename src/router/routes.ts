@@ -17,7 +17,7 @@ export type ParsedRoute =
   | { kind: 'graph'; atomId: string; tagId: string | null }
   | { kind: 'wiki-reader'; tagId: string; tagName: string | null };
 
-const VIEW_MODES: ViewMode[] = ['dashboard', 'atoms', 'canvas', 'wiki'];
+const VIEW_MODES: ViewMode[] = ['dashboard', 'atoms', 'canvas', 'wiki', 'health'];
 
 /// Build the URL for a base view, preserving the current tag scope.
 export function viewPath(mode: ViewMode, tagId?: string | null): string {

@@ -164,3 +164,99 @@ describe('Content overlap batch selection checkbox', () => {
     expect(screen.queryByText(/1 selected/)).toBeNull();
   });
 });
+
+describe('PairRow — Verify with LLM (content_overlap)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    document.body.innerHTML = '';
+  });
+
+  it('Verify with LLM button dispatches verify_with_llm action', async () => {
+    mockInvoke.mockResolvedValue({ is_duplicate: true, reason: 'Same content' });
+    render(
+      <HealthReviewModal
+        report={makeReport()}
+        checkName="content_overlap"
+        onClose={vi.fn()}
+        onResolved={vi.fn()}
+      />
+    );
+    const verifyBtn = screen.getByTitle('Ask the LLM whether this is a real duplicate');
+    await act(async () => { fireEvent.click(verifyBtn); });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'apply_health_item_fix',
+      expect.objectContaining({ action: 'verify_with_llm', check: 'content_overlap' }),
+    );
+  });
+
+  it('Merge with LLM button dispatches merge_with_llm action', async () => {
+    mockInvoke.mockResolvedValue({ status: 'ok' });
+    render(
+      <HealthReviewModal
+        report={makeReport()}
+        checkName="content_overlap"
+        onClose={vi.fn()}
+        onResolved={vi.fn()}
+      />
+    );
+    const mergeBtn = screen.getByTitle('LLM merges both atoms into one reconciled document');
+    await act(async () => { fireEvent.click(mergeBtn); });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'apply_health_item_fix',
+      expect.objectContaining({ action: 'merge_with_llm', check: 'content_overlap' }),
+    );
+  });
+});
+
+describe('ContradictionRow — Verify/Resolve with LLM', () => {
+  const makeContradictionReport = () => makeReport([], [
+    {
+      pair_id: 'cp1',
+      atom_a: { id: 'ca1', title: 'Topic X V1', source: 'https://s1.com', created_at: '2024-01-01T00:00:00Z' },
+      atom_b: { id: 'cb1', title: 'Topic X V2', source: 'https://s2.com', created_at: '2025-01-01T00:00:00Z' },
+      similarity: 0.85,
+      shared_tag_count: 2,
+    },
+  ]);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    document.body.innerHTML = '';
+  });
+
+  it('Verify (LLM) button dispatches verify_with_llm for contradiction', async () => {
+    mockInvoke.mockResolvedValue({ is_real: false, reason: 'Not a real contradiction' });
+    render(
+      <HealthReviewModal
+        report={makeContradictionReport()}
+        checkName="contradiction_detection"
+        onClose={vi.fn()}
+        onResolved={vi.fn()}
+      />
+    );
+    const verifyBtn = screen.getByTitle('Ask LLM if this is a real contradiction');
+    await act(async () => { fireEvent.click(verifyBtn); });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'apply_health_item_fix',
+      expect.objectContaining({ action: 'verify_with_llm', check: 'contradiction_detection' }),
+    );
+  });
+
+  it('Resolve (LLM) button dispatches merge_with_llm for contradiction', async () => {
+    mockInvoke.mockResolvedValue({ status: 'ok' });
+    render(
+      <HealthReviewModal
+        report={makeContradictionReport()}
+        checkName="contradiction_detection"
+        onClose={vi.fn()}
+        onResolved={vi.fn()}
+      />
+    );
+    const resolveBtn = screen.getByTitle('LLM merges both atoms into one reconciled document');
+    await act(async () => { fireEvent.click(resolveBtn); });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'apply_health_item_fix',
+      expect.objectContaining({ action: 'merge_with_llm', check: 'contradiction_detection' }),
+    );
+  });
+});

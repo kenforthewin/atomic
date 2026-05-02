@@ -4,7 +4,7 @@ import { ActivityWidget } from './widgets/ActivityWidget';
 import { NewWikisWidget } from './widgets/NewWikisWidget';
 import { RecentWikisWidget } from './widgets/RecentWikisWidget';
 import { RevisionsWidget } from './widgets/RevisionsWidget';
-import { HealthPanel } from './widgets/HealthWidget';
+import { HealthSummaryCard } from './widgets/HealthSummaryCard';
 
 export type WidgetSpan = 'full' | 'half';
 
@@ -20,5 +20,5 @@ export const dashboardWidgets: DashboardWidget[] = [
   { id: 'new-wikis',   span: 'half', Component: NewWikisWidget },
   { id: 'recent-wikis', span: 'half', Component: RecentWikisWidget },
   { id: 'revisions',   span: 'half', Component: RevisionsWidget },
-  { id: 'health',      span: 'full', Component: HealthPanel },
+  { id: 'health',      span: 'half', Component: HealthSummaryCard },
 ];

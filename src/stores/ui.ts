@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import { navigateTo } from '../router/navigate-ref';
 import { viewPath, atomReaderPath, wikiReaderPath, atomGraphPath } from '../router/routes';
 
-export type ViewMode = 'dashboard' | 'atoms' | 'canvas' | 'wiki';
+export type ViewMode = 'dashboard' | 'atoms' | 'canvas' | 'wiki' | 'health';
 export type AtomsLayout = 'grid' | 'list';
 
 interface LocalGraphState {

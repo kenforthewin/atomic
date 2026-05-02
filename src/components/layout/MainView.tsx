@@ -11,6 +11,7 @@ import {
   BookOpen,
   Search,
   Filter,
+  HeartPulse,
 } from 'lucide-react';
 import { motion, LayoutGroup } from 'motion/react';
 import { AtomGrid } from '../atoms/AtomGrid';
@@ -25,6 +26,7 @@ import { FAB } from '../ui/FAB';
 import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
 import { ChatViewer } from '../chat/ChatViewer';
+import { HealthPage } from '../health/HealthPage';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
 import { useUIStore } from '../../stores/ui';
@@ -263,6 +265,7 @@ export function MainView() {
             <div className="flex items-center gap-1 shrink-0">
               {([
                 ['dashboard', LayoutDashboard, 'Dashboard'],
+                ['health', HeartPulse, 'Knowledge Health'],
                 ['atoms', Library, 'Atoms'],
                 ['canvas', Network, 'Canvas view'],
                 ['wiki', BookOpen, 'Wiki view'],
@@ -430,6 +433,8 @@ export function MainView() {
           />
         ) : viewMode === 'dashboard' ? (
           <DashboardView />
+        ) : viewMode === 'health' ? (
+          <HealthPage />
         ) : viewMode === 'wiki' ? (
           <WikiFullView />
         ) : viewMode === 'canvas' ? (

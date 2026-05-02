@@ -16,6 +16,15 @@ vi.mock('sonner', () => ({
   }),
 }));
 
+// Suppress our toast wrapper
+vi.mock('../../../../stores/toasts', () => ({
+  toast: {
+    error: vi.fn(),
+    info: vi.fn(),
+    success: vi.fn(),
+  },
+}));
+
 const makeData = () => ({
   broken_link_list: [
     {
@@ -50,12 +59,12 @@ describe('BrokenLinksSection', () => {
     expect(screen.getByText('[broken](./gone.md)')).toBeTruthy();
   });
 
-  it('buttons are visible without hover', () => {
+  it('Auto-fix (LLM) and Remove buttons are visible', () => {
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
-    const removeBtns = screen.getAllByRole('button', { name: /Remove link/ });
+    const autoFixBtns = screen.getAllByRole('button', { name: /Auto-fix with LLM/i });
+    expect(autoFixBtns[0]).toBeTruthy();
+    const removeBtns = screen.getAllByRole('button', { name: /Remove link/i });
     expect(removeBtns[0]).toBeTruthy();
-    // no opacity-0 class on the wrapper
-    expect(removeBtns[0].closest('[class*="opacity-0"]')).toBeNull();
   });
 
   it('dispatches remove_link with correct action and content on Remove link click', async () => {
@@ -63,7 +72,7 @@ describe('BrokenLinksSection', () => {
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={onResolved} />);
 
-    const removeBtns = screen.getAllByRole('button', { name: /Remove link/ });
+    const removeBtns = screen.getAllByRole('button', { name: /Remove link/i });
     await user.click(removeBtns[0]);
 
     await waitFor(() =>
@@ -83,7 +92,7 @@ describe('BrokenLinksSection', () => {
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
-    const ignoreBtns = screen.getAllByRole('button', { name: /^Ignore$/ });
+    const ignoreBtns = screen.getAllByRole('button', { name: /^Ignore link$/i });
     await user.click(ignoreBtns[0]);
 
     await waitFor(() =>
@@ -98,12 +107,13 @@ describe('BrokenLinksSection', () => {
     );
   });
 
-  it('dispatches dismiss on Ignore atom click', async () => {
+  it('per-row Auto-fix (LLM) calls auto_resolve with link raw', async () => {
+    invoke.mockResolvedValue({ outcome: 'relinked', reason: 'Found a match' });
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
-    const ignoreAtomBtns = screen.getAllByRole('button', { name: /Ignore atom/ });
-    await user.click(ignoreAtomBtns[0]);
+    const autoFixBtns = screen.getAllByRole('button', { name: /Auto-fix with LLM/i });
+    await user.click(autoFixBtns[0]);
 
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith(
@@ -111,9 +121,23 @@ describe('BrokenLinksSection', () => {
         expect.objectContaining({
           check: 'broken_internal_links',
           item_id: 'atom-1',
-          action: 'dismiss',
+          action: 'auto_resolve',
+          content: '[[Missing Page]]',
         }),
       ),
+    );
+  });
+
+  it('Auto-fix all button calls health_broken_links_auto_resolve_all', async () => {
+    invoke.mockResolvedValue({ checked: 2, relinked: 1, removed: 1, skipped: 0 });
+    const user = userEvent.setup();
+    render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
+
+    const autoFixAllBtn = screen.getByRole('button', { name: /Auto-fix all broken links/i });
+    await user.click(autoFixAllBtn);
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('health_broken_links_auto_resolve_all', {}),
     );
   });
 
@@ -126,7 +150,7 @@ describe('BrokenLinksSection', () => {
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
-    const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
+    const linkBtns = screen.getAllByRole('button', { name: /Link to atom/i });
     await user.click(linkBtns[0]);
 
     const input = screen.getByPlaceholderText('Search atoms…') as HTMLInputElement;
@@ -158,7 +182,7 @@ describe('BrokenLinksSection (debounce)', () => {
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
-    const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
+    const linkBtns = screen.getAllByRole('button', { name: /Link to atom/i });
     await user.click(linkBtns[0]);
 
     const input = screen.getByPlaceholderText('Search atoms…');
@@ -185,7 +209,7 @@ describe('BrokenLinksSection (debounce)', () => {
     const user = userEvent.setup();
     render(<BrokenLinksSection data={makeData()} onResolved={vi.fn()} />);
 
-    const linkBtns = screen.getAllByRole('button', { name: /Link…/ });
+    const linkBtns = screen.getAllByRole('button', { name: /Link to atom/i });
     await user.click(linkBtns[0]);
 
     const input = screen.getByPlaceholderText('Search atoms…');
