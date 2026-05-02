@@ -131,14 +131,6 @@ impl FixTier {
             Self::High => "high",
         }
     }
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "low" => Self::Low,
-            "medium" => Self::Medium,
-            "high" => Self::High,
-            _ => Self::Safe,
-        }
-    }
 }
 
 /// What the caller wants the fix run to do.

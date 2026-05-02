@@ -321,8 +321,7 @@ fn eval_tag_requires(
     }
 
     // Candidate atoms: those carrying at least one of `any_of`.
-    let placeholders_any: String = std::iter::repeat("?")
-        .take(any_of.len())
+    let placeholders_any: String = std::iter::repeat_n("?", any_of.len())
         .collect::<Vec<_>>()
         .join(",");
     let candidate_sql = format!(
@@ -357,8 +356,7 @@ fn eval_tag_requires(
     let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
     let mut tags_by_atom: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     if !ids.is_empty() {
-        let placeholders: String = std::iter::repeat("?")
-            .take(ids.len())
+        let placeholders: String = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -603,7 +601,7 @@ fn eval_require_tag(
         return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
     }
     let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-    let placeholders: String = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders: String = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
     let sql = format!("SELECT atom_id, tag_id FROM atom_tags WHERE atom_id IN ({placeholders})");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {
@@ -795,7 +793,7 @@ fn eval_forbidden_combo(
         return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
     }
     // Every atom is a candidate. Count atoms that carry every required tag.
-    let placeholders: String = std::iter::repeat("?").take(all_of.len()).collect::<Vec<_>>().join(",");
+    let placeholders: String = std::iter::repeat_n("?", all_of.len()).collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT atom_id, COUNT(DISTINCT tag_id) as matched \
          FROM atom_tags \
@@ -824,7 +822,7 @@ fn eval_forbidden_combo(
 
     let mut flagged = Vec::new();
     if !flagged_ids.is_empty() {
-        let placeholders: String = std::iter::repeat("?").take(flagged_ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders: String = std::iter::repeat_n("?", flagged_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, content FROM atoms WHERE id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(flagged_ids.iter()), |row| {
@@ -871,7 +869,7 @@ fn eval_tag_cardinality(
         return Ok(RawOutcome { total_considered: 0, flagged_atoms: Vec::new() });
     }
     let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-    let placeholders: String = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders: String = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
     let sql = format!("SELECT atom_id, COUNT(*) FROM atom_tags WHERE atom_id IN ({placeholders}) GROUP BY atom_id");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().copied()), |row| {

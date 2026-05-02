@@ -443,7 +443,7 @@ pub async fn strip_boilerplate_atom(
         "boilerplate_pollution",
         "strip_boilerplate",
         "medium",
-        Some(&[atom.atom.id.clone()]),
+        Some(std::slice::from_ref(&atom.atom.id)),
         None,
         before_state,
         json!({"new_length": new_content.len()}),
@@ -672,7 +672,7 @@ pub async fn auto_resolve_all_broken_links(
                 break 'outer;
             }
             // Only include unresolved links.
-            let candidate_urls: Vec<String> = link.candidate_source_urls.iter().cloned().collect();
+            let candidate_urls: Vec<String> = link.candidate_source_urls.to_vec();
             let url_map = core
                 .storage()
                 .find_atoms_by_source_urls_sync(candidate_urls)
@@ -1184,7 +1184,7 @@ pub async fn apply_tag_proposal(
                 };
                 let fix_id = audit::log_fix(
                     core, "tag_health", "tag_proposal_rename", "low",
-                    None, Some(&[tag_id.clone()]),
+                    None, Some(std::slice::from_ref(&tag_id)),
                     json!({"tag_id": tag_id, "old_name": old_name}),
                     json!({"new_name": new_name, "reason": reason, "detail": detail}),
                     None, None,
@@ -1211,7 +1211,7 @@ pub async fn apply_tag_proposal(
                 };
                 let fix_id = audit::log_fix(
                     core, "tag_health", "tag_proposal_reparent", "low",
-                    None, Some(&[tag_id.clone()]),
+                    None, Some(std::slice::from_ref(&tag_id)),
                     json!({"tag_id": tag_id, "tag_name": tag_name}),
                     json!({"new_parent_id": new_parent_id, "reason": reason, "detail": detail}),
                     None, None,
@@ -1232,7 +1232,7 @@ pub async fn apply_tag_proposal(
                 };
                 let fix_id = audit::log_fix(
                     core, "tag_health", "tag_proposal_delete", "medium",
-                    None, Some(&[tag_id.clone()]),
+                    None, Some(std::slice::from_ref(&tag_id)),
                     json!({"tag_id": tag_id, "tag_name": tag_name}),
                     json!({"reason": reason, "detail": detail}),
                     None, None,

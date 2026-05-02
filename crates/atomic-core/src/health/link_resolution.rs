@@ -252,10 +252,10 @@ fn build_href_candidates(href: &str, current_source_url: &str) -> Vec<String> {
     };
     let dir = source_dir(current_source_url);
 
-    let resolved = if href.starts_with("./") {
-        format!("{}{}", dir, &href[2..])
-    } else if href.starts_with("../") {
-        resolve_parent(dir, &href[3..], root)
+    let resolved = if let Some(rest) = href.strip_prefix("./") {
+        format!("{}{}", dir, rest)
+    } else if let Some(rest) = href.strip_prefix("../") {
+        resolve_parent(dir, rest, root)
     } else {
         // Relative to vault root (Obsidian default for bare paths)
         format!("{}{}", root, href)
@@ -270,8 +270,8 @@ fn resolve_parent(current_dir: &str, rest: &str, vault_root: &str) -> String {
         .rfind('/')
         .map(|p| &dir[..p + 1])
         .unwrap_or(vault_root);
-    if rest.starts_with("../") {
-        resolve_parent(parent, &rest[3..], vault_root)
+    if let Some(rest) = rest.strip_prefix("../") {
+        resolve_parent(parent, rest, vault_root)
     } else {
         format!("{}{}", parent, rest)
     }
@@ -302,8 +302,8 @@ fn build_wikilink_exact_candidates(name: &str, current_source_url: &str) -> Vec<
 /// Return the URL itself plus a variant without the `.md` extension (and
 /// vice-versa), so callers can match atoms stored either way.
 fn candidates_with_and_without_extension(url: &str) -> Vec<String> {
-    if url.ends_with(".md") {
-        vec![url.to_string(), url[..url.len() - 3].to_string()]
+    if let Some(stem) = url.strip_suffix(".md") {
+        vec![url.to_string(), stem.to_string()]
     } else {
         vec![url.to_string(), format!("{}.md", url)]
     }
@@ -378,7 +378,7 @@ pub fn apply_link_replacements(content: &str, replacements: &[ResolvedLink]) -> 
             let display = inner.split('|').next().unwrap_or(inner).trim();
             let replacement = format!("[{}]({})", display, new_href);
             result = result.replacen(original.as_str(), &replacement, 1);
-        } else if let (Some(open), Some(close)) = (original.find("]("), original.rfind(')')) {
+        } else if let (Some(open), Some(_close)) = (original.find("]("), original.rfind(')')) {
             // Markdown link → update only the href part
             let display = &original[1..open];
             let replacement = format!("[{}]({})", display, new_href);

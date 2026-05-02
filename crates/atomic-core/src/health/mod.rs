@@ -520,21 +520,20 @@ pub async fn run_fix(
             }
         }
 
-        if should_run("broken_internal_links") {
-            if matches!(checks.get("broken_internal_links"), Some(c) if c.auto_fixable && c.status != "ok") {
+        if should_run("broken_internal_links")
+            && matches!(checks.get("broken_internal_links"), Some(c) if c.auto_fixable && c.status != "ok") {
                 match fixes::fix_broken_internal_links(core, dry_run).await {
                     Ok(Some(action)) => actions_taken.push(action),
                     Ok(None) => tracing::debug!("broken_internal_links: no links to fix"),
                     Err(e) => tracing::warn!(error = %e, "broken_internal_links fix failed"),
                 }
             }
-        }
     }
 
     // --- Medium tier ---
 
-    if matches!(max_tier, FixTier::Medium | FixTier::High) {
-        if should_run("source_uniqueness") {
+    if matches!(max_tier, FixTier::Medium | FixTier::High)
+        && should_run("source_uniqueness") {
             if let Some(check) = checks.get("source_uniqueness") {
                 if check.auto_fixable && check.status != "ok" {
                     match fixes::fix_source_uniqueness(core, &raw, dry_run).await {
@@ -545,7 +544,6 @@ pub async fn run_fix(
                 }
             }
         }
-    }
     // Mark high-tier issues as skipped with reason
     for (check_name, check) in &checks {
         if check.requires_review && check.status != "ok" && !should_run(check_name) {

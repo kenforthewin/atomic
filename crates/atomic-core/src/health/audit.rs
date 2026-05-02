@@ -47,6 +47,7 @@ pub struct StoredHealthReport {
 }
 
 /// Record a fix action in the audit log, returning the generated `id`.
+#[allow(clippy::too_many_arguments)]
 pub async fn log_fix(
     core: &AtomicCore,
     check_name: &str,

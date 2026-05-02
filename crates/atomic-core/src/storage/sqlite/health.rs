@@ -826,7 +826,6 @@ impl SqliteStorage {
         // Try exact stem match under the vault (case-insensitive)
         let like_pattern = format!("%/{}%.md", name.to_lowercase().replace(' ', "-"));
         let alt_pattern  = format!("%/{}%.md", name.to_lowercase().replace(' ', "_"));
-        let direct = format!("{}%.md", vault_prefix);
         let result = conn.query_row(
             "SELECT id, content FROM atoms
              WHERE source_url LIKE ?1 || ?3
@@ -874,7 +873,6 @@ impl SqliteStorage {
 
         // Normalize query: strip extension, directory prefixes, replace hyphens/underscores with spaces.
         let normalized = {
-            let no_ext = q.trim_end_matches(|c: char| c != '/' && c != '.' && c != '\\');
             let no_ext = if let Some(pos) = q.rfind('.') {
                 if pos > 0 && !q[..pos].contains('/') || q[..pos].contains('/') {
                     &q[..pos]
@@ -890,7 +888,7 @@ impl SqliteStorage {
                 no_ext
             };
             let no_prefix = no_dir.trim_start_matches('.').trim_start_matches('/');
-            no_prefix.replace('-', " ").replace('_', " ").to_lowercase()
+            no_prefix.replace(['-', '_'], " ").to_lowercase()
         };
         let nq = normalized.as_str();
 
