@@ -348,7 +348,7 @@ function getVisibleChecks(
 
 // ==================== Main component ====================
 
-export function HealthPanel() {
+export function HealthPanel({ hideTitle = false }: { hideTitle?: boolean } = {}) {
   const [report, setReport] = useState<HealthReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [fixing, setFixing] = useState(false);
@@ -575,7 +575,7 @@ export function HealthPanel() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <h3 className="text-sm font-semibold text-white">Knowledge Health</h3>
+          {!hideTitle && <h3 className="text-sm font-semibold text-white">Knowledge Health</h3>}
           <button
             onClick={fetchHealth}
             className="text-gray-500 hover:text-gray-300 transition-colors"

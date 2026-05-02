@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { HeartPulse, RefreshCw } from 'lucide-react';
+import { HeartPulse } from 'lucide-react';
 import { HealthPanel } from '../dashboard/widgets/HealthWidget';
 import { TagStructureTab } from './TagStructureTab';
 
@@ -7,7 +7,6 @@ type HealthTab = 'overview' | 'tags';
 
 export function HealthPage() {
   const [activeTab, setActiveTab] = useState<HealthTab>('overview');
-  const [refreshKey, setRefreshKey] = useState(0);
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-[var(--color-bg-primary)]">
@@ -22,15 +21,6 @@ export function HealthPage() {
             </p>
           </div>
         </div>
-        <button
-          onClick={() => setRefreshKey(k => k + 1)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors border border-[var(--color-border)]"
-          title="Refresh all checks"
-          aria-label="Refresh health checks"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          Refresh
-        </button>
       </div>
 
       {/* Tabs */}
@@ -58,7 +48,7 @@ export function HealthPage() {
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'overview' && (
           <div className="max-w-4xl mx-auto p-6">
-            <HealthPanel key={refreshKey} />
+            <HealthPanel hideTitle />
           </div>
         )}
         {activeTab === 'tags' && (

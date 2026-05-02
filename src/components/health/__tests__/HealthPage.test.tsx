@@ -27,7 +27,9 @@ vi.mock('../TagStructureTab', () => ({
 }));
 
 vi.mock('../../dashboard/widgets/HealthWidget', () => ({
-  HealthPanel: () => <div data-testid="health-panel">Health Panel</div>,
+  HealthPanel: (props: { hideTitle?: boolean }) => (
+    <div data-testid="health-panel" data-hide-title={String(!!props.hideTitle)}>Health Panel</div>
+  ),
 }));
 
 import { HealthPage } from '../HealthPage';
@@ -58,8 +60,9 @@ describe('HealthPage', () => {
     await waitFor(() => expect(screen.getByTestId('tag-structure-tab')).toBeTruthy());
   });
 
-  it('refresh button is present', () => {
+  it('passes hideTitle to the embedded HealthPanel (own h1 is the page title)', () => {
     render(<HealthPage />);
-    expect(screen.getByRole('button', { name: /Refresh health checks/i })).toBeTruthy();
+    const panel = screen.getByTestId('health-panel');
+    expect(panel.getAttribute('data-hide-title')).toBe('true');
   });
 });
