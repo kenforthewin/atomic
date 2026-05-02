@@ -355,15 +355,16 @@ mod tests {
                        "source_uniqueness", "wiki_coverage", "semantic_graph_freshness",
                        "content_quality", "orphan_tags", "tag_health", "broken_internal_links"] {
             checks_map.insert(name.to_string(), HealthCheckResult {
-                status: "ok".to_string(),
-                score: 100,
-                auto_fixable: false,
-                requires_review: false,
-                fix_action: None,
-                data: serde_json::Value::Null,
-            });
+                        status: "ok".to_string(),
+                        score: 100,
+                        auto_fixable: false,
+                        requires_review: false,
+                        informational: false,
+                        fix_action: None,
+                        data: serde_json::Value::Null,
+                    });
         }
-        let score = crate::health::aggregate_score(&checks_map);
+        let score = crate::health::aggregate_score(&checks_map, None);
         assert_eq!(score, 100);
     }
 
@@ -377,25 +378,124 @@ mod tests {
                        "wiki_coverage", "semantic_graph_freshness",
                        "content_quality", "orphan_tags", "tag_health", "broken_internal_links"] {
             checks_map.insert(name.to_string(), HealthCheckResult {
+                        status: "ok".to_string(),
+                        score: 100,
+                        auto_fixable: false,
+                        requires_review: false,
+                        informational: false,
+                        fix_action: None,
+                        data: serde_json::Value::Null,
+                    });
+        }
+        checks_map.insert("tagging_coverage".to_string(), HealthCheckResult {
+                    status: "error".to_string(),
+                    score: 0,
+                    auto_fixable: true,
+                    requires_review: false,
+                    informational: false,
+                    fix_action: Some("retry_tagging_pipeline".to_string()),
+                    data: serde_json::Value::Null,
+                });
+        let score = crate::health::aggregate_score(&checks_map, None);
+        // tagging = 0.0 * 0.20 + others = 1.0 * 0.80 → 80
+        assert_eq!(score, 80);
+    }
+
+    #[test]
+    fn test_aggregate_score_excludes_informational_by_default() {
+        use std::collections::HashMap;
+        use crate::health::HealthCheckResult;
+        let mut checks_map = HashMap::new();
+        // All default-weighted checks at 100.
+        for name in &["content_overlap", "embedding_coverage", "tagging_coverage",
+                       "source_uniqueness", "semantic_graph_freshness",
+                       "orphan_tags", "tag_health", "broken_internal_links"] {
+            checks_map.insert(name.to_string(), HealthCheckResult {
                 status: "ok".to_string(),
                 score: 100,
                 auto_fixable: false,
                 requires_review: false,
+                informational: false,
                 fix_action: None,
                 data: serde_json::Value::Null,
             });
         }
-        checks_map.insert("tagging_coverage".to_string(), HealthCheckResult {
-            status: "error".to_string(),
+        // An informational check scoring 0 must NOT drag the overall score down
+        // when the user has not assigned it a weight.
+        checks_map.insert("wiki_coverage".to_string(), HealthCheckResult {
+            status: "warning".to_string(),
             score: 0,
-            auto_fixable: true,
+            auto_fixable: false,
             requires_review: false,
-            fix_action: Some("retry_tagging_pipeline".to_string()),
+            informational: true,
+            fix_action: None,
             data: serde_json::Value::Null,
         });
-        let score = crate::health::aggregate_score(&checks_map);
-        // tagging = 0.0 * 0.20 + others = 1.0 * 0.80 → 80
-        assert_eq!(score, 80);
+        let score = crate::health::aggregate_score(&checks_map, None);
+        assert_eq!(score, 100, "informational check at 0 should not affect default score");
+    }
+
+    #[test]
+    fn test_aggregate_score_config_lifts_informational_into_scoring() {
+        use std::collections::HashMap;
+        use crate::health::{HealthCheckResult, HealthConfig, HealthCheckOverride};
+        let mut checks_map = HashMap::new();
+        checks_map.insert("embedding_coverage".to_string(), HealthCheckResult {
+            status: "ok".to_string(),
+            score: 100,
+            auto_fixable: false,
+            requires_review: false,
+            informational: false,
+            fix_action: None,
+            data: serde_json::Value::Null,
+        });
+        checks_map.insert("wiki_coverage".to_string(), HealthCheckResult {
+            status: "warning".to_string(),
+            score: 0,
+            auto_fixable: false,
+            requires_review: false,
+            informational: true,
+            fix_action: None,
+            data: serde_json::Value::Null,
+        });
+        // User explicitly weights wiki_coverage at 0.20 (same as embedding_coverage default).
+        let mut overrides = HashMap::new();
+        overrides.insert("wiki_coverage".to_string(), HealthCheckOverride { enabled: true, weight: Some(0.20) });
+        let config = HealthConfig { overrides };
+        let score = crate::health::aggregate_score(&checks_map, Some(&config));
+        // embedding_coverage (0.20 default) * 100 + wiki_coverage (0.20 override) * 0 → 50
+        assert_eq!(score, 50);
+    }
+
+    #[test]
+    fn test_aggregate_score_config_disabled_check_is_skipped() {
+        use std::collections::HashMap;
+        use crate::health::{HealthCheckResult, HealthConfig, HealthCheckOverride};
+        let mut checks_map = HashMap::new();
+        checks_map.insert("embedding_coverage".to_string(), HealthCheckResult {
+            status: "error".to_string(),
+            score: 0,
+            auto_fixable: false,
+            requires_review: false,
+            informational: false,
+            fix_action: None,
+            data: serde_json::Value::Null,
+        });
+        checks_map.insert("tagging_coverage".to_string(), HealthCheckResult {
+            status: "ok".to_string(),
+            score: 100,
+            auto_fixable: false,
+            requires_review: false,
+            informational: false,
+            fix_action: None,
+            data: serde_json::Value::Null,
+        });
+        let mut overrides = HashMap::new();
+        // Disable embedding_coverage; its 0 score must not drag the overall down.
+        overrides.insert("embedding_coverage".to_string(), HealthCheckOverride { enabled: false, weight: None });
+        let config = HealthConfig { overrides };
+        let score = crate::health::aggregate_score(&checks_map, Some(&config));
+        assert_eq!(score, 100);
     }
 
     // --- boilerplate_indices integration ---
@@ -433,20 +533,21 @@ mod tests {
         use crate::health::{apply_dismissals, pair_key, HealthCheckResult};
         use std::collections::HashSet;
         let mut result = HealthCheckResult {
-            status: "warning".into(),
-            score: 60,
-            auto_fixable: false,
-            requires_review: true,
-            fix_action: None,
-            data: serde_json::json!({
-                "count": 2,
-                "cross_source_overlaps": 2,
-                "pairs": [
-                    {"atom_a": {"id": "a1"}, "atom_b": {"id": "b1"}},
-                    {"atom_a": {"id": "a2"}, "atom_b": {"id": "b2"}},
-                ]
-            }),
-        };
+                    status: "warning".into(),
+                    score: 60,
+                    auto_fixable: false,
+                    requires_review: true,
+                    informational: false,
+                    fix_action: None,
+                    data: serde_json::json!({
+                        "count": 2,
+                        "cross_source_overlaps": 2,
+                        "pairs": [
+                            {"atom_a": {"id": "a1"}, "atom_b": {"id": "b1"}},
+                            {"atom_a": {"id": "a2"}, "atom_b": {"id": "b2"}},
+                        ]
+                    }),
+                };
         let mut dismissed = HashSet::new();
         dismissed.insert(pair_key("a1", "b1"));
         apply_dismissals("content_overlap", &mut result, &dismissed);
@@ -461,23 +562,24 @@ mod tests {
         use crate::health::{apply_dismissals, HealthCheckResult};
         use std::collections::HashSet;
         let mut result = HealthCheckResult {
-            status: "warning".into(),
-            score: 70,
-            auto_fixable: false,
-            requires_review: true,
-            fix_action: None,
-            data: serde_json::json!({
-                "issues": {
-                    "no_source": {
-                        "count": 2,
-                        "atoms": [
-                            {"id": "a1", "title": "A"},
-                            {"id": "a2", "title": "B"}
-                        ]
-                    }
-                }
-            }),
-        };
+                    status: "warning".into(),
+                    score: 70,
+                    auto_fixable: false,
+                    requires_review: true,
+                    informational: false,
+                    fix_action: None,
+                    data: serde_json::json!({
+                        "issues": {
+                            "no_source": {
+                                "count": 2,
+                                "atoms": [
+                                    {"id": "a1", "title": "A"},
+                                    {"id": "a2", "title": "B"}
+                                ]
+                            }
+                        }
+                    }),
+                };
         let mut dismissed = HashSet::new();
         dismissed.insert("a1".to_string());
         apply_dismissals("content_quality", &mut result, &dismissed);
@@ -492,19 +594,20 @@ mod tests {
         use crate::health::{apply_dismissals, HealthCheckResult};
         use std::collections::HashSet;
         let mut result = HealthCheckResult {
-            status: "warning".into(),
-            score: 80,
-            auto_fixable: false,
-            requires_review: true,
-            fix_action: None,
-            data: serde_json::json!({
-                "rootless_tags": 2,
-                "rootless_tag_list": [
-                    {"id": "t1", "name": "Foo", "atom_count": 3},
-                    {"id": "t2", "name": "Bar", "atom_count": 1}
-                ]
-            }),
-        };
+                    status: "warning".into(),
+                    score: 80,
+                    auto_fixable: false,
+                    requires_review: true,
+                    informational: false,
+                    fix_action: None,
+                    data: serde_json::json!({
+                        "rootless_tags": 2,
+                        "rootless_tag_list": [
+                            {"id": "t1", "name": "Foo", "atom_count": 3},
+                            {"id": "t2", "name": "Bar", "atom_count": 1}
+                        ]
+                    }),
+                };
         let mut dismissed = HashSet::new();
         dismissed.insert("t1".to_string());
         apply_dismissals("tag_health", &mut result, &dismissed);
@@ -519,13 +622,14 @@ mod tests {
         use crate::health::{apply_dismissals, HealthCheckResult};
         use std::collections::HashSet;
         let mut result = HealthCheckResult {
-            status: "warning".into(),
-            score: 60,
-            auto_fixable: false,
-            requires_review: true,
-            fix_action: None,
-            data: serde_json::json!({"count": 1, "pairs": [{"atom_a": {"id": "a"}, "atom_b": {"id": "b"}}]}),
-        };
+                    status: "warning".into(),
+                    score: 60,
+                    auto_fixable: false,
+                    requires_review: true,
+                    informational: false,
+                    fix_action: None,
+                    data: serde_json::json!({"count": 1, "pairs": [{"atom_a": {"id": "a"}, "atom_b": {"id": "b"}}]}),
+                };
         apply_dismissals("content_overlap", &mut result, &HashSet::new());
         assert_eq!(result.data["pairs"].as_array().unwrap().len(), 1);
     }
@@ -535,16 +639,17 @@ mod tests {
         use crate::health::{apply_dismissals, HealthCheckResult};
         use std::collections::HashSet;
         let mut result = HealthCheckResult {
-            status: "warning".into(),
-            score: 60,
-            auto_fixable: false,
-            requires_review: true,
-            fix_action: None,
-            data: serde_json::json!({
-                "count": 1,
-                "affected_atoms": [{"id": "a1", "title": "x", "clone_count": 3}]
-            }),
-        };
+                    status: "warning".into(),
+                    score: 60,
+                    auto_fixable: false,
+                    requires_review: true,
+                    informational: false,
+                    fix_action: None,
+                    data: serde_json::json!({
+                        "count": 1,
+                        "affected_atoms": [{"id": "a1", "title": "x", "clone_count": 3}]
+                    }),
+                };
         let mut d = HashSet::new();
         d.insert("a1".to_string());
         apply_dismissals("boilerplate_pollution", &mut result, &d);
@@ -1105,5 +1210,106 @@ mod llm_tests {
             .expect("propose_tag_restructure must handle fenced response");
         assert_eq!(proposal.summary, "test");
         assert_eq!(proposal.actions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_atom_locked_persists_and_roundtrips() {
+        let server = MockServer::start().await;
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let atom = core.create_atom(crate::CreateAtomRequest {
+            content: "locked content".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        assert!(!core.is_atom_locked(&atom.atom.id).await.unwrap());
+        core.set_atom_locked(&atom.atom.id, true).await.unwrap();
+        assert!(core.is_atom_locked(&atom.atom.id).await.unwrap());
+
+        // The Atom struct read back from DB must reflect the flag too.
+        let refreshed = core.get_atom(&atom.atom.id).await.unwrap().unwrap();
+        assert!(refreshed.atom.is_locked);
+
+        core.set_atom_locked(&atom.atom.id, false).await.unwrap();
+        assert!(!core.is_atom_locked(&atom.atom.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_strip_boilerplate_atom_refuses_locked() {
+        let server = MockServer::start().await;
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let atom = core.create_atom(crate::CreateAtomRequest {
+            content: "# Book\n\nSource-of-truth content".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        core.set_atom_locked(&atom.atom.id, true).await.unwrap();
+
+        let err = llm_fixes::strip_boilerplate_atom(&core, &atom.atom.id, false)
+            .await
+            .expect_err("locked atom must refuse strip");
+        let msg = format!("{err}");
+        assert!(msg.contains("locked"), "error must mention lock: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_merge_contradicting_pair_refuses_when_either_locked() {
+        let server = MockServer::start().await;
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let a = core.create_atom(crate::CreateAtomRequest {
+            content: "Claim X.".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let b = core.create_atom(crate::CreateAtomRequest {
+            content: "Claim not-X.".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        core.set_atom_locked(&a.atom.id, true).await.unwrap();
+
+        let err = llm_fixes::merge_contradicting_pair(&core, &a.atom.id, &b.atom.id, false)
+            .await
+            .expect_err("must refuse when one atom is locked");
+        assert!(format!("{err}").contains("locked"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_resolve_broken_link_skips_locked() {
+        let server = MockServer::start().await;
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let atom = core.create_atom(crate::CreateAtomRequest {
+            content: "see [x](./x.md)".to_string(),
+            source_url: Some("vault://notes/y.md".to_string()),
+            published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        core.set_atom_locked(&atom.atom.id, true).await.unwrap();
+
+        let outcome = llm_fixes::auto_resolve_broken_link(&core, &atom.atom.id, "[x](./x.md)", "x")
+            .await
+            .expect("must return without error for locked atom");
+        match outcome {
+            llm_fixes::AutoResolveOutcome::Skipped { reason } => {
+                assert!(reason.contains("locked"), "skip reason should mention lock: {reason}");
+            }
+            other => panic!("expected Skipped, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wiki_excluded_tag_ids_roundtrip() {
+        let server = MockServer::start().await;
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+
+        // Empty by default.
+        let loaded = core.get_wiki_excluded_tag_ids().await.unwrap();
+        assert!(loaded.is_empty());
+
+        // Save a set.
+        let ids = vec!["tag-private".to_string(), "tag-draft".to_string()];
+        core.set_wiki_excluded_tag_ids(&ids).await.unwrap();
+        let loaded = core.get_wiki_excluded_tag_ids().await.unwrap();
+        assert_eq!(loaded, ids);
+
+        // Clearing works.
+        core.set_wiki_excluded_tag_ids(&[]).await.unwrap();
+        let loaded = core.get_wiki_excluded_tag_ids().await.unwrap();
+        assert!(loaded.is_empty());
     }
 }

@@ -145,6 +145,17 @@ impl SqliteStorage {
     ) -> StorageResult<(Vec<ChunkWithContext>, i32)> {
         let conn = self.db.read_conn()?;
 
+        // Load per-DB wiki-excluded tag ids from settings (may be empty).
+        let excluded_tag_ids: Vec<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'wiki_excluded_tag_ids'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+
         // Get all descendant tag IDs (including the tag itself)
         let all_tag_ids =
             wiki::get_tag_hierarchy(&conn, tag_id).map_err(|e| AtomicCoreError::Wiki(e))?;
@@ -197,6 +208,7 @@ impl SqliteStorage {
                 centroid,
                 &scoped_atom_ids,
                 max_source_tokens,
+                &excluded_tag_ids,
             )
             .map_err(|e| AtomicCoreError::Wiki(e))?
         } else {
@@ -232,6 +244,17 @@ impl SqliteStorage {
         max_source_tokens: usize,
     ) -> StorageResult<Option<(Vec<ChunkWithContext>, i32)>> {
         let conn = self.db.read_conn()?;
+
+        // Load per-DB wiki-excluded tag ids from settings (may be empty).
+        let excluded_tag_ids: Vec<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'wiki_excluded_tag_ids'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
 
         // Get atoms added after the last update
         let mut new_atom_stmt = conn
@@ -271,6 +294,7 @@ impl SqliteStorage {
                 centroid,
                 &new_atom_id_set,
                 max_source_tokens,
+                &excluded_tag_ids,
             )
             .map_err(|e| AtomicCoreError::Wiki(e))?
         } else {

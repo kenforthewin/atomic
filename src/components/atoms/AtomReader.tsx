@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ChevronDown, Trash2 } from 'lucide-react';
+import { ChevronDown, Trash2, Lock, LockOpen } from 'lucide-react';
 import { openExternalUrl } from '../../lib/platform';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
@@ -380,6 +380,34 @@ function AtomReaderContent({
                     className="text-xs"
                   />
                 </div>
+                <button
+                  onClick={async () => {
+                    const next = !atom.is_locked;
+                    try {
+                      await getTransport().invoke('set_atom_locked', {
+                        atom_id: atom.id,
+                        locked: next,
+                      });
+                      onAtomUpdated?.({ ...atom, is_locked: next });
+                    } catch (err) {
+                      console.error('lock toggle failed', err);
+                    }
+                  }}
+                  className={`shrink-0 p-1.5 rounded transition-colors ${
+                    atom.is_locked
+                      ? 'text-yellow-400 hover:bg-[var(--color-bg-hover)]'
+                      : 'text-[var(--color-text-secondary)] hover:text-yellow-400 hover:bg-[var(--color-bg-hover)]'
+                  }`}
+                  title={atom.is_locked
+                    ? 'Locked — protected from automated health fixes. Click to unlock.'
+                    : 'Unlocked. Click to lock this atom against automated health fixes.'}
+                  aria-label={atom.is_locked ? 'Unlock atom' : 'Lock atom'}
+                  aria-pressed={atom.is_locked}
+                >
+                  {atom.is_locked
+                    ? <Lock className="w-3.5 h-3.5" strokeWidth={2} />
+                    : <LockOpen className="w-3.5 h-3.5" strokeWidth={2} />}
+                </button>
                 <button
                   onClick={() => setShowDeleteModal(true)}
                   className="shrink-0 p-1.5 rounded text-[var(--color-text-secondary)] hover:text-red-400 hover:bg-[var(--color-bg-hover)] transition-colors"

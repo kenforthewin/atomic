@@ -22,6 +22,11 @@ pub struct Atom {
     pub tagging_status: String,   // 'pending', 'processing', 'complete', 'failed', 'skipped'
     pub embedding_error: Option<String>,
     pub tagging_error: Option<String>,
+    /// When true, this atom is protected from automated health-fix mutations
+    /// (strip-boilerplate, auto-merge-duplicate, auto-resolve-contradiction,
+    /// relink-broken-link). It remains readable and manually editable.
+    #[serde(default)]
+    pub is_locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

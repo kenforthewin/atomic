@@ -568,20 +568,21 @@ impl ChunkStore for PostgresStorage {
             .into_iter()
             .map(|r| {
                 let atom = Atom {
-                    id: r.0.clone(),
-                    content: r.1,
-                    title: r.2,
-                    snippet: r.3,
-                    source_url: r.4,
-                    source: r.5,
-                    published_at: r.6,
-                    created_at: r.7,
-                    updated_at: r.8,
-                    embedding_status: r.9,
-                    tagging_status: r.10,
-                    embedding_error: r.11,
-                    tagging_error: r.12,
-                };
+                                id: r.0.clone(),
+                                content: r.1,
+                                title: r.2,
+                                snippet: r.3,
+                                source_url: r.4,
+                                source: r.5,
+                                published_at: r.6,
+                                created_at: r.7,
+                                updated_at: r.8,
+                                embedding_status: r.9,
+                                tagging_status: r.10,
+                                embedding_error: r.11,
+                                tagging_error: r.12,
+                                is_locked: false,
+                            };
                 (r.0, atom)
             })
             .collect();

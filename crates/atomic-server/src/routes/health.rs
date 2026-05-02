@@ -796,3 +796,48 @@ pub async fn get_latest_tag_proposal(db: Db) -> HttpResponse {
         Err(e) => crate::error::error_response(e),
     }
 }
+
+// ==================== Health Config ====================
+
+/// GET /api/health/config
+pub async fn get_health_config(db: Db) -> HttpResponse {
+    match db.0.get_health_config().await {
+        Ok(config) => HttpResponse::Ok().json(config),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+/// PUT /api/health/config
+pub async fn set_health_config(
+    db: Db,
+    body: web::Json<atomic_core::health::HealthConfig>,
+) -> HttpResponse {
+    match db.0.set_health_config(&body.into_inner()).await {
+        Ok(()) => HttpResponse::NoContent().finish(),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+// ==================== Wiki exclusion ====================
+
+#[derive(serde::Deserialize)]
+pub struct SetWikiExcludedTagsBody { pub tag_ids: Vec<String> }
+
+/// GET /api/wiki/excluded-tags
+pub async fn get_wiki_excluded_tags(db: Db) -> HttpResponse {
+    match db.0.get_wiki_excluded_tag_ids().await {
+        Ok(ids) => HttpResponse::Ok().json(serde_json::json!({ "tag_ids": ids })),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+/// PUT /api/wiki/excluded-tags
+pub async fn set_wiki_excluded_tags(
+    db: Db,
+    body: web::Json<SetWikiExcludedTagsBody>,
+) -> HttpResponse {
+    match db.0.set_wiki_excluded_tag_ids(&body.into_inner().tag_ids).await {
+        Ok(()) => HttpResponse::NoContent().finish(),
+        Err(e) => crate::error::error_response(e),
+    }
+}

@@ -122,6 +122,7 @@ pub(crate) fn select_chunks_by_centroid(
     centroid_blob: &[u8],
     scoped_atom_ids: &std::collections::HashSet<String>,
     max_source_tokens: usize,
+    excluded_tag_ids: &[String],
 ) -> Result<Vec<ChunkWithContext>, String> {
     // Fetch more than we need from vec_chunks since we'll filter by scope.
     // Over-fetch by 3x to account for chunks outside the tag hierarchy.
@@ -147,7 +148,7 @@ pub(crate) fn select_chunks_by_centroid(
 
     // Batch-load chunk details for all candidates
     let chunk_ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-    let chunk_details = batch_fetch_chunk_details(conn, &chunk_ids)?;
+    let chunk_details = super::batch_fetch_chunk_details_excluding_tags(conn, &chunk_ids, excluded_tag_ids)?;
 
     // Filter to scoped atoms and fill token budget
     let mut chunks = Vec::new();

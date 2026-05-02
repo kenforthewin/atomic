@@ -80,6 +80,11 @@ pub struct HealthCheckResult {
     pub score: u32,
     pub auto_fixable: bool,
     pub requires_review: bool,
+    /// When true, this check is opinionated ("completeness-style") and does
+    /// NOT contribute to the overall score. Shown as a diagnostic. The user
+    /// can opt-in via health config to give it a non-zero weight.
+    #[serde(default)]
+    pub informational: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_action: Option<String>,
     /// Check-specific numbers, lists, pairs, etc.
@@ -334,20 +339,60 @@ pub struct TagProposal {
     pub generated_at: String,
 }
 
+/// Per-DB health configuration.
+///
+/// Stored as JSON under the `health_config` setting key in each data DB.
+/// Empty / missing → all defaults (informational checks score-excluded,
+/// default-weighted checks use CHECK_WEIGHTS).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HealthConfig {
+    /// Per-check overrides. `enabled: false` suppresses the check entirely;
+    /// `weight: Some(w)` contributes it to the overall score at that weight
+    /// (sum of effective weights is renormalized).
+    #[serde(default)]
+    pub overrides: std::collections::HashMap<String, HealthCheckOverride>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HealthCheckOverride {
+    /// When false, the check is not run and not displayed. Default: true.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// When `Some`, use this weight in the overall score (overrides default
+    /// and lifts informational checks into scoring if > 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+fn default_enabled() -> bool { true }
+
+impl Default for HealthCheckOverride {
+    fn default() -> Self {
+        Self { enabled: true, weight: None }
+    }
+}
+
 // ==================== Orchestrator ====================
 
-/// Check weights. Must sum to 1.0.
+/// Default check weights. Must sum to 1.0.
+///
+/// Design: defaults include only checks that represent near-universal data
+/// integrity problems (coverage of the pipeline, orphaned references, broken
+/// links, accidental duplicates). Opinionated "completeness" checks
+/// (wiki_coverage, content_quality, contradiction_detection, boilerplate_pollution)
+/// are returned with `informational: true` and excluded from the overall score
+/// by default. Users can opt-in to weighting them via per-DB HealthConfig.
 const CHECK_WEIGHTS: &[(&str, f64)] = &[
-    ("content_overlap", 0.15),
-    ("embedding_coverage", 0.15),
+    ("embedding_coverage", 0.20),
     ("tagging_coverage", 0.20),
+    ("orphan_tags", 0.15),
     ("source_uniqueness", 0.10),
-    ("wiki_coverage", 0.10),
     ("semantic_graph_freshness", 0.10),
-    ("content_quality", 0.05),
-    ("orphan_tags", 0.05),
-    ("tag_health", 0.05),
-    ("broken_internal_links", 0.05),
+    ("tag_health", 0.10),
+    ("broken_internal_links", 0.10),
+    ("content_overlap", 0.05),
 ];
 
 /// Run all health checks and return a complete `HealthReport`.
@@ -356,6 +401,10 @@ const CHECK_WEIGHTS: &[(&str, f64)] = &[
 /// detection is a stub (no LLM call) so it won't time out on large graphs.
 pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCoreError> {
     let computed_at = chrono::Utc::now().to_rfc3339();
+
+    // Load per-DB health config (fall back to defaults on error — health
+    // should never fail because of a corrupt config).
+    let config = core.get_health_config().await.unwrap_or_default();
 
     // Fetch all raw data in a single spawn_blocking pass
     let raw = core.storage().health_check_data_sync().await?;
@@ -388,8 +437,17 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
     }
 
 
+    // Drop disabled checks entirely (config-driven).
+    checks.retain(|name, _| {
+        config
+            .overrides
+            .get(name)
+            .map(|o| o.enabled)
+            .unwrap_or(true)
+    });
+
     // Aggregate score
-    let overall_score = aggregate_score(&checks);
+    let overall_score = aggregate_score(&checks, Some(&config));
     let overall_status = HealthStatus::from_score(overall_score).as_str().to_string();
 
     // Count auto-fixable vs requires-review
@@ -555,6 +613,7 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
             score: 100,
             auto_fixable: false,
             requires_review: false,
+            informational: false,
             fix_action: None,
             data: serde_json::json!({ "broken_count": 0, "affected_atoms": 0, "broken_link_list": [], "broken_link_list_truncated": false }),
         });
@@ -658,6 +717,7 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
         score,
         auto_fixable: broken_count > 0,
         requires_review: broken_count > 0,
+        informational: false,
         fix_action: Some("resolve_internal_links".to_string()),
         data: serde_json::json!({
             "broken_count": broken_count,
@@ -668,15 +728,40 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
     })
 }
 
-/// Weighted average of all check scores.
-pub fn aggregate_score(checks: &HashMap<String, HealthCheckResult>) -> u32 {
+/// Weighted average of all check scores, respecting an optional per-DB config.
+///
+/// - Informational checks contribute **only** when the user supplied an
+///   explicit `weight` override via `HealthConfig`.
+/// - Disabled checks (`enabled: false`) contribute nothing.
+/// - Default-weighted checks fall back to `CHECK_WEIGHTS` when the config is
+///   empty, matching the no-config behaviour.
+pub fn aggregate_score(
+    checks: &HashMap<String, HealthCheckResult>,
+    config: Option<&HealthConfig>,
+) -> u32 {
+    let default_weights: HashMap<&str, f64> = CHECK_WEIGHTS.iter().copied().collect();
     let mut total = 0.0_f64;
     let mut weight_sum = 0.0_f64;
-    for (name, weight) in CHECK_WEIGHTS {
-        if let Some(check) = checks.get(*name) {
-            total += (check.score as f64) * weight;
-            weight_sum += weight;
+    for (name, check) in checks {
+        // Respect enabled flag.
+        let override_entry = config.and_then(|c| c.overrides.get(name));
+        if let Some(o) = override_entry {
+            if !o.enabled { continue; }
         }
+        // Effective weight: explicit override wins; else default (0 for informational).
+        let weight = match override_entry.and_then(|o| o.weight) {
+            Some(w) => w,
+            None => {
+                if check.informational {
+                    0.0
+                } else {
+                    default_weights.get(name.as_str()).copied().unwrap_or(0.0)
+                }
+            }
+        };
+        if weight <= 0.0 { continue; }
+        total += (check.score as f64) * weight;
+        weight_sum += weight;
     }
     if weight_sum == 0.0 {
         return 100;
@@ -828,13 +913,15 @@ pub async fn run_fix(
         }
     }
 
-    // Recompute score after fixes (if not dry run)
+    // Recompute score after fixes (if not dry run) — always weight with
+    // the caller DB's current HealthConfig so the number matches compute_health.
+    let config = core.get_health_config().await.unwrap_or_default();
     let new_score = if !dry_run && !actions_taken.is_empty() {
         let new_raw = core.storage().health_check_data_sync().await?;
         let new_checks = checks::run_all(&new_raw);
-        aggregate_score(&new_checks)
+        aggregate_score(&new_checks, Some(&config))
     } else {
-        aggregate_score(&checks)
+        aggregate_score(&checks, Some(&config))
     };
 
     Ok(FixResponse {

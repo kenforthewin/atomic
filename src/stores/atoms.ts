@@ -16,6 +16,7 @@ export interface Atom {
   updated_at: string;
   embedding_status: 'pending' | 'processing' | 'complete' | 'failed';
   tagging_status: 'pending' | 'processing' | 'complete' | 'failed' | 'skipped';
+  is_locked?: boolean;
 }
 
 export interface Tag {

@@ -322,8 +322,13 @@ pub async fn fix_source_uniqueness(
                     .link_tags_to_atom_impl(&keep_id, &tag_list)
                     .await;
             }
-            // Delete duplicates
+            // Delete duplicates — but skip locked atoms so source-of-truth
+            // material never gets automatically merged away.
             for id in &to_delete {
+                if core.is_atom_locked(id).await.unwrap_or(false) {
+                    tracing::info!(id, "skipping locked atom in source-duplicate merge");
+                    continue;
+                }
                 if let Err(e) = core.delete_atom(id).await {
                     tracing::warn!(id, error = %e, "failed to delete source duplicate atom");
                 } else {

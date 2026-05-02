@@ -51,6 +51,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::post().to(atoms::process_atom_pipeline),
     );
     cfg.route("/atoms/{id}", web::delete().to(atoms::delete_atom));
+    cfg.route("/atoms/{id}/lock", web::post().to(atoms::set_atom_locked));
     cfg.route("/atoms/{id}/similar", web::get().to(search::find_similar));
     cfg.route(
         "/atoms/{id}/embedding-status",
@@ -370,4 +371,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/health/tag-proposal", web::post().to(health::create_tag_proposal));
     cfg.route("/health/tag-proposal/latest", web::get().to(health::get_latest_tag_proposal));
     cfg.route("/health/tag-proposal/{proposal_id}/apply", web::post().to(health::apply_tag_proposal));
+    cfg.route("/health/config", web::get().to(health::get_health_config));
+    cfg.route("/health/config", web::put().to(health::set_health_config));
+    cfg.route("/wiki/excluded-tags", web::get().to(health::get_wiki_excluded_tags));
+    cfg.route("/wiki/excluded-tags", web::put().to(health::set_wiki_excluded_tags));
 }

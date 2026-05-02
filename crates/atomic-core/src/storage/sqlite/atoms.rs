@@ -238,6 +238,7 @@ impl SqliteStorage {
             tagging_status: "pending".to_string(),
             embedding_error: None,
             tagging_error: None,
+            is_locked: false,
         };
 
         let tags = {
@@ -320,6 +321,7 @@ impl SqliteStorage {
                     tagging_status: "pending".to_string(),
                     embedding_error: None,
                     tagging_error: None,
+                    is_locked: false,
                 };
 
                 atoms_with_tags.push(AtomWithTags { atom, tags: vec![] });

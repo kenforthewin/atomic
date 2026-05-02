@@ -769,4 +769,29 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: (a: Record<string, unknown>) => `/api/health/tag-proposal/${encodeURIComponent(String(a.proposal_id))}/apply`,
     argsMode: 'body' as const,
   },
+  get_health_config: {
+    method: 'GET' as const,
+    path: '/api/health/config',
+  },
+  set_health_config: {
+    method: 'PUT' as const,
+    path: '/api/health/config',
+    argsMode: 'body' as const,
+  },
+  set_atom_locked: {
+    method: 'POST' as const,
+    path: (a) => `/api/atoms/${encodeURIComponent(String(a.atom_id))}/lock`,
+    argsMode: 'body' as const,
+    transformArgs: (a) => ({ locked: a.locked }),
+  },
+  get_wiki_excluded_tags: {
+    method: 'GET' as const,
+    path: '/api/wiki/excluded-tags',
+  },
+  set_wiki_excluded_tags: {
+    method: 'PUT' as const,
+    path: '/api/wiki/excluded-tags',
+    argsMode: 'body' as const,
+    transformArgs: (a) => ({ tag_ids: a.tag_ids }),
+  },
 };

@@ -82,6 +82,7 @@ impl BriefingStore for PostgresStorage {
                 tagging_status,
                 embedding_error,
                 tagging_error,
+                is_locked: false,
             },
         )
         .collect();

@@ -418,6 +418,22 @@ pub async fn delete_atom(db: Db, path: web::Path<String>) -> HttpResponse {
     ok_or_error(db.0.delete_atom(&id).await)
 }
 
+#[derive(serde::Deserialize)]
+pub struct SetLockedBody { pub locked: bool }
+
+/// POST /api/atoms/{id}/lock — set the lock flag
+pub async fn set_atom_locked(
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<SetLockedBody>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    match db.0.set_atom_locked(&id, body.locked).await {
+        Ok(()) => HttpResponse::NoContent().finish(),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
 // ==================== Tags ====================
 
 #[derive(Deserialize, IntoParams)]

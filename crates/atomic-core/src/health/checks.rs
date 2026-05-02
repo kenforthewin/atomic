@@ -63,19 +63,20 @@ pub fn embedding_coverage(raw: &HealthRawData) -> HealthCheckResult {
         "error"
     };
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: failed > 0 || pending > 0,
-        requires_review: false,
-        fix_action: Some("retry_failed_and_process_pending".to_string()),
-        data: json!({
-            "total": total,
-            "complete": complete,
-            "pending": pending,
-            "processing": processing,
-            "failed": failed
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: failed > 0 || pending > 0,
+            requires_review: false,
+            informational: false,
+            fix_action: Some("retry_failed_and_process_pending".to_string()),
+            data: json!({
+                "total": total,
+                "complete": complete,
+                "pending": pending,
+                "processing": processing,
+                "failed": failed
+            }),
+        }
 }
 
 pub fn tagging_coverage(raw: &HealthRawData) -> HealthCheckResult {
@@ -106,21 +107,22 @@ pub fn tagging_coverage(raw: &HealthRawData) -> HealthCheckResult {
         "error"
     };
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: failed > 0 || pending > 0 || untagged > 0 || skipped_untagged > 0,
-        requires_review: false,
-        fix_action: Some("retry_tagging_pipeline".to_string()),
-        data: json!({
-            "total": total,
-            "tagged": tagged,
-            "untagged_complete": untagged,
-            "skipped_untagged": skipped_untagged,
-            "failed": failed,
-            "pending": pending,
-            "skipped_with_tags": raw.tagging_skipped - skipped_untagged
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: failed > 0 || pending > 0 || untagged > 0 || skipped_untagged > 0,
+            requires_review: false,
+            informational: false,
+            fix_action: Some("retry_tagging_pipeline".to_string()),
+            data: json!({
+                "total": total,
+                "tagged": tagged,
+                "untagged_complete": untagged,
+                "skipped_untagged": skipped_untagged,
+                "failed": failed,
+                "pending": pending,
+                "skipped_with_tags": raw.tagging_skipped - skipped_untagged
+            }),
+        }
 }
 
 pub fn source_uniqueness(raw: &HealthRawData) -> HealthCheckResult {
@@ -139,16 +141,17 @@ pub fn source_uniqueness(raw: &HealthRawData) -> HealthCheckResult {
         })
         .collect();
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: dup_count > 0,
-        requires_review: false,
-        fix_action: Some("merge_exact_source_duplicates".to_string()),
-        data: json!({
-            "count": dup_count,
-            "pairs": pairs
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: dup_count > 0,
+            requires_review: false,
+            informational: false,
+            fix_action: Some("merge_exact_source_duplicates".to_string()),
+            data: json!({
+                "count": dup_count,
+                "pairs": pairs
+            }),
+        }
 }
 
 pub fn orphan_tags(raw: &HealthRawData) -> HealthCheckResult {
@@ -161,13 +164,14 @@ pub fn orphan_tags(raw: &HealthRawData) -> HealthCheckResult {
         .map(|(id, name)| json!({ "id": id, "name": name }))
         .collect();
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: count > 0,
-        requires_review: false,
-        fix_action: Some("delete_orphan_tags".to_string()),
-        data: json!({ "count": count, "tags": tag_list }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: count > 0,
+            requires_review: false,
+            informational: false,
+            fix_action: Some("delete_orphan_tags".to_string()),
+            data: json!({ "count": count, "tags": tag_list }),
+        }
 }
 
 pub fn semantic_graph_freshness(raw: &HealthRawData) -> HealthCheckResult {
@@ -181,17 +185,18 @@ pub fn semantic_graph_freshness(raw: &HealthRawData) -> HealthCheckResult {
         "error"
     };
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: atoms_since > 0,
-        requires_review: false,
-        fix_action: Some("rebuild_semantic_edges".to_string()),
-        data: json!({
-            "last_rebuilt": raw.newest_edge_created_at,
-            "newest_atom": raw.newest_atom_updated_at,
-            "atoms_since_rebuild": atoms_since
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: atoms_since > 0,
+            requires_review: false,
+            informational: false,
+            fix_action: Some("rebuild_semantic_edges".to_string()),
+            data: json!({
+                "last_rebuilt": raw.newest_edge_created_at,
+                "newest_atom": raw.newest_atom_updated_at,
+                "atoms_since_rebuild": atoms_since
+            }),
+        }
 }
 
 pub fn wiki_coverage(raw: &HealthRawData) -> HealthCheckResult {
@@ -234,20 +239,21 @@ pub fn wiki_coverage(raw: &HealthRawData) -> HealthCheckResult {
         .collect();
 
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: without_wiki > 0 || stale > 0,
-        requires_review: false,
-        fix_action: Some("generate_missing_wikis".to_string()),
-        data: json!({
-            "eligible_tags": eligible,
-            "with_wiki": with_wiki,
-            "without_wiki": without_wiki,
-            "stale_wikis": stale,
-            "gaps": gaps,
-            "stale": stale_list
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: without_wiki > 0 || stale > 0,
+            requires_review: false,
+            informational: true,
+            fix_action: Some("generate_missing_wikis".to_string()),
+            data: json!({
+                "eligible_tags": eligible,
+                "with_wiki": with_wiki,
+                "without_wiki": without_wiki,
+                "stale_wikis": stale,
+                "gaps": gaps,
+                "stale": stale_list
+            }),
+        }
 }
 
 pub fn content_quality(raw: &HealthRawData) -> HealthCheckResult {
@@ -269,43 +275,44 @@ pub fn content_quality(raw: &HealthRawData) -> HealthCheckResult {
     let status = if issues == 0 { "ok" } else { "info" };
 
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: !raw.very_short_atoms.is_empty()
-            || !raw.very_long_atoms.is_empty()
-            || !raw.no_heading_atoms.is_empty(),
-        requires_review: !raw.no_source_atoms.is_empty(),
-        fix_action: None,
-        data: json!({
-            "total": raw.total_atoms,
-            "issues": {
-                "very_short": {
-                    "count": raw.very_short_atoms.len(),
-                    "auto_fixable": true,
-                    "atoms": raw.very_short_atoms
-                },
-                "very_long": {
-                    "count": raw.very_long_atoms.len(),
-                    "auto_fixable": true,
-                    "atoms": raw.very_long_atoms
-                },
-                "no_headings": {
-                    "count": raw.no_heading_atoms.len(),
-                    "auto_fixable": true,
-                    "atoms": raw.no_heading_atoms
-                },
-                "no_source": {
-                    "count": raw.no_source_atoms.len(),
-                    "auto_fixable": false,
-                    "atoms": raw.no_source_atoms.iter().map(|a| json!({
-                        "id": a.id,
-                        "title": a.title,
-                        "created_at": a.created_at
-                    })).collect::<Vec<_>>()
+            status: status.to_string(),
+            score,
+            auto_fixable: !raw.very_short_atoms.is_empty()
+                || !raw.very_long_atoms.is_empty()
+                || !raw.no_heading_atoms.is_empty(),
+            requires_review: !raw.no_source_atoms.is_empty(),
+            informational: true,
+            fix_action: None,
+            data: json!({
+                "total": raw.total_atoms,
+                "issues": {
+                    "very_short": {
+                        "count": raw.very_short_atoms.len(),
+                        "auto_fixable": true,
+                        "atoms": raw.very_short_atoms
+                    },
+                    "very_long": {
+                        "count": raw.very_long_atoms.len(),
+                        "auto_fixable": true,
+                        "atoms": raw.very_long_atoms
+                    },
+                    "no_headings": {
+                        "count": raw.no_heading_atoms.len(),
+                        "auto_fixable": true,
+                        "atoms": raw.no_heading_atoms
+                    },
+                    "no_source": {
+                        "count": raw.no_source_atoms.len(),
+                        "auto_fixable": false,
+                        "atoms": raw.no_source_atoms.iter().map(|a| json!({
+                            "id": a.id,
+                            "title": a.title,
+                            "created_at": a.created_at
+                        })).collect::<Vec<_>>()
+                    }
                 }
-            }
-        }),
-    }
+            }),
+        }
 }
 
 pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
@@ -329,6 +336,7 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
         score,
         auto_fixable,
         requires_review: rootless > 0 || similar > 0 || single > 3,
+        informational: false,
         fix_action: None,
         data: json!({
             "single_atom_tags": single,
@@ -380,19 +388,20 @@ pub fn content_overlap(raw: &HealthRawData) -> HealthCheckResult {
         .collect();
 
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: false,
-        requires_review: overlaps > 0,
-        fix_action: None,
-        data: json!({
-            "exact_duplicates": exact_dupes,
-            "template_clones": template_clones,
-            "cross_source_overlaps": overlaps,
-            "count": overlaps,
-            "pairs": pairs
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: false,
+            requires_review: overlaps > 0,
+            informational: false,
+            fix_action: None,
+            data: json!({
+                "exact_duplicates": exact_dupes,
+                "template_clones": template_clones,
+                "cross_source_overlaps": overlaps,
+                "count": overlaps,
+                "pairs": pairs
+            }),
+        }
 }
 
 pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
@@ -401,23 +410,24 @@ pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
     let status = if pair_count == 0 { "ok" } else { "warning" };
 
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: false,
-        requires_review: pair_count > 0,
-        fix_action: None,
-        data: json!({
-            "pairs_checked": raw.contradiction_pairs_checked,
-            "potential_contradictions": pair_count,
-        "pairs": raw.contradiction_pairs.iter().map(|p| json!({
-            "pair_id": p.pair_id,
-            "atom_a": { "id": p.atom_a.id, "title": p.atom_a.title, "source": p.atom_a.source, "created_at": p.atom_a.created_at },
-            "atom_b": { "id": p.atom_b.id, "title": p.atom_b.title, "source": p.atom_b.source, "created_at": p.atom_b.created_at },
-            "similarity": p.similarity,
-            "shared_tag_count": p.shared_tag_count
-        })).collect::<Vec<_>>()
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: false,
+            requires_review: pair_count > 0,
+            informational: true,
+            fix_action: None,
+            data: json!({
+                "pairs_checked": raw.contradiction_pairs_checked,
+                "potential_contradictions": pair_count,
+            "pairs": raw.contradiction_pairs.iter().map(|p| json!({
+                "pair_id": p.pair_id,
+                "atom_a": { "id": p.atom_a.id, "title": p.atom_a.title, "source": p.atom_a.source, "created_at": p.atom_a.created_at },
+                "atom_b": { "id": p.atom_b.id, "title": p.atom_b.title, "source": p.atom_b.source, "created_at": p.atom_b.created_at },
+                "similarity": p.similarity,
+                "shared_tag_count": p.shared_tag_count
+            })).collect::<Vec<_>>()
+            }),
+        }
 }
 
 
@@ -439,22 +449,23 @@ pub fn boilerplate_pollution(raw: &HealthRawData) -> HealthCheckResult {
     let score: u32 = 100u32.saturating_sub(count.saturating_mul(3).min(50)).max(50);
 
     HealthCheckResult {
-        status: status.to_string(),
-        score,
-        auto_fixable: false,
-        requires_review: count > 0,
-        fix_action: None,
-        data: json!({
-            "count": count,
-            "affected_atoms": raw.boilerplate_affected_atoms.iter().map(|a| json!({
-                "id": a.id,
-                "title": a.title,
-                "clone_count": a.clone_count
-            })).collect::<Vec<_>>(),
-            "description": "Atoms with >= 2 near-identical edges (similarity >= 0.99). \
-                             Shared boilerplate text drowns out unique content in their \
-                             embeddings. Semantic search cannot reliably distinguish \
-                             these atoms from each other."
-        }),
-    }
+            status: status.to_string(),
+            score,
+            auto_fixable: false,
+            requires_review: count > 0,
+            informational: true,
+            fix_action: None,
+            data: json!({
+                "count": count,
+                "affected_atoms": raw.boilerplate_affected_atoms.iter().map(|a| json!({
+                    "id": a.id,
+                    "title": a.title,
+                    "clone_count": a.clone_count
+                })).collect::<Vec<_>>(),
+                "description": "Atoms with >= 2 near-identical edges (similarity >= 0.99). \
+                                 Shared boilerplate text drowns out unique content in their \
+                                 embeddings. Semantic search cannot reliably distinguish \
+                                 these atoms from each other."
+            }),
+        }
 }

@@ -381,6 +381,11 @@ pub async fn strip_boilerplate_atom(
     let Some(atom) = core.get_atom(atom_id).await? else {
         return Err(AtomicCoreError::NotFound(format!("atom {atom_id} not found")));
     };
+    if atom.atom.is_locked {
+        return Err(AtomicCoreError::Validation(format!(
+            "atom {atom_id} is locked — unlock it before running automated fixes"
+        )));
+    }
     let prompt = format!(
         "You are editing a knowledge base note. The note may contain boilerplate template \
          sections (headers, field labels, empty placeholders) that are not unique to this topic. \
@@ -522,6 +527,14 @@ pub async fn auto_resolve_broken_link(
     link_raw: &str,
     link_text: &str,
 ) -> Result<AutoResolveOutcome, AtomicCoreError> {
+    // Locked atoms are not auto-rewritten. Skip without error so batch flows
+    // can continue past them.
+    if core.is_atom_locked(atom_id).await.unwrap_or(false) {
+        return Ok(AutoResolveOutcome::Skipped {
+            reason: "atom is locked".to_string(),
+        });
+    }
+
     let candidates = suggest_link_targets(core, link_raw, 8).await?;
 
     if candidates.is_empty() {
@@ -866,6 +879,11 @@ pub async fn merge_contradicting_pair(
     let Some(atom_b) = core.get_atom(atom_b_id).await? else {
         return Err(AtomicCoreError::NotFound(format!("atom {atom_b_id} not found")));
     };
+    if atom_a.atom.is_locked || atom_b.atom.is_locked {
+        return Err(AtomicCoreError::Validation(
+            "one or both atoms are locked — unlock before auto-merging. Contradictions in locked source material should stay recorded as-is.".to_string()
+        ));
+    }
 
     // Newer atom is the keeper
     let (keep, delete) = if atom_a.atom.updated_at >= atom_b.atom.updated_at {

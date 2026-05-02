@@ -50,6 +50,7 @@ impl SqliteStorage {
                     tagging_status: row.get(10)?,
                     embedding_error: row.get(11)?,
                     tagging_error: row.get(12)?,
+                    is_locked: false,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

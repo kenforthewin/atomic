@@ -910,6 +910,22 @@ impl Database {
             )?;
         }
 
+        // --- V19 → V20: atoms.is_locked flag ---
+        //
+        // Locked atoms are protected from automated mutation by health fixes
+        // (strip-boilerplate, auto-merge-duplicate, auto-resolve-contradiction,
+        // relink-broken-link). They remain readable and editable through the
+        // normal UI. Use for source-of-truth material (books, studies, primary
+        // research) where automated "correction" would do more harm than good.
+        if version < 20 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE atoms ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0;
+                PRAGMA user_version = 20;
+                "#,
+            )?;
+        }
+
         // --- Triggers (recreated every startup to stay current) ---
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS atom_tags_insert_count;

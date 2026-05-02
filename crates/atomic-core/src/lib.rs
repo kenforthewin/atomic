@@ -3646,6 +3646,87 @@ impl AtomicCore {
         crate::health::compute_health(self).await
     }
 
+    /// Load this database's `HealthConfig`. Missing/invalid → defaults.
+    ///
+    /// Reads from the per-database `settings` table (NOT the registry), so
+    /// each data DB can have its own config. See `AGENTS.md` § Multi-DB
+    /// Gotchas for why we bypass `AtomicCore::get_setting` here.
+    pub async fn get_health_config(&self) -> Result<crate::health::HealthConfig, AtomicCoreError> {
+        let raw = self.storage().get_setting_sync("health_config").await?;
+        match raw {
+            Some(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+            None => Ok(crate::health::HealthConfig::default()),
+        }
+    }
+
+    /// Persist this database's `HealthConfig`.
+    pub async fn set_health_config(
+        &self,
+        config: &crate::health::HealthConfig,
+    ) -> Result<(), AtomicCoreError> {
+        let json = serde_json::to_string(config)
+            .map_err(|e| AtomicCoreError::Validation(format!("serialize health_config: {e}")))?;
+        self.storage().set_setting_sync("health_config", &json).await
+    }
+
+    /// Set the lock flag on an atom. Locked atoms are protected from automated
+    /// health fixes (strip-boilerplate, merge-duplicate, resolve-contradiction,
+    /// relink-broken-link).
+    pub async fn set_atom_locked(&self, atom_id: &str, locked: bool) -> Result<(), AtomicCoreError> {
+        let sqlite = self.storage.as_sqlite().ok_or_else(|| {
+            AtomicCoreError::Configuration(
+                "Atom lock is not yet supported with Postgres backend".to_string(),
+            )
+        })?;
+        let conn = sqlite.db.conn.lock().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let affected = conn.execute(
+            "UPDATE atoms SET is_locked = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![locked as i64, chrono::Utc::now().to_rfc3339(), atom_id],
+        ).map_err(AtomicCoreError::Database)?;
+        if affected == 0 {
+            return Err(AtomicCoreError::Validation(format!("atom not found: {atom_id}")));
+        }
+        Ok(())
+    }
+
+    /// True when the atom's `is_locked` flag is set. Non-existent atoms return false.
+    pub async fn is_atom_locked(&self, atom_id: &str) -> Result<bool, AtomicCoreError> {
+        let sqlite = self.storage.as_sqlite().ok_or_else(|| {
+            AtomicCoreError::Configuration(
+                "Atom lock is not yet supported with Postgres backend".to_string(),
+            )
+        })?;
+        let conn = sqlite.db.conn.lock().map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let locked: i64 = conn
+            .query_row(
+                "SELECT COALESCE(is_locked, 0) FROM atoms WHERE id = ?1",
+                rusqlite::params![atom_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(locked != 0)
+    }
+
+    /// Load the per-DB list of tag ids to exclude from wiki generation.
+    ///
+    /// Any atom tagged with ANY excluded tag must not be visible to wiki LLM
+    /// prompts. Stored as a JSON array of strings under the per-DB
+    /// `wiki_excluded_tag_ids` setting. Missing/invalid → empty.
+    pub async fn get_wiki_excluded_tag_ids(&self) -> Result<Vec<String>, AtomicCoreError> {
+        let raw = self.storage().get_setting_sync("wiki_excluded_tag_ids").await?;
+        match raw {
+            Some(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Persist the per-DB list of excluded tag ids for wiki generation.
+    pub async fn set_wiki_excluded_tag_ids(&self, tag_ids: &[String]) -> Result<(), AtomicCoreError> {
+        let json = serde_json::to_string(tag_ids)
+            .map_err(|e| AtomicCoreError::Validation(format!("serialize excluded tags: {e}")))?;
+        self.storage().set_setting_sync("wiki_excluded_tag_ids", &json).await
+    }
+
     /// Run auto-fixes up to the requested tier. Returns a `FixResponse` with
     /// actions taken, skipped issues, and the new score.
     pub async fn run_health_fix(
@@ -4219,10 +4300,10 @@ pub(crate) fn parse_source(source_url: &str) -> String {
 }
 
 /// Standard SELECT columns for reading an Atom from the DB.
-pub(crate) const ATOM_COLUMNS: &str = "id, content, title, snippet, source_url, source, published_at, created_at, updated_at, COALESCE(embedding_status, 'pending'), COALESCE(tagging_status, 'pending'), embedding_error, tagging_error";
+pub(crate) const ATOM_COLUMNS: &str = "id, content, title, snippet, source_url, source, published_at, created_at, updated_at, COALESCE(embedding_status, 'pending'), COALESCE(tagging_status, 'pending'), embedding_error, tagging_error, COALESCE(is_locked, 0)";
 
 /// Same columns but table-aliased for JOINs.
-pub(crate) const ATOM_COLUMNS_A: &str = "a.id, a.content, a.title, a.snippet, a.source_url, a.source, a.published_at, a.created_at, a.updated_at, COALESCE(a.embedding_status, 'pending'), COALESCE(a.tagging_status, 'pending'), a.embedding_error, a.tagging_error";
+pub(crate) const ATOM_COLUMNS_A: &str = "a.id, a.content, a.title, a.snippet, a.source_url, a.source, a.published_at, a.created_at, a.updated_at, COALESCE(a.embedding_status, 'pending'), COALESCE(a.tagging_status, 'pending'), a.embedding_error, a.tagging_error, COALESCE(a.is_locked, 0)";
 
 /// Parse an Atom from a row selected with ATOM_COLUMNS.
 pub(crate) fn atom_from_row(row: &rusqlite::Row) -> rusqlite::Result<Atom> {
@@ -4240,6 +4321,7 @@ pub(crate) fn atom_from_row(row: &rusqlite::Row) -> rusqlite::Result<Atom> {
         tagging_status: row.get(10)?,
         embedding_error: row.get(11)?,
         tagging_error: row.get(12)?,
+        is_locked: row.get::<_, i64>(13).unwrap_or(0) != 0,
     })
 }
 

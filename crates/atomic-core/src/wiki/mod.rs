@@ -758,6 +758,28 @@ pub(crate) fn batch_fetch_chunk_details(
     conn: &Connection,
     chunk_ids: &[&str],
 ) -> Result<std::collections::HashMap<String, (String, i32, String)>, String> {
+    batch_fetch_chunk_details_filtered(conn, chunk_ids, &[])
+}
+
+/// Convenience: fetch chunk details and filter out any atom tagged with a
+/// wiki-excluded tag (resolved from the caller-provided list). Same signature
+/// as `batch_fetch_chunk_details` plus the exclusion set.
+pub(crate) fn batch_fetch_chunk_details_excluding_tags(
+    conn: &Connection,
+    chunk_ids: &[&str],
+    excluded_tag_ids: &[String],
+) -> Result<std::collections::HashMap<String, (String, i32, String)>, String> {
+    batch_fetch_chunk_details_filtered(conn, chunk_ids, excluded_tag_ids)
+}
+
+/// Fetch chunk details, dropping chunks whose atom is tagged with any of
+/// `excluded_tag_ids`. Use this when selecting source chunks for wiki
+/// generation so excluded-tagged notes stay out of the LLM context.
+pub(crate) fn batch_fetch_chunk_details_filtered(
+    conn: &Connection,
+    chunk_ids: &[&str],
+    excluded_tag_ids: &[String],
+) -> Result<std::collections::HashMap<String, (String, i32, String)>, String> {
     let mut map = std::collections::HashMap::new();
     // Batch in groups of 500 to stay under SQLite parameter limit
     for batch in chunk_ids.chunks(500) {
@@ -789,6 +811,40 @@ pub(crate) fn batch_fetch_chunk_details(
             map.insert(id, (atom_id, chunk_index, content));
         }
     }
+
+    // Drop chunks whose atom is tagged with any excluded tag. Done after the
+    // fetch (not in the SQL) so the filter works regardless of how the caller
+    // paginates chunk_ids.
+    if !excluded_tag_ids.is_empty() && !map.is_empty() {
+        let atom_ids: std::collections::HashSet<String> =
+            map.values().map(|(aid, _, _)| aid.clone()).collect();
+        if !atom_ids.is_empty() {
+            let atom_vec: Vec<String> = atom_ids.into_iter().collect();
+            let a_ph = atom_vec.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let t_ph = excluded_tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT DISTINCT atom_id FROM atom_tags WHERE atom_id IN ({}) AND tag_id IN ({})",
+                a_ph, t_ph
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+            for a in &atom_vec { params.push(a); }
+            for t in excluded_tag_ids { params.push(t); }
+            let mut stmt = conn.prepare(&query)
+                .map_err(|e| format!("Failed to prepare excluded-atoms query: {}", e))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))
+                .map_err(|e| format!("Failed to query excluded atoms: {}", e))?;
+            let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(row) = rows.next()
+                .map_err(|e| format!("Failed to read row: {}", e))?
+            {
+                let atom_id: String = row.get(0)
+                    .map_err(|e| format!("Failed to get atom_id: {}", e))?;
+                excluded.insert(atom_id);
+            }
+            map.retain(|_, (aid, _, _)| !excluded.contains(aid));
+        }
+    }
+
     Ok(map)
 }
 
@@ -1835,5 +1891,50 @@ mod tests {
             "Should deduplicate repeated citation indices"
         );
         assert_eq!(citations[0].citation_index, 1);
+    }
+
+    #[test]
+    fn test_batch_fetch_chunk_details_filtered_drops_excluded_atoms() {
+        let (db, _temp) = create_test_db();
+        let conn = db.conn.lock().unwrap();
+
+        insert_tag(&conn, "tag-public", "Public");
+        insert_tag(&conn, "tag-private", "Private");
+        insert_atom(&conn, "atom-public");
+        insert_atom(&conn, "atom-private");
+
+        // Tag atom-private with the excluded tag.
+        conn.execute(
+            "INSERT INTO atom_tags (atom_id, tag_id) VALUES (?1, ?2)",
+            rusqlite::params!["atom-private", "tag-private"],
+        ).unwrap();
+        // Tag atom-public with an unrelated tag.
+        conn.execute(
+            "INSERT INTO atom_tags (atom_id, tag_id) VALUES (?1, ?2)",
+            rusqlite::params!["atom-public", "tag-public"],
+        ).unwrap();
+
+        // Two chunks — one per atom.
+        conn.execute(
+            "INSERT INTO atom_chunks (id, atom_id, chunk_index, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["chunk-public", "atom-public", 0, "public body"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO atom_chunks (id, atom_id, chunk_index, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["chunk-private", "atom-private", 0, "private body"],
+        ).unwrap();
+
+        let ids = ["chunk-public", "chunk-private"];
+
+        // No exclusion → both chunks returned.
+        let out = batch_fetch_chunk_details(&conn, &ids).unwrap();
+        assert_eq!(out.len(), 2);
+
+        // With tag-private excluded, only the public chunk survives.
+        let excluded = vec!["tag-private".to_string()];
+        let out = batch_fetch_chunk_details_filtered(&conn, &ids, &excluded).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("chunk-public"));
+        assert!(!out.contains_key("chunk-private"));
     }
 }

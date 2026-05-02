@@ -183,20 +183,21 @@ impl PostgresStorage {
         ),
     ) -> Atom {
         Atom {
-            id: row.0,
-            content: row.1,
-            title: row.2,
-            snippet: row.3,
-            source_url: row.4,
-            source: row.5,
-            published_at: row.6,
-            created_at: row.7,
-            updated_at: row.8,
-            embedding_status: row.9,
-            tagging_status: row.10,
-            embedding_error: row.11,
-            tagging_error: row.12,
-        }
+                        id: row.0,
+                        content: row.1,
+                        title: row.2,
+                        snippet: row.3,
+                        source_url: row.4,
+                        source: row.5,
+                        published_at: row.6,
+                        created_at: row.7,
+                        updated_at: row.8,
+                        embedding_status: row.9,
+                        tagging_status: row.10,
+                        embedding_error: row.11,
+                        tagging_error: row.12,
+                        is_locked: false,
+                    }
     }
 }
 
@@ -364,6 +365,7 @@ impl AtomStore for PostgresStorage {
             tagging_status: tagging_status.to_string(),
             embedding_error: None,
             tagging_error: None,
+            is_locked: false,
         };
 
         Ok(AtomWithTags { atom, tags })
@@ -429,6 +431,7 @@ impl AtomStore for PostgresStorage {
                 tagging_status: "pending".to_string(),
                 embedding_error: None,
                 tagging_error: None,
+                is_locked: false,
             };
 
             atoms_with_tags.push(AtomWithTags { atom, tags: vec![] });
