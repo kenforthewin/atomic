@@ -841,3 +841,29 @@ pub async fn set_wiki_excluded_tags(
         Err(e) => crate::error::error_response(e),
     }
 }
+
+// ==================== Custom health checks ====================
+
+/// GET /api/health/custom-checks
+pub async fn get_custom_health_checks(db: Db) -> HttpResponse {
+    match db.0.get_custom_health_checks().await {
+        Ok(checks) => HttpResponse::Ok().json(serde_json::json!({ "checks": checks })),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetCustomHealthChecksBody {
+    pub checks: Vec<atomic_core::health::custom::CustomCheck>,
+}
+
+/// PUT /api/health/custom-checks
+pub async fn set_custom_health_checks(
+    db: Db,
+    body: web::Json<SetCustomHealthChecksBody>,
+) -> HttpResponse {
+    match db.0.set_custom_health_checks(&body.into_inner().checks).await {
+        Ok(()) => HttpResponse::NoContent().finish(),
+        Err(e) => crate::error::error_response(e),
+    }
+}

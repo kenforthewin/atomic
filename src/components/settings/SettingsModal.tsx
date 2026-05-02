@@ -75,8 +75,10 @@ const MACOS_FULL_DISK_ACCESS_URL =
 import { formatRelativeDate } from '../../lib/date';
 import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../stores/databases';
 import { OverrideControls } from './OverrideControls';
+import { HealthConfigTab } from '../health/HealthConfigTab';
+import { CustomChecksPanel } from '../health/CustomChecksPanel';
 
-export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts';
+export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts' | 'health';
 
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
@@ -86,6 +88,7 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'connection', label: 'Connection' },
   { id: 'integrations', label: 'Integrations' },
   { id: 'databases', label: 'Databases' },
+  { id: 'health', label: 'Health' },
 ];
 
 function TagCategoriesTab() {
@@ -3132,6 +3135,27 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
               {/* ===== DATABASES TAB ===== */}
               {activeTab === 'databases' && (
                 <DatabasesTab />
+              )}
+
+              {/* ===== HEALTH TAB ===== */}
+              {activeTab === 'health' && (
+                <div className="space-y-6">
+                  <div>
+                    <h3 className="text-sm font-semibold text-[var(--color-text-primary)] mb-1">Knowledge Health Checks</h3>
+                    <p className="text-xs text-[var(--color-text-secondary)] mb-4">
+                      Configure which checks contribute to your health score. Some checks are opinionated and default to informational only — enable them here if they apply to how you use Atomic.
+                    </p>
+                    <HealthConfigTab />
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-semibold text-[var(--color-text-primary)] mb-1">Custom Checks</h3>
+                    <p className="text-xs text-[var(--color-text-secondary)] mb-4">
+                      Define your own health rules. Useful for workflow conventions — e.g. “every atom with tag <code>paper</code> must have a source”.
+                    </p>
+                    <CustomChecksPanel />
+                  </div>
+                </div>
               )}
           </div>
         </div>

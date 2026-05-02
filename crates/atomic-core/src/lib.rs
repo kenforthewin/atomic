@@ -3727,6 +3727,28 @@ impl AtomicCore {
         self.storage().set_setting_sync("wiki_excluded_tag_ids", &json).await
     }
 
+    /// Load this database's custom health checks. Stored per-DB as a JSON
+    /// array under the `custom_health_checks` setting key (NOT registry).
+    pub async fn get_custom_health_checks(
+        &self,
+    ) -> Result<Vec<crate::health::custom::CustomCheck>, AtomicCoreError> {
+        let raw = self.storage().get_setting_sync("custom_health_checks").await?;
+        match raw {
+            Some(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Persist this database's custom health checks.
+    pub async fn set_custom_health_checks(
+        &self,
+        checks: &[crate::health::custom::CustomCheck],
+    ) -> Result<(), AtomicCoreError> {
+        let json = serde_json::to_string(checks)
+            .map_err(|e| AtomicCoreError::Validation(format!("serialize custom_health_checks: {e}")))?;
+        self.storage().set_setting_sync("custom_health_checks", &json).await
+    }
+
     /// Run auto-fixes up to the requested tier. Returns a `FixResponse` with
     /// actions taken, skipped issues, and the new score.
     pub async fn run_health_fix(

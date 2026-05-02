@@ -794,4 +794,14 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     argsMode: 'body' as const,
     transformArgs: (a) => ({ tag_ids: a.tag_ids }),
   },
+  get_custom_health_checks: {
+    method: 'GET' as const,
+    path: '/api/health/custom-checks',
+  },
+  set_custom_health_checks: {
+    method: 'PUT' as const,
+    path: '/api/health/custom-checks',
+    argsMode: 'body' as const,
+    transformArgs: (a) => ({ checks: a.checks }),
+  },
 };

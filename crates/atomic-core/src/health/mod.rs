@@ -27,6 +27,7 @@
 
 pub mod audit;
 pub mod checks;
+pub mod custom;
 pub mod fixes;
 pub mod link_resolution;
 pub mod llm_fixes;
@@ -436,10 +437,41 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
         }
     }
 
+    // Run user-defined custom checks (per-DB, synchronous, SqliteStorage-only).
+    // Failures are logged, not propagated — a bad custom rule must not take down
+    // the built-in health report.
+    let mut effective_config = config.clone();
+    if let Some(sqlite) = core.storage.as_sqlite() {
+        match core.get_custom_health_checks().await {
+            Ok(custom_checks) if !custom_checks.is_empty() => {
+                match custom::run_all(sqlite, &custom_checks) {
+                    Ok(results) => {
+                        for (key, result, check) in results {
+                            // Feed each custom check's weight into the aggregate-score
+                            // config so zero-weight rules stay informational and
+                            // positive-weight rules contribute at the requested weight.
+                            effective_config.overrides.insert(
+                                key.clone(),
+                                HealthCheckOverride {
+                                    enabled: check.enabled,
+                                    weight: Some(check.weight),
+                                },
+                            );
+                            checks.insert(key, result);
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "custom health checks failed"),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "load custom health checks failed"),
+        }
+    }
+
 
     // Drop disabled checks entirely (config-driven).
     checks.retain(|name, _| {
-        config
+        effective_config
             .overrides
             .get(name)
             .map(|o| o.enabled)
@@ -447,7 +479,7 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
     });
 
     // Aggregate score
-    let overall_score = aggregate_score(&checks, Some(&config));
+    let overall_score = aggregate_score(&checks, Some(&effective_config));
     let overall_status = HealthStatus::from_score(overall_score).as_str().to_string();
 
     // Count auto-fixable vs requires-review

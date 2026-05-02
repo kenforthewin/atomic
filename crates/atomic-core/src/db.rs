@@ -918,12 +918,15 @@ impl Database {
         // normal UI. Use for source-of-truth material (books, studies, primary
         // research) where automated "correction" would do more harm than good.
         if version < 20 {
-            conn.execute_batch(
-                r#"
-                ALTER TABLE atoms ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0;
-                PRAGMA user_version = 20;
-                "#,
-            )?;
+            // ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite. Ignore the
+            // "duplicate column" error so migration stays idempotent when a
+            // test resets user_version to a pre-V20 value on a DB whose table
+            // was already migrated by the initial open.
+            let _ = conn.execute(
+                "ALTER TABLE atoms ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+            conn.execute_batch("PRAGMA user_version = 20;")?;
         }
 
         // --- Triggers (recreated every startup to stay current) ---
