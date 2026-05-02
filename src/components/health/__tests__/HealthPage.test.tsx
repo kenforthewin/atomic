@@ -26,7 +26,7 @@ vi.mock('../TagStructureTab', () => ({
   TagStructureTab: () => <div data-testid="tag-structure-tab">Tag Structure</div>,
 }));
 
-vi.mock('../../dashboard/widgets/HealthWidget', () => ({
+vi.mock('../HealthPanel', () => ({
   HealthPanel: (props: { hideTitle?: boolean }) => (
     <div data-testid="health-panel" data-hide-title={String(!!props.hideTitle)}>Health Panel</div>
   ),

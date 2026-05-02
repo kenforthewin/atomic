@@ -7,7 +7,7 @@ export function getTrend(current: number, previous?: number): '↑' | '↓' | '�
   return '→';
 }
 // These constants are re-exported here for use by HealthCheckRow
-// The canonical source remains HealthWidget.tsx
+// The canonical source remains health/HealthPanel.tsx
 export interface HealthCheckResult {
   status: 'ok' | 'warning' | 'error' | 'info';
   score: number;

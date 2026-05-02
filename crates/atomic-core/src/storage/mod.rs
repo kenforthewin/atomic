@@ -165,7 +165,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health reports not supported on Postgres storage".into())),
         }
     }
 
@@ -180,7 +180,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health reports not supported on Postgres storage".into())),
         }
     }
 
@@ -196,7 +196,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(vec![]),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health reports not supported on Postgres storage".into())),
         }
     }
 
@@ -213,7 +213,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health fix log not supported on Postgres storage".into())),
         }
     }
 
@@ -230,7 +230,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health fix log not supported on Postgres storage".into())),
         }
     }
 
@@ -246,7 +246,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(vec![]),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health fix log not supported on Postgres storage".into())),
         }
     }
 
@@ -260,7 +260,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health fix log not supported on Postgres storage".into())),
         }
     }
 
@@ -277,7 +277,7 @@ impl StorageBackend {
                 .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(0),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health fixes not supported on Postgres storage".into())),
         }
     }
 
@@ -294,7 +294,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(vec![]),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("link-resolution helpers not supported on Postgres storage".into())),
         }
     }
 
@@ -310,7 +310,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(std::collections::HashMap::new()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("link-resolution helpers not supported on Postgres storage".into())),
         }
     }
 
@@ -329,7 +329,7 @@ impl StorageBackend {
                 .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("link-resolution helpers not supported on Postgres storage".into())),
         }
     }
 
@@ -347,7 +347,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(vec![]),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("atom-query suggestion not supported on Postgres storage".into())),
         }
     }
     pub(crate) async fn get_tag_by_id_sync(
@@ -363,7 +363,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("tag lookup helper not supported on Postgres storage".into())),
         }
     }
 
@@ -380,7 +380,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(Vec::new()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health dismissals not supported on Postgres storage".into())),
         }
     }
 
@@ -405,7 +405,7 @@ impl StorageBackend {
                 .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health dismissals not supported on Postgres storage".into())),
         }
     }
 
@@ -426,7 +426,7 @@ impl StorageBackend {
                 .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health dismissals not supported on Postgres storage".into())),
         }
     }
 
@@ -439,7 +439,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(0),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("health dismissals not supported on Postgres storage".into())),
         }
     }
 
@@ -455,7 +455,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("tag proposals not supported on Postgres storage".into())),
         }
     }
 
@@ -472,7 +472,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("tag proposals not supported on Postgres storage".into())),
         }
     }
 
@@ -487,7 +487,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(None),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("tag proposals not supported on Postgres storage".into())),
         }
     }
 
@@ -504,7 +504,7 @@ impl StorageBackend {
                     .map_err(join_err)?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Ok(()),
+            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation("tag proposals not supported on Postgres storage".into())),
         }
     }
     pub(crate) async fn count_chunk_hash_occurrences_sync(
@@ -519,6 +519,8 @@ impl StorageBackend {
                     .await
                     .map_err(join_err)?
             }
+            // Postgres: no content_hash column yet; returning "no duplicates"
+            // is a correct fallback — boilerplate filter becomes a no-op.
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres(_) => Ok(std::collections::HashMap::new()),
         }
@@ -536,6 +538,8 @@ impl StorageBackend {
                     .await
                     .map_err(join_err)?
             }
+            // Postgres: boilerplate filter is a no-op (see count_chunk_hash_occurrences_sync).
+            // Nothing to delete.
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres(_) => Ok(()),
         }
@@ -549,6 +553,7 @@ impl StorageBackend {
                     .await
                     .map_err(join_err)?
             }
+            // Postgres: no content_hash column to backfill yet.
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres(_) => Ok(0),
         }

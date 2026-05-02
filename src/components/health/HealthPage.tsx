@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { HeartPulse } from 'lucide-react';
-import { HealthPanel } from '../dashboard/widgets/HealthWidget';
+import { HealthPanel } from './HealthPanel';
 import { TagStructureTab } from './TagStructureTab';
 
 type HealthTab = 'overview' | 'tags';

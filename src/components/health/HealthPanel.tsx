@@ -1,16 +1,16 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { getTransport } from '../../../lib/transport';
-import { runReviewAction } from './review/reviewActions';
+import { getTransport } from '../../lib/transport';
+import { runReviewAction } from '../dashboard/widgets/review/reviewActions';
 import {
   RefreshCw, CheckCircle, AlertTriangle, XCircle, Play, Download, HelpCircle,
 } from 'lucide-react';
-import { HealthReviewModal } from './HealthReviewModal';
-import { HealthCheckRow, getTrend } from './HealthCheckRow';
-import type { HealthCheckResult } from './HealthCheckRow';
-import { HealthConfirmModal } from './HealthConfirmModal';
-import type { PendingFix } from './HealthConfirmModal';
-import { HealthExportModal } from './HealthExportModal';
-import { HealthHelpOverlay } from './HealthHelpOverlay';
+import { HealthReviewModal } from '../dashboard/widgets/HealthReviewModal';
+import { HealthCheckRow, getTrend } from '../dashboard/widgets/HealthCheckRow';
+import type { HealthCheckResult } from '../dashboard/widgets/HealthCheckRow';
+import { HealthConfirmModal } from '../dashboard/widgets/HealthConfirmModal';
+import type { PendingFix } from '../dashboard/widgets/HealthConfirmModal';
+import { HealthExportModal } from '../dashboard/widgets/HealthExportModal';
+import { HealthHelpOverlay } from '../dashboard/widgets/HealthHelpOverlay';
 
 // ==================== Types ====================
 
