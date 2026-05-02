@@ -18,6 +18,53 @@ use crate::providers::types::Message;
 use crate::AtomicCore;
 use serde_json::json;
 
+/// Strip common LLM-response wrappers (markdown code fences, leading/trailing
+/// whitespace) and return the JSON-candidate substring.
+///
+/// Handles: ```json\n{...}\n```, ```\n{...}\n```, plain {...}, and responses
+/// with leading/trailing prose by extracting the outermost {...} or [...] block.
+pub(crate) fn strip_llm_json_fences(raw: &str) -> &str {
+    let s = raw.trim();
+    // Strip ```json or ``` fences.
+    let s = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```JSON"))
+        .or_else(|| s.strip_prefix("```"))
+        .map(|x| x.trim_start())
+        .unwrap_or(s);
+    let s = s.strip_suffix("```").map(|x| x.trim_end()).unwrap_or(s);
+    let s = s.trim();
+    // If there is still leading/trailing prose, extract the outermost JSON
+    // object or array.
+    if s.starts_with('{') || s.starts_with('[') {
+        return s;
+    }
+    let start_obj = s.find('{');
+    let start_arr = s.find('[');
+    let start = match (start_obj, start_arr) {
+        (Some(o), Some(a)) => Some(o.min(a)),
+        (Some(o), None) => Some(o),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    if let Some(start) = start {
+        let end_obj = s.rfind('}');
+        let end_arr = s.rfind(']');
+        let end = match (end_obj, end_arr) {
+            (Some(o), Some(a)) => Some(o.max(a)),
+            (Some(o), None) => Some(o),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        if let Some(end) = end {
+            if end >= start {
+                return &s[start..=end];
+            }
+        }
+    }
+    s
+}
+
 /// Re-run the tagging pipeline on atoms that completed tagging but got 0 tags.
 pub async fn fix_untagged_complete_atoms(
     core: &AtomicCore,
@@ -538,12 +585,7 @@ Output JSON only (no markdown fences): {{\"target_atom_id\": \"<id>\" or null, \
     let response = llm.complete(&messages, &config).await?;
     let raw = response.content.trim().to_string();
 
-    // Strip markdown fences if the model included them.
-    let json_str = raw
-        .strip_prefix("```json")
-        .or_else(|| raw.strip_prefix("```"))
-        .map(|s| s.trim_end_matches("```").trim())
-        .unwrap_or(&raw);
+    let json_str = strip_llm_json_fences(&raw);
 
     #[derive(serde::Deserialize)]
     struct LlmAnswer {
@@ -705,7 +747,7 @@ ATOM B (source: {source_b}, created: {date_b}):\n{content_b}",
 
     #[derive(serde::Deserialize)]
     struct VerifyOverlapResp { duplicate: bool, reason: String }
-    let parsed: VerifyOverlapResp = serde_json::from_str(raw).map_err(|e| {
+    let parsed: VerifyOverlapResp = serde_json::from_str(strip_llm_json_fences(raw)).map_err(|e| {
         AtomicCoreError::Validation(format!("LLM response parse error: {e} — raw: {raw}"))
     })?;
 
@@ -779,7 +821,7 @@ ATOM B (source: {source_b}):\n{content_b}",
 
     #[derive(serde::Deserialize)]
     struct VerifyContradictionResp { contradiction: bool, reason: String }
-    let parsed: VerifyContradictionResp = serde_json::from_str(raw).map_err(|e| {
+    let parsed: VerifyContradictionResp = serde_json::from_str(strip_llm_json_fences(raw)).map_err(|e| {
         AtomicCoreError::Validation(format!("LLM response parse error: {e} — raw: {raw}"))
     })?;
 
@@ -1035,7 +1077,7 @@ Current tag tree ({count} tags):\n{tree}",
     let response = llm.complete(&messages, &config).await?;
 
     // 5. Parse.
-    let raw: RawTagProposalResponse = serde_json::from_str(&response.content).map_err(|e| {
+    let raw: RawTagProposalResponse = serde_json::from_str(strip_llm_json_fences(&response.content)).map_err(|e| {
         AtomicCoreError::Validation(format!(
             "LLM returned unparseable proposal: {e}. Raw: {}",
             &response.content[..response.content.len().min(200)]

@@ -976,4 +976,123 @@ mod llm_tests {
         assert_eq!(latest.id, proposal.id);
         assert_eq!(latest.actions.len(), 2);
     }
+
+    #[test]
+    fn test_strip_llm_json_fences_plain() {
+        let raw = r#"{"duplicate": false, "reason": "ok"}"#;
+        assert_eq!(llm_fixes::strip_llm_json_fences(raw), raw);
+    }
+
+    #[test]
+    fn test_strip_llm_json_fences_json_fence() {
+        let raw = "```json\n{\"duplicate\": true, \"reason\": \"same\"}\n```";
+        let cleaned = llm_fixes::strip_llm_json_fences(raw);
+        assert_eq!(cleaned, r#"{"duplicate": true, "reason": "same"}"#);
+    }
+
+    #[test]
+    fn test_strip_llm_json_fences_bare_fence() {
+        let raw = "```\n[{\"kind\":\"merge\"}]\n```";
+        let cleaned = llm_fixes::strip_llm_json_fences(raw);
+        assert_eq!(cleaned, r#"[{"kind":"merge"}]"#);
+    }
+
+    #[test]
+    fn test_strip_llm_json_fences_prose_wrapper() {
+        let raw = "Here is the answer: {\"duplicate\": false} — hope that helps!";
+        let cleaned = llm_fixes::strip_llm_json_fences(raw);
+        assert_eq!(cleaned, r#"{"duplicate": false}"#);
+    }
+
+    #[test]
+    fn test_strip_llm_json_fences_roundtrip_parse() {
+        // Exact shape that broke in production.
+        let raw = "```json\n{\"duplicate\": false, \"reason\": \"completely different topics\"}\n```";
+        let cleaned = llm_fixes::strip_llm_json_fences(raw);
+        let v: serde_json::Value = serde_json::from_str(cleaned).expect("must parse");
+        assert_eq!(v["duplicate"], false);
+    }
+
+    #[tokio::test]
+    async fn test_verify_overlap_pair_handles_fenced_response() {
+        // Regression: model wraps JSON in ```json fences.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(
+                    "```json\n{\"duplicate\": false, \"reason\": \"completely different topics\"}\n```",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "Rust ownership rules".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "Python GIL internals".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        let (is_dup, reason) =
+            llm_fixes::verify_overlap_pair(&core, &atom_a.atom.id, &atom_b.atom.id)
+                .await
+                .expect("verify_overlap_pair must handle fenced response");
+        assert!(!is_dup);
+        assert_eq!(reason, "completely different topics");
+    }
+
+    #[tokio::test]
+    async fn test_verify_contradiction_pair_handles_fenced_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(
+                    "```json\n{\"contradiction\": false, \"reason\": \"different subjects\"}\n```",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let atom_a = core.create_atom(crate::CreateAtomRequest {
+            content: "A".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+        let atom_b = core.create_atom(crate::CreateAtomRequest {
+            content: "B".to_string(),
+            source_url: None, published_at: None, tag_ids: vec![], skip_if_source_exists: false,
+        }, |_| {}).await.unwrap().unwrap();
+
+        let (is_real, reason) =
+            llm_fixes::verify_contradiction_pair(&core, &atom_a.atom.id, &atom_b.atom.id)
+                .await
+                .expect("verify_contradiction_pair must handle fenced response");
+        assert!(!is_real);
+        assert_eq!(reason, "different subjects");
+    }
+
+    #[tokio::test]
+    async fn test_propose_tag_restructure_handles_fenced_response() {
+        let fenced = "```json\n{\"summary\":\"test\",\"actions\":[]}\n```";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_completion_body(fenced)),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _dir) = open_core_with_llm(&server.uri()).await;
+        let proposal = llm_fixes::propose_tag_restructure(&core)
+            .await
+            .expect("propose_tag_restructure must handle fenced response");
+        assert_eq!(proposal.summary, "test");
+        assert_eq!(proposal.actions.len(), 0);
+    }
 }
