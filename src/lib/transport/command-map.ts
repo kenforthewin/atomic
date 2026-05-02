@@ -804,4 +804,10 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     argsMode: 'body' as const,
     transformArgs: (a) => ({ checks: a.checks }),
   },
+  preview_custom_health_check: {
+    method: 'POST' as const,
+    path: '/api/health/custom-checks/preview',
+    argsMode: 'body' as const,
+    transformArgs: (a) => ({ rule: a.rule }),
+  },
 };

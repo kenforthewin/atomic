@@ -867,3 +867,22 @@ pub async fn set_custom_health_checks(
         Err(e) => crate::error::error_response(e),
     }
 }
+
+#[derive(serde::Deserialize)]
+pub struct PreviewCustomHealthCheckBody {
+    pub rule: atomic_core::health::custom::CustomRule,
+}
+
+/// POST /api/health/custom-checks/preview
+///
+/// Dry-runs an unsaved rule against the current DB so the UI can show
+/// "this would flag N atoms" while the user is tuning parameters.
+pub async fn preview_custom_health_check(
+    db: Db,
+    body: web::Json<PreviewCustomHealthCheckBody>,
+) -> HttpResponse {
+    match db.0.preview_custom_health_check(&body.into_inner().rule).await {
+        Ok(result) => HttpResponse::Ok().json(result),
+        Err(e) => crate::error::error_response(e),
+    }
+}

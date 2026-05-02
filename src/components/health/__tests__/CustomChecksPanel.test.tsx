@@ -186,4 +186,76 @@ describe('CustomChecksPanel', () => {
     expect((minField as HTMLInputElement).value).toBe('1');
     expect((maxField as HTMLInputElement).value).toBe('5');
   });
+
+  it('Run preview invokes the preview command and shows counts', async () => {
+    const user = userEvent.setup();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_custom_health_checks') {
+        return Promise.resolve({
+          checks: [{
+            id: 'c1',
+            label: 'Needs source',
+            description: '',
+            enabled: true,
+            weight: 0.0,
+            rule: { kind: 'require_source', tag_filter: null },
+          }],
+        });
+      }
+      if (cmd === 'preview_custom_health_check') {
+        return Promise.resolve({
+          total_considered: 42,
+          flagged_count: 7,
+          sample: [
+            { id: 'a1', title_preview: 'first atom' },
+            { id: 'a2', title_preview: 'second atom' },
+          ],
+        });
+      }
+      return Promise.reject(new Error(`unexpected: ${cmd}`));
+    });
+
+    render(<CustomChecksPanel />);
+    const runBtn = await screen.findByRole('button', { name: /Run preview/i });
+    await user.click(runBtn);
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        'preview_custom_health_check',
+        expect.objectContaining({ rule: { kind: 'require_source', tag_filter: null } }),
+      ),
+    );
+    expect(await screen.findByText(/Would flag/i)).toBeTruthy();
+    expect(screen.getByText(/first atom/)).toBeTruthy();
+    expect(screen.getByText(/second atom/)).toBeTruthy();
+  });
+
+  it('Preview error surfaces inline without toast', async () => {
+    const user = userEvent.setup();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'get_custom_health_checks') {
+        return Promise.resolve({
+          checks: [{
+            id: 'c1',
+            label: 'Bad',
+            description: '',
+            enabled: true,
+            weight: 0.0,
+            rule: { kind: 'content_regex', pattern: '(?P<x', invert: false },
+          }],
+        });
+      }
+      if (cmd === 'preview_custom_health_check') {
+        return Promise.reject(new Error('invalid regex: unterminated'));
+      }
+      return Promise.reject(new Error(`unexpected: ${cmd}`));
+    });
+
+    render(<CustomChecksPanel />);
+    await user.click(await screen.findByRole('button', { name: /Run preview/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/invalid regex/i);
+    expect(toastError).not.toHaveBeenCalled();
+  });
 });

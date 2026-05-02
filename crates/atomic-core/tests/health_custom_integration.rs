@@ -299,3 +299,63 @@ async fn malformed_regex_does_not_break_builtin_checks() {
         "malformed rule must not leak a bogus successful result; got {custom_keys:?}"
     );
 }
+
+
+// --- Preview (dry run) -----------------------------------------------------
+
+#[tokio::test]
+async fn preview_reports_counts_and_sample_without_persisting() {
+    let (core, _dir) = setup().await;
+    make_atom(&core, "a", None).await;
+    make_atom(&core, "b", None).await;
+    make_atom(&core, "c", Some("https://x.com/c")).await;
+
+    let preview = core
+        .preview_custom_health_check(&CustomRule::RequireSource { tag_filter: None })
+        .await
+        .expect("preview");
+    assert_eq!(preview.total_considered, 3);
+    assert_eq!(preview.flagged_count, 2);
+    assert_eq!(preview.sample.len(), 2);
+
+    // Preview must not leak into persisted checks.
+    assert!(core.get_custom_health_checks().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn preview_sample_capped_at_ten() {
+    let (core, _dir) = setup().await;
+    for i in 0..15 {
+        make_atom(&core, &format!("atom {i}"), None).await;
+    }
+    let preview = core
+        .preview_custom_health_check(&CustomRule::RequireSource { tag_filter: None })
+        .await
+        .unwrap();
+    assert_eq!(preview.total_considered, 15);
+    assert_eq!(preview.flagged_count, 15);
+    assert_eq!(
+        preview.sample.len(),
+        10,
+        "sample should be capped regardless of total flagged"
+    );
+}
+
+#[tokio::test]
+async fn preview_surfaces_malformed_regex_as_error() {
+    let (core, _dir) = setup().await;
+    make_atom(&core, "x", None).await;
+
+    let err = core
+        .preview_custom_health_check(&CustomRule::ContentRegex {
+            pattern: "(?P<unterminated".into(),
+            invert: false,
+        })
+        .await
+        .expect_err("malformed regex must surface as error");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("regex") || msg.contains("pattern") || msg.contains("invalid"),
+        "error should mention the regex problem: {msg}"
+    );
+}

@@ -190,3 +190,63 @@ async fn test_custom_checks_requires_auth() {
         }
     }
 }
+
+
+// --- Preview ---------------------------------------------------------------
+
+#[actix_web::test]
+async fn test_custom_checks_preview_returns_counts() {
+    let ctx = TestCtx::new().await;
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    // Seed two atoms — one missing source_url so RequireSource flags it.
+    let req = actix_test::TestRequest::post()
+        .uri("/api/atoms")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "content": "no source" }))
+        .to_request();
+    assert!(actix_test::call_service(&app, req).await.status().is_success());
+    let req = actix_test::TestRequest::post()
+        .uri("/api/atoms")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "content": "has source", "source_url": "https://example.com/a" }))
+        .to_request();
+    assert!(actix_test::call_service(&app, req).await.status().is_success());
+
+    let req = actix_test::TestRequest::post()
+        .uri("/api/health/custom-checks/preview")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "rule": { "kind": "require_source", "tag_filter": null } }))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = actix_test::read_body_json(resp).await;
+    assert_eq!(body["total_considered"], 2);
+    assert_eq!(body["flagged_count"], 1);
+    assert_eq!(body["sample"].as_array().unwrap().len(), 1);
+
+    // Preview must not persist — list should still be empty.
+    let req = actix_test::TestRequest::get()
+        .uri("/api/health/custom-checks")
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let body: Value = actix_test::read_body_json(actix_test::call_service(&app, req).await).await;
+    assert_eq!(body["checks"].as_array().unwrap().len(), 0);
+}
+
+#[actix_web::test]
+async fn test_custom_checks_preview_returns_error_for_malformed_regex() {
+    let ctx = TestCtx::new().await;
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    let req = actix_test::TestRequest::post()
+        .uri("/api/health/custom-checks/preview")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({
+            "rule": { "kind": "content_regex", "pattern": "(?P<unterminated", "invert": false }
+        }))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert!(!resp.status().is_success(), "malformed regex should error");
+}

@@ -202,6 +202,47 @@ pub fn run_all(
     Ok(out)
 }
 
+/// Preview output for a single (unsaved) rule. Used by the UI to show
+/// users "this would flag N atoms" as they tune rule parameters, before
+/// persisting the rule.
+#[derive(Serialize, Debug)]
+pub struct PreviewResult {
+    pub total_considered: i32,
+    pub flagged_count: i32,
+    /// First few flagged atoms (capped at `PREVIEW_SAMPLE`). Each entry
+    /// has `id` and `title_preview`.
+    pub sample: Vec<serde_json::Value>,
+}
+
+/// Cap on sample atoms returned in the preview. UI doesn’t need more.
+const PREVIEW_SAMPLE: usize = 10;
+
+/// Evaluate a single rule against the database WITHOUT persisting it or
+/// touching the report. Fails when the rule itself is malformed (e.g.
+/// invalid regex); the caller surfaces the error so the user can fix it.
+pub fn preview_rule(
+    storage: &SqliteStorage,
+    rule: &CustomRule,
+) -> Result<PreviewResult, AtomicCoreError> {
+    let conn = storage
+        .db
+        .conn
+        .lock()
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+    let raw = evaluate(&conn, rule)?;
+    let sample = raw
+        .flagged_atoms
+        .iter()
+        .take(PREVIEW_SAMPLE)
+        .map(|f| json!({ "id": f.id, "title_preview": f.title_preview }))
+        .collect();
+    Ok(PreviewResult {
+        total_considered: raw.total_considered,
+        flagged_count: raw.flagged_atoms.len() as i32,
+        sample,
+    })
+}
+
 /// Raw per-rule evaluation output before we wrap it as a `HealthCheckResult`.
 struct RawOutcome {
     total_considered: i32,

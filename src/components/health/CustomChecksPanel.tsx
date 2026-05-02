@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react';
-import { Plus, Trash2, Save, Loader2, AlertTriangle } from 'lucide-react';
+import { Plus, Trash2, Save, Loader2, AlertTriangle, Play } from 'lucide-react';
 import { getTransport } from '../../lib/transport';
 import { toast } from '../../stores/toasts';
 import { useTagsStore } from '../../stores/tags';
@@ -64,6 +64,14 @@ export function CustomChecksPanel() {
     return m;
   }, [tags]);
 
+  // Per-row preview state. Keyed by check id.
+  type PreviewState =
+    | { status: 'idle' }
+    | { status: 'loading' }
+    | { status: 'ok'; total: number; flagged: number; sample: { id: string; title_preview: string }[] }
+    | { status: 'error'; message: string };
+  const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
+
   useEffect(() => {
     void (async () => {
       try {
@@ -82,7 +90,11 @@ export function CustomChecksPanel() {
     setDirty(true);
   };
 
-  const mutateRule = (id: string, rule: CustomRule) => mutate(id, { rule });
+  const mutateRule = (id: string, rule: CustomRule) => {
+    mutate(id, { rule });
+    // Rule shape changed → stale preview would mislead.
+    setPreviews(p => ({ ...p, [id]: { status: 'idle' } }));
+  };
 
   const addCheck = () => {
     setChecks(curr => [...curr, blankCheck()]);
@@ -116,6 +128,29 @@ export function CustomChecksPanel() {
       toast.error('Save custom checks failed', { detail, retry: () => { void save(); } });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const runPreview = async (check: CustomCheck) => {
+    setPreviews(p => ({ ...p, [check.id]: { status: 'loading' } }));
+    try {
+      const res = await getTransport().invoke<{
+        total_considered: number;
+        flagged_count: number;
+        sample: { id: string; title_preview: string }[];
+      }>('preview_custom_health_check', { rule: check.rule });
+      setPreviews(p => ({
+        ...p,
+        [check.id]: {
+          status: 'ok',
+          total: res.total_considered,
+          flagged: res.flagged_count,
+          sample: res.sample ?? [],
+        },
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setPreviews(p => ({ ...p, [check.id]: { status: 'error', message } }));
     }
   };
 
@@ -262,6 +297,12 @@ export function CustomChecksPanel() {
                 : `contributes ${(check.weight * 100).toFixed(0)}% alongside built-ins`}
             </span>
           </div>
+
+          {/* Preview */}
+          <PreviewRow
+            state={previews[check.id] ?? { status: 'idle' }}
+            onRun={() => { void runPreview(check); }}
+          />
         </div>
       ))}
 
@@ -677,6 +718,60 @@ function TagMultiPicker({
             <option key={t.id} value={t.id}>{t.name}</option>
           ))}
         </select>
+      </div>
+    </div>
+  );
+}
+
+
+type PreviewState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ok'; total: number; flagged: number; sample: { id: string; title_preview: string }[] }
+  | { status: 'error'; message: string };
+
+function PreviewRow({
+  state,
+  onRun,
+}: {
+  state: PreviewState;
+  onRun: () => void;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <label className="text-xs text-gray-500 w-16 shrink-0 pt-1">Preview:</label>
+      <div className="flex-1 space-y-1">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onRun}
+            disabled={state.status === 'loading'}
+            className="flex items-center gap-1 px-2 py-1 bg-[#2d2d2d] hover:bg-[#3a3a3a] disabled:opacity-50 rounded text-xs text-gray-200"
+          >
+            {state.status === 'loading' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            {state.status === 'loading' ? 'Running…' : 'Run preview'}
+          </button>
+          {state.status === 'ok' && (
+            <span className="text-xs text-gray-400">
+              Would flag <strong className="text-gray-200">{state.flagged}</strong>
+              {' of '}
+              <strong className="text-gray-200">{state.total}</strong> atoms
+            </span>
+          )}
+          {state.status === 'error' && (
+            <span className="flex items-center gap-1 text-xs text-red-400" role="alert">
+              <AlertTriangle className="w-3 h-3" /> {state.message}
+            </span>
+          )}
+        </div>
+        {state.status === 'ok' && state.sample.length > 0 && (
+          <ul className="text-xs text-gray-500 font-mono space-y-0.5 max-h-24 overflow-y-auto">
+            {state.sample.map(a => (
+              <li key={a.id} className="truncate">
+                · {a.title_preview || <span className="italic">(no preview)</span>}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

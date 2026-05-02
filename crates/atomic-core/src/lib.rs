@@ -3749,6 +3749,20 @@ impl AtomicCore {
         self.storage().set_setting_sync("custom_health_checks", &json).await
     }
 
+    /// Evaluate a rule against this DB without saving it. Used by the UI
+    /// for live preview while users author custom checks.
+    pub async fn preview_custom_health_check(
+        &self,
+        rule: &crate::health::custom::CustomRule,
+    ) -> Result<crate::health::custom::PreviewResult, AtomicCoreError> {
+        let sqlite = self.storage.as_sqlite().ok_or_else(|| {
+            AtomicCoreError::Configuration(
+                "Custom health checks are not yet supported with Postgres backend".to_string(),
+            )
+        })?;
+        crate::health::custom::preview_rule(sqlite, rule)
+    }
+
     /// Run auto-fixes up to the requested tier. Returns a `FixResponse` with
     /// actions taken, skipped issues, and the new score.
     pub async fn run_health_fix(

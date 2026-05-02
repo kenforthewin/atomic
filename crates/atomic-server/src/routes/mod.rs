@@ -377,4 +377,5 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/wiki/excluded-tags", web::put().to(health::set_wiki_excluded_tags));
     cfg.route("/health/custom-checks", web::get().to(health::get_custom_health_checks));
     cfg.route("/health/custom-checks", web::put().to(health::set_custom_health_checks));
+    cfg.route("/health/custom-checks/preview", web::post().to(health::preview_custom_health_check));
 }
