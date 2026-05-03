@@ -303,6 +303,25 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
 
   return (
     <div className="space-y-4">
+      {/* Single autosave status + reset header. Sticky so feedback stays
+          visible no matter which section the user scrolls to. */}
+      <div className="sticky top-0 z-10 -mx-1 px-1 py-2 bg-[var(--color-bg-secondary,#1e1e1e)]/95 backdrop-blur-sm border-b border-white/5 flex items-center justify-between gap-3">
+        <p className="text-xs text-gray-400 leading-snug max-w-prose">
+          Checks and detection thresholds autosave as you edit.
+        </p>
+        <div className="flex items-center gap-3 shrink-0">
+          <SaveStatusPill status={saveStatus} />
+          <button
+            onClick={resetToDefaults}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
+            title="Revert checks and thresholds to built-in defaults. Autosaves."
+          >
+            <RotateCcw className="w-3 h-3" />
+            Reset to defaults
+          </button>
+        </div>
+      </div>
+
       <div className="text-xs text-gray-400 leading-relaxed max-w-prose">
         <p>
           Pick which checks run and how much each contributes to the overall score.
@@ -375,28 +394,14 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
         </table>
       </div>
 
-      <div className="flex items-center justify-between gap-2 text-xs">
-        <p className="text-gray-600" title="Weights are renormalized so this doesn't need to be exactly 1.">
-          Total effective weight: <span className="text-gray-300 font-mono">{totalEffectiveWeight.toFixed(2)}</span>
-        </p>
-        <div className="flex items-center gap-2">
-          <SaveStatusPill status={saveStatus} />
-          <button
-            onClick={resetToDefaults}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
-            title="Revert checks and thresholds to built-in defaults. Autosaves."
-          >
-            <RotateCcw className="w-3 h-3" />
-            Reset to defaults
-          </button>
-        </div>
+      <div className="text-xs text-gray-600" title="Weights are renormalized so this doesn't need to be exactly 1.">
+        Total effective weight: <span className="text-gray-300 font-mono">{totalEffectiveWeight.toFixed(2)}</span>
       </div>
 
       <ThresholdsPanel
         draft={draft.thresholds}
         set={setThreshold}
         reset={resetThreshold}
-        saveStatus={saveStatus}
       />
 
       <WikiExclusionPanel />
@@ -468,12 +473,10 @@ function ThresholdsPanel({
   draft,
   set,
   reset,
-  saveStatus,
 }: {
   draft: ThresholdsDraft;
   set: (key: keyof HealthThresholds, value: string) => void;
   reset: (key: keyof HealthThresholds) => void;
-  saveStatus: SaveStatus;
 }) {
   // Group by `group`, preserving spec order.
   const groups: Array<{ group: string; items: ThresholdSpec[] }> = [];
@@ -488,15 +491,12 @@ function ThresholdsPanel({
 
   return (
     <div className="space-y-4 border-t border-white/5 pt-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-xs font-medium text-gray-300 mb-1">Detection thresholds</h3>
-          <p className="text-[11px] text-gray-500 max-w-prose">
-            Tune when each check fires. Leave a field blank to fall back to the built-in default
-            (shown as a placeholder). Saved per-database.
-          </p>
-        </div>
-        <SaveStatusPill status={saveStatus} />
+      <div>
+        <h3 className="text-xs font-medium text-gray-300 mb-1">Detection thresholds</h3>
+        <p className="text-[11px] text-gray-500 max-w-prose">
+          Tune when each check fires. Leave a field blank to fall back to the built-in default
+          (shown as a placeholder). Saved per-database.
+        </p>
       </div>
       {groups.map(({ group, items }) => (
         <div key={group} className="rounded border border-white/5">
