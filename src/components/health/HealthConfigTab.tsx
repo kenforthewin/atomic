@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Loader2, RotateCcw, Save } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Loader2, RotateCcw, Check, AlertCircle } from 'lucide-react';
 import { getTransport } from '../../lib/transport';
 import { toast } from '../../stores/toasts';
 import { WikiExclusionPanel } from './WikiExclusionPanel';
@@ -96,6 +96,12 @@ interface Draft {
   thresholds: ThresholdsDraft;
 }
 
+type SaveStatus =
+  | { kind: 'idle' }
+  | { kind: 'saving' }
+  | { kind: 'saved'; at: number }
+  | { kind: 'error'; message: string };
+
 function toChecksDraft(config: HealthConfig): ChecksDraft {
   const out: ChecksDraft = {};
   for (const c of CHECKS) {
@@ -161,17 +167,29 @@ function fromDraft(draft: Draft): HealthConfig {
 export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
   const [draft, setDraft] = useState<Draft>(() => toDraft(DEFAULT_CONFIG));
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>({ kind: 'idle' });
+
+  // Latest draft to persist. Ref because the debounce closure must read the
+  // freshest value, not whatever was captured when the timer was scheduled.
+  const latestDraftRef = useRef<Draft | null>(null);
+  // Tracks whether the component has finished its initial load — we must not
+  // autosave the draft that came straight from the server.
+  const initializedRef = useRef(false);
+  // Last successfully-saved JSON payload, used to suppress redundant saves.
+  const lastSavedRef = useRef<string>('');
 
   useEffect(() => {
     void (async () => {
       try {
         const cfg = await getTransport().invoke<HealthConfig>('get_health_config', {});
-        setDraft(toDraft(cfg ?? DEFAULT_CONFIG));
+        const resolved = cfg ?? DEFAULT_CONFIG;
+        setDraft(toDraft(resolved));
+        lastSavedRef.current = JSON.stringify(resolved);
       } catch (err) {
         console.error('load health config', err);
       } finally {
         setLoading(false);
+        initializedRef.current = true;
       }
     })();
   }, []);
@@ -194,22 +212,52 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
     }));
   };
 
-  const save = async () => {
-    setSaving(true);
+  // ---- Autosave ----
+  //
+  // Debounce 600ms after the last edit, then persist if the serialized config
+  // actually changed since the last successful save. Errors surface both
+  // inline (status pill) and as a toast with a retry action. A cheap
+  // dedupe-on-stringify avoids re-saving when edits cancel out.
+  const persist = async (payload: HealthConfig) => {
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastSavedRef.current) return;
+    setSaveStatus({ kind: 'saving' });
     try {
-      await getTransport().invoke('set_health_config', fromDraft(draft) as unknown as Record<string, unknown>);
-      toast.success('Health config saved');
+      await getTransport().invoke('set_health_config', payload as unknown as Record<string, unknown>);
+      lastSavedRef.current = serialized;
+      setSaveStatus({ kind: 'saved', at: Date.now() });
       onSaved?.();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      toast.error('Save health config failed', {
+      setSaveStatus({ kind: 'error', message: detail });
+      toast.error('Autosave failed', {
         detail,
-        retry: () => { void save(); },
+        retry: () => { void persist(payload); },
       });
-    } finally {
-      setSaving(false);
     }
   };
+
+  useEffect(() => {
+    latestDraftRef.current = draft;
+    if (!initializedRef.current) return;
+    const handle = window.setTimeout(() => {
+      const d = latestDraftRef.current;
+      if (!d) return;
+      void persist(fromDraft(d));
+    }, 600);
+    return () => { window.clearTimeout(handle); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  // Fade the "Saved" pill back to idle after a short delay so it stays out of
+  // the way during a normal editing session.
+  useEffect(() => {
+    if (saveStatus.kind !== 'saved') return;
+    const handle = window.setTimeout(() => {
+      setSaveStatus(s => (s.kind === 'saved' ? { kind: 'idle' } : s));
+    }, 1500);
+    return () => { window.clearTimeout(handle); };
+  }, [saveStatus]);
 
   const resetToDefaults = () => {
     setDraft(toDraft(DEFAULT_CONFIG));
@@ -309,21 +357,14 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
           Total effective weight: <span className="text-gray-300 font-mono">{totalEffectiveWeight.toFixed(2)}</span>
         </p>
         <div className="flex items-center gap-2">
+          <SaveStatusPill status={saveStatus} />
           <button
             onClick={resetToDefaults}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
+            title="Revert checks and thresholds to built-in defaults. Autosaves."
           >
             <RotateCcw className="w-3 h-3" />
             Reset to defaults
-          </button>
-          <button
-            onClick={save}
-            disabled={saving}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:bg-[#3a3a3a] rounded text-xs text-white transition-colors"
-            title="Persist check weights and detection thresholds"
-          >
-            {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
-            Save checks & thresholds
           </button>
         </div>
       </div>
@@ -470,5 +511,40 @@ function ThresholdsPanel({
         </div>
       ))}
     </div>
+  );
+}
+
+// ==================== Save status pill ====================
+
+function SaveStatusPill({ status }: { status: SaveStatus }) {
+  // Idle: render a blank placeholder of the same size so the row doesn't
+  // jitter when autosave kicks in.
+  if (status.kind === 'idle') {
+    return <span className="text-[11px] text-gray-600 select-none">Autosaves</span>;
+  }
+  if (status.kind === 'saving') {
+    return (
+      <span className="flex items-center gap-1.5 text-[11px] text-gray-400">
+        <Loader2 className="w-3 h-3 animate-spin" />
+        Saving…
+      </span>
+    );
+  }
+  if (status.kind === 'saved') {
+    return (
+      <span className="flex items-center gap-1.5 text-[11px] text-emerald-400">
+        <Check className="w-3 h-3" />
+        Saved
+      </span>
+    );
+  }
+  return (
+    <span
+      className="flex items-center gap-1.5 text-[11px] text-red-400"
+      title={status.message}
+    >
+      <AlertCircle className="w-3 h-3" />
+      Save failed
+    </span>
   );
 }
