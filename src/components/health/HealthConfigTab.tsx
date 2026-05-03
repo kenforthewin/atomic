@@ -304,33 +304,33 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
         </table>
       </div>
 
-      <div className="flex items-center justify-between text-xs">
+      <div className="flex items-center justify-between gap-2 text-xs">
         <p className="text-gray-600" title="Weights are renormalized so this doesn't need to be exactly 1.">
           Total effective weight: <span className="text-gray-300 font-mono">{totalEffectiveWeight.toFixed(2)}</span>
         </p>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={resetToDefaults}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
+          >
+            <RotateCcw className="w-3 h-3" />
+            Reset to defaults
+          </button>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:bg-[#3a3a3a] rounded text-xs text-white transition-colors"
+            title="Persist check weights and detection thresholds"
+          >
+            {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+            Save checks & thresholds
+          </button>
+        </div>
       </div>
 
       <ThresholdsPanel draft={draft.thresholds} set={setThreshold} reset={resetThreshold} />
 
       <WikiExclusionPanel />
-
-      <div className="flex items-center justify-end gap-2 text-xs border-t border-white/5 pt-4 sticky bottom-0 bg-[#1e1e1e] pb-1">
-        <button
-          onClick={resetToDefaults}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
-        >
-          <RotateCcw className="w-3 h-3" />
-          Reset all to defaults
-        </button>
-        <button
-          onClick={save}
-          disabled={saving}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:bg-[#3a3a3a] rounded text-xs text-white transition-colors"
-        >
-          {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
-          Save
-        </button>
-      </div>
     </div>
   );
 }
