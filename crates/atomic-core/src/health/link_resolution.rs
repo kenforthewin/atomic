@@ -316,6 +316,46 @@ fn build_wikilink_exact_candidates(name: &str, current_source_url: &str) -> Vec<
     candidates
 }
 
+/// Extract a filename stem from a markdown href so callers can perform
+/// a vault-wide fallback lookup when exact candidates miss.
+///
+/// Example: `../processes/onboarding.md#anchor` → `onboarding`.
+///
+/// Returns `None` for hrefs that don't look like bare filename references
+/// (e.g. fragments, external URLs — these should not hit the fallback).
+/// The stem is safe to hand to `find_atom_by_wikilink_name_sync`, which
+/// does a SQL `LIKE '%/stem%.md'` search across the vault.
+pub fn markdown_stem_fallback(href: &str) -> Option<String> {
+    // Strip fragment + query
+    let cleaned = href
+        .split('#').next().unwrap_or("")
+        .split('?').next().unwrap_or("")
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Last path segment
+    let last = cleaned.rsplit('/').next().unwrap_or(cleaned);
+    if last.is_empty() {
+        return None;
+    }
+    // Drop markdown extensions; only return a stem for things that look like
+    // markdown files (mirrors `looks_like_document`'s accepted list).
+    let lower = last.to_lowercase();
+    let stem = if let Some(s) = lower.strip_suffix(".md") {
+        s.to_string()
+    } else if let Some(s) = lower.strip_suffix(".markdown") {
+        s.to_string()
+    } else if let Some(s) = lower.strip_suffix(".mdx") {
+        s.to_string()
+    } else {
+        // No extension — treat the whole segment as a stem.
+        // `looks_like_document` permits extensionless targets.
+        lower
+    };
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
 /// Return the URL itself plus a variant without the `.md` extension (and
 /// vice-versa), so callers can match atoms stored either way.
 fn candidates_with_and_without_extension(url: &str) -> Vec<String> {
@@ -578,6 +618,32 @@ mod tests {
         let links = extract_internal_links(content, Some("obsidian://vault/index.md"));
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].original, "[start link](./page.md)");
+    }
+
+    #[test]
+    fn test_markdown_stem_fallback_basic() {
+        assert_eq!(markdown_stem_fallback("glossary.md"), Some("glossary".to_string()));
+        assert_eq!(
+            markdown_stem_fallback("../processes/onboarding.md"),
+            Some("onboarding".to_string()),
+        );
+        assert_eq!(
+            markdown_stem_fallback("shared/notes.md#section"),
+            Some("notes".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_markdown_stem_fallback_empty() {
+        assert_eq!(markdown_stem_fallback(""), None);
+        assert_eq!(markdown_stem_fallback("#only-fragment"), None);
+    }
+
+    #[test]
+    fn test_markdown_stem_fallback_extensionless() {
+        // Obsidian permits bare names; treat the last segment as stem.
+        assert_eq!(markdown_stem_fallback("glossary"), Some("glossary".to_string()));
+        assert_eq!(markdown_stem_fallback("shared/glossary"), Some("glossary".to_string()));
     }
 
 }

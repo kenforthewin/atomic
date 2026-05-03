@@ -559,17 +559,15 @@ function VirtualizedPairList({
 
 // ==================== Boilerplate section ====================
 
-function BoilerplateSection({ atoms, onResolved }: { atoms: BoilerplateEntry[]; onResolved: () => void }) {
-  const [removed, setRemoved] = useState<Set<string>>(new Set());
+function BoilerplateSection({ atoms, onResolved }: { atoms: BoilerplateEntry[]; onResolved: (id: string) => void }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const visible = atoms.filter(a => !removed.has(a.id));
+  const visible = atoms;
 
   const handleResolved = (id: string) => {
-    setRemoved(prev => new Set(prev).add(id));
     setSelected(prev => { const n = new Set(prev); n.delete(id); return n; });
-    onResolved();
+    onResolved(id);
   };
 
   const bulkDismiss = async () => {
@@ -580,8 +578,7 @@ function BoilerplateSection({ atoms, onResolved }: { atoms: BoilerplateEntry[]; 
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setProgress(okIds.size);
-      setRemoved(prev => { const next = new Set(prev); okIds.forEach(id => next.add(id)); return next; });
-      okIds.forEach(() => onResolved());
+      okIds.forEach(id => onResolved(id));
       setSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
       if (failed.length) console.warn('Batch fix partial failure:', failed);
@@ -848,14 +845,13 @@ function ContradictionRow({ pair, onDismissed }: { pair: ContradictionPair; onDi
   );
 }
 
-function ContradictionSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
+function ContradictionSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: (pairId: string) => void }) {
   const pairs = (data.pairs as ContradictionPair[] | undefined) ?? [];
   const count = (data.potential_contradictions as number) ?? 0;
-  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const visible = pairs.filter(p => !dismissed.has(p.pair_id));
+  const visible = pairs;
 
   const bulkDefer = async () => {
     setBusy(true);
@@ -865,8 +861,7 @@ function ContradictionSection({ data, onResolved }: { data: Record<string, unkno
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setProgress(okIds.size);
-      setDismissed(prev => { const next = new Set(prev); okIds.forEach(id => next.add(id)); return next; });
-      okIds.forEach(() => onResolved());
+      okIds.forEach(id => onResolved(id));
       setSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
       if (failed.length) console.warn('Batch fix partial failure:', failed);
@@ -904,7 +899,7 @@ function ContradictionSection({ data, onResolved }: { data: Record<string, unkno
               className="mt-3 peer h-3.5 w-3.5 rounded border border-white/20 bg-[#161616] checked:bg-purple-600 checked:border-purple-600 focus:outline-none shrink-0"
             />
             <div className="flex-1 min-w-0">
-              <ContradictionRow key={pair.pair_id} pair={pair} onDismissed={() => setDismissed(prev => new Set(prev).add(pair.pair_id))} />
+              <ContradictionRow key={pair.pair_id} pair={pair} onDismissed={() => onResolved(pair.pair_id)} />
             </div>
           </label>
         ))}
@@ -926,23 +921,21 @@ function ContradictionSection({ data, onResolved }: { data: Record<string, unkno
 
 // ==================== Content quality (no-source) section ====================
 
-function ContentQualitySection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
+function ContentQualitySection({ data, onResolved }: { data: Record<string, unknown>; onResolved: (id: string) => void }) {
   const issues = data.issues as Record<string, {
     count: number;
     atoms?: Array<{ id: string; title: string; created_at?: string } | string>;
   }> | undefined;
 
   const noSourceItems = (issues?.no_source?.atoms ?? []) as Array<{ id: string; title: string; created_at?: string }>;
-  const [removed, setRemoved] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const visible = noSourceItems.filter(a => !removed.has(a.id));
+  const visible = noSourceItems;
 
   const handleResolved = (id: string) => {
-    setRemoved(prev => new Set(prev).add(id));
     setSelected(prev => { const n = new Set(prev); n.delete(id); return n; });
-    onResolved();
+    onResolved(id);
   };
 
   const bulkMarkIntentional = async () => {
@@ -953,8 +946,7 @@ function ContentQualitySection({ data, onResolved }: { data: Record<string, unkn
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setProgress(okIds.size);
-      setRemoved(prev => { const next = new Set(prev); okIds.forEach(id => next.add(id)); return next; });
-      okIds.forEach(() => onResolved());
+      okIds.forEach(id => onResolved(id));
       setSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
       if (failed.length) console.warn('Batch fix partial failure:', failed);
@@ -1012,20 +1004,17 @@ function ContentQualitySection({ data, onResolved }: { data: Record<string, unkn
 
 // ==================== Tag health (rootless) section ====================
 
-function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: () => void }) {
+function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>; onResolved: (id: string) => void }) {
   const rootlessList = (data.rootless_tag_list as RootlessTag[] | undefined) ?? [];
   const similarPairs = (data.similar_name_pair_list as Array<{ pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }> | undefined) ?? [];
   const singleAtomTags = (data.single_atom_tag_list as Array<{ id: string; name: string; is_autotag: boolean }> | undefined) ?? [];
-  const [removedSingleAtom, setRemovedSingleAtom] = useState<Set<string>>(new Set());
   const [mergeTargets, setMergeTargets] = useState<Record<string, string>>({});
-  const [removed, setRemoved] = useState<Set<string>>(new Set());
-  const [removedPairs, setRemovedPairs] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const visible = rootlessList.filter(t => !removed.has(t.id));
-  const visiblePairs = similarPairs.filter(p => !removedPairs.has(p.pair_id));
-  const visibleSingleAtomTags = singleAtomTags.filter(t => !removedSingleAtom.has(t.id));
+  const visible = rootlessList;
+  const visiblePairs = similarPairs;
+  const visibleSingleAtomTags = singleAtomTags;
 
   const allTags = useTagsStore(s => s.tags);
   const parentOptions = useMemo(() => {
@@ -1036,9 +1025,8 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
   }, [allTags, rootlessList]);
 
   const handleResolved = (id: string) => {
-    setRemoved(prev => new Set(prev).add(id));
     setSelected(prev => { const n = new Set(prev); n.delete(id); return n; });
-    onResolved();
+    onResolved(id);
   };
 
   const mergeInto = async (p: { pair_id: string; a_id: string; a_name: string; b_id: string; b_name: string }, winner_id: string) => {
@@ -1048,8 +1036,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       args: { check: 'tag_health', item_id: p.pair_id, action: 'merge_tags', into_tag_id: winner_id },
     });
     if (ok === undefined) return;
-    setRemovedPairs(prev => new Set(prev).add(p.pair_id));
-    onResolved();
+    onResolved(p.pair_id);
   };
 
   const ignorePair = async (p: { pair_id: string }) => {
@@ -1059,8 +1046,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       args: { check: 'tag_health', item_id: p.pair_id, action: 'dismiss' },
     });
     if (ok === undefined) return;
-    setRemovedPairs(prev => new Set(prev).add(p.pair_id));
-    onResolved();
+    onResolved(p.pair_id);
   };
 
   const deleteSingleAtomTag = async (tagId: string) => {
@@ -1070,9 +1056,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       args: { check: 'tag_health', item_id: tagId, action: 'delete_tag' },
     });
     if (ok === undefined) return;
-    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
-    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
-    onResolved();
+    handleResolved(tagId);
   };
 
   const mergeSingleAtomTagIntoParent = async (tagId: string) => {
@@ -1084,9 +1068,7 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       args: { check: 'tag_health', item_id: tagId, action: 'merge_into_parent', into_tag_id: into },
     });
     if (ok === undefined) return;
-    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
-    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
-    onResolved();
+    handleResolved(tagId);
   };
 
   const dismissSingleAtomTag = async (tagId: string) => {
@@ -1096,24 +1078,18 @@ function TagHealthSection({ data, onResolved }: { data: Record<string, unknown>;
       args: { check: 'tag_health', item_id: tagId, action: 'dismiss' },
     });
     if (ok === undefined) return;
-    setRemovedSingleAtom(prev => new Set(prev).add(tagId));
-    setSelected(prev => { const n = new Set(prev); n.delete(tagId); return n; });
-    onResolved();
+    handleResolved(tagId);
   };
 
   const bulkDismiss = async () => {
     setBusy(true);
     setProgress(0);
     try {
-      const tagItems = Array.from(selected).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
-      const pairItems = Array.from(selected).filter(id => id.includes('__')).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
-      const items = [...tagItems, ...pairItems.filter(pi => !tagItems.find(ti => ti.item_id === pi.item_id))];
+      const items = Array.from(selected).map(id => ({ check: 'tag_health', item_id: id, action: 'dismiss' }));
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setProgress(okIds.size);
-      setRemoved(prev => { const next = new Set(prev); okIds.forEach(id => { if (!id.includes('__')) next.add(id); }); return next; });
-      setRemovedPairs(prev => { const next = new Set(prev); okIds.forEach(id => { if (id.includes('__')) next.add(id); }); return next; });
-      okIds.forEach(() => onResolved());
+      okIds.forEach(id => onResolved(id));
       setSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
       if (failed.length) console.warn('Batch fix partial failure:', failed);
@@ -1325,6 +1301,128 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
     });
   }, [dbId]);
 
+  /**
+   * Prune a resolved item from a check's data so all downstream readers
+   * (tab count, section headers, summary card on dashboard next fetch) see
+   * the same filtered state. Mutating the local `report` is the only way to
+   * keep `tabs[].count`, the paragraph copy, and the summary card consistent
+   * with the visible rows.
+   *
+   * Every section's "resolved in session" state now flows through this
+   * single reducer instead of a local removed Set.
+   */
+  const pruneItem = useCallback((check: string, id: string) => {
+    setReport(prev => {
+      const c = prev.checks[check];
+      if (!c) return prev;
+      const data = { ...(c.data as Record<string, unknown>) };
+      let touched = false;
+
+      const filterById = (arr: unknown[] | undefined, key: string) => {
+        if (!Array.isArray(arr)) return arr;
+        const next = arr.filter((x: any) => x?.[key] !== id);
+        if (next.length !== arr.length) touched = true;
+        return next;
+      };
+
+      switch (check) {
+        case 'content_overlap': {
+          const pairs = data.pairs as Array<{ pair_id: string }> | undefined;
+          data.pairs = filterById(pairs as unknown[], 'pair_id');
+          if (typeof data.count === 'number' && touched) {
+            data.count = Math.max(0, (data.count as number) - 1);
+          }
+          if (typeof data.cross_source_overlaps === 'number' && touched) {
+            data.cross_source_overlaps = Math.max(0, (data.cross_source_overlaps as number) - 1);
+          }
+          break;
+        }
+        case 'boilerplate_pollution': {
+          const atoms = data.affected_atoms as Array<{ id: string }> | undefined;
+          data.affected_atoms = filterById(atoms as unknown[], 'id');
+          if (typeof data.count === 'number' && touched) {
+            data.count = Math.max(0, (data.count as number) - 1);
+          }
+          break;
+        }
+        case 'contradiction_detection': {
+          const pairs = data.pairs as Array<{ pair_id: string }> | undefined;
+          data.pairs = filterById(pairs as unknown[], 'pair_id');
+          if (typeof data.potential_contradictions === 'number' && touched) {
+            data.potential_contradictions = Math.max(0, (data.potential_contradictions as number) - 1);
+          }
+          break;
+        }
+        case 'content_quality': {
+          const issues = data.issues as Record<string, { count?: number; atoms?: Array<{ id: string }> }> | undefined;
+          if (issues?.no_source?.atoms) {
+            const filtered = issues.no_source.atoms.filter(a => a.id !== id);
+            if (filtered.length !== issues.no_source.atoms.length) {
+              touched = true;
+              data.issues = {
+                ...issues,
+                no_source: {
+                  ...issues.no_source,
+                  atoms: filtered,
+                  count: Math.max(0, (issues.no_source.count ?? filtered.length + 1) - 1),
+                },
+              };
+            }
+          }
+          break;
+        }
+        case 'tag_health': {
+          const rootless = data.rootless_tag_list as Array<{ id: string }> | undefined;
+          const nextRootless = filterById(rootless as unknown[], 'id') as typeof rootless;
+          if (nextRootless && rootless && nextRootless.length !== rootless.length) {
+            data.rootless_tag_list = nextRootless;
+            if (typeof data.rootless_tags === 'number') {
+              data.rootless_tags = Math.max(0, (data.rootless_tags as number) - 1);
+            }
+          }
+          const pairs = data.similar_name_pair_list as Array<{ pair_id: string }> | undefined;
+          const nextPairs = filterById(pairs as unknown[], 'pair_id') as typeof pairs;
+          if (nextPairs && pairs && nextPairs.length !== pairs.length) {
+            data.similar_name_pair_list = nextPairs;
+            if (typeof data.similar_name_pairs === 'number') {
+              data.similar_name_pairs = Math.max(0, (data.similar_name_pairs as number) - 1);
+            }
+          }
+          const singles = data.single_atom_tag_list as Array<{ id: string }> | undefined;
+          const nextSingles = filterById(singles as unknown[], 'id') as typeof singles;
+          if (nextSingles && singles && nextSingles.length !== singles.length) {
+            data.single_atom_tag_list = nextSingles;
+            if (typeof data.single_atom_tags === 'number') {
+              data.single_atom_tags = Math.max(0, (data.single_atom_tags as number) - 1);
+            }
+          }
+          break;
+        }
+        case 'broken_internal_links': {
+          const atoms = data.broken_link_list as Array<{ atom_id: string }> | undefined;
+          const nextAtoms = filterById(atoms as unknown[], 'atom_id') as typeof atoms;
+          if (nextAtoms && atoms && nextAtoms.length !== atoms.length) {
+            data.broken_link_list = nextAtoms;
+            if (typeof data.broken_links === 'number') {
+              data.broken_links = Math.max(0, (data.broken_links as number) - 1);
+            }
+          }
+          break;
+        }
+      }
+
+      if (!touched) return prev;
+      return { ...prev, checks: { ...prev.checks, [check]: { ...c, data } } };
+    });
+  }, []);
+
+  const resolveItem = useCallback((check: string, id: string) => {
+    pruneItem(check, id);
+    bumpResolved(check);
+    onResolved();
+  }, [pruneItem, bumpResolved, onResolved]);
+
+
   const resolvedCount = useMemo(
     () => Object.values(resolvedByTab).reduce((a, b) => a + b, 0),
     [resolvedByTab],
@@ -1410,19 +1508,16 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
   }, [onClose]);
 
 
-  // Overlap batch selection
+  // Overlap batch selection (selection only; resolved state lives in `report`)
   const [overlapSelected, setOverlapSelected] = useState<Set<string>>(new Set());
-  const [overlapRemoved, setOverlapRemoved] = useState<Set<string>>(new Set());
   const [overlapBusy, setOverlapBusy] = useState(false);
   const [overlapProgress, setOverlapProgress] = useState(0);
-  const visibleOverlapPairs = overlapPairs.filter(p => !overlapRemoved.has(p.pair_id));
+  const visibleOverlapPairs = overlapPairs;
 
   const handlePairResolveWithRemove = useCallback((pair: OverlapPair) => {
-    setOverlapRemoved(prev => new Set(prev).add(pair.pair_id));
     setOverlapSelected(prev => { const n = new Set(prev); n.delete(pair.pair_id); return n; });
-    bumpResolved('content_overlap');
-    onResolved();
-  }, [onResolved, bumpResolved]);
+    resolveItem('content_overlap', pair.pair_id);
+  }, [resolveItem]);
 
   const bulkDismissOverlap = async () => {
     setOverlapBusy(true);
@@ -1432,8 +1527,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
       const resp = await getTransport().invoke<{ results: Array<{ check: string; item_id: string; ok: boolean; error?: string }> }>('health_fix_batch', { items });
       const okIds = new Set(resp.results.filter(r => r.ok).map(r => r.item_id));
       setOverlapProgress(okIds.size);
-      setOverlapRemoved(prev => { const next = new Set(prev); okIds.forEach(id => next.add(id)); return next; });
-      okIds.forEach(() => { bumpResolved('content_overlap'); onResolved(); });
+      okIds.forEach(id => resolveItem('content_overlap', id));
       setOverlapSelected(new Set());
       const failed = resp.results.filter(r => !r.ok);
       if (failed.length) console.warn('Batch fix partial failure:', failed);
@@ -1452,9 +1546,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
         'health_verify_batch',
         { check: 'content_overlap', item_ids: allPairIds, max: 25 },
       );
-      const dismissedSet = new Set(resp.dismissed_ids);
-      setOverlapRemoved(prev => { const next = new Set(prev); dismissedSet.forEach(id => next.add(id)); return next; });
-      resp.dismissed_ids.forEach(() => { bumpResolved('content_overlap'); onResolved(); });
+      resp.dismissed_ids.forEach(id => resolveItem('content_overlap', id));
       toast.info(`Verified ${resp.checked}, dismissed ${resp.dismissed_ids.length} false positive${resp.dismissed_ids.length !== 1 ? 's' : ''}.`);
       rescanTab('content_overlap');
     } catch (err) {
@@ -1654,7 +1746,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 resolvedToday={resolvedByTab['boilerplate_pollution'] ?? 0}
                 initialQueueSize={initialSizes['boilerplate_pollution'] ?? 0}
               />
-              <BoilerplateSection atoms={boilerplateAtoms} onResolved={() => bumpResolved('boilerplate_pollution')} />
+              <BoilerplateSection atoms={boilerplateAtoms} onResolved={(id) => resolveItem('boilerplate_pollution', id)} />
             </>
           )}
 
@@ -1679,7 +1771,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                   {verifyContradictionBusy ? 'Verifying…' : 'Verify all contradictions (LLM)'}
                 </button>
               </div>
-              <ContradictionSection data={contradictionData} onResolved={() => bumpResolved('contradiction_detection')} />
+              <ContradictionSection data={contradictionData} onResolved={(id) => resolveItem('contradiction_detection', id)} />
             </>
           )}
 
@@ -1693,7 +1785,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 resolvedToday={resolvedByTab['content_quality'] ?? 0}
                 initialQueueSize={initialSizes['content_quality'] ?? 0}
               />
-              <ContentQualitySection data={contentQualityData} onResolved={() => bumpResolved('content_quality')} />
+              <ContentQualitySection data={contentQualityData} onResolved={(id) => resolveItem('content_quality', id)} />
             </>
           )}
 
@@ -1707,7 +1799,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 resolvedToday={resolvedByTab['tag_health'] ?? 0}
                 initialQueueSize={initialSizes['tag_health'] ?? 0}
               />
-              <TagHealthSection data={tagHealthData} onResolved={() => bumpResolved('tag_health')} />
+              <TagHealthSection data={tagHealthData} onResolved={(id) => resolveItem('tag_health', id)} />
             </>
           )}
 
@@ -1725,7 +1817,7 @@ export function HealthReviewModal({ report: initialReport, checkName, onClose, o
                 Internal links in your atoms that point to atoms that no longer exist.
                 Remove the link or dismiss to ignore.
               </p>
-              <BrokenLinksSection data={brokenLinksData as { broken_link_list: import('./review/BrokenLinksSection').BrokenLinkAtom[] }} onResolved={() => bumpResolved('broken_internal_links')} />
+              <BrokenLinksSection data={brokenLinksData as { broken_link_list: import('./review/BrokenLinksSection').BrokenLinkAtom[] }} onResolved={(id) => resolveItem('broken_internal_links', id)} />
             </>
           )}
 

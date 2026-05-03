@@ -463,7 +463,8 @@ pub async fn fix_broken_internal_links(
     dry_run: bool,
 ) -> Result<Option<FixAction>, AtomicCoreError> {
     use crate::health::link_resolution::{
-        apply_link_replacements, extract_internal_links, vault_root, ResolvedLink,
+        apply_link_replacements, extract_internal_links, markdown_stem_fallback, vault_root,
+        ResolvedLink,
     };
 
     let candidates = core.storage().get_link_candidate_atoms_sync().await?;
@@ -508,13 +509,25 @@ pub async fn fix_broken_internal_links(
                 .find_map(|u| url_map.get(u).cloned());
 
             let target_id = if target_id.is_none() {
-                // For wikilinks: fall back to vault-wide name search
-                if let (Some(name), Some(pfx)) = (&link.wikilink_name, &vault_pfx) {
-                    core.storage()
-                        .find_atom_by_wikilink_name_sync(name.clone(), pfx.clone())
-                        .await
-                        .unwrap_or(None)
-                        .map(|(id, _)| id)
+                // Fall back to vault-wide name search.
+                // - wikilinks: exact wikilink name (already computed).
+                // - markdown [text](href.md): filename stem as implicit wikilink
+                //   name. Mirrors the fix in `compute.rs` so the link resolver
+                //   finds the same subdirectory matches the picker does.
+                if let Some(pfx) = &vault_pfx {
+                    let name = link
+                        .wikilink_name
+                        .clone()
+                        .or_else(|| markdown_stem_fallback(&link.href));
+                    if let Some(name) = name {
+                        core.storage()
+                            .find_atom_by_wikilink_name_sync(name, pfx.clone())
+                            .await
+                            .unwrap_or(None)
+                            .map(|(id, _)| id)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

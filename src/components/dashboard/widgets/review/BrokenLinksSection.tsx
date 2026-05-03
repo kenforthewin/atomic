@@ -265,21 +265,16 @@ function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
 
 interface Props {
   data: { broken_link_list: BrokenLinkAtom[] };
-  onResolved: () => void;
+  onResolved: (atomId: string) => void;
 }
 
 export function BrokenLinksSection({ data, onResolved }: Props) {
-  const [resolvedAtoms, setResolvedAtoms] = useState<Set<string>>(new Set());
   const [autoFixAllBusy, setAutoFixAllBusy] = useState(false);
 
-  const visibleAtoms = data.broken_link_list.filter(a => !resolvedAtoms.has(a.atom_id));
+  const visibleAtoms = data.broken_link_list;
 
   const handleResolved = (atomId: string) => {
-    setResolvedAtoms(prev => {
-      const next = new Set(prev).add(atomId);
-      if (next.size >= data.broken_link_list.length) onResolved();
-      return next;
-    });
+    onResolved(atomId);
   };
 
   const autoFixAll = async () => {
@@ -290,9 +285,8 @@ export function BrokenLinksSection({ data, onResolved }: Props) {
       toast.success(
         `Auto-fix complete: ${result.relinked} relinked, ${result.removed} removed, ${result.skipped} skipped`,
       );
-      // Mark all visible atoms as resolved optimistically; caller will re-scan
-      setResolvedAtoms(new Set(data.broken_link_list.map(a => a.atom_id)));
-      onResolved();
+      // Optimistically notify caller for every atom in scope; caller re-scans.
+      data.broken_link_list.forEach(a => onResolved(a.atom_id));
     } catch (err) {
       toast.error('Auto-fix all failed', { detail: err instanceof Error ? err.message : String(err) });
     } finally {

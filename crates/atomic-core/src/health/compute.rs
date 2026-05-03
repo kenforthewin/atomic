@@ -314,12 +314,20 @@ async fn compute_link_check(core: &AtomicCore) -> Result<HealthCheckResult, Atom
                 continue;
             }
 
-            let resolved_by_name = if let (Some(name), Some(pfx)) = (&link.wikilink_name, &vault_pfx) {
-                core.storage()
-                    .find_atom_by_wikilink_name_sync(name.clone(), pfx.clone())
-                    .await
-                    .unwrap_or(None)
-                    .is_some()
+            let resolved_by_name = if let Some(pfx) = &vault_pfx {
+                let name = link
+                    .wikilink_name
+                    .clone()
+                    .or_else(|| link_resolution::markdown_stem_fallback(&link.href));
+                if let Some(name) = name {
+                    core.storage()
+                        .find_atom_by_wikilink_name_sync(name, pfx.clone())
+                        .await
+                        .unwrap_or(None)
+                        .is_some()
+                } else {
+                    false
+                }
             } else {
                 false
             };
