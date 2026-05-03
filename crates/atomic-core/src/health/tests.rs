@@ -528,7 +528,48 @@ mod tests {
         assert_eq!(pair_key("z1", "z2"), "z1__z2");
     }
 
+
     #[test]
+    fn test_apply_dismissals_recomputes_contradiction_score() {
+        // Regression: the health dashboard rendered "Contradictions 4 → red"
+        // next to "0 atom pairs" because dismissals updated the pair list
+        // and the potential_contradictions count but left `score` frozen at
+        // the pre-dismissal baseline. The UI row reads from both fields; a
+        // score that doesn't track the count is a self-contradicting row.
+        use crate::health::{apply_dismissals, pair_key, HealthCheckResult};
+        use std::collections::HashSet;
+        let mut result = HealthCheckResult {
+            status: "warning".into(),
+            score: 4, // matches checks::contradiction_detection for 12 pairs.
+            auto_fixable: false,
+            requires_review: true,
+            informational: true,
+            fix_action: None,
+            data: serde_json::json!({
+                "potential_contradictions": 12,
+                "pairs": [
+                    {"pair_id": "p1", "atom_a": {"id": "a1"}, "atom_b": {"id": "b1"}},
+                    {"pair_id": "p2", "atom_a": {"id": "a2"}, "atom_b": {"id": "b2"}},
+                ]
+            }),
+        };
+        let mut dismissed = HashSet::new();
+        dismissed.insert(pair_key("a1", "b1"));
+        dismissed.insert(pair_key("a2", "b2"));
+        apply_dismissals("contradiction_detection", &mut result, &dismissed);
+        assert_eq!(
+            result.data["potential_contradictions"]
+                .as_u64()
+                .unwrap(),
+            0
+        );
+        // With zero pairs the check score must be the healthy ceiling,
+        // not a stale 4. Otherwise the UI shows a red row next to "0 pairs".
+        assert_eq!(result.score, 100);
+        assert_eq!(result.status, "ok");
+        assert!(!result.requires_review);
+    }
+
     fn test_apply_dismissals_filters_content_overlap_pairs() {
         use crate::health::{apply_dismissals, pair_key, HealthCheckResult};
         use std::collections::HashSet;

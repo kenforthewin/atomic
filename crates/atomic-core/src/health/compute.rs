@@ -413,6 +413,13 @@ pub(crate) fn apply_dismissals(
                 if let Some(c) = data.get_mut("cross_source_overlaps") {
                     *c = Value::from(new_count);
                 }
+                // Keep score in sync with the post-dismissal pair count. Mirrors
+                // `checks::content_overlap`: `100 - overlaps * 8`, floored at 0.
+                result.score = (100i32 - (new_count as i32) * 8).max(0) as u32;
+                if new_count == 0 {
+                    result.status = "ok".to_string();
+                    result.requires_review = false;
+                }
             }
         }
         "contradiction_detection" => {
@@ -426,7 +433,15 @@ pub(crate) fn apply_dismissals(
                 if let Some(c) = data.get_mut("potential_contradictions") {
                     *c = Value::from(new_count);
                 }
+                // Keep score in sync with the post-dismissal pair count. Mirrors
+                // `checks::contradiction_detection`: `100 - pair_count * 8`,
+                // floored at 0. Without this, dismissing the last contradiction
+                // leaves the row showing score=4 (from the frozen 12-pair
+                // baseline) next to "0 atom pairs" — a UI contradiction worse
+                // than the one we claim to have caught.
+                result.score = (100i32 - (new_count as i32) * 8).max(0) as u32;
                 if new_count == 0 {
+                    result.status = "ok".to_string();
                     result.requires_review = false;
                 }
             }
@@ -437,11 +452,16 @@ pub(crate) fn apply_dismissals(
                     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
                     !dismissed_keys.contains(id)
                 });
-                let new_count = arr.len();
+                let new_count = arr.len() as u32;
                 if let Some(c) = data.get_mut("count") {
                     *c = Value::from(new_count);
                 }
+                // Mirror `checks::boilerplate_pollution`: 100 - 3*n, floored at 50.
+                result.score = 100u32
+                    .saturating_sub(new_count.saturating_mul(3).min(50))
+                    .max(50);
                 if new_count == 0 {
+                    result.status = "ok".to_string();
                     result.requires_review = false;
                 }
             }
