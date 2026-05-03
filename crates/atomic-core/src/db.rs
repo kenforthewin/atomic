@@ -1125,6 +1125,40 @@ impl Database {
         // legacy seed rows so the resolver's "any per-DB row is an override"
         // rule stays correct.
 
+        // ---------------------------------------------------------------
+        // Self-healing: idempotent column checks.
+        //
+        // Runs on every migration pass regardless of version. Exists because
+        // a rebase/renumber in the past let some DBs tick their user_version
+        // past the migration that added `tags.autotag_description` without
+        // ever executing the ALTER. Any query joining that column then errors
+        // at runtime ("no such column: t.autotag_description"). Cheap enough
+        // to always verify; keeps migration drift from bricking a DB.
+        //
+        // When adding a new column, prefer listing it here in addition to the
+        // versioned migration step — belt and braces.
+        const EXPECTED_COLUMNS: &[(&str, &str, &str)] = &[
+            // (table, column, DDL to add)
+            ("tags", "autotag_description", "ALTER TABLE tags ADD COLUMN autotag_description TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (table, column, ddl) in EXPECTED_COLUMNS {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                    rusqlite::params![table, column],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !has_col {
+                tracing::warn!(
+                    table,
+                    column,
+                    "healing missing column (migration drift); running late ALTER"
+                );
+                conn.execute_batch(ddl)?;
+            }
+        }
+
         Ok(())
     }
 }
