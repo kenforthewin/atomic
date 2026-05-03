@@ -183,8 +183,14 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
       try {
         const cfg = await getTransport().invoke<HealthConfig>('get_health_config', {});
         const resolved = cfg ?? DEFAULT_CONFIG;
-        setDraft(toDraft(resolved));
-        lastSavedRef.current = JSON.stringify(resolved);
+        const initialDraft = toDraft(resolved);
+        setDraft(initialDraft);
+        // Use the same fromDraft pipeline autosave will use, so round-trip
+        // identity matches exactly. Comparing against the raw server payload
+        // would miss-identify benign normalizations (missing fields, key
+        // order, number precision) as user edits and fire a redundant save
+        // on mount.
+        lastSavedRef.current = JSON.stringify(fromDraft(initialDraft));
       } catch (err) {
         console.error('load health config', err);
       } finally {
@@ -214,16 +220,38 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
 
   // ---- Autosave ----
   //
-  // Debounce 600ms after the last edit, then persist if the serialized config
-  // actually changed since the last successful save. Errors surface both
-  // inline (status pill) and as a toast with a retry action. A cheap
-  // dedupe-on-stringify avoids re-saving when edits cancel out.
-  const persist = async (payload: HealthConfig) => {
+  // Coalesce edits with a 600ms debounce, then persist if the serialized
+  // config actually changed since the last successful save. Guarantees:
+  //  - at most one PUT is in-flight at a time (prevents out-of-order writes)
+  //  - edits made during a save are saved in a second, trailing PUT
+  //  - a PUT that never resolves flips the pill to error after 15s so the
+  //    UI never gets stuck on "Saving…" forever
+  //  - errors surface both in the pill and as a toast with retry
+  const savingRef = useRef(false);
+  const trailingRef = useRef<HealthConfig | null>(null);
+
+  const persist = async (payload: HealthConfig): Promise<void> => {
     const serialized = JSON.stringify(payload);
     if (serialized === lastSavedRef.current) return;
+    // Coalesce into the in-flight save; the trailing payload will be
+    // submitted as soon as the current request finishes.
+    if (savingRef.current) {
+      trailingRef.current = payload;
+      return;
+    }
+    savingRef.current = true;
     setSaveStatus({ kind: 'saving' });
+    const timeoutId = window.setTimeout(() => {
+      setSaveStatus({
+        kind: 'error',
+        message: 'Autosave timed out after 15s — server did not respond.',
+      });
+    }, 15000);
     try {
-      await getTransport().invoke('set_health_config', payload as unknown as Record<string, unknown>);
+      await getTransport().invoke(
+        'set_health_config',
+        payload as unknown as Record<string, unknown>,
+      );
       lastSavedRef.current = serialized;
       setSaveStatus({ kind: 'saved', at: Date.now() });
       onSaved?.();
@@ -234,6 +262,12 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
         detail,
         retry: () => { void persist(payload); },
       });
+    } finally {
+      window.clearTimeout(timeoutId);
+      savingRef.current = false;
+      const trailing = trailingRef.current;
+      trailingRef.current = null;
+      if (trailing) void persist(trailing);
     }
   };
 
@@ -243,13 +277,7 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
     const handle = window.setTimeout(() => {
       const d = latestDraftRef.current;
       if (!d) return;
-      const payload = fromDraft(d);
-      const serialized = JSON.stringify(payload);
-      console.debug('[health-config] autosave tick', {
-        changed: serialized !== lastSavedRef.current,
-        payload,
-      });
-      void persist(payload);
+      void persist(fromDraft(d));
     }, 600);
     return () => { window.clearTimeout(handle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
