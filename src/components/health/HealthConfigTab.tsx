@@ -243,7 +243,13 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
     const handle = window.setTimeout(() => {
       const d = latestDraftRef.current;
       if (!d) return;
-      void persist(fromDraft(d));
+      const payload = fromDraft(d);
+      const serialized = JSON.stringify(payload);
+      console.debug('[health-config] autosave tick', {
+        changed: serialized !== lastSavedRef.current,
+        payload,
+      });
+      void persist(payload);
     }, 600);
     return () => { window.clearTimeout(handle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -386,7 +392,12 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
         </div>
       </div>
 
-      <ThresholdsPanel draft={draft.thresholds} set={setThreshold} reset={resetThreshold} />
+      <ThresholdsPanel
+        draft={draft.thresholds}
+        set={setThreshold}
+        reset={resetThreshold}
+        saveStatus={saveStatus}
+      />
 
       <WikiExclusionPanel />
     </div>
@@ -457,10 +468,12 @@ function ThresholdsPanel({
   draft,
   set,
   reset,
+  saveStatus,
 }: {
   draft: ThresholdsDraft;
   set: (key: keyof HealthThresholds, value: string) => void;
   reset: (key: keyof HealthThresholds) => void;
+  saveStatus: SaveStatus;
 }) {
   // Group by `group`, preserving spec order.
   const groups: Array<{ group: string; items: ThresholdSpec[] }> = [];
@@ -475,12 +488,15 @@ function ThresholdsPanel({
 
   return (
     <div className="space-y-4 border-t border-white/5 pt-4">
-      <div>
-        <h3 className="text-xs font-medium text-gray-300 mb-1">Detection thresholds</h3>
-        <p className="text-[11px] text-gray-500 max-w-prose">
-          Tune when each check fires. Leave a field blank to fall back to the built-in default
-          (shown as a placeholder). Saved per-database.
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-xs font-medium text-gray-300 mb-1">Detection thresholds</h3>
+          <p className="text-[11px] text-gray-500 max-w-prose">
+            Tune when each check fires. Leave a field blank to fall back to the built-in default
+            (shown as a placeholder). Saved per-database.
+          </p>
+        </div>
+        <SaveStatusPill status={saveStatus} />
       </div>
       {groups.map(({ group, items }) => (
         <div key={group} className="rounded border border-white/5">
