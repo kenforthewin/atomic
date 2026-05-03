@@ -346,6 +346,13 @@ pub struct HealthThresholds {
     /// Minimum shared-tag count for a pair to surface. Default 1.
     #[serde(default = "default_contradiction_shared_tags")]
     pub contradiction_shared_tags_min: i32,
+    /// Token-Jaccard upper bound for contradiction pairs. Pairs whose atom
+    /// contents overlap at/above this fraction of unique tokens are treated
+    /// as template/boilerplate clones and filtered out of the contradiction
+    /// list — real contradictions express *different* claims and therefore
+    /// different token sets. Default 0.70.
+    #[serde(default = "default_contradiction_max_jaccard")]
+    pub contradiction_max_content_jaccard: f32,
 
     // ---- content_overlap (cross-source near-duplicates) ----
     /// Lower bound (inclusive) of the cross-source overlap window. Default 0.55.
@@ -390,6 +397,7 @@ impl Default for HealthThresholds {
             contradiction_similarity_min: default_contradiction_sim_min(),
             contradiction_similarity_max: default_contradiction_sim_max(),
             contradiction_shared_tags_min: default_contradiction_shared_tags(),
+            contradiction_max_content_jaccard: default_contradiction_max_jaccard(),
             content_overlap_similarity_min: default_overlap_sim_min(),
             content_overlap_similarity_max: default_overlap_sim_max(),
             content_overlap_shared_tags_min: default_overlap_shared_tags(),
@@ -407,6 +415,7 @@ fn default_boilerplate_min_clones() -> i32 { 2 }
 fn default_contradiction_sim_min() -> f32 { 0.80 }
 fn default_contradiction_sim_max() -> f32 { 0.92 }
 fn default_contradiction_shared_tags() -> i32 { 1 }
+fn default_contradiction_max_jaccard() -> f32 { 0.70 }
 fn default_overlap_sim_min() -> f32 { 0.55 }
 fn default_overlap_sim_max() -> f32 { 0.85 }
 fn default_overlap_shared_tags() -> i32 { 2 }
@@ -428,10 +437,11 @@ impl HealthThresholds {
         let mut errs = Vec::new();
 
         // ---- similarities must be finite and within [0.0, 1.0] ----
-        let sims: [(&str, f32); 5] = [
+        let sims: [(&str, f32); 6] = [
             ("boilerplate_similarity", self.boilerplate_similarity),
             ("contradiction_similarity_min", self.contradiction_similarity_min),
             ("contradiction_similarity_max", self.contradiction_similarity_max),
+            ("contradiction_max_content_jaccard", self.contradiction_max_content_jaccard),
             ("content_overlap_similarity_min", self.content_overlap_similarity_min),
             ("content_overlap_similarity_max", self.content_overlap_similarity_max),
         ];

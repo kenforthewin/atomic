@@ -494,7 +494,35 @@ impl SqliteStorage {
 
         // ---- contradiction candidates (similarity thresholds.contradiction_similarity_min .. thresholds.contradiction_similarity_max) ----
         // Surface actual atom pairs for manual review.
+        //
+        // Two post-query filters run here to reduce false positives caused by
+        // template / boilerplate overlap:
+        //
+        //   (1) Boilerplate-exclusion: if either atom is already flagged as
+        //       boilerplate-polluted (computed above), its embedding is known
+        //       to be dominated by shared template text rather than unique
+        //       content. A high-similarity edge between such atoms is almost
+        //       certainly template noise, not a real contradiction. Re-embed
+        //       with unique content first, then re-check.
+        //
+        //   (2) Token-Jaccard prefilter: real contradictions express *different*
+        //       claims, so their atom contents use largely different token sets.
+        //       Pairs whose unique-token overlap is at/above
+        //       thresholds.contradiction_max_content_jaccard are treated as
+        //       template clones and filtered out.
+        //
+        // We raise the SQL LIMIT so filtering doesn't starve the final list;
+        // the raw candidate count (raw.contradiction_pairs_checked) still
+        // reflects the full matching edge count pre-filter, so the UI can tell
+        // the user how many were considered.
         {
+            let boilerplate_ids: std::collections::HashSet<&str> = raw
+                .boilerplate_affected_atoms
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect();
+            const MAX_CONTRADICTION_PAIRS: usize = 20;
+            const SQL_LIMIT: i32 = 200;
             let mut stmt = conn.prepare(
                 "SELECT
                      se.source_atom_id, se.target_atom_id, se.similarity_score,
@@ -511,14 +539,19 @@ impl SqliteStorage {
                  GROUP BY se.source_atom_id, se.target_atom_id
                  HAVING COUNT(DISTINCT at_a.tag_id) >= ?3
                  ORDER BY se.similarity_score DESC
-                 LIMIT 20",
+                 LIMIT ?4",
             )?;
             let mut rows = stmt.query(params![
                 thresholds.contradiction_similarity_min,
                 thresholds.contradiction_similarity_max,
                 thresholds.contradiction_shared_tags_min,
+                SQL_LIMIT,
             ])?;
+            let jaccard_cap = thresholds.contradiction_max_content_jaccard.clamp(0.0, 1.0);
             while let Some(row) = rows.next()? {
+                if raw.contradiction_pairs.len() >= MAX_CONTRADICTION_PAIRS {
+                    break;
+                }
                 let a_id: String = row.get(0)?;
                 let b_id: String = row.get(1)?;
                 let similarity: f32 = row.get(2)?;
@@ -529,6 +562,20 @@ impl SqliteStorage {
                 let shared_tag_count: i32 = row.get(7)?;
                 let a_created_at: Option<String> = row.get(8)?;
                 let b_created_at: Option<String> = row.get(9)?;
+
+                // Filter (1): skip pairs where either atom is boilerplate-polluted.
+                if boilerplate_ids.contains(a_id.as_str())
+                    || boilerplate_ids.contains(b_id.as_str())
+                {
+                    continue;
+                }
+
+                // Filter (2): skip pairs whose contents overlap too much at the
+                // token level — likely same template, not different claims.
+                if content_token_jaccard(&a_content, &b_content) >= jaccard_cap {
+                    continue;
+                }
+
                 let a_title = extract_title_preview(&a_content);
                 let b_title = extract_title_preview(&b_content);
                 raw.contradiction_pairs.push(crate::health::ContradictionPairEntry {
@@ -1054,6 +1101,123 @@ pub(crate) fn source_prefix(url: &Option<String>) -> String {
         return u[..slash].to_string();
     }
     u.clone()
+}
+
+/// Token-level Jaccard similarity between two atom contents.
+///
+/// Tokens are lowercased alphanumeric runs, length ≥ 3 (drops punctuation,
+/// drops trivial words like "a"/"is" that add noise without signal). Returns
+/// `|A ∩ B| / |A ∪ B|`, or `0.0` when both sets are empty.
+///
+/// Rationale: the contradiction check already filters by *embedding*
+/// similarity; the embedding can be dominated by shared template text, which
+/// produces false positives. A high embedding-sim pair with also-high token
+/// Jaccard is almost certainly template overlap, not a semantic disagreement.
+/// Real contradictions use *different* words to assert conflicting facts.
+pub(crate) fn content_token_jaccard(a: &str, b: &str) -> f32 {
+    fn tokens(s: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut buf = String::new();
+        for ch in s.chars() {
+            if ch.is_alphanumeric() {
+                for c in ch.to_lowercase() {
+                    buf.push(c);
+                }
+            } else if !buf.is_empty() {
+                if buf.len() >= 3 {
+                    out.insert(std::mem::take(&mut buf));
+                } else {
+                    buf.clear();
+                }
+            }
+        }
+        if buf.len() >= 3 {
+            out.insert(buf);
+        }
+        out
+    }
+
+    let set_a = tokens(a);
+    let set_b = tokens(b);
+    if set_a.is_empty() && set_b.is_empty() {
+        return 0.0;
+    }
+    let inter = set_a.intersection(&set_b).count();
+    let union = set_a.len() + set_b.len() - inter;
+    if union == 0 {
+        0.0
+    } else {
+        inter as f32 / union as f32
+    }
+}
+
+#[cfg(test)]
+mod jaccard_tests {
+    use super::content_token_jaccard;
+
+    #[test]
+    fn empty_strings_return_zero() {
+        assert_eq!(content_token_jaccard("", ""), 0.0);
+    }
+
+    #[test]
+    fn identical_content_is_one() {
+        let s = "alpha beta gamma delta";
+        assert!((content_token_jaccard(s, s) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disjoint_content_is_zero() {
+        assert_eq!(
+            content_token_jaccard("alpha beta gamma", "delta epsilon zeta"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn punctuation_and_case_normalized() {
+        let a = "ALPHA, beta! Gamma?";
+        let b = "alpha beta gamma";
+        assert!((content_token_jaccard(a, b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn short_tokens_dropped() {
+        // "a" is length 1, dropped; the other tokens all match.
+        let a = "a big red house";
+        let b = "big red house";
+        assert!((content_token_jaccard(a, b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn template_clone_scores_high() {
+        // Mirrors the real-world PITVR vs Roster Download shape: heavy shared
+        // template (health endpoints / troubleshooting table), small unique
+        // product text. Jaccard should sit high, above the 0.70 default cap.
+        let pitvr = "PITVR Personal Interactive TVR purpose allows users obtain \
+            driving record license status checks customer DFA runtime environment \
+            Linux General health endpoints environment URL dev uat prod troubleshooting \
+            outage alerts alert message response unable connect database check cluster \
+            SMTP SendGrid external web service personal inquiry VPN TVR service CCP \
+            status generate order id payment API cache Redis cluster";
+        let roster = "Roster Download source Confluence allows users obtain downloadable \
+            roster runtime environment Linux General health endpoints environment URL \
+            dev uat prod troubleshooting outage alerts alert message response could \
+            connect database check cluster CCP service status Redis cluster template \
+            database Linux VIP cluster SFTP agency port obtain OrderId Payment API";
+        let j = content_token_jaccard(pitvr, roster);
+        assert!(j >= 0.50, "expected heavy template overlap, got {j}");
+    }
+
+    #[test]
+    fn different_claims_score_low() {
+        // Same topic, different facts — the contradiction case we *want* to keep.
+        let a = "The service runs on port 8080 with TLS disabled in development.";
+        let b = "The service listens on port 9090 with TLS required for all traffic.";
+        let j = content_token_jaccard(a, b);
+        // Some overlap (service, port, TLS) but well under 0.70.
+        assert!(j < 0.70, "expected jaccard < 0.70, got {j}");
+    }
 }
 
 // ==================== Dismissal methods ====================

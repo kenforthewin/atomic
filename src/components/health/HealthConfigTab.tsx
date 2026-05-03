@@ -17,6 +17,7 @@ interface HealthThresholds {
   contradiction_similarity_min: number;
   contradiction_similarity_max: number;
   contradiction_shared_tags_min: number;
+  contradiction_max_content_jaccard: number;
   content_overlap_similarity_min: number;
   content_overlap_similarity_max: number;
   content_overlap_shared_tags_min: number;
@@ -33,6 +34,7 @@ const DEFAULT_THRESHOLDS: HealthThresholds = {
   contradiction_similarity_min: 0.80,
   contradiction_similarity_max: 0.92,
   contradiction_shared_tags_min: 1,
+  contradiction_max_content_jaccard: 0.70,
   content_overlap_similarity_min: 0.55,
   content_overlap_similarity_max: 0.85,
   content_overlap_shared_tags_min: 2,
@@ -443,6 +445,9 @@ const THRESHOLD_SPECS: ThresholdSpec[] = [
   { key: 'contradiction_shared_tags_min', label: 'Min shared tags', group: 'Contradiction detection',
     description: 'Minimum shared-tag count for a pair to surface.',
     step: '1', min: 0 },
+  { key: 'contradiction_max_content_jaccard', label: 'Max content token overlap (Jaccard)', group: 'Contradiction detection',
+    description: 'Pairs whose atom contents share this fraction or more of unique tokens are treated as template clones and filtered out. Lower = more aggressive boilerplate filtering.',
+    step: '0.01', min: 0, max: 1 },
   // ---- Content overlap ----
   { key: 'content_overlap_similarity_min', label: 'Similarity min', group: 'Content overlap',
     description: 'Lower bound (inclusive) of the cross-source overlap window.',
