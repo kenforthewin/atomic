@@ -18,6 +18,52 @@ use crate::providers::types::Message;
 use crate::AtomicCore;
 use serde_json::json;
 
+// ==================== User-tunable prompt instructions ====================
+//
+// Each health LLM fix sends a message with two pieces: an *instruction*
+// (what to do, how to format) and a *data block* (the atom content under
+// analysis). Only the instruction is user-tunable — the data block is
+// assembled in code so placeholders can't be mis-spelled or elided.
+//
+// Overrides are read from the per-DB `settings` table under the keys
+// below. An empty or missing value falls back to the builtin default.
+
+const MERGE_DUPLICATES_SETTING_KEY: &str = "health.merge_duplicates_prompt";
+const CONTRADICTION_DETECTION_SETTING_KEY: &str = "health.contradiction_detection_prompt";
+const STRIP_BOILERPLATE_SETTING_KEY: &str = "health.strip_boilerplate_prompt";
+
+const DEFAULT_MERGE_DUPLICATES_INSTRUCTION: &str = "You are merging two duplicate knowledge base atoms into one definitive version.\n\n\
+    Rules:\n\
+    - Combine all unique information from both atoms into one coherent document\n\
+    - If they contradict each other, prefer the more recent source\n\
+    - Preserve all actionable details (URLs, commands, config values)\n\
+    - Use clean markdown with proper headings\n\
+    - Add a '## Sources' section at the bottom listing both original source URLs\n\
+    - Do not add commentary — just produce the merged document\n\n\
+    Output the merged markdown only.";
+
+const DEFAULT_CONTRADICTION_DETECTION_INSTRUCTION: &str = "Two knowledge base atoms may contradict each other. Write ONE sentence \
+    (<= 25 words) describing what they disagree about. If they don't disagree, \
+    reply exactly: NO_CONFLICT.";
+
+const DEFAULT_STRIP_BOILERPLATE_INSTRUCTION: &str = "You are editing a knowledge base note. The note may contain boilerplate template \
+    sections (headers, field labels, empty placeholders) that are not unique to this topic. \
+    Remove all boilerplate; keep only the content that is specific to this note's subject. \
+    Preserve all factual information. If the whole note is boilerplate, reply exactly: EMPTY. \
+    Do not add commentary.";
+
+/// Resolve a per-DB prompt override from the settings map, falling back to
+/// the builtin default. Empty strings are treated as "not set" so a user
+/// who clears the setting gets the default back.
+fn resolve_prompt<'a>(settings: &'a std::collections::HashMap<String, String>, key: &str, default: &'a str) -> &'a str {
+    settings
+        .get(key)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default)
+}
+
+
 /// Strip common LLM-response wrappers (markdown code fences, leading/trailing
 /// whitespace) and return the JSON-candidate substring.
 ///
@@ -145,18 +191,17 @@ pub async fn merge_duplicate_pair(
         (atom_b, atom_a)
     };
 
+    let settings = core.get_settings_map().await.unwrap_or_default();
+    let instruction = resolve_prompt(
+        &settings,
+        MERGE_DUPLICATES_SETTING_KEY,
+        DEFAULT_MERGE_DUPLICATES_INSTRUCTION,
+    );
     let merge_prompt = format!(
-        "You are merging two duplicate knowledge base atoms into one definitive version.\n\n\
+        "{instruction}\n\n\
         ATOM A (source: {source_a}, created: {date_a}):\n{content_a}\n\n\
-        ATOM B (source: {source_b}, created: {date_b}):\n{content_b}\n\n\
-        Rules:\n\
-        - Combine all unique information from both atoms into one coherent document\n\
-        - If they contradict each other, prefer the more recent source\n\
-        - Preserve all actionable details (URLs, commands, config values)\n\
-        - Use clean markdown with proper headings\n\
-        - Add a '## Sources' section at the bottom listing both original source URLs\n\
-        - Do not add commentary — just produce the merged document\n\n\
-        Output the merged markdown only.",
+        ATOM B (source: {source_b}, created: {date_b}):\n{content_b}",
+        instruction = instruction,
         source_a = keep.atom.source_url.as_deref().unwrap_or("manual"),
         date_a = keep.atom.created_at,
         content_a = &keep.atom.content,
@@ -176,7 +221,6 @@ pub async fn merge_duplicate_pair(
     }
 
     // Get LLM provider
-    let settings = core.get_settings_map().await.unwrap_or_default();
     let provider_config = ProviderConfig::from_settings(&settings);
     let llm = create_llm_provider(&provider_config).map_err(|e| {
         AtomicCoreError::Configuration(format!("LLM provider unavailable for merge: {e}"))
@@ -346,16 +390,20 @@ pub async fn contradiction_summary(
     let Some(b) = core.get_atom(atom_b_id).await? else {
         return Err(AtomicCoreError::NotFound(format!("atom {atom_b_id} not found")));
     };
+    let settings = core.get_settings_map().await.unwrap_or_default();
+    let instruction = resolve_prompt(
+        &settings,
+        CONTRADICTION_DETECTION_SETTING_KEY,
+        DEFAULT_CONTRADICTION_DETECTION_INSTRUCTION,
+    );
     let prompt = format!(
-        "Two knowledge base atoms may contradict each other. Write ONE sentence \
-         (<= 25 words) describing what they disagree about. If they don't disagree, \
-         reply exactly: NO_CONFLICT.\n\n\
+        "{instruction}\n\n\
          ATOM A:\n{}\n\n\
          ATOM B:\n{}\n\n\
          One-sentence summary:",
         a.atom.content, b.atom.content,
+        instruction = instruction,
     );
-    let settings = core.get_settings_map().await.unwrap_or_default();
     let provider_config = ProviderConfig::from_settings(&settings);
     let llm = create_llm_provider(&provider_config).map_err(|e| {
         AtomicCoreError::Configuration(format!("LLM provider unavailable: {e}"))
@@ -386,17 +434,19 @@ pub async fn strip_boilerplate_atom(
             "atom {atom_id} is locked — unlock it before running automated fixes"
         )));
     }
-    let prompt = format!(
-        "You are editing a knowledge base note. The note may contain boilerplate template \
-         sections (headers, field labels, empty placeholders) that are not unique to this topic. \
-         Remove all boilerplate; keep only the content that is specific to this note's subject. \
-         Preserve all factual information. If the whole note is boilerplate, reply exactly: EMPTY. \
-         Do not add commentary.\n\n\
-         NOTE:\n{}\n\n\
-         Rewritten note:",
-        atom.atom.content
-    );
     let settings = core.get_settings_map().await.unwrap_or_default();
+    let instruction = resolve_prompt(
+        &settings,
+        STRIP_BOILERPLATE_SETTING_KEY,
+        DEFAULT_STRIP_BOILERPLATE_INSTRUCTION,
+    );
+    let prompt = format!(
+        "{instruction}\n\n\
+         NOTE:\n{content}\n\n\
+         Rewritten note:",
+        instruction = instruction,
+        content = atom.atom.content,
+    );
     let provider_config = ProviderConfig::from_settings(&settings);
     let llm = create_llm_provider(&provider_config).map_err(|e| {
         AtomicCoreError::Configuration(format!("LLM provider unavailable: {e}"))

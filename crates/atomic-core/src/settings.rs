@@ -88,9 +88,7 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     // Health LLM prompt templates (empty = use built-in defaults)
     ("health.merge_duplicates_prompt", ""),
     ("health.contradiction_detection_prompt", ""),
-    ("health.split_long_atom_prompt", ""),
-    ("health.enrich_stub_atom_prompt", ""),
-    ("health.add_structure_prompt", ""),
+    ("health.strip_boilerplate_prompt", ""),
 ];
 
 /// Migrate settings - add any missing default settings
