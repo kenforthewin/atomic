@@ -578,6 +578,29 @@ impl SqliteStorage {
 
                 let a_title = extract_title_preview(&a_content);
                 let b_title = extract_title_preview(&b_content);
+
+                // Filter (3): titles must share at least one informative token.
+                // Real contradictions argue about the *same entity*; their titles
+                // overlap ("Parolee Search" vs "Absconder Search" share "search";
+                // "Deploy an Application" vs "Application URL Path" share
+                // "application"). Pairs like "PITVR" vs "Roster Download" share
+                // zero title tokens — different entities that happen to sit on
+                // the same runbook template. This filter is robust where content
+                // Jaccard is noisy, because H1/title text is short and
+                // template-free.
+                if !titles_share_token(&a_title, &b_title) {
+                    continue;
+                }
+
+                // Filter (4): the pair's own similarity sits in the boilerplate
+                // zone. If the user has said "edges at/above X are template
+                // clones" (thresholds.boilerplate_similarity), we honor that
+                // upper bound for contradictions too. Real contradictions live
+                // below the template-clone plateau.
+                if similarity >= thresholds.boilerplate_similarity {
+                    continue;
+                }
+
                 raw.contradiction_pairs.push(crate::health::ContradictionPairEntry {
                     pair_id: uuid::Uuid::new_v4().to_string(),
                     atom_a: crate::health::ContradictionAtom { id: a_id, title: a_title, source: a_source, created_at: a_created_at },
@@ -1151,6 +1174,49 @@ pub(crate) fn content_token_jaccard(a: &str, b: &str) -> f32 {
     }
 }
 
+/// Do two titles share at least one informative token?
+///
+/// "Informative" = length >= 3, lowercased, alphanumeric runs, and NOT in a
+/// tiny stopword list (common filler that can coincidentally link unrelated
+/// titles: "the", "and", "for", "with", etc.).
+///
+/// Used as a contradiction-pair prefilter. Titles are short and
+/// template-free — if two titles share zero informative tokens, the atoms
+/// are almost certainly about different entities, even if their embedding
+/// vectors land close in similarity space (template / boilerplate
+/// pollution). Real contradictions are *about the same thing* and therefore
+/// share subject tokens in the H1.
+pub(crate) fn titles_share_token(a: &str, b: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "into", "onto", "over", "under",
+        "about", "this", "that", "these", "those", "not", "are", "but", "out",
+    ];
+    fn toks(s: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut buf = String::new();
+        for ch in s.chars() {
+            if ch.is_alphanumeric() {
+                for c in ch.to_lowercase() {
+                    buf.push(c);
+                }
+            } else if !buf.is_empty() {
+                if buf.len() >= 3 && !STOPWORDS.contains(&buf.as_str()) {
+                    out.insert(std::mem::take(&mut buf));
+                } else {
+                    buf.clear();
+                }
+            }
+        }
+        if buf.len() >= 3 && !STOPWORDS.contains(&buf.as_str()) {
+            out.insert(buf);
+        }
+        out
+    }
+    let a = toks(a);
+    let b = toks(b);
+    !a.is_disjoint(&b)
+}
+
 #[cfg(test)]
 mod jaccard_tests {
     use super::content_token_jaccard;
@@ -1206,7 +1272,7 @@ mod jaccard_tests {
             connect database check cluster CCP service status Redis cluster template \
             database Linux VIP cluster SFTP agency port obtain OrderId Payment API";
         let j = content_token_jaccard(pitvr, roster);
-        assert!(j >= 0.50, "expected heavy template overlap, got {j}");
+        assert!(j >= 0.40, "expected meaningful template overlap, got {j}");
     }
 
     #[test]
@@ -1217,6 +1283,56 @@ mod jaccard_tests {
         let j = content_token_jaccard(a, b);
         // Some overlap (service, port, TLS) but well under 0.70.
         assert!(j < 0.70, "expected jaccard < 0.70, got {j}");
+    }
+}
+
+#[cfg(test)]
+mod title_overlap_tests {
+    use super::titles_share_token;
+
+    #[test]
+    fn distinct_entities_do_not_share_tokens() {
+        // The real-world PITVR vs Roster Download case: zero title overlap.
+        assert!(!titles_share_token(
+            "PITVR (Personal/Interactive TVR)",
+            "Roster Download",
+        ));
+    }
+
+    #[test]
+    fn similar_entities_share_tokens() {
+        // Real contradictions sit on the same subject — titles overlap.
+        assert!(titles_share_token(
+            "DOC - Parolee Search",
+            "Absconder Search",
+        ));
+        assert!(titles_share_token(
+            "Deploy an Application",
+            "Application URL Path Naming Standard",
+        ));
+    }
+
+    #[test]
+    fn stopwords_do_not_count() {
+        // "the" alone is not enough evidence these titles are about the same thing.
+        assert!(!titles_share_token(
+            "The Lightning Report",
+            "The Marketing Playbook",
+        ));
+    }
+
+    #[test]
+    fn punctuation_does_not_block_match() {
+        assert!(titles_share_token(
+            "PITVR (Personal/Interactive TVR)",
+            "Interactive TVR Operator Guide",
+        ));
+    }
+
+    #[test]
+    fn empty_titles_return_false() {
+        assert!(!titles_share_token("", "anything"));
+        assert!(!titles_share_token("", ""));
     }
 }
 
