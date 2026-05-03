@@ -252,16 +252,33 @@ fn build_href_candidates(href: &str, current_source_url: &str) -> Vec<String> {
     };
     let dir = source_dir(current_source_url);
 
-    let resolved = if let Some(rest) = href.strip_prefix("./") {
-        format!("{}{}", dir, rest)
-    } else if let Some(rest) = href.strip_prefix("../") {
-        resolve_parent(dir, rest, root)
-    } else {
-        // Relative to vault root (Obsidian default for bare paths)
-        format!("{}{}", root, href)
-    };
+    // Strip any #fragment or ?query — the atom lookup matches on source_url,
+    // which stores the file path only, never the anchor. Without this, a
+    // markdown link like `[x](./foo.md#section)` would try to resolve to a
+    // non-existent atom with the fragment baked into its URL.
+    let href = href.split(['#', '?']).next().unwrap_or(href);
 
-    candidates_with_and_without_extension(&resolved)
+    let mut out: Vec<String> = Vec::new();
+    if let Some(rest) = href.strip_prefix("./") {
+        // Explicit current-dir: resolve relative to current dir only.
+        out.extend(candidates_with_and_without_extension(&format!("{}{}", dir, rest)));
+    } else if let Some(rest) = href.strip_prefix("../") {
+        // Parent-relative: resolve via the parent-walk helper.
+        out.extend(candidates_with_and_without_extension(
+            &resolve_parent(dir, rest, root),
+        ));
+    } else {
+        // Bare relative path (no leading `./` or `../`). Obsidian's default
+        // resolution tries the *current directory first*, falling back to
+        // the vault root. Generate both so a naked `glossary.md` written
+        // next to `onboarding.md` resolves to the sibling file, not to
+        // `<vault>/glossary.md`. Without this, valid same-folder links get
+        // false-positive-flagged as broken.
+        out.extend(candidates_with_and_without_extension(&format!("{}{}", dir, href)));
+        out.extend(candidates_with_and_without_extension(&format!("{}{}", root, href)));
+    }
+    out.dedup();
+    out
 }
 
 fn resolve_parent(current_dir: &str, rest: &str, vault_root: &str) -> String {
@@ -406,6 +423,36 @@ mod tests {
 
     const VAULT: &str = "obsidian://ar-playbook/";
     const SOURCE: &str = "obsidian://ar-playbook/processes/deployment.md";
+
+    #[test]
+    fn test_bare_href_tries_current_dir_first() {
+        // Bare `glossary.md` next to `onboarding.md` must resolve to the
+        // sibling file, not to `<vault>/glossary.md`.
+        let source = "obsidian://ar-playbook/references/onboarding.md";
+        let candidates = build_href_candidates("glossary.md", source);
+        assert!(
+            candidates.contains(&"obsidian://ar-playbook/references/glossary.md".to_string()),
+            "expected dir-relative candidate, got {candidates:?}"
+        );
+        // Keep the vault-root candidate as a fallback for cases where the
+        // source note uses Obsidian's root-relative convention.
+        assert!(
+            candidates.contains(&"obsidian://ar-playbook/glossary.md".to_string()),
+            "expected vault-root fallback candidate, got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_href_fragment_is_stripped() {
+        let candidates = build_href_candidates(
+            "../processes/work-tracking.md#estimation-approach",
+            SOURCE,
+        );
+        assert!(
+            candidates.contains(&"obsidian://ar-playbook/processes/work-tracking.md".to_string()),
+            "fragment should be stripped before resolution, got {candidates:?}"
+        );
+    }
 
     #[test]
     fn test_relative_href_resolves_to_vault_root() {

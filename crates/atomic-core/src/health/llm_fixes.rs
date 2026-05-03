@@ -547,11 +547,33 @@ pub struct AutoResolveBatchResult {
 /// Returns an empty string when the format is unrecognised.
 fn extract_link_display_text(original: &str) -> String {
     if let Some(close) = original.find("](")
- {
+{
         if original.starts_with('[') {
             return original[1..close].to_string();
         }
     }
+    if let Some(inner) = original.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+        return inner.split('|').next().unwrap_or(inner).trim().to_string();
+    }
+    String::new()
+}
+
+/// Extract the *target* (href or wikilink name) from a raw link string.
+///
+/// Used as the fuzzy-search query for broken-link auto-resolution: passing the
+/// whole raw string (`"[Glossary](glossary.md)"`) to a LIKE search never
+/// matches; passing the extracted target (`"glossary.md"` or `"Glossary"`)
+/// does. For markdown links the anchor/fragment/query is stripped too.
+/// Returns an empty string when the input isn't a recognised link form.
+fn extract_link_target(original: &str) -> String {
+    // Markdown: [text](href)
+    if let (Some(open), Some(close)) = (original.find("]("), original.rfind(')')) {
+        if original.starts_with('[') && close > open {
+            let href = &original[open + 2..close];
+            return href.split(['#', '?']).next().unwrap_or(href).trim().to_string();
+        }
+    }
+    // Wikilink: [[name|alias]] — name comes before the pipe.
     if let Some(inner) = original.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
         return inner.split('|').next().unwrap_or(inner).trim().to_string();
     }
@@ -585,22 +607,45 @@ pub async fn auto_resolve_broken_link(
         });
     }
 
-    let candidates = suggest_link_targets(core, link_raw, 8).await?;
-
+    // Build candidate list by searching on the extracted link target (href or
+    // wikilink name) rather than the raw link string. Passing the whole raw
+    // string (`"[Glossary](glossary.md)"`) to the LIKE-based suggest never
+    // matches — that was the source of the "no candidates → link removed"
+    // regression. If searching by target yields nothing, fall back to the
+    // display text (`"Glossary"`), which often matches the H1 of the intended
+    // atom even when the path is stale.
+    let target = extract_link_target(link_raw);
+    let display = extract_link_display_text(link_raw);
+    let mut candidates = if !target.is_empty() {
+        suggest_link_targets(core, &target, 8).await?
+    } else {
+        Vec::new()
+    };
+    if candidates.is_empty() && !display.is_empty() && display != target {
+        candidates = suggest_link_targets(core, &display, 8).await?;
+    }
     if candidates.is_empty() {
-        // No candidates — strip the link.
-        let reason = "no candidates".to_string();
-        let _ = super::fixes::remove_broken_link(core, atom_id, link_raw).await;
-        let outcome = AutoResolveOutcome::Removed { reason: reason.clone() };
+        // No candidates found by fuzzy search. Previously this branch quietly
+        // stripped the link — destructive, and dangerous when the cause is a
+        // *missing atom* (the link's true target was deleted/renamed). Users
+        // saw "auto-fix concluded with no matches" and found links had been
+        // silently removed. Now we skip and surface the reason so the user can
+        // manually repair or dismiss. The explicit "Remove" button remains
+        // the escape hatch for the destructive path.
+        let reason = format!(
+            "no candidates matched target {:?} or display {:?}",
+            target, display,
+        );
+        let outcome = AutoResolveOutcome::Skipped { reason: reason.clone() };
         audit::log_fix(
             core,
             "broken_internal_links",
-            "auto_resolve_removed",
-            "medium",
+            "auto_resolve_skipped",
+            "low",
             Some(&[atom_id.to_string()]),
             None,
             json!({"atom_id": atom_id, "link_raw": link_raw}),
-            json!({"outcome": "removed", "reason": reason}),
+            json!({"outcome": "skipped", "reason": reason}),
             None,
             None,
         )

@@ -31,6 +31,34 @@ interface LinkRowProps {
   onIgnore: () => void;
 }
 
+/**
+ * Convert a broken-link target into a search-friendly query seed.
+ *
+ * - Strips any `#fragment` or `?query` suffix (backend source_urls don't
+ *   carry anchors, so leaving them in guarantees zero matches).
+ * - Drops the directory path and `.md` / `.markdown` / `.mdx` extension.
+ * - Replaces hyphens and underscores with spaces so slug-style filenames
+ *   (`custom-application-stewardship`) match title text
+ *   (`Custom Application Stewardship`).
+ *
+ * Examples:
+ *   `../processes/foo-bar.md#section` → `foo bar`
+ *   `glossary.md`                    → `glossary`
+ *   `Tyler Arkansas Glossary`        → `Tyler Arkansas Glossary`
+ */
+function stripLinkTargetToStem(target: string): string {
+  if (!target) return '';
+  // Strip fragment/query.
+  const clean = target.split(/[#?]/)[0];
+  // Take last path segment.
+  const segs = clean.split('/');
+  const base = segs[segs.length - 1] || clean;
+  // Drop extension.
+  const stem = base.replace(/\.(md|markdown|mdx)$/i, '');
+  // De-slug.
+  return stem.replace(/[-_]+/g, ' ').trim();
+}
+
 function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
   const [status, setStatus] = useState<ItemStatus>('idle');
   const [picking, setPicking] = useState(false);
@@ -54,7 +82,16 @@ function LinkRow({ link, atomId, onRemoved, onIgnore }: LinkRowProps) {
     return () => window.clearTimeout(t);
   }, [query, picking]);
 
-  const openPicker = () => { setQuery(link.target); setPicking(true); };
+  const openPicker = () => {
+    // Seed the search with the filename stem (or wikilink name for `[[x]]`)
+    // so fuzzy search has a fighting chance. The raw link target may be a
+    // long relative path with extension and anchor (`../foo/bar.md#sec`)
+    // that the backend's LIKE-based suggest won't match against titles.
+    // Users can still type their own query in the input.
+    const stem = stripLinkTargetToStem(link.target);
+    setQuery(stem);
+    setPicking(true);
+  };
 
   const removeLink = async () => {
     setStatus('saving');
