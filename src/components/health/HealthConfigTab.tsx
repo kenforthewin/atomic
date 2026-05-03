@@ -243,13 +243,28 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
     const handle = window.setTimeout(() => {
       const d = latestDraftRef.current;
       if (!d) return;
-      const payload = fromDraft(d);
-      console.debug('[health-config] autosave tick', { payload, lastSaved: lastSavedRef.current });
-      void persist(payload);
+      void persist(fromDraft(d));
     }, 600);
     return () => { window.clearTimeout(handle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
+
+  // Flush any pending autosave on unmount (tab switch, modal close) so the
+  // user's last edit isn't lost to the 600ms debounce.
+  useEffect(() => {
+    return () => {
+      if (!initializedRef.current) return;
+      const d = latestDraftRef.current;
+      if (!d) return;
+      const payload = fromDraft(d);
+      const serialized = JSON.stringify(payload);
+      if (serialized === lastSavedRef.current) return;
+      // Fire-and-forget: component is unmounting so we can't await or surface
+      // a status pill. Errors still reach the toast store.
+      void persist(payload);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Fade the "Saved" pill back to idle after a short delay so it stays out of
   // the way during a normal editing session.
