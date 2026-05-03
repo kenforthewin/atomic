@@ -867,6 +867,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const [briefingPrompt, setBriefingPrompt] = useState('');
   const [chatPrompt, setChatPrompt] = useState('');
   const [taggingPrompt, setTaggingPrompt] = useState('');
+  const [mergeDuplicatesPrompt, setMergeDuplicatesPrompt] = useState('');
+  const [contradictionDetectionPrompt, setContradictionDetectionPrompt] = useState('');
+  const [stripBoilerplatePrompt, setStripBoilerplatePrompt] = useState('');
   const [chatModel, setChatModel] = useState('anthropic/claude-sonnet-4.6');
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -1263,6 +1266,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     setBriefingPrompt(settings.briefing_prompt || '');
     setChatPrompt(settings.chat_prompt || '');
     setTaggingPrompt(settings.tagging_prompt || '');
+    setMergeDuplicatesPrompt(settings['health.merge_duplicates_prompt'] || '');
+    setContradictionDetectionPrompt(settings['health.contradiction_detection_prompt'] || '');
+    setStripBoilerplatePrompt(settings['health.strip_boilerplate_prompt'] || '');
     setChatModel(settings.chat_model || 'anthropic/claude-sonnet-4.6');
     setOllamaHost(settings.ollama_host || 'http://127.0.0.1:11434');
     setOllamaEmbeddingModel(settings.ollama_embedding_model || 'nomic-embed-text');
@@ -2348,6 +2354,96 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     )}
                     <OverrideControls settingKey="tagging_prompt" />
                   </div>
+
+                  {/* ===== Health Check Prompts ===== */}
+                  <div className="pt-4 border-t border-[var(--color-border)]">
+                    <h3 className="text-sm font-semibold text-[var(--color-text-primary)] mb-1">Health Check Prompts</h3>
+                    <p className="text-xs text-[var(--color-text-secondary)]">
+                      Used by the Health dashboard's LLM-powered fixes. Each instruction is prepended to a hardcoded data block (the atoms under analysis).
+                    </p>
+                  </div>
+
+                  {/* Merge Duplicates Prompt */}
+                  <div className="space-y-1">
+                    <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                      Merge Duplicates Prompt
+                    </label>
+                    <p className="text-xs text-[var(--color-text-secondary)]">
+                      Instruction for merging two duplicate atoms into one definitive version. Leave empty to use the default.
+                    </p>
+                    <textarea
+                      value={mergeDuplicatesPrompt}
+                      onChange={(e) => setMergeDuplicatesPrompt(e.target.value)}
+                      onBlur={() => autoSave('health.merge_duplicates_prompt', mergeDuplicatesPrompt)}
+                      placeholder={"You are merging two duplicate knowledge base atoms into one definitive version.\n\nRules:\n- Combine all unique information from both atoms into one coherent document\n- If they contradict each other, prefer the more recent source\n- Preserve all actionable details (URLs, commands, config values)\n- Use clean markdown with proper headings\n- Add a '## Sources' section at the bottom listing both original source URLs\n- Do not add commentary — just produce the merged document\n\nOutput the merged markdown only."}
+                      rows={6}
+                      className="w-full px-3 py-2 rounded-md bg-[var(--color-bg-main)] border border-[var(--color-border)] text-sm text-[var(--color-text-primary)] font-mono resize-y placeholder:text-[var(--color-text-secondary)]/40"
+                    />
+                    {mergeDuplicatesPrompt && (
+                      <button
+                        onClick={() => { setMergeDuplicatesPrompt(''); autoSave('health.merge_duplicates_prompt', ''); }}
+                        className="text-xs text-[var(--color-accent)] hover:underline"
+                      >
+                        Reset to default
+                      </button>
+                    )}
+                    <OverrideControls settingKey="health.merge_duplicates_prompt" />
+                  </div>
+
+                  {/* Contradiction Detection Prompt */}
+                  <div className="space-y-1">
+                    <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                      Contradiction Detection Prompt
+                    </label>
+                    <p className="text-xs text-[var(--color-text-secondary)]">
+                      Instruction for one-line summaries of contradictions between two atoms. Leave empty to use the default.
+                    </p>
+                    <textarea
+                      value={contradictionDetectionPrompt}
+                      onChange={(e) => setContradictionDetectionPrompt(e.target.value)}
+                      onBlur={() => autoSave('health.contradiction_detection_prompt', contradictionDetectionPrompt)}
+                      placeholder={"Two knowledge base atoms may contradict each other. Write ONE sentence (<= 25 words) describing what they disagree about. If they don't disagree, reply exactly: NO_CONFLICT."}
+                      rows={4}
+                      className="w-full px-3 py-2 rounded-md bg-[var(--color-bg-main)] border border-[var(--color-border)] text-sm text-[var(--color-text-primary)] font-mono resize-y placeholder:text-[var(--color-text-secondary)]/40"
+                    />
+                    {contradictionDetectionPrompt && (
+                      <button
+                        onClick={() => { setContradictionDetectionPrompt(''); autoSave('health.contradiction_detection_prompt', ''); }}
+                        className="text-xs text-[var(--color-accent)] hover:underline"
+                      >
+                        Reset to default
+                      </button>
+                    )}
+                    <OverrideControls settingKey="health.contradiction_detection_prompt" />
+                  </div>
+
+                  {/* Strip Boilerplate Prompt */}
+                  <div className="space-y-1">
+                    <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                      Strip Boilerplate Prompt
+                    </label>
+                    <p className="text-xs text-[var(--color-text-secondary)]">
+                      Instruction for removing template boilerplate from an atom while preserving unique content. Leave empty to use the default.
+                    </p>
+                    <textarea
+                      value={stripBoilerplatePrompt}
+                      onChange={(e) => setStripBoilerplatePrompt(e.target.value)}
+                      onBlur={() => autoSave('health.strip_boilerplate_prompt', stripBoilerplatePrompt)}
+                      placeholder={"You are editing a knowledge base note. The note may contain boilerplate template sections (headers, field labels, empty placeholders) that are not unique to this topic. Remove all boilerplate; keep only the content that is specific to this note's subject. Preserve all factual information. If the whole note is boilerplate, reply exactly: EMPTY. Do not add commentary."}
+                      rows={5}
+                      className="w-full px-3 py-2 rounded-md bg-[var(--color-bg-main)] border border-[var(--color-border)] text-sm text-[var(--color-text-primary)] font-mono resize-y placeholder:text-[var(--color-text-secondary)]/40"
+                    />
+                    {stripBoilerplatePrompt && (
+                      <button
+                        onClick={() => { setStripBoilerplatePrompt(''); autoSave('health.strip_boilerplate_prompt', ''); }}
+                        className="text-xs text-[var(--color-accent)] hover:underline"
+                      >
+                        Reset to default
+                      </button>
+                    )}
+                    <OverrideControls settingKey="health.strip_boilerplate_prompt" />
+                  </div>
+
 
                 </div>
               )}
