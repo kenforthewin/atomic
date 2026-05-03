@@ -16,8 +16,9 @@ pub async fn run_fix(
     core: &AtomicCore,
     req: &FixRequest,
 ) -> Result<FixResponse, AtomicCoreError> {
-    let raw = core.storage().health_check_data_sync().await?;
-    let checks = checks::run_all(&raw);
+    let config = core.get_health_config().await.unwrap_or_default();
+    let raw = core.storage().health_check_data_sync(config.thresholds.clone()).await?;
+    let checks = checks::run_all(&raw, &config.thresholds);
     let max_tier = req.max_tier();
     let dry_run = req.is_dry_run();
 
@@ -155,10 +156,12 @@ pub async fn run_fix(
 
     // Recompute score after fixes (if not dry run) — always weight with
     // the caller DB's current HealthConfig so the number matches compute_health.
-    let config = core.get_health_config().await.unwrap_or_default();
     let new_score = if !dry_run && !actions_taken.is_empty() {
-        let new_raw = core.storage().health_check_data_sync().await?;
-        let new_checks = checks::run_all(&new_raw);
+        let new_raw = core
+            .storage()
+            .health_check_data_sync(config.thresholds.clone())
+            .await?;
+        let new_checks = checks::run_all(&new_raw, &config.thresholds);
         aggregate_score(&new_checks, Some(&config))
     } else {
         aggregate_score(&checks, Some(&config))

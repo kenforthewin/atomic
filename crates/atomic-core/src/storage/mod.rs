@@ -137,11 +137,12 @@ impl StorageBackend {
 
     pub(crate) async fn health_check_data_sync(
         &self,
+        thresholds: crate::health::HealthThresholds,
     ) -> Result<crate::storage::sqlite::health::HealthRawData, AtomicCoreError> {
         match self {
             StorageBackend::Sqlite(s) => {
                 let s = s.clone();
-                tokio::task::spawn_blocking(move || s.health_check_data_impl())
+                tokio::task::spawn_blocking(move || s.health_check_data_impl(&thresholds))
                     .await
                     .map_err(join_err)?
             }

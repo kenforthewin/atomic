@@ -3,13 +3,16 @@
 //! Each check takes a `&HealthRawData` snapshot (fetched once) and returns a
 //! `HealthCheckResult` with a 0–100 score and check-specific JSON data.
 
-use super::{DuplicatePair, HealthCheckResult, WikiGap, WikiStaleEntry};
+use super::{DuplicatePair, HealthCheckResult, HealthThresholds, WikiGap, WikiStaleEntry};
 use crate::storage::sqlite::health::HealthRawData;
 use serde_json::json;
 use std::collections::HashMap;
 
 /// Run all 10 checks against pre-fetched raw data.
-pub fn run_all(raw: &HealthRawData) -> HashMap<String, HealthCheckResult> {
+pub fn run_all(
+    raw: &HealthRawData,
+    thresholds: &HealthThresholds,
+) -> HashMap<String, HealthCheckResult> {
     let mut map = HashMap::new();
     map.insert("embedding_coverage".to_string(), embedding_coverage(raw));
     map.insert("tagging_coverage".to_string(), tagging_coverage(raw));
@@ -17,11 +20,11 @@ pub fn run_all(raw: &HealthRawData) -> HashMap<String, HealthCheckResult> {
     map.insert("orphan_tags".to_string(), orphan_tags(raw));
     map.insert(
         "semantic_graph_freshness".to_string(),
-        semantic_graph_freshness(raw),
+        semantic_graph_freshness(raw, thresholds),
     );
     map.insert("wiki_coverage".to_string(), wiki_coverage(raw));
     map.insert("content_quality".to_string(), content_quality(raw));
-    map.insert("tag_health".to_string(), tag_health(raw));
+    map.insert("tag_health".to_string(), tag_health(raw, thresholds));
     map.insert("content_overlap".to_string(), content_overlap(raw));
     map.insert(
         "contradiction_detection".to_string(),
@@ -31,7 +34,7 @@ pub fn run_all(raw: &HealthRawData) -> HashMap<String, HealthCheckResult> {
     // Surfaces boilerplate-dominated atoms to the UI without penalising the KB.
     map.insert(
         "boilerplate_pollution".to_string(),
-        boilerplate_pollution(raw),
+        boilerplate_pollution(raw, thresholds),
     );
     map
 }
@@ -174,12 +177,15 @@ pub fn orphan_tags(raw: &HealthRawData) -> HealthCheckResult {
         }
 }
 
-pub fn semantic_graph_freshness(raw: &HealthRawData) -> HealthCheckResult {
+pub fn semantic_graph_freshness(
+    raw: &HealthRawData,
+    thresholds: &HealthThresholds,
+) -> HealthCheckResult {
     let atoms_since = raw.atoms_since_edge_rebuild;
     let score = (100i32 - atoms_since * 2).max(0) as u32;
     let status = if atoms_since == 0 {
         "ok"
-    } else if atoms_since <= 20 {
+    } else if atoms_since <= thresholds.semantic_graph_freshness_warning {
         "warning"
     } else {
         "error"
@@ -315,19 +321,23 @@ pub fn content_quality(raw: &HealthRawData) -> HealthCheckResult {
         }
 }
 
-pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
+pub fn tag_health(
+    raw: &HealthRawData,
+    thresholds: &HealthThresholds,
+) -> HealthCheckResult {
     let single = raw.single_atom_tags;
     let rootless = raw.rootless_tags;
     let similar = raw.similar_name_pair_count;
+    let single_thresh = thresholds.tag_health_single_atom_threshold;
 
-    let issues = (single > 3) as u32 + (rootless > 0) as u32 + (similar > 0) as u32;
+    let issues = (single > single_thresh) as u32 + (rootless > 0) as u32 + (similar > 0) as u32;
     let score = (100u32).saturating_sub(issues * 10);
     let status = if issues == 0 { "ok" } else { "warning" };
 
     // auto_fixable only when there are auto-tag single-atom tags above the threshold.
     // fix_tag_health_single_atom targets is_autotag=true entries only.
     let autotag_single = raw.single_atom_tag_list.iter().filter(|t| t.is_autotag).count() as i32;
-    let auto_fixable = autotag_single > 3;
+    let auto_fixable = autotag_single > single_thresh;
 
     let single_atom_truncated = raw.single_atom_tags > raw.single_atom_tag_list.len() as i32;
 
@@ -335,7 +345,7 @@ pub fn tag_health(raw: &HealthRawData) -> HealthCheckResult {
         status: status.to_string(),
         score,
         auto_fixable,
-        requires_review: rootless > 0 || similar > 0 || single > 3,
+        requires_review: rootless > 0 || similar > 0 || single > single_thresh,
         informational: false,
         fix_action: None,
         data: json!({
@@ -433,13 +443,17 @@ pub fn contradiction_detection(raw: &HealthRawData) -> HealthCheckResult {
 
 /// Diagnostic check: atoms whose embeddings are dominated by shared boilerplate.
 ///
-/// An atom is flagged when it has >= 2 semantic edges at similarity >= 0.99.
+/// An atom is flagged when it has >= thresholds.boilerplate_min_clones semantic edges
+/// at similarity >= thresholds.boilerplate_similarity.
 /// That means the vector space can't distinguish it from multiple other atoms,
 /// so semantic search will return the wrong runbook / article for those queries.
 ///
 /// This check does NOT affect the overall score (not in CHECK_WEIGHTS).
 /// Fix: re-chunk excluding boilerplate sections, or re-embed with a unique-content prefix.
-pub fn boilerplate_pollution(raw: &HealthRawData) -> HealthCheckResult {
+pub fn boilerplate_pollution(
+    raw: &HealthRawData,
+    thresholds: &HealthThresholds,
+) -> HealthCheckResult {
     let count = raw.boilerplate_affected_atoms.len() as u32;
     let status = if count == 0 { "ok" } else { "warning" };
     // Score reflects detection health: 0 affected = 100, degrades ~3/atom, floor at 50.
@@ -462,10 +476,16 @@ pub fn boilerplate_pollution(raw: &HealthRawData) -> HealthCheckResult {
                     "title": a.title,
                     "clone_count": a.clone_count
                 })).collect::<Vec<_>>(),
-                "description": "Atoms with >= 2 near-identical edges (similarity >= 0.99). \
-                                 Shared boilerplate text drowns out unique content in their \
-                                 embeddings. Semantic search cannot reliably distinguish \
-                                 these atoms from each other."
+                "threshold_similarity": thresholds.boilerplate_similarity,
+                "threshold_min_clones": thresholds.boilerplate_min_clones,
+                "description": format!(
+                    "Atoms with >= {} near-identical edges (similarity >= {:.2}). \
+                     Shared boilerplate text drowns out unique content in their \
+                     embeddings. Semantic search cannot reliably distinguish \
+                     these atoms from each other.",
+                    thresholds.boilerplate_min_clones,
+                    thresholds.boilerplate_similarity,
+                )
             }),
         }
 }

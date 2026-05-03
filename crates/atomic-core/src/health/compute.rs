@@ -29,10 +29,10 @@ pub async fn compute_health(core: &AtomicCore) -> Result<HealthReport, AtomicCor
     let config = core.get_health_config().await.unwrap_or_default();
 
     // Fetch all raw data in a single spawn_blocking pass
-    let raw = core.storage().health_check_data_sync().await?;
+    let raw = core.storage().health_check_data_sync(config.thresholds.clone()).await?;
 
     // Run all synchronous checks
-    let mut checks = checks::run_all(&raw);
+    let mut checks = checks::run_all(&raw, &config.thresholds);
 
     // Run async link-resolution check (needs DB lookups per candidate atom)
     match compute_link_check(core).await {
@@ -168,19 +168,24 @@ pub async fn compute_single_check(
         | "tag_health"
         | "contradiction_detection"
         | "boilerplate_pollution" => {
-            let raw = core.storage().health_check_data_sync().await?;
+            let config = core.get_health_config().await.unwrap_or_default();
+            let raw = core
+                .storage()
+                .health_check_data_sync(config.thresholds.clone())
+                .await?;
+            let t = &config.thresholds;
             match check_name {
                 "embedding_coverage"       => checks::embedding_coverage(&raw),
                 "tagging_coverage"         => checks::tagging_coverage(&raw),
                 "content_overlap"          => checks::content_overlap(&raw),
                 "source_uniqueness"        => checks::source_uniqueness(&raw),
                 "wiki_coverage"            => checks::wiki_coverage(&raw),
-                "semantic_graph_freshness" => checks::semantic_graph_freshness(&raw),
+                "semantic_graph_freshness" => checks::semantic_graph_freshness(&raw, t),
                 "content_quality"          => checks::content_quality(&raw),
                 "orphan_tags"              => checks::orphan_tags(&raw),
-                "tag_health"               => checks::tag_health(&raw),
+                "tag_health"               => checks::tag_health(&raw, t),
                 "contradiction_detection"  => checks::contradiction_detection(&raw),
-                "boilerplate_pollution"    => checks::boilerplate_pollution(&raw),
+                "boilerplate_pollution"    => checks::boilerplate_pollution(&raw, t),
                 _ => unreachable!(),
             }
         }

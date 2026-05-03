@@ -47,9 +47,9 @@ pub use score::aggregate_score;
 pub use types::{
     AtomPreview, BoilerplateAtomEntry, ContradictionAtom, ContradictionPairEntry,
     DuplicatePair, FixAction, FixRequest, FixResponse, FixTier, HealthCheckOverride,
-    HealthCheckResult, HealthConfig, HealthReport, HealthStatus, RootlessTagEntry,
-    SingleAtomTagEntry, SkippedFix, TagProposal, TagProposalAction, WikiGap,
-    WikiStaleEntry,
+    HealthCheckResult, HealthConfig, HealthReport, HealthStatus, HealthThresholds,
+    RootlessTagEntry, SingleAtomTagEntry, SkippedFix, TagProposal, TagProposalAction,
+    WikiGap, WikiStaleEntry,
 };
 
 // Internal cross-module references.

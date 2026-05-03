@@ -314,7 +314,107 @@ pub struct HealthConfig {
     /// (sum of effective weights is renormalized).
     #[serde(default)]
     pub overrides: std::collections::HashMap<String, HealthCheckOverride>,
+
+    /// Detection thresholds shared across the synchronous health checks.
+    /// Missing / partial values fall back to `HealthThresholds::default()`.
+    #[serde(default)]
+    pub thresholds: HealthThresholds,
 }
+
+/// Tunable detection thresholds. Every field has a sane default baked in via
+/// `Default` so a fresh DB works without any config. Serialised with
+/// `#[serde(default)]` on each field so adding new thresholds is forward-
+/// compatible — older configs deserialise into current defaults.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HealthThresholds {
+    // ---- boilerplate_pollution ----
+    /// Edges at/above this similarity are treated as template clones. Default 0.99.
+    #[serde(default = "default_boilerplate_similarity")]
+    pub boilerplate_similarity: f32,
+    /// Minimum clone-edge count before an atom is flagged. Default 2.
+    #[serde(default = "default_boilerplate_min_clones")]
+    pub boilerplate_min_clones: i32,
+
+    // ---- contradiction_detection ----
+    /// Lower bound (inclusive) of the contradiction similarity window. Default 0.80.
+    #[serde(default = "default_contradiction_sim_min")]
+    pub contradiction_similarity_min: f32,
+    /// Upper bound (exclusive) of the contradiction similarity window. Default 0.92.
+    #[serde(default = "default_contradiction_sim_max")]
+    pub contradiction_similarity_max: f32,
+    /// Minimum shared-tag count for a pair to surface. Default 1.
+    #[serde(default = "default_contradiction_shared_tags")]
+    pub contradiction_shared_tags_min: i32,
+
+    // ---- content_overlap (cross-source near-duplicates) ----
+    /// Lower bound (inclusive) of the cross-source overlap window. Default 0.55.
+    #[serde(default = "default_overlap_sim_min")]
+    pub content_overlap_similarity_min: f32,
+    /// Upper bound (inclusive) of the cross-source overlap window. Default 0.85.
+    #[serde(default = "default_overlap_sim_max")]
+    pub content_overlap_similarity_max: f32,
+    /// Minimum shared-tag count for a pair to surface. Default 2.
+    #[serde(default = "default_overlap_shared_tags")]
+    pub content_overlap_shared_tags_min: i32,
+
+    // ---- content_quality ----
+    /// Atoms shorter than this are flagged as `very_short`. Default 100.
+    #[serde(default = "default_short_chars")]
+    pub content_quality_short_chars: i32,
+    /// Atoms longer than this are flagged as `very_long`. Default 15_000.
+    #[serde(default = "default_long_chars")]
+    pub content_quality_long_chars: i32,
+
+    // ---- wiki_coverage ----
+    /// Minimum atoms per tag for the tag to be "wiki-eligible". Default 5.
+    #[serde(default = "default_wiki_min_atoms")]
+    pub wiki_min_atoms_per_tag: i32,
+
+    // ---- tag_health ----
+    /// Max autotag single-atom tags before the check penalises. Default 3.
+    #[serde(default = "default_single_atom_tag_threshold")]
+    pub tag_health_single_atom_threshold: i32,
+
+    // ---- semantic_graph_freshness ----
+    /// Atoms added since last rebuild before score drops from warning to error. Default 20.
+    #[serde(default = "default_graph_freshness_warning")]
+    pub semantic_graph_freshness_warning: i32,
+}
+
+impl Default for HealthThresholds {
+    fn default() -> Self {
+        Self {
+            boilerplate_similarity: default_boilerplate_similarity(),
+            boilerplate_min_clones: default_boilerplate_min_clones(),
+            contradiction_similarity_min: default_contradiction_sim_min(),
+            contradiction_similarity_max: default_contradiction_sim_max(),
+            contradiction_shared_tags_min: default_contradiction_shared_tags(),
+            content_overlap_similarity_min: default_overlap_sim_min(),
+            content_overlap_similarity_max: default_overlap_sim_max(),
+            content_overlap_shared_tags_min: default_overlap_shared_tags(),
+            content_quality_short_chars: default_short_chars(),
+            content_quality_long_chars: default_long_chars(),
+            wiki_min_atoms_per_tag: default_wiki_min_atoms(),
+            tag_health_single_atom_threshold: default_single_atom_tag_threshold(),
+            semantic_graph_freshness_warning: default_graph_freshness_warning(),
+        }
+    }
+}
+
+fn default_boilerplate_similarity() -> f32 { 0.99 }
+fn default_boilerplate_min_clones() -> i32 { 2 }
+fn default_contradiction_sim_min() -> f32 { 0.80 }
+fn default_contradiction_sim_max() -> f32 { 0.92 }
+fn default_contradiction_shared_tags() -> i32 { 1 }
+fn default_overlap_sim_min() -> f32 { 0.55 }
+fn default_overlap_sim_max() -> f32 { 0.85 }
+fn default_overlap_shared_tags() -> i32 { 2 }
+fn default_short_chars() -> i32 { 100 }
+fn default_long_chars() -> i32 { 15_000 }
+fn default_wiki_min_atoms() -> i32 { 5 }
+fn default_single_atom_tag_threshold() -> i32 { 3 }
+fn default_graph_freshness_warning() -> i32 { 20 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]

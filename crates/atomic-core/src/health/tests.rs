@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_boilerplate_no_pollution() {
         let raw = base_raw();
-        let result = checks::boilerplate_pollution(&raw);
+        let result = checks::boilerplate_pollution(&raw, &crate::health::HealthThresholds::default());
         assert_eq!(result.status, "ok");
         assert!(!result.requires_review);
         assert_eq!(result.data["count"], 0);
@@ -201,7 +201,7 @@ mod tests {
             title: "Template Note".to_string(),
             clone_count: 3,
         });
-        let result = checks::boilerplate_pollution(&raw);
+        let result = checks::boilerplate_pollution(&raw, &crate::health::HealthThresholds::default());
         assert_ne!(result.status, "ok");
         assert!(result.requires_review);
         assert_eq!(result.data["count"], 2);
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_tag_health_perfect() {
         let raw = base_raw();
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
         assert_eq!(result.status, "ok");
         assert!(!result.requires_review);
         let rootless_list = result.data["rootless_tag_list"].as_array().unwrap();
@@ -319,7 +319,7 @@ mod tests {
             atom_count: 3,
         });
         raw.rootless_tags = 2;
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
         assert!(result.requires_review);
         let list = result.data["rootless_tag_list"].as_array().unwrap();
         assert_eq!(list.len(), 2);
@@ -336,7 +336,7 @@ mod tests {
             ("id-a".to_string(), "Machine Learning".to_string(), "id-b".to_string(), "Learning".to_string()),
         ];
         raw.similar_name_pair_count = 1;
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
         assert_eq!(result.status, "warning");
         let pair_list = result.data["similar_name_pair_list"].as_array().unwrap();
         assert_eq!(pair_list.len(), 1);
@@ -461,7 +461,7 @@ mod tests {
         // User explicitly weights wiki_coverage at 0.20 (same as embedding_coverage default).
         let mut overrides = HashMap::new();
         overrides.insert("wiki_coverage".to_string(), HealthCheckOverride { enabled: true, weight: Some(0.20) });
-        let config = HealthConfig { overrides };
+        let config = HealthConfig { overrides, thresholds: Default::default() };
         let score = crate::health::aggregate_score(&checks_map, Some(&config));
         // embedding_coverage (0.20 default) * 100 + wiki_coverage (0.20 override) * 0 → 50
         assert_eq!(score, 50);
@@ -493,7 +493,7 @@ mod tests {
         let mut overrides = HashMap::new();
         // Disable embedding_coverage; its 0 score must not drag the overall down.
         overrides.insert("embedding_coverage".to_string(), HealthCheckOverride { enabled: false, weight: None });
-        let config = HealthConfig { overrides };
+        let config = HealthConfig { overrides, thresholds: Default::default() };
         let score = crate::health::aggregate_score(&checks_map, Some(&config));
         assert_eq!(score, 100);
     }
@@ -677,7 +677,7 @@ mod tests {
         });
         raw.single_atom_tags = 2;
 
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
 
         // Expect the list in JSON data
         let list = result.data["single_atom_tag_list"].as_array().unwrap();
@@ -701,7 +701,7 @@ mod tests {
             });
         }
         raw.single_atom_tags = 2;
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
         // auto_fixable = false because count <= 3
         assert!(!result.auto_fixable);
 
@@ -715,7 +715,7 @@ mod tests {
             });
         }
         raw2.single_atom_tags = 4;
-        let result2 = checks::tag_health(&raw2);
+        let result2 = checks::tag_health(&raw2, &crate::health::HealthThresholds::default());
         assert!(result2.auto_fixable);
     }
 
@@ -728,7 +728,7 @@ mod tests {
         raw.single_atom_tag_list.push(SingleAtomTagEntry { id: "tag-x".to_string(), name: "X".to_string(), is_autotag: false });
         raw.single_atom_tag_list.push(SingleAtomTagEntry { id: "tag-y".to_string(), name: "Y".to_string(), is_autotag: true });
         raw.single_atom_tags = 2;
-        let mut result = checks::tag_health(&raw);
+        let mut result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
 
         let mut dismissed = HashSet::new();
         dismissed.insert("tag-x".to_string());
@@ -750,7 +750,7 @@ mod tests {
             "id-b".to_string(), "Artificial Intelligence".to_string(),
         )];
         raw.similar_name_pair_count = 1;
-        let result = checks::tag_health(&raw);
+        let result = checks::tag_health(&raw, &crate::health::HealthThresholds::default());
         assert!(result.requires_review);
     }
 }

@@ -95,7 +95,10 @@ pub struct HealthRawData {
 
 impl SqliteStorage {
     /// Gather all raw health-check data in a single blocking pass.
-    pub(crate) fn health_check_data_impl(&self) -> Result<HealthRawData, AtomicCoreError> {
+    pub(crate) fn health_check_data_impl(
+        &self,
+        thresholds: &crate::health::HealthThresholds,
+    ) -> Result<HealthRawData, AtomicCoreError> {
         let conn = self.db.read_conn()?;
         let mut raw = HealthRawData::default();
 
@@ -220,7 +223,7 @@ impl SqliteStorage {
         }
 
         // ---- wiki coverage ----
-        // Tags with >= 5 atoms
+        // Tags with >= thresholds.wiki_min_atoms_per_tag atoms
         let mut stmt = conn.prepare(
             "SELECT t.id, t.name,
                     COUNT(DISTINCT at.atom_id) as atom_count,
@@ -233,11 +236,11 @@ impl SqliteStorage {
              JOIN atom_tags at ON t.id = at.tag_id
              LEFT JOIN wiki_articles w ON t.id = w.tag_id
              GROUP BY t.id
-             HAVING COUNT(DISTINCT at.atom_id) >= 5
+             HAVING COUNT(DISTINCT at.atom_id) >= ?1
              ORDER BY COUNT(DISTINCT at.atom_id) DESC
              LIMIT 50",
         )?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params![thresholds.wiki_min_atoms_per_tag])?;
         while let Some(row) = rows.next()? {
             let tag_id: String = row.get(0)?;
             let tag_name: String = row.get(1)?;
@@ -276,17 +279,17 @@ impl SqliteStorage {
         const LIMIT: usize = 20;
 
         let mut stmt = conn.prepare(
-            "SELECT id FROM atoms WHERE length(content) < 100 LIMIT ?1",
+            "SELECT id FROM atoms WHERE length(content) < ?1 LIMIT ?2",
         )?;
-        let mut rows = stmt.query(params![LIMIT as i32])?;
+        let mut rows = stmt.query(params![thresholds.content_quality_short_chars, LIMIT as i32])?;
         while let Some(row) = rows.next()? {
             raw.very_short_atoms.push(row.get(0)?);
         }
 
         let mut stmt = conn.prepare(
-            "SELECT id FROM atoms WHERE length(content) > 15000 LIMIT ?1",
+            "SELECT id FROM atoms WHERE length(content) > ?1 LIMIT ?2",
         )?;
-        let mut rows = stmt.query(params![LIMIT as i32])?;
+        let mut rows = stmt.query(params![thresholds.content_quality_long_chars, LIMIT as i32])?;
         while let Some(row) = rows.next()? {
             raw.very_long_atoms.push(row.get(0)?);
         }
@@ -414,13 +417,17 @@ impl SqliteStorage {
                  JOIN atoms a2 ON se.target_atom_id = a2.id
                  JOIN atom_tags at_a ON a1.id = at_a.atom_id
                  JOIN atom_tags at_b ON a2.id = at_b.atom_id AND at_a.tag_id = at_b.tag_id
-                 WHERE se.similarity_score BETWEEN 0.55 AND 0.85
+                 WHERE se.similarity_score BETWEEN ?1 AND ?2
                  GROUP BY se.source_atom_id, se.target_atom_id
-                 HAVING COUNT(DISTINCT at_a.tag_id) >= 2
+                 HAVING COUNT(DISTINCT at_a.tag_id) >= ?3
                  ORDER BY COUNT(DISTINCT at_a.tag_id) DESC, se.similarity_score DESC
                  LIMIT 20",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(params![
+                thresholds.content_overlap_similarity_min,
+                thresholds.content_overlap_similarity_max,
+                thresholds.content_overlap_shared_tags_min,
+            ])?;
             while let Some(row) = rows.next()? {
                 let a_id: String = row.get(0)?;
                 let b_id: String = row.get(1)?;
@@ -459,20 +466,23 @@ impl SqliteStorage {
             }
         }
 
-        // ---- boilerplate pollution (atoms with >= 2 edges at similarity >= 0.99) ----
+        // ---- boilerplate pollution (atoms with >= thresholds.boilerplate_min_clones edges at similarity >= thresholds.boilerplate_similarity) ----
         // Return atom title + clone count so UI can show context and prioritise review.
         {
             let mut stmt = conn.prepare(
                 "SELECT se.source_atom_id, a.content, COUNT(*) as clone_count
                  FROM semantic_edges se
                  JOIN atoms a ON se.source_atom_id = a.id
-                 WHERE se.similarity_score >= 0.99
+                 WHERE se.similarity_score >= ?1
                  GROUP BY se.source_atom_id
-                 HAVING COUNT(*) >= 2
+                 HAVING COUNT(*) >= ?2
                  ORDER BY clone_count DESC
                  LIMIT 50",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(params![
+                thresholds.boilerplate_similarity,
+                thresholds.boilerplate_min_clones,
+            ])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 let content: String = row.get(1)?;
@@ -482,7 +492,7 @@ impl SqliteStorage {
             }
         }
 
-        // ---- contradiction candidates (similarity 0.80..0.92) ----
+        // ---- contradiction candidates (similarity thresholds.contradiction_similarity_min .. thresholds.contradiction_similarity_max) ----
         // Surface actual atom pairs for manual review.
         {
             let mut stmt = conn.prepare(
@@ -497,13 +507,17 @@ impl SqliteStorage {
                  JOIN atoms a2 ON se.target_atom_id = a2.id
                  LEFT JOIN atom_tags at_a ON a1.id = at_a.atom_id
                  LEFT JOIN atom_tags at_b ON a2.id = at_b.atom_id AND at_a.tag_id = at_b.tag_id
-                 WHERE se.similarity_score >= 0.80 AND se.similarity_score < 0.92
+                 WHERE se.similarity_score >= ?1 AND se.similarity_score < ?2
                  GROUP BY se.source_atom_id, se.target_atom_id
-                 HAVING COUNT(DISTINCT at_a.tag_id) >= 1
+                 HAVING COUNT(DISTINCT at_a.tag_id) >= ?3
                  ORDER BY se.similarity_score DESC
                  LIMIT 20",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(params![
+                thresholds.contradiction_similarity_min,
+                thresholds.contradiction_similarity_max,
+                thresholds.contradiction_shared_tags_min,
+            ])?;
             while let Some(row) = rows.next()? {
                 let a_id: String = row.get(0)?;
                 let b_id: String = row.get(1)?;
@@ -527,8 +541,11 @@ impl SqliteStorage {
             }
             raw.contradiction_pairs_checked = conn.query_row(
                 "SELECT COUNT(*) FROM semantic_edges
-                 WHERE similarity_score >= 0.80 AND similarity_score < 0.92",
-                [],
+                 WHERE similarity_score >= ?1 AND similarity_score < ?2",
+                params![
+                    thresholds.contradiction_similarity_min,
+                    thresholds.contradiction_similarity_max,
+                ],
                 |r| r.get(0),
             )?;
             raw.contradiction_candidate_count = raw.contradiction_pairs.len() as i32;
