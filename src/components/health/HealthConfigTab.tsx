@@ -243,7 +243,9 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
     const handle = window.setTimeout(() => {
       const d = latestDraftRef.current;
       if (!d) return;
-      void persist(fromDraft(d));
+      const payload = fromDraft(d);
+      console.debug('[health-config] autosave tick', { payload, lastSaved: lastSavedRef.current });
+      void persist(payload);
     }, 600);
     return () => { window.clearTimeout(handle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
