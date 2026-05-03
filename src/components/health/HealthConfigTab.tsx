@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Loader2, RotateCcw, Check, AlertCircle } from 'lucide-react';
+import { Loader2, RotateCcw } from 'lucide-react';
 import { getTransport } from '../../lib/transport';
 import { toast } from '../../stores/toasts';
 import { WikiExclusionPanel } from './WikiExclusionPanel';
@@ -96,11 +96,6 @@ interface Draft {
   thresholds: ThresholdsDraft;
 }
 
-type SaveStatus =
-  | { kind: 'idle' }
-  | { kind: 'saving' }
-  | { kind: 'saved'; at: number }
-  | { kind: 'error'; message: string };
 
 function toChecksDraft(config: HealthConfig): ChecksDraft {
   const out: ChecksDraft = {};
@@ -167,7 +162,6 @@ function fromDraft(draft: Draft): HealthConfig {
 export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
   const [draft, setDraft] = useState<Draft>(() => toDraft(DEFAULT_CONFIG));
   const [loading, setLoading] = useState(true);
-  const [saveStatus, setSaveStatus] = useState<SaveStatus>({ kind: 'idle' });
 
   // Latest draft to persist. Ref because the debounce closure must read the
   // freshest value, not whatever was captured when the timer was scheduled.
@@ -240,11 +234,13 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
       return;
     }
     savingRef.current = true;
-    setSaveStatus({ kind: 'saving' });
+    // Watchdog: if the invoke never resolves, surface a toast so the user
+    // knows the save stalled. We no longer render a status pill, so the
+    // toast is the only channel for this failure mode.
     const timeoutId = window.setTimeout(() => {
-      setSaveStatus({
-        kind: 'error',
-        message: 'Autosave timed out after 15s — server did not respond.',
+      toast.error('Autosave failed', {
+        detail: 'Autosave timed out after 15s — server did not respond.',
+        retry: () => { void persist(payload); },
       });
     }, 15000);
     try {
@@ -253,11 +249,9 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
         payload as unknown as Record<string, unknown>,
       );
       lastSavedRef.current = serialized;
-      setSaveStatus({ kind: 'saved', at: Date.now() });
       onSaved?.();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      setSaveStatus({ kind: 'error', message: detail });
       toast.error('Autosave failed', {
         detail,
         retry: () => { void persist(payload); },
@@ -300,16 +294,6 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fade the "Saved" pill back to idle after a short delay so it stays out of
-  // the way during a normal editing session.
-  useEffect(() => {
-    if (saveStatus.kind !== 'saved') return;
-    const handle = window.setTimeout(() => {
-      setSaveStatus(s => (s.kind === 'saved' ? { kind: 'idle' } : s));
-    }, 1500);
-    return () => { window.clearTimeout(handle); };
-  }, [saveStatus]);
-
   const resetToDefaults = () => {
     setDraft(toDraft(DEFAULT_CONFIG));
   };
@@ -331,25 +315,6 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
 
   return (
     <div className="space-y-4">
-      {/* Single autosave status + reset header. Sticky so feedback stays
-          visible no matter which section the user scrolls to. */}
-      <div className="sticky top-0 z-10 -mx-1 px-1 py-2 bg-[var(--color-bg-secondary,#1e1e1e)]/95 backdrop-blur-sm border-b border-white/5 flex items-center justify-between gap-3">
-        <p className="text-xs text-gray-400 leading-snug max-w-prose">
-          Checks and detection thresholds autosave as you edit.
-        </p>
-        <div className="flex items-center gap-3 shrink-0">
-          <SaveStatusPill status={saveStatus} />
-          <button
-            onClick={resetToDefaults}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors rounded hover:bg-white/5"
-            title="Revert checks and thresholds to built-in defaults. Autosaves."
-          >
-            <RotateCcw className="w-3 h-3" />
-            Reset to defaults
-          </button>
-        </div>
-      </div>
-
       <div className="text-xs text-gray-400 leading-relaxed max-w-prose">
         <p>
           Pick which checks run and how much each contributes to the overall score.
@@ -433,6 +398,17 @@ export function HealthConfigTab({ onSaved }: { onSaved?: () => void } = {}) {
       />
 
       <WikiExclusionPanel />
+
+      <div className="pt-2 flex justify-end">
+        <button
+          onClick={resetToDefaults}
+          className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-gray-500 hover:text-gray-300 transition-colors rounded hover:bg-white/5"
+          title="Revert checks and thresholds to built-in defaults. Autosaves."
+        >
+          <RotateCcw className="w-3 h-3" />
+          Reset to defaults
+        </button>
+      </div>
     </div>
   );
 }
@@ -575,37 +551,4 @@ function ThresholdsPanel({
   );
 }
 
-// ==================== Save status pill ====================
 
-function SaveStatusPill({ status }: { status: SaveStatus }) {
-  // Idle: render a blank placeholder of the same size so the row doesn't
-  // jitter when autosave kicks in.
-  if (status.kind === 'idle') {
-    return <span className="text-[11px] text-gray-600 select-none">Autosaves</span>;
-  }
-  if (status.kind === 'saving') {
-    return (
-      <span className="flex items-center gap-1.5 text-[11px] text-gray-400">
-        <Loader2 className="w-3 h-3 animate-spin" />
-        Saving…
-      </span>
-    );
-  }
-  if (status.kind === 'saved') {
-    return (
-      <span className="flex items-center gap-1.5 text-[11px] text-emerald-400">
-        <Check className="w-3 h-3" />
-        Saved
-      </span>
-    );
-  }
-  return (
-    <span
-      className="flex items-center gap-1.5 text-[11px] text-red-400"
-      title={status.message}
-    >
-      <AlertCircle className="w-3 h-3" />
-      Save failed
-    </span>
-  );
-}
