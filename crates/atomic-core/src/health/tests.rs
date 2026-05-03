@@ -1312,4 +1312,63 @@ mod llm_tests {
         let loaded = core.get_wiki_excluded_tag_ids().await.unwrap();
         assert!(loaded.is_empty());
     }
+    // ==================== HealthThresholds::validate ====================
+
+    #[test]
+    fn test_thresholds_default_validates() {
+        let t = crate::health::HealthThresholds::default();
+        assert!(t.validate().is_empty(), "defaults must be valid: {:?}", t.validate());
+    }
+
+    #[test]
+    fn test_thresholds_similarity_out_of_range() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.boilerplate_similarity = 1.5;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("boilerplate_similarity")));
+    }
+
+    #[test]
+    fn test_thresholds_similarity_nan() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.content_overlap_similarity_max = f32::NAN;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("finite")));
+    }
+
+    #[test]
+    fn test_thresholds_inverted_contradiction_window() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.contradiction_similarity_min = 0.95;
+        t.contradiction_similarity_max = 0.90;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("contradiction_similarity_min")));
+    }
+
+    #[test]
+    fn test_thresholds_negative_counts() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.boilerplate_min_clones = -1;
+        t.content_quality_short_chars = -10;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("boilerplate_min_clones")));
+        assert!(errs.iter().any(|e| e.contains("content_quality_short_chars")));
+    }
+
+    #[test]
+    fn test_thresholds_wiki_min_atoms_zero_rejected() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.wiki_min_atoms_per_tag = 0;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("wiki_min_atoms_per_tag")));
+    }
+
+    #[test]
+    fn test_thresholds_short_geq_long_rejected() {
+        let mut t = crate::health::HealthThresholds::default();
+        t.content_quality_short_chars = 20_000;
+        t.content_quality_long_chars = 15_000;
+        let errs = t.validate();
+        assert!(errs.iter().any(|e| e.contains("content_quality_short_chars")));
+    }
 }

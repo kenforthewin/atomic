@@ -416,6 +416,83 @@ fn default_wiki_min_atoms() -> i32 { 5 }
 fn default_single_atom_tag_threshold() -> i32 { 3 }
 fn default_graph_freshness_warning() -> i32 { 20 }
 
+
+impl HealthThresholds {
+    /// Validate user-supplied thresholds. Returns a list of problems, empty on success.
+    ///
+    /// Rules are deliberately lenient — we only reject values that would cause the
+    /// SQL / score math to misbehave (NaN, negative counts, similarities outside [0,1],
+    /// inverted min/max windows). Tightening beyond that is an editorial choice, left
+    /// to the UI.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+
+        // ---- similarities must be finite and within [0.0, 1.0] ----
+        let sims: [(&str, f32); 5] = [
+            ("boilerplate_similarity", self.boilerplate_similarity),
+            ("contradiction_similarity_min", self.contradiction_similarity_min),
+            ("contradiction_similarity_max", self.contradiction_similarity_max),
+            ("content_overlap_similarity_min", self.content_overlap_similarity_min),
+            ("content_overlap_similarity_max", self.content_overlap_similarity_max),
+        ];
+        for (name, v) in sims {
+            if !v.is_finite() {
+                errs.push(format!("{name} must be a finite number"));
+            } else if !(0.0..=1.0).contains(&v) {
+                errs.push(format!("{name} must be in [0.0, 1.0] (got {v})"));
+            }
+        }
+
+        // ---- min/max windows must not be inverted ----
+        if self.contradiction_similarity_min >= self.contradiction_similarity_max {
+            errs.push(format!(
+                "contradiction_similarity_min ({}) must be < contradiction_similarity_max ({})",
+                self.contradiction_similarity_min, self.contradiction_similarity_max,
+            ));
+        }
+        if self.content_overlap_similarity_min > self.content_overlap_similarity_max {
+            errs.push(format!(
+                "content_overlap_similarity_min ({}) must be ≤ content_overlap_similarity_max ({})",
+                self.content_overlap_similarity_min, self.content_overlap_similarity_max,
+            ));
+        }
+
+        // ---- non-negative integer counts ----
+        let non_neg: [(&str, i32); 7] = [
+            ("boilerplate_min_clones", self.boilerplate_min_clones),
+            ("contradiction_shared_tags_min", self.contradiction_shared_tags_min),
+            ("content_overlap_shared_tags_min", self.content_overlap_shared_tags_min),
+            ("content_quality_short_chars", self.content_quality_short_chars),
+            ("content_quality_long_chars", self.content_quality_long_chars),
+            ("tag_health_single_atom_threshold", self.tag_health_single_atom_threshold),
+            ("semantic_graph_freshness_warning", self.semantic_graph_freshness_warning),
+        ];
+        for (name, v) in non_neg {
+            if v < 0 {
+                errs.push(format!("{name} must be ≥ 0 (got {v})"));
+            }
+        }
+
+        // ---- wiki min_atoms must be ≥ 1 (0 would make every tag "wiki-eligible") ----
+        if self.wiki_min_atoms_per_tag < 1 {
+            errs.push(format!(
+                "wiki_min_atoms_per_tag must be ≥ 1 (got {})",
+                self.wiki_min_atoms_per_tag,
+            ));
+        }
+
+        // ---- short_chars must be < long_chars (else every atom is both) ----
+        if self.content_quality_short_chars >= self.content_quality_long_chars {
+            errs.push(format!(
+                "content_quality_short_chars ({}) must be < content_quality_long_chars ({})",
+                self.content_quality_short_chars, self.content_quality_long_chars,
+            ));
+        }
+
+        errs
+    }
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct HealthCheckOverride {

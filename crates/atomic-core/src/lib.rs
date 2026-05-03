@@ -3664,6 +3664,13 @@ impl AtomicCore {
         &self,
         config: &crate::health::HealthConfig,
     ) -> Result<(), AtomicCoreError> {
+        let errs = config.thresholds.validate();
+        if !errs.is_empty() {
+            return Err(AtomicCoreError::Validation(format!(
+                "invalid health thresholds: {}",
+                errs.join("; "),
+            )));
+        }
         let json = serde_json::to_string(config)
             .map_err(|e| AtomicCoreError::Validation(format!("serialize health_config: {e}")))?;
         self.storage().set_setting_sync("health_config", &json).await
