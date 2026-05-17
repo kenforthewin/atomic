@@ -55,6 +55,7 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::search::find_similar,
         // Wiki
         routes::wiki::get_all_wiki_articles,
+        routes::wiki::get_wiki_suggestions,
         routes::wiki::get_wiki,
         routes::wiki::get_wiki_status,
         routes::wiki::generate_wiki,

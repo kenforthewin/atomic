@@ -87,6 +87,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     // Wiki
     cfg.route("/wiki", web::get().to(wiki::get_all_wiki_articles));
     cfg.route(
+        "/wiki/suggestions",
+        web::get().to(wiki::get_wiki_suggestions),
+    );
+    cfg.route(
         "/wiki/versions/{version_id}",
         web::get().to(wiki::get_wiki_version),
     );

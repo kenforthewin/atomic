@@ -499,6 +499,8 @@ CREATE TABLE knowledge_signal_preferences (
     provider_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL,
     weight REAL NOT NULL,
+    min_score REAL NOT NULL,
+    min_confidence REAL NOT NULL,
     show_on_dashboard INTEGER NOT NULL,
     include_in_briefing INTEGER NOT NULL,
     config_json TEXT NOT NULL,
@@ -540,6 +542,23 @@ CREATE TABLE knowledge_signal_action_log (
     executed_at TEXT NOT NULL,
     undone_at TEXT
 );
+
+CREATE TABLE briefing_signals (
+    id TEXT PRIMARY KEY,
+    briefing_id TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    score REAL NOT NULL,
+    confidence REAL NOT NULL,
+    target_json TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    suggested_actions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 ```
 
 The cache can be skipped initially if on-demand computation is fast enough, but feedback state should exist from the beginning. Dismiss/snooze is part of making the modular system tolerable.
@@ -547,6 +566,8 @@ The cache can be skipped initially if on-demand computation is fast enough, but 
 The action log is only needed once mutating signal actions ship. It should not block read-only v1. When implemented, use it for actions that modify atoms, tags, wiki content, or links. Non-mutating actions such as opening a tag or generating a preview do not need audit rows.
 
 Because this is per-database state, helpers should write through `core.storage()` rather than `AtomicCore::set_setting()` when a registry is attached.
+
+Postgres uses the same logical schema with `db_id` in the primary keys because all logical databases share the same physical tables.
 
 ## Actions And Undo
 
@@ -622,7 +643,7 @@ Server:
 
 Frontend transport should expose these as normal commands. The React page should stay transport-agnostic.
 
-Briefing read shapes should eventually include attached signal suggestions. That can be done either by extending `BriefingWithCitations` with a `signals` field or by adding a companion route keyed by briefing ID. Extending the read shape is cleaner if the suggestions are persisted with the briefing.
+Briefing read shapes include attached signal suggestions by extending `BriefingWithCitations` with a `signals` field. Suggestions are persisted with each briefing so historical briefings do not drift as the knowledge base changes.
 
 ## Milestones
 
@@ -635,8 +656,9 @@ Briefing read shapes should eventually include attached signal suggestions. That
 - Implement dismiss, snooze, restore, and provider enable/disable.
 - Build the first dashboard widget backed by signals.
 - Upgrade `NewWikisWidget` to use `WikiCandidateProvider` ranking rather than atom count.
+- Support both SQLite and Postgres for provider evaluation, preferences, and feedback state.
 
-Exit criteria: the existing dashboard can show deterministic signals from at least one provider, explain them, and remember when the user dismisses or snoozes them. There is no new dashboard route.
+Exit criteria: the existing dashboard can show deterministic signals from at least one provider, explain them, and remember when the user dismisses or snoozes them on either storage backend. There is no new dashboard route.
 
 ### Milestone 2 - Briefing Suggestions
 

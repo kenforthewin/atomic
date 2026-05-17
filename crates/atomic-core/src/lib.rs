@@ -71,6 +71,7 @@ pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResu
 pub use knowledge_signals::{
     KnowledgeSignal, KnowledgeSignalAction, KnowledgeSignalFilter, KnowledgeSignalProviderConfig,
     KnowledgeSignalReason, KnowledgeSignalSeverity, KnowledgeSignalTarget, WikiCandidateEvidence,
+    WIKI_CANDIDATE_PROVIDER_ID,
 };
 pub use manager::DatabaseManager;
 pub use models::*;
@@ -3835,6 +3836,17 @@ impl AtomicCore {
         filter: KnowledgeSignalFilter,
     ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
         knowledge_signals::list_knowledge_signals(self, filter).await
+    }
+
+    /// List deterministic knowledge-quality signals eligible for briefing attachment.
+    pub async fn list_briefing_knowledge_signals(
+        &self,
+        window_start: chrono::DateTime<chrono::Utc>,
+        window_end: chrono::DateTime<chrono::Utc>,
+        limit: i32,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        knowledge_signals::list_briefing_knowledge_signals(self, window_start, window_end, limit)
+            .await
     }
 
     /// Dismiss a knowledge-quality signal until its identity changes or it is restored.

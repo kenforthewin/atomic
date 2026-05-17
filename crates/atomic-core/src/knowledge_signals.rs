@@ -8,14 +8,14 @@ use crate::error::AtomicCoreError;
 use crate::storage::StorageBackend;
 use crate::AtomicCore;
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-const WIKI_CANDIDATE_PROVIDER_ID: &str = "wiki_candidate";
+pub const WIKI_CANDIDATE_PROVIDER_ID: &str = "wiki_candidate";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -234,6 +234,59 @@ pub async fn list_knowledge_signals(
     Ok(out)
 }
 
+pub async fn list_briefing_knowledge_signals(
+    core: &AtomicCore,
+    _window_start: DateTime<Utc>,
+    _window_end: DateTime<Utc>,
+    limit: i32,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let providers: Vec<Box<dyn KnowledgeSignalProvider>> = vec![Box::new(WikiCandidateProvider)];
+    let feedback = list_feedback(core).await?;
+    let now = Utc::now();
+    let mut out = Vec::new();
+
+    for provider in providers {
+        let config = get_provider_config(core, provider.id()).await?;
+        if !config.enabled || !config.include_in_briefing {
+            continue;
+        }
+
+        let mut signals = provider.evaluate(core, &config).await?;
+        signals.retain(|signal| {
+            signal.score >= config.min_score
+                && signal.confidence >= config.min_confidence
+                && match feedback.get(&signal.id) {
+                    Some(fb) if matches!(fb.state.as_str(), "dismissed" | "ignored") => false,
+                    Some(fb) if fb.state == "snoozed" => fb
+                        .snoozed_until
+                        .as_deref()
+                        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                        .map(|until| until.with_timezone(&Utc) <= now)
+                        .unwrap_or(true),
+                    _ => true,
+                }
+        });
+        out.extend(signals);
+    }
+
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    if limit >= 0 {
+        out.truncate(limit as usize);
+    }
+
+    Ok(out)
+}
+
 pub async fn dismiss_signal(core: &AtomicCore, signal_key: &str) -> Result<(), AtomicCoreError> {
     set_feedback(core, signal_key, "dismissed", None).await
 }
@@ -308,9 +361,39 @@ pub async fn set_provider_config(
             Ok(config)
         }
         #[cfg(feature = "postgres")]
-        StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-            "knowledge signals are not yet supported on Postgres".to_string(),
-        )),
+        StorageBackend::Postgres(storage) => {
+            let now = Utc::now().to_rfc3339();
+            let config_json = serde_json::to_string(&config.config_json)?;
+            sqlx::query(
+                "INSERT INTO knowledge_signal_preferences
+                    (db_id, provider_id, enabled, weight, min_score, min_confidence,
+                     show_on_dashboard, include_in_briefing, config_json, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT(db_id, provider_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    weight = excluded.weight,
+                    min_score = excluded.min_score,
+                    min_confidence = excluded.min_confidence,
+                    show_on_dashboard = excluded.show_on_dashboard,
+                    include_in_briefing = excluded.include_in_briefing,
+                    config_json = excluded.config_json,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&storage.db_id)
+            .bind(&config.provider_id)
+            .bind(config.enabled)
+            .bind(config.weight)
+            .bind(config.min_score)
+            .bind(config.min_confidence)
+            .bind(config.show_on_dashboard)
+            .bind(config.include_in_briefing)
+            .bind(config_json)
+            .bind(now)
+            .execute(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            Ok(config)
+        }
     }
 }
 
@@ -335,9 +418,18 @@ pub async fn restore_signal(core: &AtomicCore, signal_key: &str) -> Result<(), A
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
         }
         #[cfg(feature = "postgres")]
-        StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-            "knowledge signals are not yet supported on Postgres".to_string(),
-        )),
+        StorageBackend::Postgres(storage) => {
+            sqlx::query(
+                "DELETE FROM knowledge_signal_feedback
+                 WHERE db_id = $1 AND signal_key = $2",
+            )
+            .bind(&storage.db_id)
+            .bind(signal_key)
+            .execute(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            Ok(())
+        }
     }
 }
 
@@ -374,7 +466,7 @@ async fn get_provider_config(
 
                 let Some((enabled, weight, min_score, min_confidence, show, briefing, json)) = row
                 else {
-                    return Ok(KnowledgeSignalProviderConfig::default_for(&id));
+                    return Ok(default_provider_config(&id));
                 };
 
                 Ok(KnowledgeSignalProviderConfig {
@@ -392,10 +484,45 @@ async fn get_provider_config(
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
         }
         #[cfg(feature = "postgres")]
-        StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-            "knowledge signals are not yet supported on Postgres".to_string(),
-        )),
+        StorageBackend::Postgres(storage) => {
+            let row = sqlx::query_as::<_, (bool, f32, f32, f32, bool, bool, String)>(
+                "SELECT enabled, weight, min_score, min_confidence, show_on_dashboard,
+                        include_in_briefing, config_json
+                 FROM knowledge_signal_preferences
+                 WHERE db_id = $1 AND provider_id = $2",
+            )
+            .bind(&storage.db_id)
+            .bind(provider_id)
+            .fetch_optional(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+            let Some((enabled, weight, min_score, min_confidence, show, briefing, config_json)) =
+                row
+            else {
+                return Ok(default_provider_config(provider_id));
+            };
+
+            Ok(KnowledgeSignalProviderConfig {
+                provider_id: provider_id.to_string(),
+                enabled,
+                weight,
+                min_score,
+                min_confidence,
+                show_on_dashboard: show,
+                include_in_briefing: briefing,
+                config_json: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
+            })
+        }
     }
+}
+
+fn default_provider_config(provider_id: &str) -> KnowledgeSignalProviderConfig {
+    let mut config = KnowledgeSignalProviderConfig::default_for(provider_id);
+    if provider_id == WIKI_CANDIDATE_PROVIDER_ID {
+        config.include_in_briefing = true;
+    }
+    config
 }
 
 async fn list_feedback(
@@ -432,9 +559,43 @@ async fn list_feedback(
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
         }
         #[cfg(feature = "postgres")]
-        StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-            "knowledge signals are not yet supported on Postgres".to_string(),
-        )),
+        StorageBackend::Postgres(storage) => {
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                ),
+            >(
+                "SELECT signal_key, provider_id, target_type, target_id, state, snoozed_until
+                 FROM knowledge_signal_feedback
+                 WHERE db_id = $1",
+            )
+            .bind(&storage.db_id)
+            .fetch_all(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+            let mut out = HashMap::new();
+            for (signal_key, provider_id, target_type, target_id, state, snoozed_until) in rows {
+                out.insert(
+                    signal_key.clone(),
+                    KnowledgeSignalFeedback {
+                        signal_key,
+                        provider_id,
+                        target_type,
+                        target_id,
+                        state,
+                        snoozed_until,
+                    },
+                );
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -482,9 +643,31 @@ async fn set_feedback(
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
         }
         #[cfg(feature = "postgres")]
-        StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-            "knowledge signals are not yet supported on Postgres".to_string(),
-        )),
+        StorageBackend::Postgres(storage) => {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO knowledge_signal_feedback
+                    (db_id, signal_key, provider_id, target_type, target_id, state,
+                     snoozed_until, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                 ON CONFLICT(db_id, signal_key) DO UPDATE SET
+                    state = excluded.state,
+                    snoozed_until = excluded.snoozed_until,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&storage.db_id)
+            .bind(signal_key)
+            .bind(provider_id)
+            .bind(target_type)
+            .bind(target_id)
+            .bind(state)
+            .bind(snoozed_until)
+            .bind(now)
+            .execute(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            Ok(())
+        }
     }
 }
 
@@ -615,9 +798,112 @@ impl KnowledgeSignalProvider for WikiCandidateProvider {
                 .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
             }
             #[cfg(feature = "postgres")]
-            StorageBackend::Postgres(_) => Err(AtomicCoreError::DatabaseOperation(
-                "knowledge signals are not yet supported on Postgres".to_string(),
-            )),
+            StorageBackend::Postgres(storage) => {
+                let cutoff = (Utc::now() - Duration::days(14)).to_rfc3339();
+                let rows = sqlx::query_as::<
+                    _,
+                    (String, String, i64, i64, i64, i64, i64, i64, f64),
+                >(
+                    "WITH link_mentions AS (
+                        SELECT wl.target_tag_id as tag_id, COUNT(*)::BIGINT as link_count
+                        FROM wiki_links wl
+                        WHERE wl.target_tag_id IS NOT NULL
+                          AND wl.db_id = $2
+                        GROUP BY wl.target_tag_id
+                    ),
+                    tag_atoms AS (
+                        SELECT
+                            at.tag_id,
+                            COUNT(DISTINCT a.id)::BIGINT as atom_count,
+                            COUNT(DISTINCT CASE
+                                WHEN a.source_url IS NOT NULL AND length(trim(a.source_url)) > 0
+                                THEN a.source_url
+                            END)::BIGINT as source_count,
+                            SUM(CASE WHEN length(trim(a.content)) >= 200 THEN 1 ELSE 0 END)::BIGINT as substantive_count,
+                            SUM(CASE WHEN a.created_at >= $1 THEN 1 ELSE 0 END)::BIGINT as recent_count
+                        FROM atom_tags at
+                        JOIN atoms a ON a.id = at.atom_id AND a.db_id = at.db_id
+                        WHERE at.db_id = $2
+                        GROUP BY at.tag_id
+                    ),
+                    intra_edges AS (
+                        SELECT
+                            at1.tag_id,
+                            COUNT(*)::BIGINT as edge_count,
+                            AVG(se.similarity_score)::FLOAT8 as avg_similarity
+                        FROM semantic_edges se
+                        JOIN atom_tags at1
+                          ON at1.atom_id = se.source_atom_id
+                         AND at1.db_id = se.db_id
+                        JOIN atom_tags at2
+                          ON at2.atom_id = se.target_atom_id
+                         AND at2.tag_id = at1.tag_id
+                         AND at2.db_id = se.db_id
+                        WHERE se.db_id = $2
+                        GROUP BY at1.tag_id
+                    )
+                    SELECT
+                        t.id,
+                        t.name,
+                        COALESCE(ta.atom_count, 0)::BIGINT as atom_count,
+                        COALESCE(lm.link_count, 0)::BIGINT as mention_count,
+                        COALESCE(ta.source_count, 0)::BIGINT as source_count,
+                        COALESCE(ta.substantive_count, 0)::BIGINT as substantive_count,
+                        COALESCE(ta.recent_count, 0)::BIGINT as recent_count,
+                        COALESCE(ie.edge_count, 0)::BIGINT as edge_count,
+                        COALESCE(ie.avg_similarity, 0.0)::FLOAT8 as avg_similarity
+                    FROM tags t
+                    JOIN tag_atoms ta ON ta.tag_id = t.id
+                    LEFT JOIN link_mentions lm ON lm.tag_id = t.id
+                    LEFT JOIN intra_edges ie ON ie.tag_id = t.id
+                    WHERE t.db_id = $2
+                      AND t.parent_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM wiki_articles wa
+                          WHERE wa.tag_id = t.id AND wa.db_id = $2
+                      )
+                      AND t.name ~ '[^0-9]'
+                      AND length(t.name) >= 2
+                      AND ta.atom_count > 0",
+                )
+                .bind(cutoff)
+                .bind(&storage.db_id)
+                .fetch_all(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+                let now = Utc::now().to_rfc3339();
+                let mut signals = Vec::with_capacity(rows.len());
+                for (
+                    tag_id,
+                    tag_name,
+                    atom_count,
+                    mention_count,
+                    source_count,
+                    substantive_count,
+                    recent_count,
+                    edge_count,
+                    avg_similarity,
+                ) in rows
+                {
+                    signals.push(
+                        WikiCandidateRow {
+                            tag_id,
+                            tag_name,
+                            atom_count: atom_count as i32,
+                            mention_count: mention_count as i32,
+                            source_count: source_count as i32,
+                            substantive_count: substantive_count as i32,
+                            recent_count: recent_count as i32,
+                            edge_count: edge_count as i32,
+                            avg_similarity: avg_similarity as f32,
+                        }
+                        .into_signal(&now)?,
+                    );
+                }
+                signals.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+                Ok(signals)
+            }
         }
     }
 }

@@ -3,12 +3,74 @@
 use crate::db_extractor::Db;
 use crate::error::{ok_or_error, ApiErrorResponse};
 use actix_web::{web, HttpResponse};
+use atomic_core::{KnowledgeSignalFilter, TagWithCount, WIKI_CANDIDATE_PROVIDER_ID};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 #[utoipa::path(get, path = "/api/wiki", responses((status = 200, description = "All wiki articles", body = Vec<atomic_core::WikiArticleSummary>)), tag = "wiki")]
 pub async fn get_all_wiki_articles(db: Db) -> HttpResponse {
     ok_or_error(db.0.get_all_wiki_articles().await)
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct WikiSuggestionsQuery {
+    /// Optional tag-name search filter
+    pub q: Option<String>,
+    /// Max suggestions to return (default: 20)
+    pub limit: Option<i32>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/wiki/suggestions",
+    params(WikiSuggestionsQuery),
+    responses((status = 200, description = "Suggested tags for wiki generation", body = Vec<atomic_core::TagWithCount>)),
+    tag = "wiki"
+)]
+pub async fn get_wiki_suggestions(db: Db, query: web::Query<WikiSuggestionsQuery>) -> HttpResponse {
+    let query = query.into_inner();
+    let q = query.q.unwrap_or_default().to_lowercase();
+    let limit = query.limit.unwrap_or(20).max(0);
+
+    let signals = match db
+        .0
+        .list_knowledge_signals(KnowledgeSignalFilter {
+            provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
+            limit: Some(limit.max(100)),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(signals) => signals,
+        Err(e) => return crate::error::error_response(e),
+    };
+
+    let tag_tree = match db.0.get_all_tags().await {
+        Ok(tags) => tags,
+        Err(e) => return crate::error::error_response(e),
+    };
+    let mut tags_by_id = HashMap::new();
+    flatten_tags(&tag_tree, &mut tags_by_id);
+
+    let suggestions: Vec<TagWithCount> = signals
+        .into_iter()
+        .filter(|signal| q.is_empty() || signal.target.label.to_lowercase().contains(&q))
+        .filter_map(|signal| tags_by_id.remove(&signal.target.id))
+        .take(limit as usize)
+        .collect();
+
+    HttpResponse::Ok().json(suggestions)
+}
+
+fn flatten_tags(tags: &[TagWithCount], out: &mut HashMap<String, TagWithCount>) {
+    for tag in tags {
+        let mut flat = tag.clone();
+        flat.children = Vec::new();
+        out.insert(flat.tag.id.clone(), flat);
+        flatten_tags(&tag.children, out);
+    }
 }
 
 #[utoipa::path(get, path = "/api/wiki/{tag_id}", params(("tag_id" = String, Path, description = "Tag ID")), responses((status = 200, description = "Wiki article with citations", body = atomic_core::WikiArticleWithCitations), (status = 404, description = "No article for tag", body = ApiErrorResponse)), tag = "wiki")]

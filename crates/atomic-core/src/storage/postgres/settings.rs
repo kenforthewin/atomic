@@ -438,6 +438,8 @@ impl DatabaseStore for PostgresStorage {
         // Delete from all per-database tables in dependency order (children first).
         // Tables with FKs to other per-db tables are deleted first to avoid constraint violations.
         let tables = [
+            "knowledge_signal_feedback",
+            "knowledge_signal_preferences",
             "chat_citations",
             "chat_tool_calls",
             "chat_messages",
