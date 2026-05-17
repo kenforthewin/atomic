@@ -85,19 +85,6 @@ pub async fn get_wiki_links(db: Db, path: web::Path<String>) -> HttpResponse {
     ok_or_error(db.0.get_wiki_links(&tag_id).await)
 }
 
-#[derive(Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct SuggestionsQuery {
-    /// Max suggestions (default: 10)
-    pub limit: Option<i32>,
-}
-
-#[utoipa::path(get, path = "/api/wiki/suggestions", params(SuggestionsQuery), responses((status = 200, description = "Suggested wiki articles", body = Vec<atomic_core::SuggestedArticle>)), tag = "wiki")]
-pub async fn get_wiki_suggestions(db: Db, query: web::Query<SuggestionsQuery>) -> HttpResponse {
-    let limit = query.limit.unwrap_or(10);
-    ok_or_error(db.0.get_suggested_wiki_articles(limit).await)
-}
-
 #[utoipa::path(get, path = "/api/wiki/{tag_id}/versions", params(("tag_id" = String, Path, description = "Tag ID")), responses((status = 200, description = "Version history", body = Vec<atomic_core::WikiVersionSummary>)), tag = "wiki")]
 pub async fn list_wiki_versions(db: Db, path: web::Path<String>) -> HttpResponse {
     let tag_id = path.into_inner();

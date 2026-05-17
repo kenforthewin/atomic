@@ -530,17 +530,6 @@ pub struct RelatedTag {
     pub has_article: bool,
 }
 
-/// Suggested wiki article for tags that don't have articles yet
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct SuggestedArticle {
-    pub tag_id: String,
-    pub tag_name: String,
-    pub atom_count: i32,
-    pub mention_count: i32,
-    pub score: f64,
-}
-
 /// Archived version of a wiki article
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

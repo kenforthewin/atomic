@@ -375,10 +375,6 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'GET',
     path: (a) => `/api/wiki/${encodeURIComponent(a.tagId as string)}/links`,
   },
-  get_suggested_wiki_articles: {
-    method: 'GET',
-    path: (a) => `/api/wiki/suggestions?limit=${a.limit ?? 10}`,
-  },
   get_wiki_versions: {
     method: 'GET',
     path: (a) => `/api/wiki/${encodeURIComponent(a.tagId as string)}/versions`,

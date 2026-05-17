@@ -11,9 +11,8 @@ pub mod section_ops;
 pub use section_ops::{apply_section_ops, WikiSectionOp, WikiSectionOpWire};
 
 use crate::models::{
-    ChunkWithContext, RelatedTag, SuggestedArticle, WikiArticle, WikiArticleStatus,
-    WikiArticleSummary, WikiArticleVersion, WikiArticleWithCitations, WikiCitation, WikiLink,
-    WikiVersionSummary,
+    ChunkWithContext, RelatedTag, WikiArticle, WikiArticleStatus, WikiArticleSummary,
+    WikiArticleVersion, WikiArticleWithCitations, WikiCitation, WikiLink, WikiVersionSummary,
 };
 use crate::providers::structured::{call_structured, StructuredCall};
 use crate::providers::types::Message;
@@ -1638,64 +1637,6 @@ fn find_tags_mentioned_in_article(
     mentioned.truncate(limit);
 
     Ok(mentioned)
-}
-
-/// Get suggested wiki articles: tags without articles ranked by demand + content richness
-pub fn get_suggested_wiki_articles(
-    conn: &Connection,
-    limit: i32,
-) -> Result<Vec<SuggestedArticle>, String> {
-    let mut stmt = conn
-        .prepare(
-            "WITH link_mentions AS (
-                -- Drive from wiki_links (small), not from all candidate tags
-                SELECT tag_id, SUM(cnt) as link_count FROM (
-                    SELECT wl.target_tag_id as tag_id, COUNT(*) as cnt
-                    FROM wiki_links wl
-                    WHERE wl.target_tag_id IS NOT NULL
-                    GROUP BY wl.target_tag_id
-                    UNION ALL
-                    SELECT t2.id as tag_id, COUNT(*) as cnt
-                    FROM wiki_links wl
-                    JOIN tags t2 ON wl.target_tag_name = t2.name COLLATE NOCASE
-                    WHERE wl.target_tag_id IS NULL
-                    GROUP BY t2.id
-                )
-                GROUP BY tag_id
-            )
-            SELECT
-                t.id,
-                t.name,
-                t.atom_count,
-                COALESCE(lm.link_count, 0) as mention_count,
-                t.atom_count * 1.0 + COALESCE(lm.link_count, 0) * 3.0 as score
-            FROM tags t
-            LEFT JOIN link_mentions lm ON lm.tag_id = t.id
-            WHERE t.parent_id IS NOT NULL
-              AND NOT EXISTS (SELECT 1 FROM wiki_articles wa WHERE wa.tag_id = t.id)
-              AND t.name GLOB '*[^0-9]*'
-              AND length(t.name) >= 2
-              AND t.atom_count > 0
-            ORDER BY score DESC
-            LIMIT ?1",
-        )
-        .map_err(|e| format!("Failed to prepare suggestions query: {}", e))?;
-
-    let suggestions: Vec<SuggestedArticle> = stmt
-        .query_map([limit], |row| {
-            Ok(SuggestedArticle {
-                tag_id: row.get(0)?,
-                tag_name: row.get(1)?,
-                atom_count: row.get(2)?,
-                mention_count: row.get(3)?,
-                score: row.get(4)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query suggestions: {}", e))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to collect suggestions: {}", e))?;
-
-    Ok(suggestions)
 }
 
 #[cfg(test)]

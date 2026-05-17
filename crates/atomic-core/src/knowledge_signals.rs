@@ -667,7 +667,7 @@ impl WikiCandidateRow {
         };
         let recent_growth = (self.recent_count as f32 / 5.0).min(1.0);
         let mention_strength = (self.mention_count as f32 / 5.0).min(1.0);
-        let semantic_cohesion = if self.edge_count == 0 {
+        let semantic_edge_cohesion = if self.edge_count == 0 {
             0.0
         } else {
             ((self.avg_similarity - 0.5) / 0.35).clamp(0.0, 1.0)
@@ -679,12 +679,12 @@ impl WikiCandidateRow {
                 + 0.15 * substantive
                 + 0.15 * recent_growth
                 + 0.10 * mention_strength
-                + 0.10 * semantic_cohesion);
+                + 0.10 * semantic_edge_cohesion);
 
         let confidence = (0.35 * atom_volume
             + 0.25 * substantive
             + 0.20 * source_diversity
-            + 0.20 * semantic_cohesion)
+            + 0.20 * semantic_edge_cohesion)
             .clamp(0.0, 1.0);
 
         let mut reasons = vec![
@@ -734,13 +734,13 @@ impl WikiCandidateRow {
 
         if self.edge_count > 0 {
             reasons.push(KnowledgeSignalReason {
-                kind: "semantic_cohesion".to_string(),
-                label: format!("semantic cohesion {:.0}%", self.avg_similarity * 100.0),
+                kind: "semantic_edge_cohesion".to_string(),
+                label: format!("semantic edge cohesion {:.0}%", self.avg_similarity * 100.0),
                 value: json!({
                     "edge_count": self.edge_count,
                     "avg_similarity": self.avg_similarity,
                 }),
-                contribution: semantic_cohesion,
+                contribution: semantic_edge_cohesion,
             });
         }
 
@@ -791,5 +791,142 @@ fn scaled_ln(value: i32, cap_at: f32) -> f32 {
         0.0
     } else {
         ((value as f32 + 1.0).ln() / cap_at.ln()).min(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CreateAtomRequest;
+    use tempfile::NamedTempFile;
+
+    fn long_note(seed: &str) -> String {
+        format!(
+            "# {seed}\n\n{}",
+            "This note contains enough substantive content for wiki candidate scoring. ".repeat(5)
+        )
+    }
+
+    async fn test_core() -> (AtomicCore, NamedTempFile) {
+        let temp = NamedTempFile::new().unwrap();
+        let core = AtomicCore::open_or_create(temp.path()).unwrap();
+        (core, temp)
+    }
+
+    async fn create_child_tag(core: &AtomicCore, name: &str) -> crate::Tag {
+        let parent = core.create_tag("Research Areas", None).await.unwrap();
+        core.create_tag(name, Some(&parent.id)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn wiki_candidate_signal_has_typed_evidence_and_reasons() {
+        let (core, _temp) = test_core().await;
+        let tag = create_child_tag(&core, "Distributed Systems").await;
+
+        for i in 0..3 {
+            core.create_atom(
+                CreateAtomRequest {
+                    content: long_note(&format!("Distributed Systems {i}")),
+                    source_url: Some(format!("https://example.com/systems/{i}")),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| signal.target.id == tag.id)
+            .expect("wiki candidate signal");
+
+        assert_eq!(signal.id, format!("wiki_candidate:tag:{}", tag.id));
+        assert_eq!(signal.provider_id, WIKI_CANDIDATE_PROVIDER_ID);
+        assert!(signal.score > 0.0);
+        assert!(signal.confidence > 0.0);
+        assert!(signal
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == "atom_volume"));
+        assert!(signal
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == "source_diversity"));
+        assert_eq!(signal.evidence["schema"], "wiki_candidate");
+        assert_eq!(signal.evidence["schema_version"], 1);
+        assert_eq!(signal.evidence["tag_id"], tag.id);
+        assert_eq!(signal.evidence["tag_name"], "Distributed Systems");
+        assert_eq!(signal.evidence["atom_count"], 3);
+        assert_eq!(signal.evidence["source_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn dismissed_wiki_candidate_is_hidden_until_included_or_restored() {
+        let (core, _temp) = test_core().await;
+        let tag = create_child_tag(&core, "Compiler Design").await;
+
+        core.create_atom(
+            CreateAtomRequest {
+                content: long_note("Compiler Design"),
+                source_url: Some("https://example.com/compiler-design".to_string()),
+                tag_ids: vec![tag.id.clone()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let key = format!("wiki_candidate:tag:{}", tag.id);
+        dismiss_signal(&core, &key).await.unwrap();
+
+        let visible = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!visible.iter().any(|signal| signal.id == key));
+
+        let dismissed = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
+                include_dismissed: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(dismissed.iter().any(|signal| signal.id == key));
+
+        restore_signal(&core, &key).await.unwrap();
+        let restored = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(restored.iter().any(|signal| signal.id == key));
     }
 }

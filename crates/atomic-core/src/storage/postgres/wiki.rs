@@ -693,65 +693,6 @@ impl WikiStore for PostgresStorage {
         Ok(Some((new_chunks, atom_count)))
     }
 
-    async fn get_suggested_wiki_articles(
-        &self,
-        limit: i32,
-    ) -> StorageResult<Vec<SuggestedArticle>> {
-        // Postgres equivalent of the SQLite query, using SIMILAR TO instead of GLOB
-        // and standard SQL features instead of SQLite-specific ones.
-        let rows = sqlx::query_as::<_, (String, String, i32, i64, f64)>(
-            "WITH link_mentions AS (
-                SELECT tag_id, SUM(cnt) as link_count FROM (
-                    SELECT wl.target_tag_id as tag_id, COUNT(*) as cnt
-                    FROM wiki_links wl
-                    WHERE wl.target_tag_id IS NOT NULL AND wl.db_id = $2
-                    GROUP BY wl.target_tag_id
-                    UNION ALL
-                    SELECT t2.id as tag_id, COUNT(*) as cnt
-                    FROM wiki_links wl
-                    JOIN tags t2 ON LOWER(wl.link_text) = LOWER(t2.name)
-                    WHERE wl.target_tag_id IS NULL AND wl.db_id = $2 AND t2.db_id = $2
-                    GROUP BY t2.id
-                ) sub
-                GROUP BY tag_id
-            )
-            SELECT
-                t.id,
-                t.name,
-                t.atom_count,
-                COALESCE(lm.link_count, 0)::BIGINT as mention_count,
-                (t.atom_count * 1.0 + COALESCE(lm.link_count, 0) * 3.0)::FLOAT8 as score
-            FROM tags t
-            LEFT JOIN link_mentions lm ON lm.tag_id = t.id
-            WHERE t.parent_id IS NOT NULL
-              AND NOT EXISTS (SELECT 1 FROM wiki_articles wa WHERE wa.tag_id = t.id AND wa.db_id = $2)
-              AND t.name ~ '[^0-9]'
-              AND LENGTH(t.name) >= 2
-              AND t.atom_count > 0
-              AND t.db_id = $2
-            ORDER BY score DESC
-            LIMIT $1",
-        )
-        .bind(limit)
-        .bind(&self.db_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(
-                |(tag_id, tag_name, atom_count, mention_count, score)| SuggestedArticle {
-                    tag_id,
-                    tag_name,
-                    atom_count,
-                    mention_count: mention_count as i32,
-                    score,
-                },
-            )
-            .collect())
-    }
-
     async fn save_wiki_proposal(&self, proposal: &WikiProposal) -> StorageResult<()> {
         let citations_json = serde_json::to_string(&proposal.citations)
             .map_err(|e| AtomicCoreError::Wiki(format!("Failed to serialize citations: {}", e)))?;

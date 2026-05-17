@@ -3829,14 +3829,6 @@ impl AtomicCore {
             .await;
     }
 
-    /// Get suggested wiki articles (tags without articles, ranked by demand)
-    pub async fn get_suggested_wiki_articles(
-        &self,
-        limit: i32,
-    ) -> Result<Vec<SuggestedArticle>, AtomicCoreError> {
-        self.storage.get_suggested_wiki_articles_sync(limit).await
-    }
-
     /// List deterministic knowledge-quality signals for the active database.
     pub async fn list_knowledge_signals(
         &self,

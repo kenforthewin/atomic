@@ -749,10 +749,6 @@ pub trait WikiStore: Send + Sync {
     /// Get all wiki articles (summaries for list view).
     async fn get_all_wiki_articles(&self) -> StorageResult<Vec<WikiArticleSummary>>;
 
-    /// Get tags that would benefit from having wiki articles.
-    async fn get_suggested_wiki_articles(&self, limit: i32)
-        -> StorageResult<Vec<SuggestedArticle>>;
-
     /// Select chunks for wiki article generation, ranked by centroid similarity.
     ///
     /// Returns (chunks, atom_count) for the tag hierarchy. Uses centroid embedding
