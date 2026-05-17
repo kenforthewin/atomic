@@ -65,6 +65,39 @@ export interface SuggestedArticle {
   atom_count: number;
   mention_count: number;
   score: number;
+  signal_id?: string;
+  confidence?: number;
+  reasons?: string[];
+  source_count?: number;
+  recent_count?: number;
+}
+
+interface KnowledgeSignal {
+  id: string;
+  provider_id: string;
+  target: {
+    kind: string;
+    id: string;
+    label: string;
+  };
+  score: number;
+  confidence: number;
+  reasons: Array<{
+    kind: string;
+    label: string;
+    value: unknown;
+    contribution: number;
+  }>;
+  evidence?: {
+    schema?: string;
+    schema_version?: number;
+    tag_id?: string;
+    tag_name?: string;
+    atom_count?: number;
+    mention_count?: number;
+    source_count?: number;
+    recent_count?: number;
+  };
 }
 
 export interface WikiVersionSummary {
@@ -144,6 +177,7 @@ interface WikiStore {
   // List actions
   fetchAllArticles: () => Promise<void>;
   fetchSuggestedArticles: () => Promise<void>;
+  dismissSuggestedArticle: (signalKey: string) => Promise<void>;
   showList: () => void;
   openArticle: (tagId: string, tagName: string) => void;
   openAndGenerate: (tagId: string, tagName: string) => void;
@@ -219,12 +253,41 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   fetchSuggestedArticles: async () => {
     set({ isLoadingSuggestions: true });
     try {
-      const suggestions = await getTransport().invoke<SuggestedArticle[]>('get_suggested_wiki_articles', { limit: 100 });
+      const signals = await getTransport().invoke<KnowledgeSignal[]>('list_knowledge_signals', {
+        providerId: 'wiki_candidate',
+        limit: 100,
+      });
+      const suggestions: SuggestedArticle[] = signals.map(signal => ({
+        tag_id: signal.evidence?.tag_id ?? signal.target.id,
+        tag_name: signal.evidence?.tag_name ?? signal.target.label,
+        atom_count: signal.evidence?.atom_count ?? 0,
+        mention_count: signal.evidence?.mention_count ?? 0,
+        score: signal.score,
+        signal_id: signal.id,
+        confidence: signal.confidence,
+        reasons: signal.reasons.map(reason => reason.label),
+        source_count: signal.evidence?.source_count ?? 0,
+        recent_count: signal.evidence?.recent_count ?? 0,
+      }));
       set({ suggestedArticles: suggestions, isLoadingSuggestions: false });
     } catch (error) {
       console.error('Failed to fetch suggested articles:', error);
       toast.error('Failed to load suggested articles', { id: 'wiki-suggestions-error', description: String(error) });
       set({ isLoadingSuggestions: false });
+    }
+  },
+
+  dismissSuggestedArticle: async (signalKey: string) => {
+    const previous = get().suggestedArticles;
+    set({
+      suggestedArticles: previous.filter(s => s.signal_id !== signalKey),
+    });
+    try {
+      await getTransport().invoke('dismiss_knowledge_signal', { signalKey });
+    } catch (error) {
+      console.error('Failed to dismiss wiki suggestion:', error);
+      set({ suggestedArticles: previous });
+      toast.error('Failed to dismiss suggestion', { description: String(error) });
     }
   },
 

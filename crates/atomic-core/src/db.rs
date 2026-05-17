@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 22;
+    const LATEST_VERSION: i32 = 23;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -1019,7 +1019,43 @@ impl Database {
         // at server startup with a per-DB idempotency flag. A pure SQL drop
         // here would discard history before the Rust path could rehome it.
         if version < 22 {
-            conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
+            conn.execute_batch("PRAGMA user_version = 22;")?;
+        }
+
+        // --- V22 → V23: Knowledge-quality signal preferences and feedback ---
+        if version < 23 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS knowledge_signal_preferences (
+                    provider_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    min_score REAL NOT NULL DEFAULT 0.0,
+                    min_confidence REAL NOT NULL DEFAULT 0.0,
+                    show_on_dashboard INTEGER NOT NULL DEFAULT 1,
+                    include_in_briefing INTEGER NOT NULL DEFAULT 0,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS knowledge_signal_feedback (
+                    signal_key TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT,
+                    state TEXT NOT NULL,
+                    snoozed_until TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_signal_feedback_provider
+                    ON knowledge_signal_feedback(provider_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_signal_feedback_target
+                    ON knowledge_signal_feedback(target_type, target_id);
+                "#,
+            )?;
+            conn.execute_batch("PRAGMA user_version = 23;")?;
         }
 
         // --- Triggers (recreated every startup to stay current) ---

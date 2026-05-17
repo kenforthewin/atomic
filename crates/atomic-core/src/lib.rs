@@ -44,6 +44,7 @@ pub mod extraction;
 pub mod graph_maintenance;
 pub mod import;
 pub mod ingest;
+pub mod knowledge_signals;
 pub mod manager;
 pub mod models;
 pub mod pipeline_task;
@@ -67,6 +68,10 @@ pub use error::AtomicCoreError;
 pub use export::{MarkdownArchiveFormat, MarkdownExportProgress, MarkdownExportResult};
 pub use import::{ImportProgress, ImportResult};
 pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResult};
+pub use knowledge_signals::{
+    KnowledgeSignal, KnowledgeSignalAction, KnowledgeSignalFilter, KnowledgeSignalProviderConfig,
+    KnowledgeSignalReason, KnowledgeSignalSeverity, KnowledgeSignalTarget, WikiCandidateEvidence,
+};
 pub use manager::DatabaseManager;
 pub use models::*;
 pub use providers::{ProviderConfig, ProviderType};
@@ -3830,6 +3835,42 @@ impl AtomicCore {
         limit: i32,
     ) -> Result<Vec<SuggestedArticle>, AtomicCoreError> {
         self.storage.get_suggested_wiki_articles_sync(limit).await
+    }
+
+    /// List deterministic knowledge-quality signals for the active database.
+    pub async fn list_knowledge_signals(
+        &self,
+        filter: KnowledgeSignalFilter,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        knowledge_signals::list_knowledge_signals(self, filter).await
+    }
+
+    /// Dismiss a knowledge-quality signal until its identity changes or it is restored.
+    pub async fn dismiss_knowledge_signal(&self, signal_key: &str) -> Result<(), AtomicCoreError> {
+        knowledge_signals::dismiss_signal(self, signal_key).await
+    }
+
+    /// Snooze a knowledge-quality signal until an RFC3339 timestamp.
+    pub async fn snooze_knowledge_signal(
+        &self,
+        signal_key: &str,
+        until: &str,
+    ) -> Result<(), AtomicCoreError> {
+        knowledge_signals::snooze_signal(self, signal_key, until).await
+    }
+
+    /// Persist per-database configuration for a knowledge signal provider.
+    pub async fn set_knowledge_signal_provider_config(
+        &self,
+        provider_id: &str,
+        config: KnowledgeSignalProviderConfig,
+    ) -> Result<KnowledgeSignalProviderConfig, AtomicCoreError> {
+        knowledge_signals::set_provider_config(self, provider_id, config).await
+    }
+
+    /// Restore a dismissed or snoozed knowledge-quality signal.
+    pub async fn restore_knowledge_signal(&self, signal_key: &str) -> Result<(), AtomicCoreError> {
+        knowledge_signals::restore_signal(self, signal_key).await
     }
 
     /// Recompute centroid embeddings for all tags that have atoms with embeddings.
