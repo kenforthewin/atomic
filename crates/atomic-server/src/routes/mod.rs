@@ -13,6 +13,7 @@ pub mod feeds;
 pub mod graph;
 pub mod import;
 pub mod ingest;
+pub mod knowledge_signals;
 pub mod logs;
 pub mod oauth;
 pub mod ollama;
@@ -128,6 +129,28 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route(
         "/wiki/recompute-tag-embeddings",
         web::post().to(wiki::recompute_all_tag_embeddings),
+    );
+
+    // Knowledge-quality signals
+    cfg.route(
+        "/knowledge-signals",
+        web::get().to(knowledge_signals::list_knowledge_signals),
+    );
+    cfg.route(
+        "/knowledge-signals/providers/{provider_id}",
+        web::put().to(knowledge_signals::set_knowledge_signal_provider_config),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/dismiss",
+        web::post().to(knowledge_signals::dismiss_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/snooze",
+        web::post().to(knowledge_signals::snooze_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/restore",
+        web::post().to(knowledge_signals::restore_knowledge_signal),
     );
 
     // Briefings

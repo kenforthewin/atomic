@@ -357,6 +357,39 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     transformResponse: (d: any) => d.count as number,
   },
 
+  // ==================== Knowledge Signals ====================
+  list_knowledge_signals: {
+    method: 'GET',
+    path: (a) => {
+      const params = new URLSearchParams();
+      if (a.providerId) params.set('provider_id', a.providerId as string);
+      if (a.includeDismissed != null) params.set('include_dismissed', String(a.includeDismissed));
+      if (a.includeSnoozed != null) params.set('include_snoozed', String(a.includeSnoozed));
+      if (a.limit != null) params.set('limit', String(a.limit));
+      return `/api/knowledge-signals${params.toString() ? `?${params}` : ''}`;
+    },
+  },
+  dismiss_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/dismiss`,
+  },
+  set_knowledge_signal_provider_config: {
+    method: 'PUT',
+    path: (a) => `/api/knowledge-signals/providers/${encodeURIComponent(a.providerId as string)}`,
+    argsMode: 'body',
+    transformArgs: (a) => a.config,
+  },
+  snooze_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/snooze`,
+    argsMode: 'body',
+    transformArgs: (a) => ({ until: a.until }),
+  },
+  restore_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/restore`,
+  },
+
   // ==================== Settings ====================
   get_settings: {
     method: 'GET',
