@@ -12,7 +12,7 @@ use atomic_server::{
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
     mcp, mcp_auth, routes,
-    state::{AppState, SetupClaimLimiter, SetupToken},
+    state::{AppState, ServerEvent, SetupClaimLimiter, SetupToken},
     ws, Scalar, Servable,
 };
 use clap::Parser;
@@ -559,6 +559,7 @@ async fn run_server(
     // previous tick is still running.
     {
         let reports_manager = Arc::clone(&manager);
+        let reports_tx = event_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.tick().await;
@@ -586,6 +587,7 @@ async fn run_server(
                             continue;
                         }
                         let core_clone = core.clone();
+                        let run_tx = reports_tx.clone();
                         tokio::spawn(async move {
                             match atomic_core::reports::run_report(
                                 &core_clone,
@@ -594,11 +596,42 @@ async fn run_server(
                             )
                             .await
                             {
-                                Ok(outcome) => tracing::info!(
-                                    report_id = %report.id,
-                                    outcome = ?outcome,
-                                    "[reports] scheduled run complete"
-                                ),
+                                Ok(outcome) => {
+                                    tracing::info!(
+                                        report_id = %report.id,
+                                        outcome = ?outcome,
+                                        "[reports] scheduled run complete"
+                                    );
+                                    // Broadcast `atom-created` for the new
+                                    // finding so the dashboard widget
+                                    // refreshes live. The runner writes
+                                    // directly through storage and doesn't
+                                    // touch the event bridge, so without
+                                    // this an open dashboard would only
+                                    // see the new finding after a manual
+                                    // refresh or DB switch.
+                                    if let atomic_core::reports::RunOutcome::Succeeded {
+                                        finding_atom_id,
+                                    } = outcome
+                                    {
+                                        match core_clone.get_atom(&finding_atom_id).await {
+                                            Ok(Some(atom)) => {
+                                                let _ =
+                                                    run_tx.send(ServerEvent::AtomCreated { atom });
+                                            }
+                                            Ok(None) => tracing::warn!(
+                                                report_id = %report.id,
+                                                finding_atom_id = %finding_atom_id,
+                                                "[reports] finding atom missing after write — skipping broadcast"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                report_id = %report.id,
+                                                error = %e,
+                                                "[reports] finding fetch for broadcast failed"
+                                            ),
+                                        }
+                                    }
+                                }
                                 Err(e) => tracing::error!(
                                     report_id = %report.id,
                                     error = %e,

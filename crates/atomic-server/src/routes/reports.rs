@@ -8,6 +8,7 @@
 
 use crate::db_extractor::Db;
 use crate::error::{error_response, ok_or_error, ApiErrorResponse};
+use crate::state::{AppState, ServerEvent};
 use actix_web::{web, HttpResponse};
 use atomic_core::models::{CreateReportRequest, UpdateReportRequest};
 use serde::Deserialize;
@@ -198,7 +199,11 @@ pub struct RunNowResponse {
     ),
     tag = "reports"
 )]
-pub async fn run_report_now(db: Db, path: web::Path<String>) -> HttpResponse {
+pub async fn run_report_now(
+    db: Db,
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> HttpResponse {
     let id = path.into_inner();
     // Validate the report exists before reporting 202 — otherwise the
     // 404 would be deferred to the background task and the caller would
@@ -213,13 +218,24 @@ pub async fn run_report_now(db: Db, path: web::Path<String>) -> HttpResponse {
 
     let core = db.0.clone();
     let id_owned = id.clone();
+    let event_tx = state.event_tx.clone();
     tokio::spawn(async move {
         match core.run_report_now(&id_owned).await {
-            Ok(outcome) => tracing::info!(
-                report_id = %id_owned,
-                outcome = ?outcome,
-                "[reports/run-now] complete"
-            ),
+            Ok(outcome) => {
+                tracing::info!(
+                    report_id = %id_owned,
+                    outcome = ?outcome,
+                    "[reports/run-now] complete"
+                );
+                // Broadcast `atom-created` on success so the dashboard
+                // widget refreshes live. Matches what the scheduled-run
+                // loop emits in `atomic-server::main`.
+                if let atomic_core::reports::RunOutcome::Succeeded { finding_atom_id } = outcome {
+                    if let Ok(Some(atom)) = core.get_atom(&finding_atom_id).await {
+                        let _ = event_tx.send(ServerEvent::AtomCreated { atom });
+                    }
+                }
+            }
             Err(e) => tracing::error!(
                 report_id = %id_owned,
                 error = %e,

@@ -595,10 +595,20 @@ async fn final_pass(
 }
 
 /// Resolve each `[N]` marker in `content` to a `(position, atom_id,
-/// excerpt)` tuple. Markers that don't map to a known citable are dropped
-/// with a warning — same behavior as the briefing's extractor. Position
-/// is 1-indexed by appearance order in the prose, so the same atom cited
-/// twice yields two rows with different positions but the same atom_id.
+/// excerpt)` row. Markers that don't map to a known citable are dropped
+/// with a warning — same behavior as the briefing's extractor.
+///
+/// `position` carries the **marker number N**, not the order of appearance.
+/// The dashboard renders `[N]` in the prose and looks up the citation by
+/// that same N (`citationMap.get(citation_index)`); the storage column is
+/// the lookup key. Storing appearance order would break the lookup the
+/// moment the agent emits `[3]` before `[1]` or uses one marker twice.
+///
+/// Repeated markers dedupe — `Detail [1]. More [1].` produces a single row
+/// for atom 1. The composite PK `(finding_atom_id, cited_atom_id,
+/// position)` would otherwise reject the second insert, and the dashboard
+/// only needs one row per `(finding, marker)` to render every occurrence
+/// of that marker as a clickable popover.
 fn extract_citations(content: &str, citables: &HashMap<String, Citable>) -> Vec<ResolvedCitation> {
     let re = match Regex::new(r"\[(\d+)\]") {
         Ok(r) => r,
@@ -608,13 +618,16 @@ fn extract_citations(content: &str, citables: &HashMap<String, Citable>) -> Vec<
         }
     };
     let by_number: HashMap<i32, &Citable> = citables.values().map(|c| (c.number, c)).collect();
+    let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut out: Vec<ResolvedCitation> = Vec::new();
-    let mut position: i32 = 1;
     for cap in re.captures_iter(content) {
         let Some(m) = cap.get(1) else { continue };
         let Ok(n) = m.as_str().parse::<i32>() else {
             continue;
         };
+        if !seen.insert(n) {
+            continue;
+        }
         let Some(c) = by_number.get(&n) else {
             tracing::warn!(
                 citation_number = n,
@@ -623,11 +636,10 @@ fn extract_citations(content: &str, citables: &HashMap<String, Citable>) -> Vec<
             continue;
         };
         out.push(ResolvedCitation {
-            position,
+            position: n,
             cited_atom_id: c.atom_id.clone(),
             excerpt: c.excerpt.clone(),
         });
-        position += 1;
     }
     out
 }
@@ -785,15 +797,38 @@ mod tests {
             mock_atom("a2", "two", "second"),
         ];
         let state = AgentState::from_source(&report, &source);
+        // `[1]` cited twice; only one row should land. `position` reflects
+        // the actual marker number, not appearance order — the dashboard
+        // looks the citation up by N.
         let content = "Intro [1]. Detail [2]. More [1].";
         let cites = extract_citations(content, &state.citables);
-        assert_eq!(cites.len(), 3);
+        assert_eq!(cites.len(), 2);
         assert_eq!(cites[0].position, 1);
         assert_eq!(cites[0].cited_atom_id, "a1");
         assert_eq!(cites[1].position, 2);
         assert_eq!(cites[1].cited_atom_id, "a2");
-        assert_eq!(cites[2].position, 3);
-        assert_eq!(cites[2].cited_atom_id, "a1");
+    }
+
+    #[test]
+    fn extract_citations_out_of_sequence_preserves_marker_number() {
+        // Regression for the appearance-counter bug: the agent emits
+        // `[3]` before `[1]` and skips `[2]`. The stored `position` must
+        // be the marker number itself so the dashboard's lookup by
+        // citation_index finds the right source.
+        let report = mock_report(CitationPolicy::SourceOnly);
+        let source = vec![
+            mock_atom("a1", "one", "first"),
+            mock_atom("a2", "two", "second"),
+            mock_atom("a3", "three", "third"),
+        ];
+        let state = AgentState::from_source(&report, &source);
+        let content = "First [3]. Then [1].";
+        let cites = extract_citations(content, &state.citables);
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0].position, 3);
+        assert_eq!(cites[0].cited_atom_id, "a3");
+        assert_eq!(cites[1].position, 1);
+        assert_eq!(cites[1].cited_atom_id, "a1");
     }
 
     #[test]

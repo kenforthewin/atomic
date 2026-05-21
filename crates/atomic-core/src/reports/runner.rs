@@ -62,24 +62,23 @@ pub async fn run_report(
     };
 
     match execute(core, report, &handle).await {
-        Ok(RunInner::Empty(reason)) => {
-            // Empty scope is terminal-success: advance cache, complete
-            // the ledger row without a result_id. The agent never ran;
-            // any prior `last_error` is left in place (a transient
-            // empty-scope tick shouldn't clear a real failure record).
-            let now = Utc::now().to_rfc3339();
+        Ok(RunInner::Empty { reason, watermark }) => {
+            // Empty scope is terminal-success: advance cache to the
+            // resolution-time watermark (not now), complete the ledger
+            // row without a result_id. The agent never ran; any prior
+            // `last_error` is left in place (a transient empty-scope
+            // tick shouldn't clear a real failure record).
             core.storage()
-                .update_report_cache_sync(&report.id, Some(&now), None, None)
+                .update_report_cache_sync(&report.id, Some(&watermark), None, None)
                 .await?;
             let _ = handle.complete(None).await?;
             Ok(RunOutcome::EmptyScope { reason })
         }
-        Ok(RunInner::Written(atom_id)) => {
-            let now = Utc::now().to_rfc3339();
+        Ok(RunInner::Written { atom_id, watermark }) => {
             core.storage()
                 .update_report_cache_sync(
                     &report.id,
-                    Some(&now),
+                    Some(&watermark),
                     Some(Some(atom_id.as_str())),
                     Some(None),
                 )
@@ -108,10 +107,17 @@ pub async fn run_report(
     }
 }
 
-/// Inner result before we map it to a `RunOutcome` + cache writes.
+/// Inner result before we map it to a `RunOutcome` + cache writes. Both
+/// branches carry the **scope-resolution timestamp** rather than letting
+/// the caller stamp `Utc::now()` at completion. For
+/// `source_scope_window = SinceLastRun`, the next tick filters atoms with
+/// `created_at > last_run_at`; if we advanced past completion time
+/// instead, any atom captured between scope resolution and run finish
+/// would have `created_at` in the just-crossed gap and never be picked up
+/// on the following run.
 enum RunInner {
-    Empty(String),
-    Written(String),
+    Empty { reason: String, watermark: String },
+    Written { atom_id: String, watermark: String },
 }
 
 async fn execute(
@@ -120,6 +126,11 @@ async fn execute(
     handle: &ledger::RunHandle,
 ) -> Result<RunInner, AtomicCoreError> {
     let now = Utc::now();
+    // Watermark for `last_run_at` is the moment we resolved scope. Any
+    // atom captured between here and the run's completion belongs to the
+    // *next* batch, not this one; advancing past completion time would
+    // silently swallow it.
+    let watermark = now.to_rfc3339();
 
     let source = scope::resolve_source(core, report, now).await?;
     if source.atoms.is_empty() {
@@ -131,7 +142,7 @@ async fn execute(
                 source.total_in_scope
             )
         };
-        return Ok(RunInner::Empty(reason));
+        return Ok(RunInner::Empty { reason, watermark });
     }
 
     let ctx_filter = scope::build_context_filter(core, report, &source, now).await?;
@@ -150,10 +161,16 @@ async fn execute(
     // happen with a well-behaved LLM but the cost of catching it is one
     // string check.
     if output.content.trim().is_empty() {
-        return Ok(RunInner::Empty("agent returned empty content".to_string()));
+        return Ok(RunInner::Empty {
+            reason: "agent returned empty content".to_string(),
+            watermark,
+        });
     }
 
     let atom_id = uuid::Uuid::new_v4().to_string();
+    // The atom's own `created_at` records when the run finished — distinct
+    // from the report-watermark, which records the cutoff for what was
+    // *in scope* for this run.
     let created_at = Utc::now().to_rfc3339();
     let provenance = ReportFinding {
         finding_atom_id: atom_id.clone(),
@@ -191,5 +208,5 @@ async fn execute(
         )
         .await?;
 
-    Ok(RunInner::Written(atom_id))
+    Ok(RunInner::Written { atom_id, watermark })
 }

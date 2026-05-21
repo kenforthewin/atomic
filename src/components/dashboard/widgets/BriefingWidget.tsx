@@ -75,13 +75,13 @@ export function BriefingWidget() {
 
   // Load on mount and re-fetch whenever a new report finding atom lands.
   // We filter on `kind === 'report'` so a normal capture doesn't trigger a
-  // pointless refresh, and the runner publishes through the standard
-  // atom-created stream so no special event channel is needed.
+  // pointless refresh. The event-normalizer delivers AtomWithTags as the
+  // payload, and AtomWithTags uses `serde(flatten)` for its inner atom —
+  // so `kind` lives at the top of the payload, not under `.atom`.
   useEffect(() => {
     fetchLatest();
     const unsub = getTransport().subscribe('atom-created', (payload) => {
-      const kind = (payload as { atom?: { kind?: string } } | undefined)?.atom
-        ?.kind;
+      const kind = (payload as { kind?: string } | undefined)?.kind;
       if (kind === 'report') {
         fetchLatest();
       }

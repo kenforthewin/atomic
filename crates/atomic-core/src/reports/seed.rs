@@ -183,9 +183,26 @@ pub async fn migrate_briefings_to_findings(core: &AtomicCore) -> Result<usize, A
 
     let rows = storage.fetch_legacy_briefings_sync().await?;
     let mut written = 0usize;
+    let mut skipped = 0usize;
 
     for (index, row) in rows.iter().enumerate() {
-        let atom_id = uuid::Uuid::new_v4().to_string();
+        // Resumability: derive the finding atom's id from the legacy
+        // briefing's id so a crash between any per-row commit and the
+        // final flag flip is recoverable. On restart we re-process the
+        // same legacy rows (the source tables haven't been dropped yet),
+        // see that their target atom already exists, and skip — instead
+        // of writing duplicate findings under fresh UUIDs.
+        //
+        // The `legacy-briefing-` prefix protects against the
+        // (effectively zero) chance of collision with a user-authored
+        // captured atom whose id happens to match a legacy briefing id.
+        let atom_id = format!("legacy-briefing-{}", row.id);
+
+        if storage.get_atom_impl(&atom_id).await?.is_some() {
+            skipped += 1;
+            continue;
+        }
+
         let req = CreateAtomRequest {
             content: row.content.clone(),
             source_url: None,
@@ -213,10 +230,10 @@ pub async fn migrate_briefings_to_findings(core: &AtomicCore) -> Result<usize, A
 
         // `write_finding_transactionally` stamps `kind = 'report'`,
         // `tagging_status = 'skipped'`, inserts the provenance + citation
-        // rows, all in one transaction. A crash mid-loop leaves prior
-        // rows committed (per-row commit) but the flag unset, so the next
-        // boot resumes (re-inserting rows whose atom_ids are gone is
-        // safe — finding_atom_id PKs are freshly generated).
+        // rows, all in one transaction. Per-row commit + the stable atom
+        // id above give us resumability: re-running the loop after a
+        // partial crash skips already-migrated rows via the existence
+        // check above.
         storage
             .write_finding_transactionally_sync(
                 &req,
@@ -231,10 +248,18 @@ pub async fn migrate_briefings_to_findings(core: &AtomicCore) -> Result<usize, A
         if (index + 1) % 100 == 0 {
             tracing::info!(
                 migrated = written,
+                resumed_skip = skipped,
                 total = rows.len(),
                 "[reports/seed] Briefing migration progress"
             );
         }
+    }
+
+    if skipped > 0 {
+        tracing::info!(
+            resumed_skip = skipped,
+            "[reports/seed] Resumed briefing migration; skipped already-migrated rows"
+        );
     }
 
     // Flag + DROP happen after every row has committed. Both are tiny

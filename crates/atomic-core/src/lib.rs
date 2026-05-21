@@ -7241,6 +7241,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_scope_watermark_uses_resolution_time_not_completion() {
+        // Regression: `last_run_at` after a run must reflect the moment we
+        // resolved scope — not the (later) moment the run finished. Atoms
+        // captured during the run belong to the *next* batch; advancing
+        // past completion would silently swallow them.
+        //
+        // Empty-scope path is sufficient — it skips the LLM and exits with
+        // a watermark from `scope_resolution_time` at the top of execute().
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("watermark", "0 0 * * * *"))
+            .await
+            .unwrap();
+        let before = chrono::Utc::now();
+        let outcome = run_report(&db, &r, TaskRunTrigger::Manual).await.unwrap();
+        let after = chrono::Utc::now();
+        assert!(matches!(outcome, RunOutcome::EmptyScope { .. }));
+        let last_run = db.list_reports().await.unwrap()[0]
+            .last_run_at
+            .clone()
+            .expect("last_run_at set");
+        let stamped = chrono::DateTime::parse_from_rfc3339(&last_run).unwrap();
+        assert!(
+            stamped >= before && stamped <= after,
+            "watermark {stamped} should be inside the run window [{before}, {after}]"
+        );
+    }
+
+    #[tokio::test]
     async fn run_report_skips_when_active_run_exists() {
         // claim_or_create returns None when a run is already in flight.
         // We simulate that by inserting a `task_runs` row directly in the
@@ -7647,6 +7676,68 @@ mod tests {
         assert_eq!(citations[0].excerpt, "atom one excerpt");
         assert_eq!(citations[1].position, 2);
         assert_eq!(citations[1].cited_atom_id, b.atom.id);
+    }
+
+    #[tokio::test]
+    async fn migrate_briefings_to_findings_resumes_after_partial_crash() {
+        // Simulate a crash mid-migration: pre-write one of two legacy
+        // briefings into a finding atom under the stable
+        // `legacy-briefing-{id}` key (as if a prior boot wrote it but
+        // crashed before flipping the migration flag). The migration must
+        // skip that row on restart and migrate only the second — no
+        // duplicates, no fresh-UUID rewrites.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let anchor = create_test_atom(&db, "anchor").await;
+        restore_legacy_briefings_tables(&db);
+        insert_legacy_briefing(
+            &db,
+            "b-first",
+            "first [1].",
+            "2026-05-18T10:00:00Z",
+            1,
+            &[(1, &anchor.atom.id, "x")],
+        );
+        insert_legacy_briefing(
+            &db,
+            "b-second",
+            "second [1].",
+            "2026-05-19T10:00:00Z",
+            1,
+            &[(1, &anchor.atom.id, "y")],
+        );
+
+        // Pre-stamp the first briefing as if a prior run had completed
+        // its write but crashed before the migration flag flipped.
+        {
+            let sqlite = db.storage.as_sqlite().unwrap();
+            let conn = sqlite.db.conn.lock().unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO atoms (id, content, created_at, updated_at, embedding_status, tagging_status, title, snippet, kind) \
+                 VALUES ('legacy-briefing-b-first', 'first [1].', ?1, ?1, 'pending', 'skipped', '', '', 'report')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        }
+
+        let migrated = migrate_briefings_to_findings(&db).await.unwrap();
+        // Only the second briefing should be written — the first was
+        // already present at its stable id.
+        assert_eq!(migrated, 1);
+
+        let featured = db.get_featured_report_id().await.unwrap().unwrap();
+        let findings = db.list_findings_for_report(&featured, 10).await.unwrap();
+        // One finding written this run + the pre-stamped atom (which the
+        // migration left alone). The pre-stamped atom has no
+        // report_findings row, so list_findings_for_report still returns
+        // exactly the freshly-migrated one.
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0]
+            .1
+            .atom
+            .id
+            .starts_with("legacy-briefing-b-second"));
     }
 
     #[tokio::test]
