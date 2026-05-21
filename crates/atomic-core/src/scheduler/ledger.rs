@@ -135,9 +135,12 @@ pub async fn claim_or_create(
         }
         None => {
             // No active row exists — insert a fresh pending one. The
-            // claim attempt below races other callers fairly because the
-            // UPDATE predicate is `state = 'pending'`, which only one
-            // claimant can flip.
+            // insert goes through `try_insert_task_run` which fences on
+            // the `idx_task_runs_active_unique` partial index; if
+            // another worker raced past our `find_active` and got there
+            // first, the insert returns false and we abort this tick.
+            // Without that fence, both workers would insert distinct
+            // rows and both claim them — same report runs twice.
             let id = uuid::Uuid::now_v7().to_string();
             let row = TaskRun {
                 id,
@@ -157,7 +160,9 @@ pub async fn claim_or_create(
                 created_at: now_str.clone(),
                 updated_at: now_str.clone(),
             };
-            storage.insert_task_run_sync(&row).await?;
+            if !storage.try_insert_task_run_sync(&row).await? {
+                return Ok(None);
+            }
             row
         }
     };

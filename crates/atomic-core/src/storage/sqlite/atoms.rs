@@ -25,7 +25,7 @@ fn escape_like_pattern(input: &str) -> String {
 
 /// Insert the FTS row for an atom. Call after the corresponding row has been
 /// inserted into `atoms` so the external-content select finds the current state.
-fn atoms_fts_insert(conn: &rusqlite::Connection, atom_id: &str) -> rusqlite::Result<()> {
+pub(super) fn atoms_fts_insert(conn: &rusqlite::Connection, atom_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO atoms_fts(rowid, id, content)
          SELECT rowid, id, content FROM atoms WHERE id = ?1",
@@ -672,6 +672,168 @@ impl SqliteStorage {
             .collect();
 
         Ok(result)
+    }
+
+    /// Resolve a report's source-scope atom set in a single recursive CTE.
+    ///
+    /// Three branches by `tag_ids`:
+    /// - empty: skip the CTE entirely (linear scan with optional time + kind
+    ///   filters).
+    /// - non-empty: recursive subtree expansion over multiple roots.
+    ///
+    /// Centralizes the scope query so the reports runner and any future
+    /// scope-preview UI use exactly the same predicate the runner does.
+    pub(crate) fn list_atoms_for_report_scope_sync(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        let conn = self.db.read_conn()?;
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
+
+        // Build SQL based on whether we have a tag scope. The shapes differ
+        // enough that splitting is clearer than threading conditional
+        // clauses through one big format!.
+        let sql = if tag_ids.is_empty() {
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            let limit_pred = if limit.is_some() { "LIMIT ?" } else { "" };
+            format!(
+                "SELECT {ATOM_COLUMNS_A}
+                 FROM atoms a
+                 WHERE {kind_frag}
+                   {since_pred}
+                 ORDER BY a.created_at DESC
+                 {limit_pred}"
+            )
+        } else {
+            let tag_placeholders = (0..tag_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            let limit_pred = if limit.is_some() { "LIMIT ?" } else { "" };
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                    SELECT id FROM tags WHERE id IN ({tag_placeholders})
+                    UNION ALL
+                    SELECT t.id FROM tags t
+                    INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                 )
+                 SELECT {ATOM_COLUMNS_A}
+                 FROM atoms a
+                 WHERE EXISTS (
+                     SELECT 1 FROM atom_tags at
+                     WHERE at.atom_id = a.id
+                       AND at.tag_id IN (SELECT id FROM descendant_tags)
+                 )
+                   AND {kind_frag}
+                   {since_pred}
+                 GROUP BY a.id
+                 ORDER BY a.created_at DESC
+                 {limit_pred}"
+            )
+        };
+
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        // tag roots first so they match the placeholders in the CTE.
+        for t in tag_ids {
+            binds.push(t as &dyn rusqlite::ToSql);
+        }
+        for v in &kind_binds {
+            binds.push(v as &dyn rusqlite::ToSql);
+        }
+        if let Some(s) = &since {
+            binds.push(s as &dyn rusqlite::ToSql);
+        }
+        if let Some(l) = &limit {
+            binds.push(l as &dyn rusqlite::ToSql);
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let atoms: Vec<Atom> = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), atom_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let atom_ids: Vec<String> = atoms.iter().map(|a| a.id.clone()).collect();
+        let tag_map = get_atom_tags_map_for_ids(&conn, &atom_ids)?;
+        Ok(atoms
+            .into_iter()
+            .map(|atom| {
+                let tags = tag_map.get(&atom.id).cloned().unwrap_or_default();
+                AtomWithTags { atom, tags }
+            })
+            .collect())
+    }
+
+    pub(crate) fn count_atoms_for_report_scope_sync(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        let conn = self.db.read_conn()?;
+        let (kind_frag, kind_binds) = kinds.sqlite_in_clause("a.kind");
+
+        let sql = if tag_ids.is_empty() {
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            format!("SELECT COUNT(*) FROM atoms a WHERE {kind_frag} {since_pred}")
+        } else {
+            let tag_placeholders = (0..tag_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let since_pred = if since.is_some() {
+                "AND a.created_at > ?"
+            } else {
+                ""
+            };
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                    SELECT id FROM tags WHERE id IN ({tag_placeholders})
+                    UNION ALL
+                    SELECT t.id FROM tags t
+                    INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                 )
+                 SELECT COUNT(DISTINCT a.id) FROM atoms a
+                 WHERE EXISTS (
+                     SELECT 1 FROM atom_tags at
+                     WHERE at.atom_id = a.id
+                       AND at.tag_id IN (SELECT id FROM descendant_tags)
+                 )
+                   AND {kind_frag}
+                   {since_pred}"
+            )
+        };
+
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for t in tag_ids {
+            binds.push(t as &dyn rusqlite::ToSql);
+        }
+        for v in &kind_binds {
+            binds.push(v as &dyn rusqlite::ToSql);
+        }
+        if let Some(s) = &since {
+            binds.push(s as &dyn rusqlite::ToSql);
+        }
+
+        let count: i32 = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
+            row.get(0)
+        })?;
+        Ok(count)
     }
 
     pub(crate) fn list_atoms_impl(
@@ -1674,5 +1836,40 @@ impl AtomStore for SqliteStorage {
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>> {
         self.get_canvas_atom_metadata_light_sync(kinds)
+    }
+
+    async fn list_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        let storage = self.clone();
+        let tag_ids = tag_ids.to_vec();
+        let since = since.map(|s| s.to_string());
+        let kinds = kinds.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.list_atoms_for_report_scope_sync(&tag_ids, since.as_deref(), &kinds, limit)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn count_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        let storage = self.clone();
+        let tag_ids = tag_ids.to_vec();
+        let since = since.map(|s| s.to_string());
+        let kinds = kinds.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.count_atoms_for_report_scope_sync(&tag_ids, since.as_deref(), &kinds)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 }

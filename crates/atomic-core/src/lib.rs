@@ -51,6 +51,7 @@ pub mod pipeline_task;
 pub mod projection;
 pub mod providers;
 pub mod registry;
+pub mod reports;
 pub mod scheduler;
 pub mod search;
 pub mod settings;
@@ -1921,6 +1922,100 @@ impl AtomicCore {
         limit: i32,
     ) -> Result<Vec<briefing::Briefing>, AtomicCoreError> {
         self.storage.list_briefings_sync(limit).await
+    }
+
+    // ==================== Reports ====================
+    //
+    // Thin wrappers around `ReportStore` so transport layers (REST, MCP,
+    // future Tauri IPC) don't reach into `core.storage` directly. The
+    // runner entry points (`run_report_*`) compose ledger + agentic +
+    // storage and are the real heavy lifting; everything else is CRUD.
+
+    pub async fn list_reports(&self) -> Result<Vec<models::Report>, AtomicCoreError> {
+        self.storage.list_reports_sync().await
+    }
+
+    pub async fn list_enabled_reports(&self) -> Result<Vec<models::Report>, AtomicCoreError> {
+        self.storage.list_enabled_reports_sync().await
+    }
+
+    pub async fn get_report(&self, id: &str) -> Result<Option<models::Report>, AtomicCoreError> {
+        self.storage.get_report_sync(id).await
+    }
+
+    pub async fn create_report(
+        &self,
+        request: models::CreateReportRequest,
+    ) -> Result<models::Report, AtomicCoreError> {
+        use std::str::FromStr;
+        // Validate the cron expression at the API boundary so authoring
+        // clients get a 400 instead of a deferred "schedule is invalid"
+        // log line at runtime.
+        cron::Schedule::from_str(&request.schedule)
+            .map_err(|e| AtomicCoreError::Validation(format!("invalid cron expression: {e}")))?;
+        if let Some(tz) = &request.schedule_tz {
+            tz.parse::<chrono_tz::Tz>().map_err(|e| {
+                AtomicCoreError::Validation(format!("invalid timezone '{tz}': {e}"))
+            })?;
+        }
+        self.storage.insert_report_sync(&request).await
+    }
+
+    pub async fn update_report(
+        &self,
+        id: &str,
+        request: models::UpdateReportRequest,
+    ) -> Result<models::Report, AtomicCoreError> {
+        use std::str::FromStr;
+        // Validate schedule changes the same way as `create_report`.
+        if let Some(s) = &request.schedule {
+            cron::Schedule::from_str(s).map_err(|e| {
+                AtomicCoreError::Validation(format!("invalid cron expression: {e}"))
+            })?;
+        }
+        if let Some(Some(tz)) = &request.schedule_tz {
+            tz.parse::<chrono_tz::Tz>().map_err(|e| {
+                AtomicCoreError::Validation(format!("invalid timezone '{tz}': {e}"))
+            })?;
+        }
+        self.storage.update_report_sync(id, &request).await
+    }
+
+    pub async fn set_report_enabled(&self, id: &str, enabled: bool) -> Result<(), AtomicCoreError> {
+        self.storage.set_report_enabled_sync(id, enabled).await
+    }
+
+    pub async fn delete_report(&self, id: &str) -> Result<(), AtomicCoreError> {
+        self.storage.delete_report_sync(id).await
+    }
+
+    pub async fn list_findings_for_report(
+        &self,
+        report_id: &str,
+        limit: i32,
+    ) -> Result<Vec<(models::ReportFinding, models::AtomWithTags)>, AtomicCoreError> {
+        self.storage
+            .list_findings_for_report_sync(report_id, limit)
+            .await
+    }
+
+    /// Manual "run now" entry point — same machinery as the scheduled
+    /// loop, but the run row carries `trigger = 'manual'` for history.
+    /// Returns immediately with a `RunOutcome::Skipped` if the report
+    /// has work in flight; otherwise blocks until the run finishes (the
+    /// HTTP handler wraps this in a `tokio::spawn` for 202-style async).
+    pub async fn run_report_now(
+        &self,
+        report_id: &str,
+    ) -> Result<reports::RunOutcome, AtomicCoreError> {
+        let report = self
+            .storage
+            .get_report_sync(report_id)
+            .await?
+            .ok_or_else(|| {
+                AtomicCoreError::DatabaseOperation(format!("report {report_id} not found"))
+            })?;
+        reports::run_report(self, &report, models::TaskRunTrigger::Manual).await
     }
 
     // ==================== Embedding Management ====================
@@ -6196,16 +6291,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ledger_find_runnable_prefers_earliest_next_attempt() {
+    async fn ledger_find_runnable_returns_the_active_row() {
+        // Post-V21 there can only ever be one non-terminal row per
+        // (task_id, subject_id) — the partial unique index enforces
+        // that. find_runnable just needs to surface it when it's due.
         let (db, _temp) = create_test_db().await;
         let now = Utc::now();
-        let earlier = insert_pending_run(&db, "task-A", now, 3).await;
-        // Bump the second row's next_attempt_at into the future via insert
-        // then read-back; easier than reaching into the trait again.
-        let later_id = uuid::Uuid::now_v7().to_string();
-        let later_at = (now + chrono::Duration::minutes(10)).to_rfc3339();
-        let later_row = TaskRun {
-            id: later_id.clone(),
+        let row = insert_pending_run(&db, "task-A", now, 3).await;
+        let picked = db
+            .storage
+            .find_runnable_task_run_sync("task-A", None, &now.to_rfc3339())
+            .await
+            .unwrap()
+            .expect("a runnable row");
+        assert_eq!(picked.id, row.id);
+    }
+
+    #[tokio::test]
+    async fn ledger_partial_unique_blocks_second_active_row() {
+        // Direct test of the V21 constraint: a second pending row for
+        // the same (task_id, subject_id) must be rejected. Insert via
+        // try_insert returns false; the strict `insert_task_run` errors.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let _first = insert_pending_run(&db, "task-A", now, 3).await;
+
+        let id = uuid::Uuid::now_v7().to_string();
+        let now_str = now.to_rfc3339();
+        let duplicate = TaskRun {
+            id,
             task_id: "task-A".to_string(),
             subject_id: None,
             state: TaskRunState::Pending,
@@ -6213,24 +6327,63 @@ mod tests {
             attempts: 0,
             max_attempts: 3,
             lease_until: None,
-            next_attempt_at: later_at.clone(),
+            next_attempt_at: now_str.clone(),
             scope: None,
             result_id: None,
             last_error: None,
             started_at: None,
             finished_at: None,
-            created_at: later_at.clone(),
-            updated_at: later_at,
+            created_at: now_str.clone(),
+            updated_at: now_str,
         };
-        db.storage.insert_task_run_sync(&later_row).await.unwrap();
-
-        let picked = db
+        let inserted = db
             .storage
-            .find_runnable_task_run_sync("task-A", None, &now.to_rfc3339())
+            .try_insert_task_run_sync(&duplicate)
             .await
-            .unwrap()
-            .expect("a runnable row");
-        assert_eq!(picked.id, earlier.id, "earliest next_attempt_at wins");
+            .unwrap();
+        assert!(!inserted, "try_insert must refuse a duplicate active row");
+        // Strict insert errors so callers can't accidentally clobber.
+        assert!(db.storage.insert_task_run_sync(&duplicate).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ledger_claim_or_create_no_dup_when_two_workers_race() {
+        // Two workers calling claim_or_create with no existing active
+        // row must produce at most one running row total. Without the
+        // V21 fence both could insert + claim distinct rows and the
+        // report would execute twice.
+        let (db, _temp) = create_test_db().await;
+        let n = 16;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let core = db.clone();
+            handles.push(tokio::spawn(async move {
+                crate::scheduler::ledger::claim_or_create(
+                    &core,
+                    "task-A",
+                    None,
+                    TaskRunTrigger::Schedule,
+                    3,
+                )
+                .await
+            }));
+        }
+        let mut claimed = 0;
+        for h in handles {
+            if let Some(handle) = h.await.unwrap().unwrap() {
+                claimed += 1;
+                // Drop the handle without completing — leaves row in
+                // running, which is fine since we're just counting wins.
+                drop(handle);
+            }
+        }
+        assert_eq!(claimed, 1, "exactly one concurrent claim_or_create wins");
+        let rows = db
+            .storage
+            .list_recent_task_runs_sync("task-A", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only one task_runs row exists");
     }
 
     #[tokio::test]
@@ -6292,10 +6445,27 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_list_recent_orders_desc_and_respects_limit() {
+        // Post-V21 we can only have one non-terminal row at a time, so
+        // history rows must be terminal. Insert + claim + complete five
+        // times to build a multi-row history under the same task_id.
         let (db, _temp) = create_test_db().await;
         let base = Utc::now();
         for i in 0..5 {
-            let _ = insert_pending_run(&db, "task-A", base + chrono::Duration::seconds(i), 3).await;
+            let row =
+                insert_pending_run(&db, "task-A", base + chrono::Duration::seconds(i), 3).await;
+            let now_s = (base + chrono::Duration::seconds(i)).to_rfc3339();
+            let lease =
+                (base + chrono::Duration::seconds(i) + chrono::Duration::minutes(15)).to_rfc3339();
+            assert!(db
+                .storage
+                .claim_pending_task_run_sync(&row.id, &now_s, &lease)
+                .await
+                .unwrap());
+            assert!(db
+                .storage
+                .complete_task_run_sync(&row.id, &lease, Some("done"), &now_s)
+                .await
+                .unwrap());
         }
         let rows = db
             .storage
@@ -6608,5 +6778,658 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // ==================== Reports primitive (V20) ====================
+    //
+    // Phase 2 ships reports as a parallel primitive next to the existing
+    // briefing path. These tests cover schema CRUD, scope resolution
+    // (the hot path of run_report), and the empty-scope short-circuit —
+    // the LLM-driven full-loop tests live in the integration suite where
+    // a wiremock provider is already wired.
+
+    use crate::models::{
+        CitationPolicy, ContextScopeMode, ContextScopeWindow, CreateReportRequest, ReportFinding,
+        ReportFindingCitation, SourceScopeWindow, UpdateReportRequest,
+    };
+    use crate::reports::{run_report, RunOutcome};
+
+    fn basic_report(name: &str, schedule: &str) -> CreateReportRequest {
+        CreateReportRequest {
+            name: name.to_string(),
+            research_prompt: "investigate".to_string(),
+            schedule: schedule.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn report_crud_round_trip() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("Daily", "0 0 7 * * *"))
+            .await
+            .unwrap();
+        assert_eq!(r.name, "Daily");
+        assert_eq!(r.citation_policy, CitationPolicy::SourceOnly);
+        assert!(r.enabled);
+
+        let listed = db.list_reports().await.unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let got = db.get_report(&r.id).await.unwrap().unwrap();
+        assert_eq!(got.id, r.id);
+
+        let updated = db
+            .update_report(
+                &r.id,
+                UpdateReportRequest {
+                    name: Some("Renamed".into()),
+                    citation_policy: Some(CitationPolicy::SourceAndContext),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.citation_policy, CitationPolicy::SourceAndContext);
+
+        db.set_report_enabled(&r.id, false).await.unwrap();
+        let after_disable = db.get_report(&r.id).await.unwrap().unwrap();
+        assert!(!after_disable.enabled);
+        // list_enabled_reports skips disabled rows.
+        assert!(db.list_enabled_reports().await.unwrap().is_empty());
+
+        db.delete_report(&r.id).await.unwrap();
+        assert!(db.list_reports().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_create_rejects_invalid_cron_as_validation() {
+        // Invalid user input must surface as `Validation` so the HTTP
+        // layer maps it to 400, not 500.
+        let (db, _temp) = create_test_db().await;
+        let err = db
+            .create_report(basic_report("Bad", "this is not a cron"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AtomicCoreError::Validation(_)),
+            "expected Validation variant, got: {err:?}"
+        );
+        assert!(format!("{err}").contains("cron"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn report_create_rejects_invalid_timezone_as_validation() {
+        let (db, _temp) = create_test_db().await;
+        let req = CreateReportRequest {
+            schedule_tz: Some("Not/A_Zone".to_string()),
+            ..basic_report("Bad TZ", "0 0 7 * * *")
+        };
+        let err = db.create_report(req).await.unwrap_err();
+        assert!(
+            matches!(err, AtomicCoreError::Validation(_)),
+            "expected Validation variant, got: {err:?}"
+        );
+        assert!(format!("{err}").contains("timezone"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn report_update_rejects_invalid_cron_as_validation() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("Initial", "0 0 7 * * *"))
+            .await
+            .unwrap();
+        let err = db
+            .update_report(
+                &r.id,
+                UpdateReportRequest {
+                    schedule: Some("nope".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AtomicCoreError::Validation(_)),
+            "expected Validation variant, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_source_iso8601_duration_window_filters_old_atoms() {
+        let (db, _temp) = create_test_db().await;
+        let recent = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Recent".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Backdate one atom so the window excludes it.
+        let old = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Old".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE atoms SET created_at = '1970-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![old.atom.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let r = db
+            .create_report(CreateReportRequest {
+                source_scope_window: Some(SourceScopeWindow::Duration("P7D".into())),
+                ..basic_report("Recent only", "0 0 * * * *")
+            })
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let resolved = crate::reports::scope::resolve_source(&db, &r, now)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            resolved.atoms.iter().map(|a| a.atom.id.as_str()).collect();
+        assert!(ids.contains(recent.atom.id.as_str()));
+        assert!(!ids.contains(old.atom.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn scope_source_since_last_run_uses_last_run_at() {
+        let (db, _temp) = create_test_db().await;
+        let _early = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Early".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Stamp last_run_at to "now" so the next-created atom is the only
+        // thing the report should see.
+        let last_run = chrono::Utc::now().to_rfc3339();
+        // Sleep enough to ensure created_at > last_run strictly. SQLite's
+        // RFC3339 resolution is to the second.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let late = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Late".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut r = db
+            .create_report(CreateReportRequest {
+                source_scope_window: Some(SourceScopeWindow::SinceLastRun),
+                ..basic_report("Late only", "0 0 * * * *")
+            })
+            .await
+            .unwrap();
+        r.last_run_at = Some(last_run);
+
+        let resolved = crate::reports::scope::resolve_source(&db, &r, chrono::Utc::now())
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            resolved.atoms.iter().map(|a| a.atom.id.as_str()).collect();
+        assert!(ids.contains(late.atom.id.as_str()));
+        assert_eq!(ids.len(), 1, "only the late atom should be in scope");
+    }
+
+    #[tokio::test]
+    async fn scope_source_tag_subtree_includes_descendants() {
+        let (db, _temp) = create_test_db().await;
+        let topics = get_seeded_tag(&db, "Topics");
+        let parent = db.create_tag("AI", Some(&topics.id)).await.unwrap();
+        let child = db.create_tag("LLMs", Some(&parent.id)).await.unwrap();
+
+        let direct = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Direct".into(),
+                    tag_ids: vec![parent.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Descendant".into(),
+                    tag_ids: vec![child.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _unrelated = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Unrelated".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let r = db
+            .create_report(CreateReportRequest {
+                source_scope_tag_ids: vec![parent.id.clone()],
+                ..basic_report("AI subtree", "0 0 * * * *")
+            })
+            .await
+            .unwrap();
+        let resolved = crate::reports::scope::resolve_source(&db, &r, chrono::Utc::now())
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            resolved.atoms.iter().map(|a| a.atom.id.as_str()).collect();
+        assert!(ids.contains(direct.atom.id.as_str()), "direct match");
+        assert!(
+            ids.contains(descendant.atom.id.as_str()),
+            "descendant should be included via subtree expansion"
+        );
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scope_source_kind_filter_excludes_findings_by_default() {
+        let (db, _temp) = create_test_db().await;
+        let captured = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Captured".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let report_atom = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "# Pretend finding".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Mark the second as kind=report (phase 2 production path will
+        // be `write_finding_transactionally`; here we stamp directly).
+        stamp_report_kind(&db, &report_atom.atom.id);
+
+        let r = db
+            .create_report(basic_report("Default kinds", "0 0 * * * *"))
+            .await
+            .unwrap();
+        let resolved = crate::reports::scope::resolve_source(&db, &r, chrono::Utc::now())
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            resolved.atoms.iter().map(|a| a.atom.id.as_str()).collect();
+        assert!(ids.contains(captured.atom.id.as_str()));
+        assert!(!ids.contains(report_atom.atom.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn context_filter_excludes_source_and_prior_findings() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("ctx", "0 0 * * * *"))
+            .await
+            .unwrap();
+
+        // Set up: a source batch + a prior finding linked to this report.
+        let source_atom = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "source".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let prior_finding = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "prior".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        stamp_report_kind(&db, &prior_finding.atom.id);
+        let prov = ReportFinding {
+            finding_atom_id: prior_finding.atom.id.clone(),
+            report_id: Some(r.id.clone()),
+            run_id: None,
+            report_name_snapshot: r.name.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        // Use the storage path directly to seed provenance without going
+        // through the full transactional helper.
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO report_findings
+                (finding_atom_id, report_id, run_id, report_name_snapshot, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                prov.finding_atom_id,
+                prov.report_id,
+                prov.run_id,
+                prov.report_name_snapshot,
+                prov.created_at,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source = crate::reports::scope::ResolvedSource {
+            atoms: vec![source_atom.clone()],
+            total_in_scope: 1,
+            since_cutoff: None,
+        };
+        let ctx = crate::reports::scope::build_context_filter(&db, &r, &source, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(ctx.excluded_atom_ids.contains(&source_atom.atom.id));
+        assert!(ctx.excluded_atom_ids.contains(&prior_finding.atom.id));
+    }
+
+    #[tokio::test]
+    async fn context_filter_older_than_source_uses_source_cutoff() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(CreateReportRequest {
+                context_scope_window: Some(ContextScopeWindow::OlderThanSource),
+                ..basic_report("ctx-older", "0 0 * * * *")
+            })
+            .await
+            .unwrap();
+        let source = crate::reports::scope::ResolvedSource {
+            atoms: vec![],
+            total_in_scope: 0,
+            since_cutoff: Some("2026-05-01T00:00:00Z".to_string()),
+        };
+        let ctx = crate::reports::scope::build_context_filter(&db, &r, &source, chrono::Utc::now())
+            .await
+            .unwrap();
+        match ctx.time_window {
+            Some(crate::reports::scope::TimeWindow::Before(c)) => {
+                assert_eq!(c, "2026-05-01T00:00:00Z");
+            }
+            other => panic!("expected Before window, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_filter_same_as_source_inherits_tags() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(CreateReportRequest {
+                source_scope_tag_ids: vec!["tag-a".to_string(), "tag-b".to_string()],
+                context_scope_mode: ContextScopeMode::SameAsSource,
+                ..basic_report("ctx-same", "0 0 * * * *")
+            })
+            .await
+            .unwrap();
+        let source = crate::reports::scope::ResolvedSource {
+            atoms: vec![],
+            total_in_scope: 0,
+            since_cutoff: None,
+        };
+        let ctx = crate::reports::scope::build_context_filter(&db, &r, &source, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(ctx.tag_ids, vec!["tag-a".to_string(), "tag-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_report_empty_scope_succeeds_without_llm_or_atom() {
+        // No atoms in the DB → scope resolves to empty → run_report
+        // short-circuits to RunOutcome::EmptyScope without calling the
+        // LLM provider (which isn't configured in this test). The cache
+        // advances `last_run_at`; the ledger row terminates `succeeded`.
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("empty", "0 0 * * * *"))
+            .await
+            .unwrap();
+        let before = db.list_reports().await.unwrap()[0].last_run_at.clone();
+        let outcome = run_report(&db, &r, TaskRunTrigger::Manual).await.unwrap();
+        match outcome {
+            RunOutcome::EmptyScope { .. } => {}
+            other => panic!("expected EmptyScope, got {other:?}"),
+        }
+        // No finding atom written.
+        let findings = db.list_findings_for_report(&r.id, 10).await.unwrap();
+        assert!(findings.is_empty());
+        // Cache advanced.
+        let after = db.list_reports().await.unwrap()[0].last_run_at.clone();
+        assert!(after.is_some());
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn run_report_skips_when_active_run_exists() {
+        // claim_or_create returns None when a run is already in flight.
+        // We simulate that by inserting a `task_runs` row directly in the
+        // running state with a live lease.
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("dup", "0 0 * * * *"))
+            .await
+            .unwrap();
+        let task_id = format!("report::{}", r.id);
+        let now = chrono::Utc::now();
+        let lease_until = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        let id = uuid::Uuid::now_v7().to_string();
+        let row = crate::models::TaskRun {
+            id,
+            task_id,
+            subject_id: None,
+            state: crate::models::TaskRunState::Running,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: Some(lease_until),
+            next_attempt_at: now.to_rfc3339(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: Some(now.to_rfc3339()),
+            finished_at: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        db.storage.insert_task_run_sync(&row).await.unwrap();
+
+        let outcome = run_report(&db, &r, TaskRunTrigger::Manual).await.unwrap();
+        match outcome {
+            RunOutcome::Skipped => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_finding_transactionally_persists_everything() {
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("write", "0 0 * * * *"))
+            .await
+            .unwrap();
+
+        // Pre-seed a source atom we'll cite.
+        let source = db
+            .create_atom(
+                CreateAtomRequest {
+                    content: "source".into(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let atom_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let provenance = ReportFinding {
+            finding_atom_id: atom_id.clone(),
+            report_id: Some(r.id.clone()),
+            run_id: Some("run-1".into()),
+            report_name_snapshot: r.name.clone(),
+            created_at: now.clone(),
+        };
+        let citations = vec![ReportFindingCitation {
+            finding_atom_id: atom_id.clone(),
+            cited_atom_id: source.atom.id.clone(),
+            position: 1,
+            excerpt: "src excerpt".into(),
+        }];
+        let req = CreateAtomRequest {
+            content: "# Finding\nProse with [1].".into(),
+            ..Default::default()
+        };
+        let written = db
+            .storage
+            .write_finding_transactionally_sync(&req, &atom_id, &now, &provenance, &citations)
+            .await
+            .unwrap();
+        assert_eq!(written.atom.id, atom_id);
+        assert_eq!(written.atom.kind, models::AtomKind::Report);
+
+        // Provenance reads back.
+        let prov = db
+            .storage
+            .get_finding_provenance_sync(&atom_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prov.report_id.as_deref(), Some(r.id.as_str()));
+        assert_eq!(prov.run_id.as_deref(), Some("run-1"));
+
+        // Findings listing.
+        let findings = db.list_findings_for_report(&r.id, 10).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0.finding_atom_id, atom_id);
+
+        // Regression: finding atoms must ship `tagging_status = 'skipped'`
+        // so the auto-tag pipeline ignores them. Otherwise the LLM
+        // tagger runs on agent prose and creates runaway categories.
+        assert_eq!(written.atom.tagging_status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn run_report_first_failure_leaves_last_run_at_null() {
+        // Regression: previously the failure branch passed
+        // `last_run_at.as_deref().unwrap_or("")` which wrote an empty
+        // string. Subsequent ticks parsed `Some("")` as RFC3339, failed,
+        // and `is_due` returned false, wedging the retry path. Fix:
+        // failure stamping doesn't touch `last_run_at`.
+        //
+        // We force a failure by inserting a pending row that's already
+        // running with an expired lease, then calling run_report: the
+        // claim succeeds, scope resolves to empty for the empty DB,
+        // which routes to RunInner::Empty — but that's success, not
+        // failure. To exercise the failure path we have to make the
+        // *runner* itself error out. The cleanest synthetic failure
+        // path is to manually call update_report_cache_sync the way
+        // the runner does on the failure branch and confirm last_run_at
+        // remains None.
+        let (db, _temp) = create_test_db().await;
+        // Use a once-a-second cron so the next assertion about
+        // `is_due` after a failure is deterministic regardless of when
+        // in the minute/hour this test runs.
+        let r = db
+            .create_report(basic_report("first-fail", "* * * * * *"))
+            .await
+            .unwrap();
+        assert!(r.last_run_at.is_none());
+        // Simulate the runner's failure-stamping call: no last_run_at,
+        // just last_error.
+        db.storage
+            .update_report_cache_sync(&r.id, None, None, Some(Some("transient blow-up")))
+            .await
+            .unwrap();
+        let after = db.get_report(&r.id).await.unwrap().unwrap();
+        assert!(
+            after.last_run_at.is_none(),
+            "last_run_at must remain None after a first-run failure; got {:?}",
+            after.last_run_at
+        );
+        assert_eq!(after.last_error.as_deref(), Some("transient blow-up"));
+        // And `is_due` still recognises the report as runnable. Before
+        // the fix this would compute `Some("")` for last_run_at, fail
+        // RFC3339 parsing in schedule::is_due, and return false —
+        // wedging every retry forever.
+        let due_at = chrono::DateTime::parse_from_rfc3339(&after.created_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(2);
+        assert!(crate::reports::schedule::is_due(&after, due_at));
+    }
+
+    #[tokio::test]
+    async fn run_report_recorded_failure_does_not_advance_cache_for_retry() {
+        // Companion to the test above: a success then a failure leaves
+        // `last_run_at` at the success timestamp, not bumped or cleared.
+        let (db, _temp) = create_test_db().await;
+        let r = db
+            .create_report(basic_report("recorded", "0 0 * * * *"))
+            .await
+            .unwrap();
+        db.storage
+            .update_report_cache_sync(&r.id, Some("2026-05-20T10:00:00Z"), None, None)
+            .await
+            .unwrap();
+        db.storage
+            .update_report_cache_sync(&r.id, None, None, Some(Some("blip")))
+            .await
+            .unwrap();
+        let after = db.get_report(&r.id).await.unwrap().unwrap();
+        assert_eq!(after.last_run_at.as_deref(), Some("2026-05-20T10:00:00Z"));
+        assert_eq!(after.last_error.as_deref(), Some("blip"));
     }
 }

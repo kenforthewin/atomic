@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 19;
+    const LATEST_VERSION: i32 = 21;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -921,6 +921,94 @@ impl Database {
                      ON task_runs(task_id, subject_id, created_at);",
             )?;
 
+            conn.execute_batch("PRAGMA user_version = 19;")?;
+        }
+
+        // V20: reports primitive (definitions, findings, citations).
+        // Phase 2 lands the reports tables alongside the existing briefing
+        // path; phase 3 will seed the default Daily Briefing report and
+        // collapse the briefing module onto the reports runner. Until then
+        // both primitives coexist.
+        //
+        // `schedule` holds a cron expression; `schedule_tz` an IANA zone.
+        // Scope fields are JSON arrays (tag id lists, kind lists). Window
+        // fields are typed strings (`since_last_run` / ISO-8601 duration /
+        // NULL) interpreted at runtime by `crate::reports::scope`. The
+        // cache columns (`last_run_at`, `last_finding_atom_id`,
+        // `last_error`) are advisory only — authoritative state lives on
+        // the `task_runs` ledger and `report_findings`.
+        if version < 20 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS reports (
+                     id                    TEXT PRIMARY KEY,
+                     name                  TEXT NOT NULL,
+                     description           TEXT,
+                     research_prompt       TEXT NOT NULL,
+                     source_scope_tag_ids  TEXT NOT NULL DEFAULT '[]',
+                     source_scope_window   TEXT,
+                     source_include_kinds  TEXT NOT NULL DEFAULT '[\"captured\"]',
+                     context_scope_mode    TEXT NOT NULL DEFAULT 'all',
+                     context_scope_tag_ids TEXT NOT NULL DEFAULT '[]',
+                     context_scope_window  TEXT,
+                     context_include_kinds TEXT NOT NULL DEFAULT '[\"captured\"]',
+                     citation_policy       TEXT NOT NULL DEFAULT 'source_only',
+                     max_source_atoms      INTEGER,
+                     max_source_tokens     INTEGER,
+                     max_tool_iterations   INTEGER,
+                     schedule              TEXT NOT NULL,
+                     schedule_tz           TEXT,
+                     enabled               INTEGER NOT NULL DEFAULT 1,
+                     output_atom_tags      TEXT NOT NULL DEFAULT '[]',
+                     last_run_at           TEXT,
+                     last_finding_atom_id  TEXT,
+                     last_error            TEXT,
+                     created_at            TEXT NOT NULL,
+                     updated_at            TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_reports_enabled
+                     ON reports(enabled, last_run_at);
+
+                 CREATE TABLE IF NOT EXISTS report_findings (
+                     finding_atom_id      TEXT PRIMARY KEY,
+                     report_id            TEXT,
+                     run_id               TEXT,
+                     report_name_snapshot TEXT NOT NULL,
+                     created_at           TEXT NOT NULL,
+                     FOREIGN KEY (finding_atom_id) REFERENCES atoms(id) ON DELETE CASCADE,
+                     FOREIGN KEY (report_id) REFERENCES reports(id) ON DELETE SET NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_report_findings_report_created
+                     ON report_findings(report_id, created_at DESC);
+
+                 CREATE TABLE IF NOT EXISTS report_finding_citations (
+                     finding_atom_id TEXT NOT NULL,
+                     cited_atom_id   TEXT NOT NULL,
+                     position        INTEGER NOT NULL,
+                     excerpt         TEXT NOT NULL,
+                     PRIMARY KEY (finding_atom_id, cited_atom_id, position),
+                     FOREIGN KEY (finding_atom_id) REFERENCES atoms(id) ON DELETE CASCADE,
+                     FOREIGN KEY (cited_atom_id)   REFERENCES atoms(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_finding_citations_cited
+                     ON report_finding_citations(cited_atom_id);",
+            )?;
+
+            conn.execute_batch("PRAGMA user_version = 20;")?;
+        }
+
+        // V21: enforce at most one non-terminal task_runs row per
+        // (task_id, subject_id) via a partial unique index. Without
+        // this, two scheduler ticks finding no active row race to
+        // insert + claim, and both win — driving the same report twice.
+        // `COALESCE(subject_id, '')` is needed because SQLite's UNIQUE
+        // constraint treats NULL as distinct from itself, so two rows
+        // with NULL subject_id would otherwise both be "unique".
+        if version < 21 {
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_active_unique
+                 ON task_runs(task_id, COALESCE(subject_id, ''))
+                 WHERE state IN ('pending', 'running');",
+            )?;
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
         }
 

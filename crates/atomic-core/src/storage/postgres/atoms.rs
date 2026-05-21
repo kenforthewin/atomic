@@ -1938,4 +1938,232 @@ impl AtomStore for PostgresStorage {
             .map(|(id, title, tag, count, src)| (id, title, tag, count as i32, src))
             .collect())
     }
+
+    async fn list_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>> {
+        // We bind in fixed positional order: db_id, then tag_ids (as
+        // text[] for the recursive case), then since, then limit, then
+        // kinds binds. Build the SQL to match.
+        let no_tags = tag_ids.is_empty();
+        // Placeholder accounting:
+        //   $1 = db_id
+        //   $2 = tag_ids array         (only present when !no_tags)
+        //   $N = since                 (only present when since.is_some())
+        //   $M = limit                 (only present when limit.is_some())
+        //   last placeholder = kinds   (only present when kinds.has_bind_value())
+        let mut next_param: usize = 2;
+        let tags_ph = if no_tags {
+            String::new()
+        } else {
+            let p = format!("${next_param}");
+            next_param += 1;
+            p
+        };
+        let since_ph = if since.is_some() {
+            let p = format!("${next_param}");
+            next_param += 1;
+            Some(p)
+        } else {
+            None
+        };
+        let limit_ph = if limit.is_some() {
+            let p = format!("${next_param}");
+            next_param += 1;
+            Some(p)
+        } else {
+            None
+        };
+        let kinds_ph = format!("${next_param}");
+        let kind_predicate = kinds.postgres_predicate("a.kind", &kinds_ph);
+
+        let since_pred = since_ph
+            .as_ref()
+            .map(|p| format!("AND a.created_at > {p}"))
+            .unwrap_or_default();
+        let limit_pred = limit_ph
+            .as_ref()
+            .map(|p| format!("LIMIT {p}"))
+            .unwrap_or_default();
+
+        let sql = if no_tags {
+            format!(
+                "SELECT a.id, a.content, a.title, a.snippet, a.source_url, a.source,
+                        a.published_at, a.created_at, a.updated_at, a.embedding_status,
+                        a.tagging_status, a.embedding_error, a.tagging_error,
+                        COALESCE(a.kind, 'captured')
+                 FROM atoms a
+                 WHERE a.db_id = $1 AND {kind_predicate} {since_pred}
+                 ORDER BY a.created_at DESC
+                 {limit_pred}"
+            )
+        } else {
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                     SELECT id FROM tags WHERE id = ANY({tags_ph}) AND db_id = $1
+                     UNION
+                     SELECT t.id FROM tags t
+                     INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                     WHERE t.db_id = $1
+                 )
+                 SELECT a.id, a.content, a.title, a.snippet, a.source_url, a.source,
+                        a.published_at, a.created_at, a.updated_at, a.embedding_status,
+                        a.tagging_status, a.embedding_error, a.tagging_error,
+                        COALESCE(a.kind, 'captured')
+                 FROM atoms a
+                 WHERE a.db_id = $1
+                   AND EXISTS (
+                       SELECT 1 FROM atom_tags at
+                       WHERE at.atom_id = a.id
+                         AND at.db_id = $1
+                         AND at.tag_id IN (SELECT id FROM descendant_tags)
+                   )
+                   AND {kind_predicate}
+                   {since_pred}
+                 GROUP BY a.id
+                 ORDER BY MAX(a.created_at) DESC
+                 {limit_pred}"
+            )
+        };
+
+        let mut q = sqlx::query(&sql).bind(&self.db_id);
+        if !no_tags {
+            q = q.bind(tag_ids.to_vec());
+        }
+        if let Some(s) = since {
+            q = q.bind(s);
+        }
+        if let Some(l) = limit {
+            q = q.bind(l as i64);
+        }
+        if kinds.has_bind_value() {
+            q = q.bind(kinds.kind_strings());
+        }
+
+        use crate::models::Atom;
+        use sqlx::Row;
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+        let atoms: Vec<Atom> = rows
+            .iter()
+            .map(|row| {
+                let kind_str: String = row.get(13);
+                let kind = kind_str
+                    .parse::<crate::models::AtomKind>()
+                    .unwrap_or(crate::models::AtomKind::Captured);
+                Atom {
+                    id: row.get(0),
+                    content: row.get(1),
+                    title: row.get(2),
+                    snippet: row.get(3),
+                    source_url: row.get(4),
+                    source: row.get(5),
+                    published_at: row.get(6),
+                    created_at: row.get(7),
+                    updated_at: row.get(8),
+                    embedding_status: row.get(9),
+                    tagging_status: row.get(10),
+                    embedding_error: row.get(11),
+                    tagging_error: row.get(12),
+                    kind,
+                }
+            })
+            .collect();
+
+        if atoms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batch-load tags via the existing private helper.
+        let atom_ids: Vec<String> = atoms.iter().map(|a| a.id.clone()).collect();
+        let id_to_tags = self.tags_for_atom_ids(&atom_ids).await?;
+        Ok(atoms
+            .into_iter()
+            .map(|atom| {
+                let tags = id_to_tags.get(&atom.id).cloned().unwrap_or_default();
+                AtomWithTags { atom, tags }
+            })
+            .collect())
+    }
+
+    async fn count_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32> {
+        let no_tags = tag_ids.is_empty();
+        let mut next_param: usize = 2;
+        let tags_ph = if no_tags {
+            String::new()
+        } else {
+            let p = format!("${next_param}");
+            next_param += 1;
+            p
+        };
+        let since_ph = if since.is_some() {
+            let p = format!("${next_param}");
+            next_param += 1;
+            Some(p)
+        } else {
+            None
+        };
+        let kinds_ph = format!("${next_param}");
+        let kind_predicate = kinds.postgres_predicate("a.kind", &kinds_ph);
+        let since_pred = since_ph
+            .as_ref()
+            .map(|p| format!("AND a.created_at > {p}"))
+            .unwrap_or_default();
+
+        let sql = if no_tags {
+            format!(
+                "SELECT COUNT(*) FROM atoms a
+                 WHERE a.db_id = $1 AND {kind_predicate} {since_pred}"
+            )
+        } else {
+            format!(
+                "WITH RECURSIVE descendant_tags(id) AS (
+                     SELECT id FROM tags WHERE id = ANY({tags_ph}) AND db_id = $1
+                     UNION
+                     SELECT t.id FROM tags t
+                     INNER JOIN descendant_tags dt ON t.parent_id = dt.id
+                     WHERE t.db_id = $1
+                 )
+                 SELECT COUNT(DISTINCT a.id) FROM atoms a
+                 WHERE a.db_id = $1
+                   AND EXISTS (
+                       SELECT 1 FROM atom_tags at
+                       WHERE at.atom_id = a.id
+                         AND at.db_id = $1
+                         AND at.tag_id IN (SELECT id FROM descendant_tags)
+                   )
+                   AND {kind_predicate}
+                   {since_pred}"
+            )
+        };
+
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(&self.db_id);
+        if !no_tags {
+            q = q.bind(tag_ids.to_vec());
+        }
+        if let Some(s) = since {
+            q = q.bind(s);
+        }
+        if kinds.has_bind_value() {
+            q = q.bind(kinds.kind_strings());
+        }
+
+        let count = q
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(count as i32)
+    }
 }

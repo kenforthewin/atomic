@@ -30,6 +30,10 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+# Cron schedule parser used by `reports::schedule`. `cron` 0.12 returns a
+# `Schedule` iterator that yields successive fire times, which we wrap in a
+# chrono-tz conversion for IANA-zoned schedules.
+cron = "0.12"
 iana-time-zone = "0.1"
 regex = "1"
 tiktoken-rs = "0.6"

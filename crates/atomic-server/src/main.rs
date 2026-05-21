@@ -505,6 +505,67 @@ async fn run_server(
         });
     }
 
+    // Reports runner. Independent of the legacy scheduler tick: reports
+    // are dynamic per-DB, gated by cron, and dispatched through the
+    // `task_runs` ledger from phase 1.5. Each tick we iterate every DB,
+    // list enabled reports, and call `claim_or_create` for due ones; the
+    // ledger's conditional-update guards against double-firing if a
+    // previous tick is still running.
+    {
+        let reports_manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let databases = match reports_manager.list_databases().await {
+                    Ok((dbs, _)) => dbs,
+                    Err(_) => continue,
+                };
+                for db_info in &databases {
+                    let core = match reports_manager.get_core(&db_info.id).await {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let reports = match core.list_enabled_reports().await {
+                        Ok(rs) => rs,
+                        Err(e) => {
+                            tracing::warn!(db = %db_info.id, error = %e, "[reports] list failed");
+                            continue;
+                        }
+                    };
+                    let now = chrono::Utc::now();
+                    for report in reports {
+                        if !atomic_core::reports::schedule::is_due(&report, now) {
+                            continue;
+                        }
+                        let core_clone = core.clone();
+                        tokio::spawn(async move {
+                            match atomic_core::reports::run_report(
+                                &core_clone,
+                                &report,
+                                atomic_core::models::TaskRunTrigger::Schedule,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => tracing::info!(
+                                    report_id = %report.id,
+                                    outcome = ?outcome,
+                                    "[reports] scheduled run complete"
+                                ),
+                                Err(e) => tracing::error!(
+                                    report_id = %report.id,
+                                    error = %e,
+                                    "[reports] scheduled run failed"
+                                ),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
     let bind_owned = bind.to_string();
     let shutdown_manager = Arc::clone(&manager);
     let cors_public_url = public_url.clone();

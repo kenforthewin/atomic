@@ -188,6 +188,39 @@ pub trait AtomStore: Send + Sync {
         &self,
         kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<(String, String, Option<String>, i32, Option<String>)>>;
+
+    /// Resolve the source-scope atom set for a report run in one query.
+    ///
+    /// - `tag_ids` empty: no tag filter (every atom in the per-DB store).
+    /// - `tag_ids` non-empty: recursive subtree expansion so a top-level
+    ///   tag implicitly includes its descendants.
+    /// - `since` `Some`: filter `atoms.created_at > since`. None = no time
+    ///   bound. Caller pre-resolves "since_last_run" and ISO-8601
+    ///   durations into an RFC3339 timestamp.
+    /// - `kinds`: standard kind filter (same `Only(vec![Captured])`
+    ///   default as every other context-assembly query).
+    /// - `limit`: optional cap. None = unlimited; pre-cap counts are
+    ///   reported separately via [`count_atoms_for_report_scope`].
+    ///
+    /// Returns newest-first, joined with tag rows so the agent prompt has
+    /// the same shape as the daily briefing today.
+    async fn list_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+        limit: Option<i32>,
+    ) -> StorageResult<Vec<AtomWithTags>>;
+
+    /// Pre-cap count for the same scope query used by
+    /// [`list_atoms_for_report_scope`]. Reported back to the agent so it
+    /// knows whether the visible list is truncated.
+    async fn count_atoms_for_report_scope(
+        &self,
+        tag_ids: &[String],
+        since: Option<&str>,
+        kinds: &crate::models::KindFilter,
+    ) -> StorageResult<i32>;
 }
 
 // ==================== Tag Storage ====================
@@ -999,6 +1032,16 @@ pub trait TaskRunStore: Send + Sync {
     /// `pending`). The caller owns id and all timestamps.
     async fn insert_task_run(&self, run: &crate::models::TaskRun) -> StorageResult<()>;
 
+    /// Best-effort variant of [`Self::insert_task_run`]. Returns `false`
+    /// when the `idx_task_runs_active_unique` partial index rejected the
+    /// insert (another worker already created an active row for this
+    /// task/subject). Used by `claim_or_create` to close the race window
+    /// between `find_active_task_run` and the actual insert: without this
+    /// check, two concurrent claimers can both observe "no active row"
+    /// and insert distinct rows that each get claimed, executing the
+    /// same report twice.
+    async fn try_insert_task_run(&self, run: &crate::models::TaskRun) -> StorageResult<bool>;
+
     /// Read a single row by id.
     async fn get_task_run(&self, id: &str) -> StorageResult<Option<crate::models::TaskRun>>;
 
@@ -1107,6 +1150,97 @@ pub trait TaskRunStore: Send + Sync {
     ) -> StorageResult<Vec<crate::models::TaskRun>>;
 }
 
+// ==================== Reports ====================
+
+/// Storage operations for reports, finding provenance, and citations.
+///
+/// CRUD on the definitions, plus the transactional finding-write helper
+/// that wraps the atom + provenance + citation rows in a single commit.
+/// `update_report_cache` is the fast-path writer for the advisory cache
+/// fields (`last_run_at`, `last_finding_atom_id`, `last_error`); the
+/// authoritative state lives on `task_runs` and `report_findings`.
+#[async_trait]
+pub trait ReportStore: Send + Sync {
+    /// List every report definition, most-recently-updated first.
+    async fn list_reports(&self) -> StorageResult<Vec<crate::models::Report>>;
+
+    /// List enabled reports only. Fast path for the scheduler tick.
+    async fn list_enabled_reports(&self) -> StorageResult<Vec<crate::models::Report>>;
+
+    async fn get_report(&self, id: &str) -> StorageResult<Option<crate::models::Report>>;
+
+    /// Insert a fresh report. The storage layer generates `id`, timestamps,
+    /// and the cache columns; the request carries everything else.
+    async fn insert_report(
+        &self,
+        request: &crate::models::CreateReportRequest,
+    ) -> StorageResult<crate::models::Report>;
+
+    /// Partial-update by id. Only `Some` fields are written.
+    async fn update_report(
+        &self,
+        id: &str,
+        request: &crate::models::UpdateReportRequest,
+    ) -> StorageResult<crate::models::Report>;
+
+    async fn set_report_enabled(&self, id: &str, enabled: bool) -> StorageResult<()>;
+
+    async fn delete_report(&self, id: &str) -> StorageResult<()>;
+
+    /// Write the cache columns (`last_run_at`, `last_finding_atom_id`,
+    /// `last_error`) after a run terminates. Optional fields lets callers
+    /// pass `None` for "leave previous value" or explicit `Some(None)` for
+    /// "clear" — encoded as `Option<Option<...>>` everywhere except where
+    /// "leave unchanged" is the only sensible no-op (every cache column).
+    ///
+    /// `last_run_at = None` leaves the column untouched. This is the path
+    /// taken by failure stamping: a first-run failure must not write an
+    /// empty string into `last_run_at` (which would round-trip back as
+    /// `Some("")` and then fail RFC3339 parsing in `schedule::is_due`,
+    /// effectively wedging the report).
+    async fn update_report_cache(
+        &self,
+        id: &str,
+        last_run_at: Option<&str>,
+        last_finding_atom_id: Option<Option<&str>>,
+        last_error: Option<Option<&str>>,
+    ) -> StorageResult<()>;
+
+    /// Most-recent-first list of provenance rows for a report, joined with
+    /// the finding atom so the dashboard history view can render snippets.
+    async fn list_findings_for_report(
+        &self,
+        report_id: &str,
+        limit: i32,
+    ) -> StorageResult<Vec<(crate::models::ReportFinding, crate::models::AtomWithTags)>>;
+
+    /// Lookup the provenance row for a finding atom. None if the atom is
+    /// either not a finding or its provenance row was removed.
+    async fn get_finding_provenance(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Option<crate::models::ReportFinding>>;
+
+    /// Set of finding atom ids previously produced by `report_id`. Used by
+    /// the agent loop to exclude a report's own prior output from its
+    /// semantic_search results.
+    async fn list_finding_atom_ids_for_report(&self, report_id: &str)
+        -> StorageResult<Vec<String>>;
+
+    /// One-shot transactional write of the finding atom, its tags, its
+    /// provenance row, and all citation rows. On any error the entire
+    /// commit is rolled back so a partial write cannot orphan a finding
+    /// atom without its provenance.
+    async fn write_finding_transactionally(
+        &self,
+        atom_request: &crate::CreateAtomRequest,
+        atom_id: &str,
+        atom_created_at: &str,
+        provenance: &crate::models::ReportFinding,
+        citations: &[crate::models::ReportFindingCitation],
+    ) -> StorageResult<crate::models::AtomWithTags>;
+}
+
 // ==================== Supertrait ====================
 
 /// Combined storage trait. Every storage backend must implement all sub-traits.
@@ -1127,6 +1261,7 @@ pub trait Storage:
     + TokenStore
     + DatabaseStore
     + TaskRunStore
+    + ReportStore
     + Send
     + Sync
 {

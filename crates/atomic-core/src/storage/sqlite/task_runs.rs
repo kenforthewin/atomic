@@ -96,6 +96,52 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub(crate) fn try_insert_task_run_sync(&self, run: &TaskRun) -> StorageResult<bool> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let scope_json = match &run.scope {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                AtomicCoreError::DatabaseOperation(format!("scope serialize: {e}"))
+            })?),
+            None => None,
+        };
+        // `INSERT OR IGNORE` returns Ok(0) when any UNIQUE constraint
+        // rejects the row — both the PK and the partial active-row index.
+        // PK collisions on uuid v7 are vanishingly unlikely, so a 0
+        // return effectively means "the active-row constraint caught a
+        // duplicate."
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO task_runs
+                (id, task_id, subject_id, state, trigger, attempts, \
+                 max_attempts, lease_until, next_attempt_at, scope, \
+                 result_id, last_error, started_at, finished_at, \
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                run.id,
+                run.task_id,
+                run.subject_id,
+                run.state.as_str(),
+                run.trigger.as_str(),
+                run.attempts,
+                run.max_attempts,
+                run.lease_until,
+                run.next_attempt_at,
+                scope_json,
+                run.result_id,
+                run.last_error,
+                run.started_at,
+                run.finished_at,
+                run.created_at,
+                run.updated_at,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub(crate) fn get_task_run_sync(&self, id: &str) -> StorageResult<Option<TaskRun>> {
         let conn = self.db.read_conn()?;
         let sql = format!("SELECT {COLS} FROM task_runs WHERE id = ?1");
@@ -371,6 +417,14 @@ impl TaskRunStore for SqliteStorage {
         let storage = self.clone();
         let run = run.clone();
         tokio::task::spawn_blocking(move || storage.insert_task_run_sync(&run))
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn try_insert_task_run(&self, run: &TaskRun) -> StorageResult<bool> {
+        let storage = self.clone();
+        let run = run.clone();
+        tokio::task::spawn_blocking(move || storage.try_insert_task_run_sync(&run))
             .await
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }

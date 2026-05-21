@@ -119,6 +119,48 @@ impl TaskRunStore for PostgresStorage {
         Ok(())
     }
 
+    async fn try_insert_task_run(&self, run: &TaskRun) -> StorageResult<bool> {
+        let scope_json = match &run.scope {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                AtomicCoreError::DatabaseOperation(format!("scope serialize: {e}"))
+            })?),
+            None => None,
+        };
+        // `ON CONFLICT DO NOTHING` without a column tuple catches any
+        // UNIQUE violation — both the PK and the partial active-row
+        // index. Returns 0 affected rows when a duplicate active row
+        // already exists.
+        let result = sqlx::query(
+            "INSERT INTO task_runs (id, task_id, subject_id, state, trigger, attempts, \
+                                    max_attempts, lease_until, next_attempt_at, scope, \
+                                    result_id, last_error, started_at, finished_at, \
+                                    created_at, updated_at, db_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&run.id)
+        .bind(&run.task_id)
+        .bind(&run.subject_id)
+        .bind(run.state.as_str())
+        .bind(run.trigger.as_str())
+        .bind(run.attempts)
+        .bind(run.max_attempts)
+        .bind(&run.lease_until)
+        .bind(&run.next_attempt_at)
+        .bind(scope_json)
+        .bind(&run.result_id)
+        .bind(&run.last_error)
+        .bind(&run.started_at)
+        .bind(&run.finished_at)
+        .bind(&run.created_at)
+        .bind(&run.updated_at)
+        .bind(&self.db_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn get_task_run(&self, id: &str) -> StorageResult<Option<TaskRun>> {
         let sql = format!("SELECT {COLS} FROM task_runs WHERE id = $1 AND db_id = $2");
         let row = sqlx::query(&sql)
