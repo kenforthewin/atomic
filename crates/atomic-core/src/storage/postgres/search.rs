@@ -23,8 +23,16 @@ impl PostgresStorage {
             });
         }
 
+        // Global search is the in-app palette — show every kind, mirroring
+        // the SQLite path and the UI list/canvas surfaces.
         let atoms = self
-            .keyword_search(query_trimmed, section_limit, None, None)
+            .keyword_search(
+                query_trimmed,
+                section_limit,
+                None,
+                None,
+                &crate::models::KindFilter::All,
+            )
             .await?;
         let wiki =
             pg_keyword_search_wiki(&self.pool, query_trimmed, section_limit, &self.db_id).await?;
@@ -51,6 +59,7 @@ impl SearchStore for PostgresStorage {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let embedding_vec = Vector::from(query_embedding.to_vec());
         let fetch_limit = limit * 10;
@@ -114,12 +123,36 @@ impl SearchStore for PostgresStorage {
         } else {
             std::collections::HashSet::new()
         };
+        // Kind filtering. `None` = `KindFilter::All` (no filter applied).
+        let kind_allowed: Option<std::collections::HashSet<String>> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                None
+            } else {
+                let candidate_atom_ids: Vec<&str> = filtered
+                    .iter()
+                    .map(|(_, aid, _, _, _)| aid.as_str())
+                    .collect();
+                Some(
+                    pg_batch_atoms_matching_kind(
+                        &self.pool,
+                        &candidate_atom_ids,
+                        kinds,
+                        &self.db_id,
+                    )
+                    .await?,
+                )
+            };
 
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
         for (_chunk_id, atom_id, content, chunk_index, similarity) in &filtered {
             if tag_id.is_some() && !scope_atom_ids.contains(atom_id) {
                 continue;
+            }
+            if let Some(ref allowed) = kind_allowed {
+                if !allowed.contains(atom_id) {
+                    continue;
+                }
             }
             let entry = atom_best.entry(atom_id.clone());
             match entry {
@@ -175,6 +208,7 @@ impl SearchStore for PostgresStorage {
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let query_trimmed = query.trim();
         if query_trimmed.is_empty() {
@@ -235,6 +269,28 @@ impl SearchStore for PostgresStorage {
         } else {
             rows
         };
+
+        // Apply kind filter post-pass (FTS index is kind-agnostic).
+        let filtered: Vec<(String, String, String, i32, f32)> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                filtered
+            } else {
+                let candidate_atom_ids: Vec<&str> = filtered
+                    .iter()
+                    .map(|(_, aid, _, _, _)| aid.as_str())
+                    .collect();
+                let allowed = pg_batch_atoms_matching_kind(
+                    &self.pool,
+                    &candidate_atom_ids,
+                    kinds,
+                    &self.db_id,
+                )
+                .await?;
+                filtered
+                    .into_iter()
+                    .filter(|(_, aid, _, _, _)| allowed.contains(aid.as_str()))
+                    .collect()
+            };
 
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();

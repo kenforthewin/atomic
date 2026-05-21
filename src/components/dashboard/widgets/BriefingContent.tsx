@@ -2,12 +2,12 @@ import { Fragment, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CitationLink } from '../../wiki/CitationLink';
-import type { BriefingCitation } from '../../../stores/briefing';
+import type { FindingCitation } from '../../../stores/featuredReport';
 
 interface BriefingContentProps {
   content: string;
-  citations: BriefingCitation[];
-  onCitationClick: (citation: BriefingCitation, element: HTMLElement) => void;
+  citations: FindingCitation[];
+  onCitationClick: (citation: FindingCitation, element: HTMLElement) => void;
 }
 
 /**

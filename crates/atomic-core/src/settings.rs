@@ -75,12 +75,11 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("openai_compat_timeout_secs", "300"), // 5 minutes default for OpenAI-compatible servers
     ("wiki_generation_prompt", ""),
     ("wiki_update_prompt", ""),
-    ("briefing_prompt", ""),
     ("chat_prompt", ""),
     ("tagging_prompt", ""),
-    // Scheduled tasks — see crate::scheduler::state for key format
-    ("task.daily_briefing.enabled", "true"),
-    ("task.daily_briefing.interval_hours", "24"),
+    // Scheduled tasks — see crate::scheduler::state for key format.
+    // The daily briefing was retired in phase 3; its prompt and schedule
+    // live on the seeded "Daily Briefing" report row, not in settings.
     ("task.draft_pipeline.enabled", "true"),
     ("task.draft_pipeline.interval_minutes", "1"),
     ("task.draft_pipeline.quiet_minutes", "1"),

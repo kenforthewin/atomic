@@ -35,24 +35,19 @@ pub fn chat_event_callback(
     }
 }
 
-/// Create a TaskEvent callback for the scheduler. Only the daily briefing
-/// task produces a broadcast-visible event right now (BriefingReady). Other
-/// task events are logged at debug level and ignored.
+/// Create a TaskEvent callback for the scheduler. With the daily briefing
+/// retired in phase 3, every remaining task event is debug-logged and
+/// otherwise dropped — finding atoms produced by the reports loop ride
+/// the standard `atom_created` / embedding-event broadcast.
 pub fn task_event_callback(
     tx: broadcast::Sender<ServerEvent>,
 ) -> Arc<dyn Fn(atomic_core::scheduler::TaskEvent) + Send + Sync> {
+    // `tx` is kept on the signature so existing call sites and the future
+    // wiring back of task-scoped events do not have to ripple-change.
+    let _ = &tx;
     Arc::new(move |event: atomic_core::scheduler::TaskEvent| {
         use atomic_core::scheduler::TaskEvent;
         match event {
-            TaskEvent::Completed {
-                task_id,
-                db_id,
-                result_id,
-            } if task_id == "daily_briefing" => {
-                if let Some(briefing_id) = result_id {
-                    let _ = tx.send(ServerEvent::BriefingReady { db_id, briefing_id });
-                }
-            }
             TaskEvent::Started { task_id, db_id } => {
                 tracing::debug!(task_id, db_id, "[scheduler] task started");
             }

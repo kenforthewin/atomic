@@ -10,5 +10,6 @@ pub mod agentic;
 pub mod runner;
 pub mod schedule;
 pub mod scope;
+pub mod seed;
 
 pub use runner::{run_report, RunOutcome};

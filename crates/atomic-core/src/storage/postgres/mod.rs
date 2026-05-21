@@ -7,7 +7,6 @@
 #[cfg(feature = "postgres")]
 mod atoms;
 #[cfg(feature = "postgres")]
-mod briefings;
 #[cfg(feature = "postgres")]
 mod chat;
 #[cfg(feature = "postgres")]
@@ -120,6 +119,7 @@ impl PostgresStorage {
                 17,
                 include_str!("migrations/017_task_runs_active_unique.sql"),
             ),
+            (18, include_str!("migrations/018_briefings_teardown.sql")),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

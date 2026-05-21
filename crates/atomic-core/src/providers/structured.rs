@@ -996,8 +996,8 @@ mod tests {
         );
         out.insert("wiki_update_section_ops", crate::wiki::section_ops_schema());
         out.insert(
-            "briefing_generation_result",
-            crate::briefing::agentic::briefing_schema(),
+            "report_finding_result",
+            crate::reports::agentic::report_schema_for_snapshot(),
         );
         out.insert("extraction_result", crate::extraction::extraction_schema());
         out.insert(

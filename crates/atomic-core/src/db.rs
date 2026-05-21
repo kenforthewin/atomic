@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 21;
+    const LATEST_VERSION: i32 = 22;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -925,9 +925,10 @@ impl Database {
         }
 
         // V20: reports primitive (definitions, findings, citations).
-        // Phase 2 lands the reports tables alongside the existing briefing
-        // path; phase 3 will seed the default Daily Briefing report and
-        // collapse the briefing module onto the reports runner. Until then
+        // Phase 2 introduced the reports tables; phase 3 collapsed the
+        // legacy briefing path onto the reports runner. The reports tables
+        // remain a per-DB schema; the migration carrying historical
+        // briefings into finding atoms lives in `reports::seed`. Until then
         // both primitives coexist.
         //
         // `schedule` holds a cron expression; `schedule_tz` an IANA zone.
@@ -1009,6 +1010,15 @@ impl Database {
                  ON task_runs(task_id, COALESCE(subject_id, ''))
                  WHERE state IN ('pending', 'running');",
             )?;
+            conn.execute_batch("PRAGMA user_version = 21;")?;
+        }
+
+        // V22: marker only. The briefings → finding-atom data migration and
+        // the subsequent DROP of `briefings` / `briefing_citations` are owned
+        // by `crate::reports::seed::migrate_briefings_to_findings`, which runs
+        // at server startup with a per-DB idempotency flag. A pure SQL drop
+        // here would discard history before the Rust path could rehome it.
+        if version < 22 {
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
         }
 

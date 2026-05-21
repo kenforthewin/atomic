@@ -7,7 +7,7 @@ import { useAtomsStore } from './atoms';
 import { useTagsStore } from './tags';
 import { useWikiStore } from './wiki';
 import { useChatStore } from './chat';
-import { useBriefingStore } from './briefing';
+import { useFeaturedReportStore } from './featuredReport';
 
 export interface DatabaseInfo {
   id: string;
@@ -100,10 +100,10 @@ export const useDatabasesStore = create<DatabasesStore>()(
         useTagsStore.getState().reset();
         useWikiStore.getState().reset();
         useChatStore.getState().reset();
-        useBriefingStore.getState().reset();
+        useFeaturedReportStore.getState().reset();
         useTagsStore.getState().fetchTags();
         useAtomsStore.getState().fetchAtoms();
-        useBriefingStore.getState().fetchLatest();
+        useFeaturedReportStore.getState().fetchLatest();
       }
     } catch (e) {
       toast.error('Failed to delete database', { description: String(e) });
@@ -144,7 +144,7 @@ export const useDatabasesStore = create<DatabasesStore>()(
       useTagsStore.getState().reset();
       useWikiStore.getState().reset();
       useChatStore.getState().reset();
-      useBriefingStore.getState().reset();
+      useFeaturedReportStore.getState().reset();
 
       // Hydrate the new DB's cached data before firing fetches — user sees
       // the sidebar/list for the new DB instantly instead of an empty flash.
@@ -156,7 +156,7 @@ export const useDatabasesStore = create<DatabasesStore>()(
       // Refetch data for the new database
       useTagsStore.getState().fetchTags();
       useAtomsStore.getState().fetchAtoms();
-      useBriefingStore.getState().fetchLatest();
+      useFeaturedReportStore.getState().fetchLatest();
     } catch (e) {
       toast.error('Failed to switch database', { description: String(e) });
       throw e;

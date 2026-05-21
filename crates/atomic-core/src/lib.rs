@@ -30,7 +30,6 @@
 pub mod agent;
 pub mod atom_edit;
 pub(crate) mod atom_links;
-pub mod briefing;
 pub mod canvas_level;
 pub mod chat;
 pub mod chunking;
@@ -62,10 +61,6 @@ pub mod wiki;
 // Re-exports for convenience
 pub use agent::{CanvasClusterSummary, CanvasContext, ChatEvent, PageContext};
 pub use atom_edit::{apply_atom_edits, AtomEditOperation};
-pub use briefing::{
-    Briefing, BriefingCitation, BriefingFrequency, BriefingSchedule, BriefingScheduleStatus,
-    BriefingWeekday, BriefingWithCitations,
-};
 pub use db::Database;
 pub use embedding::{EmbeddingEvent, EmbeddingStrategy, TaggingStrategy};
 pub use error::AtomicCoreError;
@@ -116,6 +111,11 @@ type CanvasRebuilder =
 /// kicking off a background rebuild. Sized so that bulk-event storms (e.g.
 /// a 100-atom embedding batch) collapse into a single rebuild.
 const CANVAS_CACHE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Per-DB settings key holding the dashboard's featured-report id. The
+/// seed helper stamps this on every DB; the dashboard widget reads it; a
+/// report deletion clears it when the pointer would otherwise dangle.
+const FEATURED_REPORT_SETTING: &str = "dashboard.featured_report_id";
 
 /// In-memory cache for the global canvas payload.
 ///
@@ -250,11 +250,6 @@ pub struct AtomicCore {
     /// working set is bounded by the number of wiki articles touched.
     wiki_tag_locks:
         Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Single-flight guard for `run_daily_briefing`. Both the scheduler tick
-    /// loop and the `POST /api/briefings/run` route contend for this lock —
-    /// `try_lock` rejects the loser with `Conflict` so we never fire two
-    /// overlapping LLM calls for the same coverage window.
-    briefing_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-memory cache for `compute_and_get_canvas_data`. Shared across clones
     /// so every handle sees the same cached payload.
     canvas_cache: CanvasCache,
@@ -269,7 +264,6 @@ impl AtomicCore {
             storage,
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            briefing_lock: Arc::new(tokio::sync::Mutex::new(())),
             canvas_cache: CanvasCache::new(),
         };
         core.register_canvas_rebuilder();
@@ -344,7 +338,6 @@ impl AtomicCore {
             storage,
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            briefing_lock: Arc::new(tokio::sync::Mutex::new(())),
             canvas_cache: CanvasCache::new(),
         };
         core.register_canvas_rebuilder();
@@ -358,7 +351,6 @@ impl AtomicCore {
             storage: storage::StorageBackend::Postgres(pg),
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            briefing_lock: Arc::new(tokio::sync::Mutex::new(())),
             canvas_cache: CanvasCache::new(),
         };
         core.register_canvas_rebuilder();
@@ -476,7 +468,6 @@ impl AtomicCore {
             storage,
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            briefing_lock: Arc::new(tokio::sync::Mutex::new(())),
             canvas_cache: CanvasCache::new(),
         };
         core.register_canvas_rebuilder();
@@ -1339,7 +1330,13 @@ impl AtomicCore {
         match options.mode {
             search::SearchMode::Keyword => {
                 self.storage
-                    .keyword_search_sync(&options.query, options.limit, tag_id, cutoff_ref)
+                    .keyword_search_sync(
+                        &options.query,
+                        options.limit,
+                        tag_id,
+                        cutoff_ref,
+                        &options.kinds,
+                    )
                     .await
             }
             search::SearchMode::Semantic => {
@@ -1361,6 +1358,7 @@ impl AtomicCore {
                         options.threshold,
                         tag_id,
                         cutoff_ref,
+                        &options.kinds,
                     )
                     .await
             }
@@ -1376,7 +1374,13 @@ impl AtomicCore {
 
                 let keyword_results = self
                     .storage
-                    .keyword_search_sync(&options.query, options.limit * 2, tag_id, cutoff_ref)
+                    .keyword_search_sync(
+                        &options.query,
+                        options.limit * 2,
+                        tag_id,
+                        cutoff_ref,
+                        &options.kinds,
+                    )
                     .await?;
 
                 let semantic_results = if !embeddings.is_empty() && !embeddings[0].is_empty() {
@@ -1387,6 +1391,7 @@ impl AtomicCore {
                             options.threshold,
                             tag_id,
                             cutoff_ref,
+                            &options.kinds,
                         )
                         .await?
                 } else {
@@ -1851,79 +1856,6 @@ impl AtomicCore {
         self.storage.get_wiki_version_sync(version_id).await
     }
 
-    // ==================== Daily Briefing ====================
-
-    /// Run the daily briefing pipeline immediately. Used by the scheduled
-    /// task and the `/briefings/run` route. Computes `since` from the
-    /// persisted `task.daily_briefing.last_run` (or a 7-day lookback on the
-    /// first run), invokes the agentic loop, and persists the result.
-    ///
-    /// Returns `Ok(None)` when there are no new atoms in the window — no
-    /// briefing row is written in that case. `last_run` is still bumped so
-    /// the scheduler waits the full interval before re-polling.
-    ///
-    /// Updates `task.daily_briefing.last_run` on success so the next
-    /// scheduled tick correctly waits for the full interval. On failure the
-    /// error bubbles up and `last_run` is left unchanged — the scheduler
-    /// will retry on the next tick.
-    pub async fn run_daily_briefing(
-        &self,
-    ) -> Result<Option<briefing::BriefingWithCitations>, AtomicCoreError> {
-        let _guard = self.briefing_lock.try_lock().map_err(|_| {
-            AtomicCoreError::Conflict("A daily briefing is already running".to_string())
-        })?;
-        let since = scheduler::state::get_last_run(self, "daily_briefing")
-            .await?
-            .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::days(7));
-        let result = briefing::run_briefing(self, since).await?;
-        if let Err(e) =
-            scheduler::state::set_last_run(self, "daily_briefing", chrono::Utc::now()).await
-        {
-            tracing::warn!(error = %e, "[briefing] Failed to persist daily_briefing last_run");
-        }
-        Ok(result)
-    }
-
-    /// Get the active database's briefing schedule and computed next run.
-    pub async fn get_briefing_schedule(
-        &self,
-    ) -> Result<briefing::BriefingScheduleStatus, AtomicCoreError> {
-        briefing::schedule::get_schedule_status(self).await
-    }
-
-    /// Persist the active database's briefing schedule. This is intentionally
-    /// per-DB task state, not a generic resolved setting.
-    pub async fn set_briefing_schedule(
-        &self,
-        schedule: briefing::BriefingSchedule,
-    ) -> Result<briefing::BriefingScheduleStatus, AtomicCoreError> {
-        briefing::schedule::set_schedule(self, schedule).await
-    }
-
-    /// Get the most recent briefing joined with citations.
-    pub async fn get_latest_briefing(
-        &self,
-    ) -> Result<Option<briefing::BriefingWithCitations>, AtomicCoreError> {
-        self.storage.get_latest_briefing_sync().await
-    }
-
-    /// Get a specific briefing by id, joined with citations. Returns `None`
-    /// if no briefing with that id exists.
-    pub async fn get_briefing(
-        &self,
-        id: &str,
-    ) -> Result<Option<briefing::BriefingWithCitations>, AtomicCoreError> {
-        self.storage.get_briefing_sync(id).await
-    }
-
-    /// List recent briefings (without citations) for a lightweight history view.
-    pub async fn list_briefings(
-        &self,
-        limit: i32,
-    ) -> Result<Vec<briefing::Briefing>, AtomicCoreError> {
-        self.storage.list_briefings_sync(limit).await
-    }
-
     // ==================== Reports ====================
     //
     // Thin wrappers around `ReportStore` so transport layers (REST, MCP,
@@ -1986,7 +1918,70 @@ impl AtomicCore {
     }
 
     pub async fn delete_report(&self, id: &str) -> Result<(), AtomicCoreError> {
+        // Clear the dashboard pointer if it referenced this report, so the
+        // widget falls into its empty state rather than chasing a dead id.
+        // Per-DB setting — read via `storage().get_setting_sync` to bypass
+        // the registry-routed `get_settings` path.
+        if let Some(featured) = self
+            .storage
+            .get_setting_sync(FEATURED_REPORT_SETTING)
+            .await?
+        {
+            if featured == id {
+                self.storage
+                    .delete_setting_sync(FEATURED_REPORT_SETTING)
+                    .await?;
+            }
+        }
         self.storage.delete_report_sync(id).await
+    }
+
+    /// Read the per-DB dashboard featured-report id, if any. Returns `None`
+    /// when the setting is unset or the referenced report no longer exists.
+    /// A stale pointer is self-healing: callers see `None` and the next
+    /// `set_featured_report_id` (or a fresh seed) re-points it.
+    pub async fn get_featured_report_id(&self) -> Result<Option<String>, AtomicCoreError> {
+        let Some(id) = self
+            .storage
+            .get_setting_sync(FEATURED_REPORT_SETTING)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if id.is_empty() {
+            return Ok(None);
+        }
+        if self.storage.get_report_sync(&id).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(id))
+    }
+
+    /// Set (or clear) the per-DB dashboard featured-report id. Stored
+    /// directly through `storage()` rather than `set_setting` so the value
+    /// stays isolated per database — the dashboard a user sees should
+    /// reflect *that* DB's chosen report, not a registry-wide default.
+    pub async fn set_featured_report_id(
+        &self,
+        report_id: Option<&str>,
+    ) -> Result<(), AtomicCoreError> {
+        match report_id {
+            Some(id) if !id.is_empty() => {
+                if self.storage.get_report_sync(id).await?.is_none() {
+                    return Err(AtomicCoreError::Validation(format!(
+                        "report not found: {id}"
+                    )));
+                }
+                self.storage
+                    .set_setting_sync(FEATURED_REPORT_SETTING, id)
+                    .await
+            }
+            _ => {
+                self.storage
+                    .delete_setting_sync(FEATURED_REPORT_SETTING)
+                    .await
+            }
+        }
     }
 
     pub async fn list_findings_for_report(
@@ -1996,6 +1991,18 @@ impl AtomicCore {
     ) -> Result<Vec<(models::ReportFinding, models::AtomWithTags)>, AtomicCoreError> {
         self.storage
             .list_findings_for_report_sync(report_id, limit)
+            .await
+    }
+
+    /// Fetch the citation rows for a finding atom, ordered by `position`.
+    /// Dashboard widget pairs this with the finding atom content to render
+    /// `[N]` markers as clickable popovers, matching the old briefing UX.
+    pub async fn list_citations_for_finding(
+        &self,
+        finding_atom_id: &str,
+    ) -> Result<Vec<models::ReportFindingCitation>, AtomicCoreError> {
+        self.storage
+            .list_citations_for_finding_sync(finding_atom_id)
             .await
     }
 
@@ -5535,25 +5542,6 @@ mod tests {
         assert_eq!(topics_tag.atom_count, 3);
     }
 
-    #[tokio::test]
-    async fn run_daily_briefing_rejects_concurrent_call_with_conflict() {
-        let (db, _temp) = create_test_db().await;
-
-        // Simulate an in-flight briefing by holding the single-flight lock.
-        // The lock is acquired as the very first step of `run_daily_briefing`
-        // (before any DB or LLM work), so we don't need a working provider to
-        // exercise the contention path.
-        let _held = db.briefing_lock.clone().lock_owned().await;
-
-        let result = db.run_daily_briefing().await;
-        match result {
-            Err(AtomicCoreError::Conflict(msg)) => {
-                assert!(msg.contains("already running"), "unexpected message: {msg}");
-            }
-            other => panic!("expected Conflict, got {:?}", other.err()),
-        }
-    }
-
     #[test]
     fn test_strip_inline_markdown() {
         // Backslash escapes
@@ -6782,8 +6770,9 @@ mod tests {
 
     // ==================== Reports primitive (V20) ====================
     //
-    // Phase 2 ships reports as a parallel primitive next to the existing
-    // briefing path. These tests cover schema CRUD, scope resolution
+    // Phase 3 collapsed the legacy briefing path onto this primitive; the
+    // seeded "Daily Briefing" report is now the only thing producing daily
+    // synthesis atoms. These tests cover schema CRUD, scope resolution
     // (the hot path of run_report), and the empty-scope short-circuit —
     // the LLM-driven full-loop tests live in the integration suite where
     // a wiremock provider is already wired.
@@ -7431,5 +7420,361 @@ mod tests {
         let after = db.get_report(&r.id).await.unwrap().unwrap();
         assert_eq!(after.last_run_at.as_deref(), Some("2026-05-20T10:00:00Z"));
         assert_eq!(after.last_error.as_deref(), Some("blip"));
+    }
+
+    // ==================== Phase-3 briefing collapse ====================
+    //
+    // Seed + migration helpers. Each test starts with `create_test_db` (which
+    // is post-V22 — the briefings tables already dropped on a fresh DB), and
+    // those exercising the historical-data path stamp the legacy `briefings`
+    // and `briefing_citations` tables back in via raw SQL before running.
+
+    use crate::reports::seed::{migrate_briefings_to_findings, seed_default_briefing_report};
+
+    /// Recreate the legacy `briefings` / `briefing_citations` tables on a
+    /// fresh SQLite DB. Phase-3 seeds a flagged DB so the migration runs
+    /// against pre-existing data; this helper simulates that pre-existing
+    /// state for tests.
+    fn restore_legacy_briefings_tables(db: &AtomicCore) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS briefings (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                atom_count INTEGER NOT NULL,
+                last_run_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS briefing_citations (
+                id TEXT PRIMARY KEY,
+                briefing_id TEXT NOT NULL REFERENCES briefings(id) ON DELETE CASCADE,
+                citation_index INTEGER NOT NULL,
+                atom_id TEXT NOT NULL REFERENCES atoms(id) ON DELETE CASCADE,
+                excerpt TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// Insert a legacy briefing row + its citations directly.
+    fn insert_legacy_briefing(
+        db: &AtomicCore,
+        id: &str,
+        content: &str,
+        created_at: &str,
+        atom_count: i32,
+        citations: &[(i32, &str, &str)],
+    ) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO briefings (id, content, created_at, atom_count, last_run_at) \
+             VALUES (?1, ?2, ?3, ?4, ?3)",
+            rusqlite::params![id, content, created_at, atom_count],
+        )
+        .unwrap();
+        for (idx, atom_id, excerpt) in citations {
+            conn.execute(
+                "INSERT INTO briefing_citations (id, briefing_id, citation_index, atom_id, excerpt) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    id,
+                    idx,
+                    atom_id,
+                    excerpt
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    async fn briefing_settings_with(db: &AtomicCore, kv: &[(&str, &str)]) {
+        for (k, v) in kv {
+            db.storage.set_setting_sync(k, v).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_default_briefing_report_idempotent() {
+        // First call seeds; second call sees `dashboard.featured_report_id`
+        // pointing at an extant report and returns without creating another.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let after_first = db.list_reports().await.unwrap();
+        assert_eq!(after_first.len(), 1);
+        let id1 = after_first[0].id.clone();
+
+        seed_default_briefing_report(&db).await.unwrap();
+        let after_second = db.list_reports().await.unwrap();
+        assert_eq!(after_second.len(), 1, "second seed must not duplicate");
+        assert_eq!(after_second[0].id, id1, "same row, not replaced");
+    }
+
+    #[tokio::test]
+    async fn seed_pulls_research_prompt_from_briefing_prompt_setting() {
+        let (db, _temp) = create_test_db().await;
+        briefing_settings_with(&db, &[("briefing_prompt", "look for tensions")]).await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let r = &db.list_reports().await.unwrap()[0];
+        assert_eq!(r.research_prompt, "look for tensions");
+        // Legacy key is cleared so the report row is the new source of truth.
+        let cleared = db
+            .storage
+            .get_setting_sync("briefing_prompt")
+            .await
+            .unwrap();
+        assert!(cleared.is_none() || cleared.as_deref() == Some(""));
+    }
+
+    #[tokio::test]
+    async fn seed_creates_reports_briefings_tag_idempotently() {
+        // `get_all_tags()` returns a hierarchical tree; flatten so a child
+        // tag under a freshly-created top-level category is visible.
+        fn flatten(tree: &[TagWithCount]) -> Vec<&TagWithCount> {
+            let mut out: Vec<&TagWithCount> = Vec::new();
+            fn walk<'a>(node: &'a TagWithCount, out: &mut Vec<&'a TagWithCount>) {
+                out.push(node);
+                for c in &node.children {
+                    walk(c, out);
+                }
+            }
+            for n in tree {
+                walk(n, &mut out);
+            }
+            out
+        }
+
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        seed_default_briefing_report(&db).await.unwrap();
+        let tree = db.get_all_tags().await.unwrap();
+        let flat = flatten(&tree);
+        let reports = flat
+            .iter()
+            .filter(|t| t.tag.name == "Reports" && t.tag.parent_id.is_none())
+            .count();
+        let briefings = flat.iter().filter(|t| t.tag.name == "Briefings").count();
+        assert_eq!(reports, 1, "exactly one Reports top-level tag");
+        assert_eq!(briefings, 1, "exactly one Briefings child tag");
+    }
+
+    #[tokio::test]
+    async fn seed_sets_dashboard_featured_report_id() {
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let id = db.get_featured_report_id().await.unwrap();
+        assert!(id.is_some(), "featured report id is set after seed");
+        let report = db.list_reports().await.unwrap();
+        assert_eq!(id.as_deref(), Some(report[0].id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn featured_report_id_cleared_when_report_deleted() {
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let id = db.get_featured_report_id().await.unwrap().unwrap();
+        db.delete_report(&id).await.unwrap();
+        let after = db.get_featured_report_id().await.unwrap();
+        assert!(after.is_none(), "deleting the report clears the pointer");
+    }
+
+    #[tokio::test]
+    async fn migrate_briefings_to_findings_writes_atoms_with_kind_report() {
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+
+        // Need a captured atom to anchor a citation, then a legacy briefing
+        // referencing it.
+        let cited = create_test_atom(&db, "anchor content").await;
+        restore_legacy_briefings_tables(&db);
+        insert_legacy_briefing(
+            &db,
+            "b1",
+            "Yesterday's roundup [1].",
+            "2026-05-19T10:00:00Z",
+            1,
+            &[(1, &cited.atom.id, "anchor content")],
+        );
+
+        let migrated = migrate_briefings_to_findings(&db).await.unwrap();
+        assert_eq!(migrated, 1);
+
+        let featured = db.get_featured_report_id().await.unwrap().unwrap();
+        let findings = db.list_findings_for_report(&featured, 10).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        let (_, atom) = &findings[0];
+        assert_eq!(atom.atom.kind, AtomKind::Report);
+        assert_eq!(atom.atom.tagging_status, "skipped");
+        assert_eq!(atom.atom.content, "Yesterday's roundup [1].");
+        // `created_at` preserved.
+        assert_eq!(atom.atom.created_at, "2026-05-19T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn migrate_briefings_to_findings_preserves_citations() {
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let a = create_test_atom(&db, "atom one").await;
+        let b = create_test_atom(&db, "atom two").await;
+        restore_legacy_briefings_tables(&db);
+        insert_legacy_briefing(
+            &db,
+            "b1",
+            "Two atoms today [1] and [2].",
+            "2026-05-19T10:00:00Z",
+            2,
+            &[
+                (1, &a.atom.id, "atom one excerpt"),
+                (2, &b.atom.id, "atom two excerpt"),
+            ],
+        );
+
+        migrate_briefings_to_findings(&db).await.unwrap();
+        let featured = db.get_featured_report_id().await.unwrap().unwrap();
+        let findings = db.list_findings_for_report(&featured, 10).await.unwrap();
+        let finding_atom_id = &findings[0].1.atom.id;
+        let citations = db
+            .list_citations_for_finding(finding_atom_id)
+            .await
+            .unwrap();
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[0].position, 1);
+        assert_eq!(citations[0].cited_atom_id, a.atom.id);
+        assert_eq!(citations[0].excerpt, "atom one excerpt");
+        assert_eq!(citations[1].position, 2);
+        assert_eq!(citations[1].cited_atom_id, b.atom.id);
+    }
+
+    #[tokio::test]
+    async fn migrate_briefings_to_findings_idempotent() {
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let a = create_test_atom(&db, "anchor").await;
+        restore_legacy_briefings_tables(&db);
+        insert_legacy_briefing(
+            &db,
+            "b1",
+            "one [1].",
+            "2026-05-19T10:00:00Z",
+            1,
+            &[(1, &a.atom.id, "x")],
+        );
+
+        let first = migrate_briefings_to_findings(&db).await.unwrap();
+        assert_eq!(first, 1);
+        let second = migrate_briefings_to_findings(&db).await.unwrap();
+        assert_eq!(second, 0, "flag prevents re-run");
+    }
+
+    #[tokio::test]
+    async fn migrate_carries_over_last_run_at() {
+        // Critique #1: the seeded report's `last_run_at` must inherit from
+        // `task.daily_briefing.last_run` so the first reports-loop tick
+        // doesn't reprocess weeks of already-briefed atoms.
+        let (db, _temp) = create_test_db().await;
+        db.storage
+            .set_setting_sync("task.daily_briefing.last_run", "2026-05-15T10:00:00Z")
+            .await
+            .unwrap();
+        seed_default_briefing_report(&db).await.unwrap();
+        let r = &db.list_reports().await.unwrap()[0];
+        assert_eq!(
+            r.last_run_at.as_deref(),
+            Some("2026-05-15T10:00:00+00:00"),
+            "seeded report carries last_run forward (as ISO-8601)"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_filters_by_kind() {
+        // Storage-level test: the new `kinds` parameter on
+        // `keyword_search_sync` actually constrains results. Two atoms
+        // with the same searchable token, one stamped `kind = 'report'`;
+        // a `KindFilter::only(Captured)` search must return only the
+        // captured atom and a `KindFilter::All` must return both.
+        let (db, _temp) = create_test_db().await;
+        let captured = create_test_atom(&db, "elephants march east").await;
+        let finding = create_test_atom(&db, "elephants march west").await;
+        stamp_report_kind(&db, &finding.atom.id);
+
+        let captured_only = db
+            .storage
+            .keyword_search_sync(
+                "elephants",
+                10,
+                None,
+                None,
+                &models::KindFilter::only(models::AtomKind::Captured),
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = captured_only
+            .iter()
+            .map(|r| r.atom.atom.id.clone())
+            .collect();
+        assert!(ids.contains(&captured.atom.id), "captured atom present");
+        assert!(!ids.contains(&finding.atom.id), "finding excluded");
+
+        let all = db
+            .storage
+            .keyword_search_sync("elephants", 10, None, None, &models::KindFilter::All)
+            .await
+            .unwrap();
+        let all_ids: std::collections::HashSet<_> =
+            all.iter().map(|r| r.atom.atom.id.clone()).collect();
+        assert!(
+            all_ids.contains(&captured.atom.id) && all_ids.contains(&finding.atom.id),
+            "KindFilter::All returns both kinds"
+        );
+    }
+
+    #[tokio::test]
+    async fn featured_report_id_is_per_database() {
+        // Critique #12: the per-DB pointer must isolate. Two independent
+        // DBs each get their own seed → distinct `featured_report_id` →
+        // setting one must not bleed into the other. The actual multi-DB
+        // server holds a shared registry, but the relevant invariant is
+        // that the value goes through `core.storage()` (per-DB settings
+        // table), not `core.set_setting()` (registry-routed).
+        let (db_a, _ta) = create_test_db().await;
+        let (db_b, _tb) = create_test_db().await;
+        seed_default_briefing_report(&db_a).await.unwrap();
+        seed_default_briefing_report(&db_b).await.unwrap();
+        let id_a = db_a.get_featured_report_id().await.unwrap().unwrap();
+        let id_b = db_b.get_featured_report_id().await.unwrap().unwrap();
+        assert_ne!(id_a, id_b, "each DB has its own report id");
+
+        // Clearing on A leaves B untouched.
+        db_a.set_featured_report_id(None).await.unwrap();
+        assert!(db_a.get_featured_report_id().await.unwrap().is_none());
+        assert_eq!(
+            db_b.get_featured_report_id().await.unwrap(),
+            Some(id_b),
+            "DB B's pointer is undisturbed by writes to DB A"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_to_end_seed_then_empty_scope_run() {
+        // Fresh DB → seed → manual run. The since-last-run window is set to
+        // "now" by the seed (well, None), the scope is empty (no atoms), so
+        // run_report short-circuits with EmptyScope and advances last_run_at.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let id = db.get_featured_report_id().await.unwrap().unwrap();
+        let report = db.get_report(&id).await.unwrap().unwrap();
+        let outcome = run_report(&db, &report, models::TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::EmptyScope { .. }));
+        let r = db.get_report(&id).await.unwrap().unwrap();
+        assert!(
+            r.last_run_at.is_some(),
+            "empty-scope success still advances last_run_at"
+        );
     }
 }

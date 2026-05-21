@@ -289,7 +289,6 @@ impl_reborrow_struct!(
     ListAtomsParams,
     WikiArticle,
     WikiProposal,
-    crate::briefing::Briefing,
     crate::models::KindFilter,
     crate::models::TaskRun,
     crate::models::CreateReportRequest,
@@ -510,9 +509,9 @@ dispatch! {
         => sqlite: count_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_pipeline_jobs;
 
     // ---- SearchStore ----
-    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: vector_search_sync, pg_trait: SearchStore, pg_method: vector_search;
-    fn keyword_search_sync(&self, query: &str, limit: i32, tag_id: Option<&str>, created_after: Option<&str>) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
+    fn keyword_search_sync(&self, query: &str, limit: i32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
         => sqlite: keyword_search_sync, pg_trait: SearchStore, pg_method: keyword_search;
     fn find_similar_sync(&self, atom_id: &str, limit: i32, threshold: f32) -> Result<Vec<SimilarAtomResult>, AtomicCoreError>
         => sqlite: find_similar_sync, pg_trait: SearchStore, pg_method: find_similar;
@@ -580,20 +579,6 @@ dispatch! {
         => sqlite: delete_wiki_proposal_sync, pg_trait: WikiStore, pg_method: delete_wiki_proposal;
     fn advance_wiki_baseline_sync(&self, tag_id: &str, max_current_count: Option<i32>) -> Result<bool, AtomicCoreError>
         => sqlite: advance_wiki_baseline_sync, pg_trait: WikiStore, pg_method: advance_wiki_baseline;
-
-    // ---- BriefingStore ----
-    fn list_new_atoms_since_sync(&self, since: &str, limit: i32, kinds: &crate::models::KindFilter) -> Result<Vec<AtomWithTags>, AtomicCoreError>
-        => sqlite: list_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: list_new_atoms_since;
-    fn count_new_atoms_since_sync(&self, since: &str) -> Result<i32, AtomicCoreError>
-        => sqlite: count_new_atoms_since_sync, pg_trait: BriefingStore, pg_method: count_new_atoms_since;
-    fn insert_briefing_sync(&self, briefing: &crate::briefing::Briefing, citations: &[crate::briefing::BriefingCitation]) -> Result<crate::briefing::BriefingWithCitations, AtomicCoreError>
-        => sqlite: insert_briefing_sync, pg_trait: BriefingStore, pg_method: insert_briefing;
-    fn get_latest_briefing_sync(&self) -> Result<Option<crate::briefing::BriefingWithCitations>, AtomicCoreError>
-        => sqlite: get_latest_briefing_sync, pg_trait: BriefingStore, pg_method: get_latest_briefing;
-    fn get_briefing_sync(&self, id: &str) -> Result<Option<crate::briefing::BriefingWithCitations>, AtomicCoreError>
-        => sqlite: get_briefing_sync, pg_trait: BriefingStore, pg_method: get_briefing;
-    fn list_briefings_sync(&self, limit: i32) -> Result<Vec<crate::briefing::Briefing>, AtomicCoreError>
-        => sqlite: list_briefings_sync, pg_trait: BriefingStore, pg_method: list_briefings;
 
     // ---- FeedStore ----
     fn list_feeds_sync(&self) -> Result<Vec<Feed>, AtomicCoreError>
@@ -702,8 +687,16 @@ dispatch! {
         => sqlite: get_finding_provenance_sync, pg_trait: ReportStore, pg_method: get_finding_provenance;
     fn list_finding_atom_ids_for_report_sync(&self, report_id: &str) -> Result<Vec<String>, AtomicCoreError>
         => sqlite: list_finding_atom_ids_for_report_sync, pg_trait: ReportStore, pg_method: list_finding_atom_ids_for_report;
+    fn list_citations_for_finding_sync(&self, finding_atom_id: &str) -> Result<Vec<crate::models::ReportFindingCitation>, AtomicCoreError>
+        => sqlite: list_citations_for_finding_sync, pg_trait: ReportStore, pg_method: list_citations_for_finding;
     fn write_finding_transactionally_sync(&self, atom_request: &CreateAtomRequest, atom_id: &str, atom_created_at: &str, provenance: &crate::models::ReportFinding, citations: &[crate::models::ReportFindingCitation]) -> Result<AtomWithTags, AtomicCoreError>
         => sqlite: write_finding_transactionally_sync, pg_trait: ReportStore, pg_method: write_finding_transactionally;
+
+    // ---- LegacyBriefingsMigrationStore (phase-3 collapse) ----
+    fn fetch_legacy_briefings_sync(&self) -> Result<Vec<crate::reports::seed::LegacyBriefingRow>, AtomicCoreError>
+        => sqlite: fetch_legacy_briefings_sync, pg_trait: crate::storage::traits::LegacyBriefingsMigrationStore, pg_method: fetch_legacy_briefings;
+    fn drop_legacy_briefing_tables_sync(&self) -> Result<(), AtomicCoreError>
+        => sqlite: drop_legacy_briefing_tables_sync, pg_trait: crate::storage::traits::LegacyBriefingsMigrationStore, pg_method: drop_legacy_briefing_tables;
 }
 
 #[cfg(feature = "postgres")]

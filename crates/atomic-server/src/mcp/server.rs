@@ -72,10 +72,20 @@ impl AtomicMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let core = self.resolve_core(&context).await?;
         let limit = params.limit.unwrap_or(10).min(50);
+        // External MCP clients (Claude Desktop, claude.ai, third-party
+        // agents) get a captured-only view by default. The `kind`
+        // discriminator landed in phase 1 so background-generated content
+        // (report findings, etc.) wouldn't surface in external retrievers
+        // unless the caller opts in. Threading the filter through
+        // `SearchOptions` rather than post-filtering keeps result counts
+        // accurate at `limit` and pushes the constraint into the SQL.
         let options =
             atomic_core::SearchOptions::new(params.query, atomic_core::SearchMode::Hybrid, limit)
                 .with_threshold(0.3)
-                .with_since_days(params.since_days);
+                .with_since_days(params.since_days)
+                .with_kinds(atomic_core::models::KindFilter::only(
+                    atomic_core::models::AtomKind::Captured,
+                ));
 
         let results = core
             .search(options)

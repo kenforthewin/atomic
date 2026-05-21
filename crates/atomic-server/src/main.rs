@@ -366,6 +366,50 @@ async fn run_server(
         }
     }
 
+    // Phase-3 briefing collapse: seed the default Daily Briefing report and
+    // migrate historical briefings into finding atoms on every data DB.
+    // Both helpers are idempotent (the seed keys on
+    // `dashboard.featured_report_id` pointing at an extant report; the
+    // migration keys on a per-DB `briefings.migrated_to_findings` flag), so
+    // crashing partway through means the next boot resumes. We run this
+    // synchronously, before background loops spawn, so the reports tick
+    // never finds a half-migrated DB. A failure in one DB logs and skips
+    // that DB; we deliberately do not abort startup on a per-DB error.
+    {
+        let (databases, _) = manager.list_databases().await.unwrap_or_default();
+        for db_info in &databases {
+            let core = match manager.get_core(&db_info.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        db = %db_info.name, error = %e,
+                        "[reports/seed] failed to load database — skipping seed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = atomic_core::reports::seed::seed_default_briefing_report(&core).await {
+                tracing::error!(
+                    db = %db_info.name, error = %e,
+                    "[reports/seed] seed failed — skipping migration on this DB"
+                );
+                continue;
+            }
+            match atomic_core::reports::seed::migrate_briefings_to_findings(&core).await {
+                Ok(0) => {} // no-op: either already migrated or no rows
+                Ok(n) => tracing::info!(
+                    db = %db_info.name,
+                    migrated = n,
+                    "[reports/seed] briefings → findings migration complete"
+                ),
+                Err(e) => tracing::error!(
+                    db = %db_info.name, error = %e,
+                    "[reports/seed] migration failed — will retry on next boot"
+                ),
+            }
+        }
+    }
+
     // Canvas cache warmup: compute the global canvas payload for every
     // database in the background so the first request after startup hits a
     // warm cache. Sequenced across databases (not parallel) to avoid an
@@ -453,7 +497,9 @@ async fn run_server(
         let task_tx = event_tx.clone();
         tokio::spawn(async move {
             let mut registry = atomic_core::scheduler::TaskRegistry::new();
-            registry.register(Arc::new(atomic_core::briefing::DailyBriefingTask));
+            // DailyBriefingTask retired in phase 3 — the seeded Daily Briefing
+            // report runs through the reports loop below, dispatched via the
+            // task_runs ledger.
             registry.register(Arc::new(atomic_core::pipeline_task::DraftPipelineTask));
             registry.register(Arc::new(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,

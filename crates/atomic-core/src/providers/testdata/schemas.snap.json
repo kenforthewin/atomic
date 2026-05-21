@@ -1,25 +1,4 @@
 {
-  "briefing_generation_result": {
-    "additionalProperties": false,
-    "properties": {
-      "briefing_content": {
-        "description": "The 2-3 paragraph briefing in markdown, with [N] citation markers referring to the initial new-atoms list.",
-        "type": "string"
-      },
-      "citations_used": {
-        "description": "List of citation numbers actually used in briefing_content.",
-        "items": {
-          "type": "integer"
-        },
-        "type": "array"
-      }
-    },
-    "required": [
-      "briefing_content",
-      "citations_used"
-    ],
-    "type": "object"
-  },
   "consolidation_result": {
     "additionalProperties": false,
     "properties": {
@@ -123,6 +102,27 @@
     },
     "required": [
       "merges"
+    ],
+    "type": "object"
+  },
+  "report_finding_result": {
+    "additionalProperties": false,
+    "properties": {
+      "citations_used": {
+        "description": "List of citation numbers actually used.",
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "finding_content": {
+        "description": "The finding in markdown, with [N] citation markers.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_content",
+      "citations_used"
     ],
     "type": "object"
   },

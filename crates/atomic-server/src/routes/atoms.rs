@@ -35,6 +35,46 @@ pub struct GetAtomsQuery {
     pub sort_by: Option<String>,
     /// Sort direction: "desc" or "asc"
     pub sort_order: Option<String>,
+    /// Optional `kind` filter for external consumers (MCP exports, future
+    /// sync clients) that want to exclude report-generated finding atoms.
+    /// CSV of `captured` / `report`. Missing/empty = no filter (returns all
+    /// kinds, preserving the UI's read shape — the React app does not pass
+    /// this parameter). Invalid value → 400.
+    pub kinds: Option<String>,
+}
+
+/// Parse the `?kinds=` CSV into a `KindFilter`. `None` and empty strings
+/// resolve to `KindFilter::All` (backwards compatible). Any unknown token
+/// returns a 400-ready error. Whitespace around individual tokens is
+/// trimmed so `?kinds=captured, report` works.
+fn parse_kinds(raw: Option<&str>) -> Result<atomic_core::models::KindFilter, HttpResponse> {
+    use atomic_core::models::{AtomKind, KindFilter};
+    use std::str::FromStr;
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(KindFilter::All);
+    };
+    let mut kinds = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match AtomKind::from_str(token) {
+            Ok(k) if !kinds.contains(&k) => kinds.push(k),
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HttpResponse::BadRequest().json(ApiErrorResponse {
+                    error: format!(
+                        "invalid kinds value '{token}': expected 'captured' or 'report'"
+                    ),
+                }));
+            }
+        }
+    }
+    if kinds.is_empty() {
+        return Ok(KindFilter::All);
+    }
+    Ok(KindFilter::Only(kinds))
 }
 
 #[utoipa::path(
@@ -74,12 +114,81 @@ pub async fn get_atoms(db: Db, query: web::Query<GetAtomsQuery>) -> HttpResponse
         sort_by,
         sort_order,
     };
-    // UI listing is a display surface; show all kinds (visual differentiation
-    // of report findings is a future phase concern).
-    ok_or_error(
-        db.0.list_atoms(&params, &atomic_core::models::KindFilter::All)
-            .await,
-    )
+    // The default (missing `kinds`) stays `KindFilter::All` so the React
+    // app — which does not pass this parameter — keeps showing findings
+    // alongside captured atoms. External consumers that don't want
+    // findings in their export must opt in with `?kinds=captured`. This
+    // is deliberately backwards compatible; restricting the default would
+    // hide finding atoms from the UI that already renders them.
+    let kinds = match parse_kinds(query.kinds.as_deref()) {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+    ok_or_error(db.0.list_atoms(&params, &kinds).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::models::{AtomKind, KindFilter};
+
+    #[test]
+    fn kinds_query_filter_parses_captured() {
+        let f = parse_kinds(Some("captured")).expect("parses");
+        assert!(matches!(f, KindFilter::Only(ref ks) if ks == &vec![AtomKind::Captured]));
+    }
+
+    #[test]
+    fn kinds_query_filter_parses_csv_both() {
+        let f = parse_kinds(Some("captured,report")).expect("parses");
+        match f {
+            KindFilter::Only(ks) => {
+                assert_eq!(ks, vec![AtomKind::Captured, AtomKind::Report]);
+            }
+            _ => panic!("expected Only"),
+        }
+    }
+
+    #[test]
+    fn kinds_query_filter_dedupes_duplicates() {
+        // Defensive: `?kinds=captured,captured` collapses, not duplicates.
+        let f = parse_kinds(Some("captured,captured")).expect("parses");
+        assert!(matches!(f, KindFilter::Only(ref ks) if ks == &vec![AtomKind::Captured]));
+    }
+
+    #[test]
+    fn kinds_query_invalid_returns_400() {
+        let err = parse_kinds(Some("banana")).expect_err("rejected");
+        assert_eq!(err.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn kinds_query_missing_returns_all_kinds() {
+        assert!(matches!(
+            parse_kinds(None).expect("none ok"),
+            KindFilter::All
+        ));
+        // Empty / whitespace-only matches None semantics.
+        assert!(matches!(
+            parse_kinds(Some("")).expect("empty ok"),
+            KindFilter::All
+        ));
+        assert!(matches!(
+            parse_kinds(Some("   ")).expect("ws ok"),
+            KindFilter::All
+        ));
+    }
+
+    #[test]
+    fn kinds_query_tolerates_whitespace_around_tokens() {
+        let f = parse_kinds(Some(" captured , report ")).expect("parses");
+        match f {
+            KindFilter::Only(ks) => {
+                assert_eq!(ks, vec![AtomKind::Captured, AtomKind::Report]);
+            }
+            _ => panic!("expected Only"),
+        }
+    }
 }
 
 #[utoipa::path(

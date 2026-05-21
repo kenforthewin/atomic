@@ -70,13 +70,6 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::wiki::get_wiki_proposal,
         routes::wiki::accept_wiki_proposal,
         routes::wiki::dismiss_wiki_proposal,
-        // Briefings
-        routes::briefings::get_latest_briefing,
-        routes::briefings::list_briefings,
-        routes::briefings::get_briefing,
-        routes::briefings::run_briefing_now,
-        routes::briefings::get_briefing_schedule,
-        routes::briefings::set_briefing_schedule,
         // Settings
         routes::settings::get_settings,
         routes::settings::set_setting,
@@ -205,10 +198,6 @@ pub use utoipa_scalar::{Scalar, Servable};
         atomic_core::WikiArticleVersion,
         atomic_core::WikiVersionSummary,
         atomic_core::WikiProposal,
-        // Briefings
-        atomic_core::Briefing,
-        atomic_core::BriefingCitation,
-        atomic_core::BriefingWithCitations,
         // Canvas
         atomic_core::AtomPosition,
         atomic_core::AtomWithEmbedding,
@@ -307,7 +296,6 @@ pub use utoipa_scalar::{Scalar, Servable};
         (name = "import", description = "Data import"),
         (name = "ingestion", description = "URL content ingestion"),
         (name = "feeds", description = "RSS/Atom feed management"),
-        (name = "briefings", description = "Daily briefing generation and history"),
         (name = "logs", description = "Server log access"),
         (name = "oauth", description = "OAuth 2.0 endpoints for remote MCP clients"),
     ),

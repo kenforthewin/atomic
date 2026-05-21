@@ -5,7 +5,6 @@
 //! wrapped in `tokio::task::spawn_blocking` to satisfy the async trait interface.
 
 mod atoms;
-mod briefings;
 mod chat;
 mod chunks;
 mod clusters;

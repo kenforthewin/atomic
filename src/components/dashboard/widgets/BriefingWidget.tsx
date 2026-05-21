@@ -9,7 +9,10 @@ import { useAtomsStore } from '../../../stores/atoms';
 import { useWikiStore } from '../../../stores/wiki';
 import { useUIStore } from '../../../stores/ui';
 import { useCanvasStore } from '../../../stores/canvas';
-import { useBriefingStore, type BriefingCitation } from '../../../stores/briefing';
+import {
+  useFeaturedReportStore,
+  type FindingCitation,
+} from '../../../stores/featuredReport';
 import { getTransport } from '../../../lib/transport';
 import { formatRelativeDate } from '../../../lib/date';
 
@@ -31,6 +34,16 @@ function formatToday(date: Date): string {
     .toUpperCase();
 }
 
+/**
+ * Dashboard widget showing the most recent finding from the database's
+ * featured report. Phase 3 replaced the legacy briefing path with this
+ * reports-driven flow; the visual contract is unchanged so the rewire is
+ * invisible to users.
+ *
+ * Real-time refresh: subscribes to the standard `atom-created` event and
+ * re-fetches when a kind=report atom for the active report lands. The
+ * runNow path also schedules a fallback fetch in case the websocket missed.
+ */
 export function BriefingWidget() {
   const atoms = useAtomsStore(s => s.atoms);
   const createAtom = useAtomsStore(s => s.createAtom);
@@ -50,20 +63,28 @@ export function BriefingWidget() {
     }
   };
 
-  const active = useBriefingStore(s => s.active);
-  const history = useBriefingStore(s => s.history);
-  const activeIndex = useBriefingStore(s => s.activeIndex);
-  const isLoading = useBriefingStore(s => s.isLoading);
-  const isRunning = useBriefingStore(s => s.isRunning);
-  const fetchLatest = useBriefingStore(s => s.fetchLatest);
-  const navigate = useBriefingStore(s => s.navigate);
-  const runNow = useBriefingStore(s => s.runNow);
+  const reportId = useFeaturedReportStore(s => s.reportId);
+  const active = useFeaturedReportStore(s => s.active);
+  const history = useFeaturedReportStore(s => s.history);
+  const activeIndex = useFeaturedReportStore(s => s.activeIndex);
+  const isLoading = useFeaturedReportStore(s => s.isLoading);
+  const isRunning = useFeaturedReportStore(s => s.isRunning);
+  const fetchLatest = useFeaturedReportStore(s => s.fetchLatest);
+  const navigate = useFeaturedReportStore(s => s.navigate);
+  const runNow = useFeaturedReportStore(s => s.runNow);
 
-  // Load on mount and re-fetch whenever the backend emits briefing-ready.
+  // Load on mount and re-fetch whenever a new report finding atom lands.
+  // We filter on `kind === 'report'` so a normal capture doesn't trigger a
+  // pointless refresh, and the runner publishes through the standard
+  // atom-created stream so no special event channel is needed.
   useEffect(() => {
     fetchLatest();
-    const unsub = getTransport().subscribe('briefing-ready', () => {
-      fetchLatest();
+    const unsub = getTransport().subscribe('atom-created', (payload) => {
+      const kind = (payload as { atom?: { kind?: string } } | undefined)?.atom
+        ?.kind;
+      if (kind === 'report') {
+        fetchLatest();
+      }
     });
     return () => unsub();
   }, [fetchLatest]);
@@ -84,26 +105,17 @@ export function BriefingWidget() {
   }, [active]);
 
   const handleMiniNodeClick = (atomId: string) => {
-    // Open the main canvas focused on the clicked atom. SigmaCanvas consumes
-    // pendingFocusAtomId on mount and animates the camera + opens the popover,
-    // so by the time the user sees the canvas it's already on that atom.
     const store = useCanvasStore.getState();
     store.setPendingCamera(null);
     store.setPendingFocusAtomId(atomId);
     setViewMode('canvas');
   };
 
-  // Citation popover state
-  const [activeCitation, setActiveCitation] = useState<BriefingCitation | null>(null);
+  const [activeCitation, setActiveCitation] = useState<FindingCitation | null>(null);
   const [anchorRect, setAnchorRect] = useState<{ top: number; left: number; bottom: number; width: number } | null>(null);
 
-  const handleCitationClick = (citation: BriefingCitation, element: HTMLElement) => {
-    // Drive the preview canvas (the Sigma instance rendered inside this widget)
-    // to zoom to the referenced atom. No-op if the preview controller hasn't
-    // registered yet (still loading).
+  const handleCitationClick = (citation: FindingCitation, element: HTMLElement) => {
     useCanvasStore.getState().previewController?.focusAtom(citation.atom_id);
-
-    // Open the popover anchored to the clicked citation
     const rect = element.getBoundingClientRect();
     setActiveCitation(citation);
     setAnchorRect({ top: rect.top, left: rect.left, bottom: rect.bottom, width: rect.width });
@@ -114,7 +126,7 @@ export function BriefingWidget() {
     setAnchorRect(null);
   };
 
-  // ===== Fallback stub used when no briefing exists yet =====
+  // ===== Fallback stub used when no finding exists yet =====
 
   const stats = useMemo(() => {
     const newAtoms24h = atoms.filter(a => withinHours(a.created_at, 24)).length;
@@ -132,19 +144,21 @@ export function BriefingWidget() {
     `${suggestedArticles.length} suggested`,
   ];
 
-  // ===== Render =====
-
-  const hasBriefing = active !== null;
+  const hasFinding = active !== null;
   const canGoNewer = activeIndex > 0;
   const canGoOlder = activeIndex < history.length - 1;
-  const eyebrowLabel = hasBriefing
-    ? `BRIEFING · ${formatRelativeDate(active!.briefing.created_at).toUpperCase()}`
+  const eyebrowLabel = hasFinding
+    ? `BRIEFING · ${formatRelativeDate(active!.finding.created_at).toUpperCase()}`
     : formatToday(now);
+
+  // Run Now is gated on having a featured report; without one we still
+  // show the empty-state CTA (capture an atom), not a non-functional button.
+  const canRunNow = Boolean(reportId);
 
   return (
     <div className="pb-2">
       <div className="flex items-center gap-2 mb-3">
-        {hasBriefing && (
+        {hasFinding && (
           <>
             <button
               onClick={() => navigate(1)}
@@ -167,20 +181,19 @@ export function BriefingWidget() {
         <div className="text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
           {eyebrowLabel}
         </div>
-        <button
-          onClick={() => runNow()}
-          disabled={isRunning}
-          title="Regenerate briefing now"
-          className="ml-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] transition-colors disabled:opacity-50 disabled:cursor-wait"
-        >
-          <RefreshCw className={`w-3 h-3 ${isRunning ? 'animate-spin' : ''}`} strokeWidth={2} />
-        </button>
+        {canRunNow && (
+          <button
+            onClick={() => runNow()}
+            disabled={isRunning}
+            title="Regenerate briefing now"
+            className="ml-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] transition-colors disabled:opacity-50 disabled:cursor-wait"
+          >
+            <RefreshCw className={`w-3 h-3 ${isRunning ? 'animate-spin' : ''}`} strokeWidth={2} />
+          </button>
+        )}
       </div>
 
-      {/* Desktop: canvas floats right so the briefing copy wraps alongside it.
-          Rendered only on desktop to avoid mounting Sigma twice. Skipped in the
-          no-briefing state — a near-empty graph reads as a broken widget. */}
-      {!isMobile && hasBriefing && (
+      {!isMobile && hasFinding && (
         <div className="float-right ml-2 mb-2 w-96 aspect-[4/3]">
           <SigmaCanvas
             mode="preview"
@@ -194,9 +207,7 @@ export function BriefingWidget() {
         {hello}.
       </h1>
 
-      {/* Mobile: canvas stacks full-width between title and content so it
-          never appears above the title. */}
-      {isMobile && hasBriefing && (
+      {isMobile && hasFinding && (
         <div className="my-4 w-full aspect-[16/10]">
           <SigmaCanvas
             mode="preview"
@@ -206,9 +217,9 @@ export function BriefingWidget() {
         </div>
       )}
 
-      {hasBriefing ? (
+      {hasFinding ? (
         <BriefingContent
-          content={active!.briefing.content}
+          content={active!.atom.content}
           citations={active!.citations}
           onCitationClick={handleCitationClick}
         />
@@ -222,28 +233,16 @@ export function BriefingWidget() {
         </button>
       )}
 
-      {!hasBriefing && (
+      {!hasFinding && (
         <div className="mt-5 text-[13px] text-[var(--color-text-tertiary)] tabular-nums">
           {chips.join('  ·  ')}
         </div>
       )}
 
-      {hasBriefing && (
-        <div className="mt-4 text-[12px] text-[var(--color-text-tertiary)]">
-          Covers {active!.briefing.atom_count} new atom{active!.briefing.atom_count === 1 ? '' : 's'}
-        </div>
-      )}
-
-      {/* Clear the float so any following sibling (layout-level gap) doesn't collide */}
       <div className="md:clear-right" />
 
-      {/* When there's no briefing yet, surface every capture/import path below
-          the primary CTA so a first-time user can pick whichever source best
-          fits their knowledge base. */}
-      {!hasBriefing && <CaptureOptions />}
+      {!hasFinding && <CaptureOptions />}
 
-      {/* Citation popover — shared with wiki, tolerates the BriefingCitation shape
-          because CitationForPopover only requires {citation_index, atom_id, excerpt}. */}
       {activeCitation && anchorRect && (
         <CitationPopover
           citation={activeCitation}

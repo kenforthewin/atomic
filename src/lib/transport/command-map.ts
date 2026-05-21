@@ -248,39 +248,40 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     path: '/api/embeddings/status/all',
   },
 
-  // ==================== Briefings ====================
-  get_latest_briefing: {
-    method: 'GET',
-    path: '/api/briefings/latest',
-  },
-  list_briefings: {
+  // ==================== Reports ====================
+  // Reports replaced the legacy briefing path in phase 3. Findings are
+  // first-class atoms; their listing is the dashboard widget's data
+  // source via `list_findings_for_report`.
+  list_findings_for_report: {
     method: 'GET',
     path: (a) => {
+      const id = encodeURIComponent(a.report_id as string);
       const params = new URLSearchParams();
       if (a.limit != null) params.set('limit', String(a.limit));
-      return `/api/briefings${params.toString() ? `?${params}` : ''}`;
+      return `/api/reports/${id}/findings${
+        params.toString() ? `?${params}` : ''
+      }`;
     },
   },
-  get_briefing: {
+  list_finding_citations: {
     method: 'GET',
-    path: (a) => `/api/briefings/${encodeURIComponent(a.id as string)}`,
+    path: (a) =>
+      `/api/findings/${encodeURIComponent(a.atom_id as string)}/citations`,
   },
-  run_briefing_now: {
+  run_report_now: {
     method: 'POST',
-    path: '/api/briefings/run',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}/run`,
   },
-  get_briefing_schedule: {
+  get_featured_report_id: {
     method: 'GET',
-    path: '/api/briefings/schedule',
+    path: '/api/dashboard/featured-report',
   },
-  set_briefing_schedule: {
+  set_featured_report_id: {
     method: 'PUT',
-    path: '/api/briefings/schedule',
+    path: '/api/dashboard/featured-report',
     argsMode: 'body',
     transformArgs: (a) => ({
-      frequency: a.frequency,
-      time: a.time,
-      weekday: a.weekday ?? null,
+      report_id: a.report_id ?? null,
     }),
   },
 

@@ -444,6 +444,30 @@ impl SqliteStorage {
         Ok(row)
     }
 
+    pub(crate) fn list_citations_for_finding_sync(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Vec<ReportFindingCitation>> {
+        let conn = self.db.read_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT finding_atom_id, cited_atom_id, position, excerpt
+             FROM report_finding_citations
+             WHERE finding_atom_id = ?1
+             ORDER BY position ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![finding_atom_id], |row| {
+                Ok(ReportFindingCitation {
+                    finding_atom_id: row.get(0)?,
+                    cited_atom_id: row.get(1)?,
+                    position: row.get(2)?,
+                    excerpt: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub(crate) fn list_finding_atom_ids_for_report_sync(
         &self,
         report_id: &str,
@@ -673,6 +697,19 @@ impl ReportStore for SqliteStorage {
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
+    async fn list_citations_for_finding(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Vec<ReportFindingCitation>> {
+        let storage = self.clone();
+        let finding_atom_id = finding_atom_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.list_citations_for_finding_sync(&finding_atom_id)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
     async fn write_finding_transactionally(
         &self,
         atom_request: &CreateAtomRequest,
@@ -698,5 +735,127 @@ impl ReportStore for SqliteStorage {
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+}
+
+// ==================== Phase-3 briefings → findings migration ====================
+
+impl SqliteStorage {
+    pub(crate) fn fetch_legacy_briefings_sync(
+        &self,
+    ) -> StorageResult<Vec<crate::reports::seed::LegacyBriefingRow>> {
+        use crate::reports::seed::{LegacyBriefingCitation, LegacyBriefingRow};
+
+        let conn = self.db.read_conn()?;
+
+        // Table-missing is a valid pre-state: a fresh DB created post-V22
+        // never had `briefings`. Returning empty matches the idempotent
+        // contract.
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='briefings'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(Vec::new());
+        }
+
+        // Deterministic order so positions in the resulting findings line
+        // up with how the user originally saw them.
+        let mut briefings_stmt = conn.prepare(
+            "SELECT id, content, created_at
+             FROM briefings
+             ORDER BY created_at ASC",
+        )?;
+        let briefings: Vec<(String, String, String)> = briefings_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(briefings_stmt);
+
+        let mut citations_stmt = conn.prepare(
+            "SELECT briefing_id, citation_index, atom_id, excerpt
+             FROM briefing_citations
+             ORDER BY briefing_id ASC, citation_index ASC",
+        )?;
+        let citation_rows: Vec<(String, i32, String, String)> = citations_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Bucket citations by briefing_id for an O(n) join.
+        let mut by_briefing: std::collections::HashMap<String, Vec<LegacyBriefingCitation>> =
+            std::collections::HashMap::with_capacity(briefings.len());
+        for (briefing_id, citation_index, atom_id, excerpt) in citation_rows {
+            by_briefing
+                .entry(briefing_id)
+                .or_default()
+                .push(LegacyBriefingCitation {
+                    citation_index,
+                    atom_id,
+                    excerpt,
+                });
+        }
+
+        Ok(briefings
+            .into_iter()
+            .map(|(id, content, created_at)| {
+                let citations = by_briefing.remove(&id).unwrap_or_default();
+                LegacyBriefingRow {
+                    id,
+                    content,
+                    created_at,
+                    citations,
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn drop_legacy_briefing_tables_sync(&self) -> StorageResult<()> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        // `briefing_citations` first — it FKs to `briefings`.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS briefing_citations;
+             DROP TABLE IF EXISTS briefings;
+             DROP INDEX IF EXISTS idx_briefings_created;
+             DROP INDEX IF EXISTS idx_briefing_citations_briefing;",
+        )?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::storage::traits::LegacyBriefingsMigrationStore for SqliteStorage {
+    async fn fetch_legacy_briefings(
+        &self,
+    ) -> StorageResult<Vec<crate::reports::seed::LegacyBriefingRow>> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.fetch_legacy_briefings_sync())
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn drop_legacy_briefing_tables(&self) -> StorageResult<()> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.drop_legacy_briefing_tables_sync())
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 }

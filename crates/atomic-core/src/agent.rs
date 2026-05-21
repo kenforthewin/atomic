@@ -429,13 +429,18 @@ async fn execute_search_atoms(
     let cutoff = since_days.map(crate::search::since_days_cutoff);
     let cutoff_ref = cutoff.as_deref();
 
+    // Chat is an in-app conversational surface over the user's own KB;
+    // finding atoms participate as first-class context just like captured
+    // ones (mirrors the SQLite path that goes through SearchOptions with
+    // its default KindFilter::All).
+    let kinds = crate::models::KindFilter::All;
     let keyword = storage
-        .keyword_search_sync(query, limit * 2, tag_id, cutoff_ref)
+        .keyword_search_sync(query, limit * 2, tag_id, cutoff_ref, &kinds)
         .await
         .map_err(|e| e.to_string())?;
     let semantic = if !embeddings.is_empty() && !embeddings[0].is_empty() {
         storage
-            .vector_search_sync(&embeddings[0], limit * 2, 0.3, tag_id, cutoff_ref)
+            .vector_search_sync(&embeddings[0], limit * 2, 0.3, tag_id, cutoff_ref, &kinds)
             .await
             .map_err(|e| e.to_string())?
     } else {

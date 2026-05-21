@@ -83,6 +83,13 @@ struct ReportGenerationResult {
     citations_used: Vec<i32>,
 }
 
+/// Public re-export of the report output schema for the structured-output
+/// snapshot test. Kept module-public so phase-3 wiring can reach it
+/// without exposing the agent loop internals.
+pub fn report_schema_for_snapshot() -> serde_json::Value {
+    report_schema()
+}
+
 fn report_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",

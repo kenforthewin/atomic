@@ -559,7 +559,9 @@ pub trait ChunkStore: Send + Sync {
 pub trait SearchStore: Send + Sync {
     /// Perform vector similarity search using embeddings.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
-    /// this timestamp are returned.
+    /// this timestamp are returned. `kinds` is non-defaulted so every caller
+    /// declares whether finding atoms are in scope (the UI path passes
+    /// `KindFilter::All`; external tools opt in to `KindFilter::only(Captured)`).
     async fn vector_search(
         &self,
         query_embedding: &[f32],
@@ -567,17 +569,20 @@ pub trait SearchStore: Send + Sync {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Perform keyword search using full-text search.
     /// `created_after` is an optional ISO 8601 cutoff — only atoms created at or after
-    /// this timestamp are returned.
+    /// this timestamp are returned. `kinds` controls the atom-kind filter; see
+    /// `vector_search` for the discipline.
     async fn keyword_search(
         &self,
         query: &str,
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>>;
 
     /// Find atoms similar to a given atom.
@@ -789,48 +794,6 @@ pub trait WikiStore: Send + Sync {
         tag_id: &str,
         max_current_count: Option<i32>,
     ) -> StorageResult<bool>;
-}
-
-// ==================== Briefing Storage ====================
-
-/// Storage operations for daily briefings (the scheduled-task briefing feature).
-#[async_trait]
-pub trait BriefingStore: Send + Sync {
-    /// Fetch up to `limit` atoms with `created_at > since`, newest first.
-    async fn list_new_atoms_since(
-        &self,
-        since: &str,
-        limit: i32,
-        kinds: &crate::models::KindFilter,
-    ) -> StorageResult<Vec<AtomWithTags>>;
-
-    /// Count atoms with `created_at > since`.
-    async fn count_new_atoms_since(&self, since: &str) -> StorageResult<i32>;
-
-    /// Insert a new briefing plus its citations. Returns the briefing joined
-    /// with citations (citations have `source_url` populated via JOIN).
-    async fn insert_briefing(
-        &self,
-        briefing: &crate::briefing::Briefing,
-        citations: &[crate::briefing::BriefingCitation],
-    ) -> StorageResult<crate::briefing::BriefingWithCitations>;
-
-    /// Fetch the most recent briefing (joined with citations).
-    async fn get_latest_briefing(
-        &self,
-    ) -> StorageResult<Option<crate::briefing::BriefingWithCitations>>;
-
-    /// Fetch a specific briefing by id (joined with citations).
-    async fn get_briefing(
-        &self,
-        id: &str,
-    ) -> StorageResult<Option<crate::briefing::BriefingWithCitations>>;
-
-    /// List recent briefings (without citations) for a lightweight history view.
-    async fn list_briefings(&self, limit: i32) -> StorageResult<Vec<crate::briefing::Briefing>>;
-
-    /// Delete a briefing by id. Briefing citations cascade.
-    async fn delete_briefing(&self, id: &str) -> StorageResult<()>;
 }
 
 // ==================== Feed Storage ====================
@@ -1227,6 +1190,14 @@ pub trait ReportStore: Send + Sync {
     async fn list_finding_atom_ids_for_report(&self, report_id: &str)
         -> StorageResult<Vec<String>>;
 
+    /// Every citation row for a finding atom, ordered by `position` ASC so
+    /// the markdown renderer's `[N]` lookup is a direct index. Returns
+    /// empty when the atom isn't a finding (or has no citations).
+    async fn list_citations_for_finding(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Vec<crate::models::ReportFindingCitation>>;
+
     /// One-shot transactional write of the finding atom, its tags, its
     /// provenance row, and all citation rows. On any error the entire
     /// commit is rolled back so a partial write cannot orphan a finding
@@ -1239,6 +1210,29 @@ pub trait ReportStore: Send + Sync {
         provenance: &crate::models::ReportFinding,
         citations: &[crate::models::ReportFindingCitation],
     ) -> StorageResult<crate::models::AtomWithTags>;
+}
+
+/// Minimal raw-access surface kept alive solely so the phase-3 briefings →
+/// finding-atoms migration can read the legacy `briefings` /
+/// `briefing_citations` tables and drop them afterwards.
+///
+/// The full `BriefingStore` was retired in phase 3; everything user-facing
+/// moved onto the reports primitive. These two methods are the only
+/// remaining touchpoints, kept on the supertrait so the migration can run
+/// on any DB an older deployment is upgraded from.
+#[async_trait]
+pub trait LegacyBriefingsMigrationStore: Send + Sync {
+    /// Stream every legacy briefing row joined with its citation rows in a
+    /// deterministic order (briefing.created_at ASC, citation.citation_index
+    /// ASC). Returns an empty Vec if the tables have already been dropped.
+    async fn fetch_legacy_briefings(
+        &self,
+    ) -> StorageResult<Vec<crate::reports::seed::LegacyBriefingRow>>;
+
+    /// Drop the `briefings` and `briefing_citations` tables. Idempotent —
+    /// `DROP TABLE IF EXISTS` semantics so a re-run after a successful
+    /// migration is a no-op.
+    async fn drop_legacy_briefing_tables(&self) -> StorageResult<()>;
 }
 
 // ==================== Supertrait ====================
@@ -1254,7 +1248,6 @@ pub trait Storage:
     + SearchStore
     + ChatStore
     + WikiStore
-    + BriefingStore
     + FeedStore
     + ClusterStore
     + SettingsStore
@@ -1262,6 +1255,7 @@ pub trait Storage:
     + DatabaseStore
     + TaskRunStore
     + ReportStore
+    + LegacyBriefingsMigrationStore
     + Send
     + Sync
 {

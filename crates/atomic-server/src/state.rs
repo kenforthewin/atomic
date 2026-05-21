@@ -269,12 +269,6 @@ pub enum ServerEvent {
         conversation_id: String,
         error: String,
     },
-
-    // Scheduled task events
-    BriefingReady {
-        db_id: String,
-        briefing_id: String,
-    },
 }
 
 impl From<atomic_core::EmbeddingEvent> for ServerEvent {

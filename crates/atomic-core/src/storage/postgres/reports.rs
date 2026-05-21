@@ -463,6 +463,37 @@ impl ReportStore for PostgresStorage {
         Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
+    async fn list_citations_for_finding(
+        &self,
+        finding_atom_id: &str,
+    ) -> StorageResult<Vec<ReportFindingCitation>> {
+        let rows = sqlx::query(
+            "SELECT finding_atom_id, cited_atom_id, position, excerpt
+             FROM report_finding_citations
+             WHERE finding_atom_id = $1 AND db_id = $2
+             ORDER BY position ASC",
+        )
+        .bind(finding_atom_id)
+        .bind(&self.db_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| db_op(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(ReportFindingCitation {
+                finding_atom_id: row
+                    .try_get("finding_atom_id")
+                    .map_err(|e| db_op(e.to_string()))?,
+                cited_atom_id: row
+                    .try_get("cited_atom_id")
+                    .map_err(|e| db_op(e.to_string()))?,
+                position: row.try_get("position").map_err(|e| db_op(e.to_string()))?,
+                excerpt: row.try_get("excerpt").map_err(|e| db_op(e.to_string()))?,
+            });
+        }
+        Ok(out)
+    }
+
     async fn write_finding_transactionally(
         &self,
         atom_request: &CreateAtomRequest,
@@ -548,5 +579,123 @@ impl ReportStore for PostgresStorage {
         self.get_atom(atom_id)
             .await?
             .ok_or_else(|| db_op(format!("finding atom {atom_id} vanished after write")))
+    }
+}
+
+// ==================== Phase-3 briefings → findings migration ====================
+
+#[async_trait]
+impl crate::storage::traits::LegacyBriefingsMigrationStore for PostgresStorage {
+    async fn fetch_legacy_briefings(
+        &self,
+    ) -> StorageResult<Vec<crate::reports::seed::LegacyBriefingRow>> {
+        use crate::reports::seed::{LegacyBriefingCitation, LegacyBriefingRow};
+
+        // The `briefings` table may not exist on a fresh Postgres backend
+        // created post-V22; the seed remains idempotent in that case.
+        let exists: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = current_schema() AND table_name = 'briefings'
+             )",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| db_op(e.to_string()))?;
+        if !exists.map(|(e,)| e).unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+
+        let briefing_rows = sqlx::query(
+            "SELECT id, content, created_at FROM briefings
+             WHERE db_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(&self.db_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| db_op(e.to_string()))?;
+
+        let citation_rows = sqlx::query(
+            "SELECT briefing_id, citation_index, atom_id, excerpt FROM briefing_citations
+             WHERE db_id = $1 ORDER BY briefing_id ASC, citation_index ASC",
+        )
+        .bind(&self.db_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| db_op(e.to_string()))?;
+
+        let mut by_briefing: std::collections::HashMap<String, Vec<LegacyBriefingCitation>> =
+            std::collections::HashMap::new();
+        for row in citation_rows {
+            let briefing_id: String = row
+                .try_get("briefing_id")
+                .map_err(|e| db_op(e.to_string()))?;
+            by_briefing
+                .entry(briefing_id)
+                .or_default()
+                .push(LegacyBriefingCitation {
+                    citation_index: row
+                        .try_get("citation_index")
+                        .map_err(|e| db_op(e.to_string()))?,
+                    atom_id: row.try_get("atom_id").map_err(|e| db_op(e.to_string()))?,
+                    excerpt: row.try_get("excerpt").map_err(|e| db_op(e.to_string()))?,
+                });
+        }
+
+        let mut out = Vec::with_capacity(briefing_rows.len());
+        for row in briefing_rows {
+            let id: String = row.try_get("id").map_err(|e| db_op(e.to_string()))?;
+            let citations = by_briefing.remove(&id).unwrap_or_default();
+            out.push(LegacyBriefingRow {
+                id,
+                content: row.try_get("content").map_err(|e| db_op(e.to_string()))?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|e| db_op(e.to_string()))?,
+                citations,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn drop_legacy_briefing_tables(&self) -> StorageResult<()> {
+        // Shared Postgres deployments multiplex many logical DBs onto one
+        // schema; we cannot DROP the global tables while another db_id may
+        // still own rows there. So: delete this db_id's rows first, and
+        // only DROP TABLE when no rows remain across any db_id.
+        let mut tx = self.pool.begin().await.map_err(|e| db_op(e.to_string()))?;
+
+        sqlx::query("DELETE FROM briefing_citations WHERE db_id = $1")
+            .bind(&self.db_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_op(e.to_string()))?;
+        sqlx::query("DELETE FROM briefings WHERE db_id = $1")
+            .bind(&self.db_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_op(e.to_string()))?;
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COALESCE((SELECT COUNT(*) FROM briefings), 0)
+                  + COALESCE((SELECT COUNT(*) FROM briefing_citations), 0)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_op(e.to_string()))?;
+
+        if remaining.0 == 0 {
+            sqlx::query("DROP TABLE IF EXISTS briefing_citations")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_op(e.to_string()))?;
+            sqlx::query("DROP TABLE IF EXISTS briefings")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_op(e.to_string()))?;
+        }
+
+        tx.commit().await.map_err(|e| db_op(e.to_string()))?;
+        Ok(())
     }
 }

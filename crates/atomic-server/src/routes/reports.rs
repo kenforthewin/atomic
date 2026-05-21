@@ -164,6 +164,19 @@ pub async fn list_findings_for_report(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/findings/{atom_id}/citations",
+    responses(
+        (status = 200, description = "Citation rows for a finding atom, ordered by position",
+         body = Vec<atomic_core::models::ReportFindingCitation>)
+    ),
+    tag = "reports"
+)]
+pub async fn list_finding_citations(db: Db, path: web::Path<String>) -> HttpResponse {
+    ok_or_error(db.0.list_citations_for_finding(&path.into_inner()).await)
+}
+
 /// Async manual-run response. Includes the report id and a hint at where
 /// to poll for results; the actual finding atom shows up via the
 /// findings endpoint once the agent loop completes.

@@ -18,6 +18,7 @@ impl SqliteStorage {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let query_blob = f32_vec_to_blob_public(query_embedding);
         let conn = self.db.read_conn()?;
@@ -45,6 +46,19 @@ impl SqliteStorage {
         } else {
             std::collections::HashSet::new()
         };
+        // Kind filtering. `None` short-circuits `KindFilter::All`.
+        let kind_allowed: Option<std::collections::HashSet<String>> =
+            if matches!(kinds, crate::models::KindFilter::All) {
+                None
+            } else {
+                let candidate_atom_ids: Vec<&str> =
+                    chunk_map.values().map(|(aid, _, _)| aid.as_str()).collect();
+                Some(batch_atoms_matching_kind(
+                    &conn,
+                    &candidate_atom_ids,
+                    kinds,
+                )?)
+            };
 
         // Deduplicate by atom_id, keeping best score
         let mut atom_best: HashMap<String, (f32, String, i32)> = HashMap::new();
@@ -53,6 +67,11 @@ impl SqliteStorage {
             if let Some((atom_id, content, chunk_index)) = chunk_map.get(chunk_id) {
                 if !scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
                     continue;
+                }
+                if let Some(ref allowed) = kind_allowed {
+                    if !allowed.contains(atom_id) {
+                        continue;
+                    }
                 }
                 let entry = atom_best.entry(atom_id.clone());
                 match entry {
@@ -109,6 +128,7 @@ impl SqliteStorage {
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let conn = self.db.read_conn()?;
 
@@ -135,6 +155,18 @@ impl SqliteStorage {
                 .collect::<Vec<_>>()
         } else {
             raw_results
+        };
+
+        // Apply kind filter post-pass (FTS index is kind-agnostic).
+        let filtered = if matches!(kinds, crate::models::KindFilter::All) {
+            filtered
+        } else {
+            let candidate_atom_ids: Vec<&str> = filtered.iter().map(|r| r.0.as_str()).collect();
+            let allowed = batch_atoms_matching_kind(&conn, &candidate_atom_ids, kinds)?;
+            filtered
+                .into_iter()
+                .filter(|r| allowed.contains(&r.0))
+                .collect()
         };
 
         // Sort by BM25 ascending (lower = better) then truncate
@@ -340,7 +372,15 @@ impl SqliteStorage {
             });
         }
 
-        let atoms = self.keyword_search_sync(query, section_limit, None, None)?;
+        // Global search is the in-app palette — show every kind, mirroring
+        // the UI list/canvas surfaces.
+        let atoms = self.keyword_search_sync(
+            query,
+            section_limit,
+            None,
+            None,
+            &crate::models::KindFilter::All,
+        )?;
         let wiki = keyword_search_wiki(&conn, &escaped_query, section_limit)?;
         let chats = keyword_search_chats(&conn, &escaped_query, &trimmed_query, section_limit)?;
         let tags = keyword_search_tags(&conn, &trimmed_query, section_limit)?;
@@ -363,11 +403,13 @@ impl SearchStore for SqliteStorage {
         threshold: f32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let storage = self.clone();
         let query_embedding = query_embedding.to_vec();
         let tag_id = tag_id.map(|s| s.to_string());
         let created_after = created_after.map(|s| s.to_string());
+        let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
             storage.vector_search_sync(
                 &query_embedding,
@@ -375,6 +417,7 @@ impl SearchStore for SqliteStorage {
                 threshold,
                 tag_id.as_deref(),
                 created_after.as_deref(),
+                &kinds,
             )
         })
         .await
@@ -387,13 +430,21 @@ impl SearchStore for SqliteStorage {
         limit: i32,
         tag_id: Option<&str>,
         created_after: Option<&str>,
+        kinds: &crate::models::KindFilter,
     ) -> StorageResult<Vec<SemanticSearchResult>> {
         let storage = self.clone();
         let query = query.to_string();
         let tag_id = tag_id.map(|s| s.to_string());
         let created_after = created_after.map(|s| s.to_string());
+        let kinds = kinds.clone();
         tokio::task::spawn_blocking(move || {
-            storage.keyword_search_sync(&query, limit, tag_id.as_deref(), created_after.as_deref())
+            storage.keyword_search_sync(
+                &query,
+                limit,
+                tag_id.as_deref(),
+                created_after.as_deref(),
+                &kinds,
+            )
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?

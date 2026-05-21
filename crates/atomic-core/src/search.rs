@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 use crate::embedding::{distance_to_similarity, f32_vec_to_blob_public};
-use crate::models::{Atom, AtomWithTags, SemanticSearchResult, SimilarAtomResult, Tag};
+use crate::models::{Atom, AtomWithTags, KindFilter, SemanticSearchResult, SimilarAtomResult, Tag};
 use crate::providers::{get_embedding_provider, EmbeddingConfig, ProviderConfig};
 use crate::settings::get_all_settings;
 
@@ -39,6 +39,12 @@ pub struct SearchOptions {
     pub scope_tag_ids: Vec<String>,
     /// Optional recency filter: only return atoms created within the last N days
     pub since_days: Option<i32>,
+    /// Atom-kind filter. Defaults to `KindFilter::All` so existing callers
+    /// (UI, chat, wiki) keep their unfiltered behavior; external surfaces
+    /// (the MCP `semantic_search` tool, and any future `?kinds=` query
+    /// parameter on `/api/search`) opt in to a tighter filter — typically
+    /// `KindFilter::only(AtomKind::Captured)` to exclude report findings.
+    pub kinds: KindFilter,
 }
 
 impl SearchOptions {
@@ -50,6 +56,7 @@ impl SearchOptions {
             threshold: 0.3,
             scope_tag_ids: vec![],
             since_days: None,
+            kinds: KindFilter::All,
         }
     }
 
@@ -67,6 +74,11 @@ impl SearchOptions {
         self.since_days = since_days;
         self
     }
+
+    pub fn with_kinds(mut self, kinds: KindFilter) -> Self {
+        self.kinds = kinds;
+        self
+    }
 }
 
 impl Default for SearchOptions {
@@ -78,6 +90,7 @@ impl Default for SearchOptions {
             threshold: 0.3,
             scope_tag_ids: vec![],
             since_days: None,
+            kinds: KindFilter::All,
         }
     }
 }
@@ -431,6 +444,8 @@ async fn search_keyword_chunks(
 
     // Apply tag scope filter if specified
     let filtered = filter_by_scope(&conn, raw_results, &options.scope_tag_ids)?;
+    // Apply atom-kind filter (e.g. exclude report findings on external paths).
+    let filtered = filter_by_kind(&conn, filtered, &options.kinds)?;
 
     // Convert to ChunkResult with normalized scores
     Ok(filtered
@@ -552,6 +567,13 @@ async fn search_semantic_chunks(
     } else {
         std::collections::HashSet::new()
     };
+    // Same shape for the kind filter: one batch lookup, then a per-chunk
+    // gate in the loop below. `None` means `KindFilter::All` (no filtering).
+    let kind_allowed_atom_ids = batch_atom_ids_matching_kind(
+        &conn,
+        chunk_map.values().map(|(aid, _, _)| aid.as_str()),
+        &options.kinds,
+    )?;
 
     let mut results = Vec::new();
     for (chunk_id, distance) in filtered {
@@ -559,6 +581,11 @@ async fn search_semantic_chunks(
         if let Some((atom_id, content, chunk_index)) = chunk_map.get(&chunk_id) {
             if !options.scope_tag_ids.is_empty() && !scope_atom_ids.contains(atom_id) {
                 continue;
+            }
+            if let Some(ref allowed) = kind_allowed_atom_ids {
+                if !allowed.contains(atom_id) {
+                    continue;
+                }
             }
             results.push(ChunkResult {
                 chunk_id,
@@ -662,6 +689,83 @@ fn filter_by_scope<T>(
         .filter(|r| matching_atom_ids.contains(r.1.as_str()))
         .collect();
     Ok(filtered)
+}
+
+/// Filter results by atom-kind discriminator. Mirrors `filter_by_scope` in
+/// shape — one batch lookup against the atoms table, then a `retain`. The
+/// FTS / vec virtual tables are kind-blind by design (kind isn't part of
+/// the index), so the filter lives in the post-pass rather than the
+/// underlying SQL. `KindFilter::All` short-circuits.
+fn filter_by_kind<T>(
+    conn: &rusqlite::Connection,
+    results: Vec<(String, String, String, i32, T)>,
+    kinds: &KindFilter,
+) -> Result<Vec<(String, String, String, i32, T)>, String> {
+    let allowed = batch_atom_ids_matching_kind(conn, results.iter().map(|r| r.1.as_str()), kinds)?;
+    let Some(allowed) = allowed else {
+        // KindFilter::All — no filtering.
+        return Ok(results);
+    };
+    Ok(results
+        .into_iter()
+        .filter(|r| allowed.contains(r.1.as_str()))
+        .collect())
+}
+
+/// Resolve the set of atom_ids in `candidates` whose `kind` is within the
+/// filter. Returns `None` for `KindFilter::All` so callers can skip the
+/// allocation; returns an empty set for `KindFilter::Only(vec![])`
+/// (defensive — matches the empty-only short-circuit elsewhere in the
+/// codebase).
+fn batch_atom_ids_matching_kind<'a>(
+    conn: &rusqlite::Connection,
+    candidates: impl Iterator<Item = &'a str>,
+    kinds: &KindFilter,
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    let kinds = match kinds {
+        KindFilter::All => return Ok(None),
+        KindFilter::Only(ks) => ks,
+    };
+    if kinds.is_empty() {
+        return Ok(Some(std::collections::HashSet::new()));
+    }
+    let candidate_ids: Vec<&str> = candidates.collect();
+    if candidate_ids.is_empty() {
+        return Ok(Some(std::collections::HashSet::new()));
+    }
+
+    let atom_placeholders: Vec<&str> = candidate_ids.iter().map(|_| "?").collect();
+    let kind_placeholders: Vec<&str> = kinds.iter().map(|_| "?").collect();
+    let query = format!(
+        "SELECT id FROM atoms WHERE id IN ({}) AND kind IN ({})",
+        atom_placeholders.join(","),
+        kind_placeholders.join(","),
+    );
+
+    let kind_strs: Vec<&'static str> = kinds.iter().map(|k| k.as_str()).collect();
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        Vec::with_capacity(candidate_ids.len() + kind_strs.len());
+    for id in &candidate_ids {
+        params.push(id);
+    }
+    for k in &kind_strs {
+        params.push(k);
+    }
+
+    let mut stmt = conn
+        .prepare(&query)
+        .map_err(|e| format!("Failed to prepare kind query: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("Failed to execute kind query: {}", e))?;
+
+    let mut allowed = std::collections::HashSet::new();
+    for row in rows {
+        allowed.insert(row.map_err(|e| format!("Failed to read kind result: {}", e))?);
+    }
+    Ok(Some(allowed))
 }
 
 /// Batch check which atom_ids have at least one of the specified scope tags.
