@@ -199,10 +199,34 @@ export const ScheduleField = memo(function ScheduleField({
   const [hour, setHour] = useState(initial.hour);
   const [minute, setMinute] = useState(initial.minute);
   const [weekday, setWeekday] = useState(initial.weekday);
-  const [customCron, setCustomCron] = useState(preset === 'custom' ? cron : cron);
+  const [customCron, setCustomCron] = useState(cron);
 
   const resolvedTz = tz ?? getBrowserTimeZone();
   const supportedTzs = useMemo(() => getSupportedTimeZones(), []);
+
+  // Sync internal state when the `cron` prop changes from outside —
+  // template-gallery prefill, edit-modal opening on a different
+  // report, etc. `useState` initializers only fire on mount, so
+  // without this the modal stays seeded with the DEFAULT_FORM cron
+  // ("daily 9am") even after the parent's setForm swaps to the
+  // template's "weekly Monday 9am".
+  //
+  // Idempotent against the user's own edits: when the user changes a
+  // control, emit → onChange → parent state → `cron` prop loops back
+  // at the same value `detectPreset` will return, so the setState
+  // calls below are no-ops (React skips setState when the value is
+  // referentially equal). Only externally-initiated prop changes
+  // produce real updates.
+  useEffect(() => {
+    const next = detectPreset(cron);
+    setPreset(next.preset);
+    setHour(next.hour);
+    setMinute(next.minute);
+    setWeekday(next.weekday);
+    if (next.preset === 'custom') {
+      setCustomCron(cron);
+    }
+  }, [cron]);
 
   // Lift changes to the parent whenever any control changes. The parent
   // is the source of truth for `cron` + `tz`; this component just
