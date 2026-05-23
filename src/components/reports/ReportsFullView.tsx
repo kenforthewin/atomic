@@ -20,7 +20,6 @@ export function ReportsFullView() {
   const lastFindingByReport = useReportsStore(s => s.lastFindingByReport);
   const isLoadingList = useReportsStore(s => s.isLoadingList);
   const fetchAll = useReportsStore(s => s.fetchAll);
-  const reset = useReportsStore(s => s.reset);
   const setEnabled = useReportsStore(s => s.setEnabled);
   const deleteReport = useReportsStore(s => s.delete);
   const ensureSubscription = useReportsStore(s => s.ensureSubscription);
@@ -36,9 +35,13 @@ export function ReportsFullView() {
     ensureSubscription();
   }, [fetchAll, ensureSubscription]);
 
-  useEffect(() => {
-    return () => { reset(); };
-  }, [reset]);
+  // Note: no `reset()` on unmount. The data in useReportsStore is
+  // shared with ReportDetailView, the TabStrip's report-tab labels,
+  // and the AtomCreated subscription's completion-matching logic.
+  // Wiping it on view unmount empties byId before those consumers
+  // can read it, causing blank detail pages and "Report N" fallback
+  // labels. The wiki pattern that inspired this isn't a fit because
+  // wikis aren't shared across views the way reports are.
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingReport, setEditingReport] = useState<Report | null>(null);

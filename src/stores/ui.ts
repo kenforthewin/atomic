@@ -643,10 +643,16 @@ export const useUIStore = create<UIStore>()(
       },
 
       closeReportDetail: () => {
+        // Deactivate-without-close, mirroring `overlayDismiss`. Reports
+        // are a small, persistent set per database — users routinely
+        // bounce between the list and a specific report's detail view,
+        // and `closeTab` semantics (which actually destroy the tab)
+        // make every round-trip create a fresh tab with an incremented
+        // ordinal. Keep the tab in the strip; the X button on the pill
+        // is the explicit close affordance.
         const state = get();
-        if (state.activeTabId) {
-          state.closeTab(state.activeTabId);
-        }
+        state.deactivateTabs();
+        navigateTo(viewPath('reports', state.selectedTagId));
       },
 
       overlayNavigate: (entry, opts) => {
