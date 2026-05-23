@@ -1,6 +1,6 @@
 ---
 title: WebSocket Events
-description: Subscribe to realtime Atomic server events for pipeline progress, chat streaming, ingestion, feeds, and briefings.
+description: Subscribe to realtime Atomic server events for pipeline progress, chat streaming, ingestion, feeds, and reports.
 ---
 
 Atomic broadcasts realtime events over a WebSocket endpoint:
@@ -59,6 +59,8 @@ Frontend-normalized names include `embedding-started`, `embedding-complete`, `ta
 
 These are emitted when atoms are created or updated through API, bulk create, or MCP paths that broadcast lifecycle events.
 
+Report findings ride this same channel: a successful scheduled or manual report run broadcasts `AtomCreated` with the new finding atom (which has `kind = 'report'`). The UI filters on `kind` to react only to findings when that matters.
+
 ## Import and Ingestion Events
 
 - `ImportProgress`
@@ -84,18 +86,18 @@ These power progress UI for Obsidian import, URL ingestion, browser clipping, iO
 
 The message send endpoint returns a final response, but the UI receives streaming deltas and tool events over WebSocket.
 
-## Briefing Events
+## Dashboard Events
 
-- `BriefingReady`
+- `DashboardFeaturedChanged`
 
-The payload includes `db_id` and `briefing_id`.
+Emitted when the per-database featured-report pointer changes — explicitly via `PUT /api/dashboard/featured-report`, or implicitly when the featured report is deleted (the backend auto-clears the pointer in that case). The payload carries the new `report_id` (or `null` when cleared) so the dashboard widget and any open report detail-view star can refetch without polling. Frontend-normalized name: `dashboard-featured-changed`.
 
 ## Lag Handling
 
-The server uses a broadcast channel. If a client falls behind, it can receive an `EventsLagged` event with the number of skipped events. Clients should reconcile state by refetching the relevant resource, such as atoms, pipeline status, or the latest briefing.
+The server uses a broadcast channel. If a client falls behind, it can receive an `EventsLagged` event with the number of skipped events. Clients should reconcile state by refetching the relevant resource — atoms, pipeline status, or the latest finding from the featured report.
 
 ## Related
 
 - [API Overview](/api/overview/)
-- [Daily Briefings](/concepts/daily-briefings/)
+- [Reports](/concepts/reports/)
 - [URL Ingestion and Feeds](/guides/url-ingestion-and-feeds/)

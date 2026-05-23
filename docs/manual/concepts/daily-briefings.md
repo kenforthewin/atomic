@@ -1,63 +1,37 @@
 ---
 title: Daily Briefings
-description: Generate cited summaries of recently added atoms.
+description: The default seeded report — a daily cited recap of recently captured atoms.
 ---
 
-Daily briefings summarize recently captured atoms and show citations back to source atoms. They are designed for catching up on what changed in your knowledge base.
+The Daily Briefing is the default **report** that's seeded into every Atomic database on first run. It fills the dashboard widget out of the box: each morning it summarizes recently captured atoms into a short cited briefing.
 
-## How Briefings Work
+It's no longer its own primitive — the briefing was generalized into **Reports** in v1.39, and the Daily Briefing is now just one instance of that. Everything you used to do with briefings (configure the schedule, edit the prompt, view history) you now do as a report.
 
-The daily briefing task:
+## The Reframe
 
-1. Looks for atoms created since the last successful briefing run.
-2. Uses an LLM to identify important themes and related context.
-3. Writes a short briefing with citation markers.
-4. Stores the briefing and citation rows.
-5. Emits a `briefing-ready` WebSocket event when a new briefing is available.
+| Before | Now |
+|---|---|
+| A hard-coded scheduled task. | A seeded report you can edit, scope, disable, or delete. |
+| One per database. | Any number of reports per database; one is "featured" on the dashboard. |
+| Briefing stored in its own table. | Each run writes a regular atom with `kind = 'report'`. |
+| `/api/briefings/*` REST routes. | `/api/reports/*` and `/api/dashboard/featured-report`. |
+| `BriefingReady` WebSocket event. | Standard `atom-created` event (filter on `kind === 'report'`). |
+| `task.daily_briefing.*` settings. | The report row itself — schedule, prompt, scope all live on the `reports` table. |
 
-If there are no new atoms in the window, Atomic does not create a new briefing. It still advances the last-run timestamp so the quiet period does not repeatedly generate empty summaries.
+If you had a customized briefing prompt or schedule before upgrading, it carried forward into the seeded Daily Briefing report. Past briefings were migrated into finding atoms with their citations preserved.
 
-## Schedule
+## Editing the Daily Briefing
 
-Fresh databases seed these settings:
+Open the Reports view (Telescope icon in the top nav), find the seeded "Daily Briefing" row, and click into it. The schedule editor offers daily / weekly / hourly presets and a custom-cron escape hatch. The prompt is freely editable.
 
-| Setting | Default |
-|---------|---------|
-| `task.daily_briefing.enabled` | `true` |
-| `task.daily_briefing.interval_hours` | `24` |
+You can also add **additional** topic-scoped briefings from the template gallery (e.g. "Daily AI Briefing" scoped to an AI tag subtree) and feature whichever one you want on the dashboard via the star icon on the detail view.
 
-The scheduled task runs per database on the server. This matters in multi-database setups: each database has its own briefing state.
+## Disabling It
 
-## Run Manually
-
-```bash
-curl -X POST http://localhost:8080/api/briefings/run \
-  -H "Authorization: Bearer <token>"
-```
-
-If a briefing is generated, the response contains the briefing and citations. If no new atoms are available, the route can return no content.
-
-## Read Briefings
-
-```bash
-curl http://localhost:8080/api/briefings/latest \
-  -H "Authorization: Bearer <token>"
-
-curl http://localhost:8080/api/briefings?limit=20 \
-  -H "Authorization: Bearer <token>"
-
-curl http://localhost:8080/api/briefings/<briefing-id> \
-  -H "Authorization: Bearer <token>"
-```
-
-## Troubleshooting
-
-- If no briefing appears, add atoms and run the task after the server has processed them.
-- If generation fails, check the configured wiki model/provider because briefings use the wiki-model path.
-- If self-hosting multiple databases, verify you are viewing the database that received the new atoms.
+Open the Daily Briefing's detail view and toggle the "Enabled" switch in the editor, or delete the report outright. Past findings stay in your knowledge base; the dashboard widget will show its empty state.
 
 ## Related
 
-- [AI Providers](/getting-started/ai-providers/)
-- [Atoms](/concepts/atoms/)
-- [WebSocket Events](/api/websocket-events/)
+- [Reports](/concepts/reports/) — the full primitive
+- [Atoms](/concepts/atoms/) — what findings are
+- [WebSocket Events](/api/websocket-events/) — `atom-created` for kind=report

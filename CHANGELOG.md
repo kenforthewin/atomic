@@ -2,6 +2,14 @@
 
 All notable changes to Atomic are documented here.
 
+## Unreleased
+
+- Add **Reports** — scheduled research over your knowledge base, with each run writing a single cited finding as a first-class atom. Reports are configurable from a new top-nav view: schedule (cron + timezone, with presets and a custom escape hatch), source scope (tags + time window), context scope (same-as-source / all / specific tags), and citation policy (source-only / source-and-context).
+- Add a curated template gallery for new reports: Daily Briefing, Weekly Contradiction Scan, Open Questions Status, and Themes This Month — each ships with a hand-written research prompt that pre-fills the editor.
+- Add a dashboard featured-report picker so any report (not just the seeded Daily Briefing) can fill the dashboard widget. The pointer is per-database and syncs across windows via a new `dashboard-featured-changed` WebSocket event.
+- Collapse the legacy daily briefing into Reports. The Daily Briefing is now the default seeded report (one per database); your existing briefing schedule, prompt, and history were migrated in place. Past briefings became finding atoms with their citations preserved. The `/api/briefings/*` REST routes and `BriefingReady` event are removed; equivalent functionality lives at `/api/reports/*` and the standard `atom-created` event filtered on `kind === 'report'`.
+- Add a Run Now button on each report's detail view, with optimistic running state that clears via the success event or a periodic poll for the failure path.
+
 ## v1.38.0 — 2026-05-16
 
 - Add `edit_atom` MCP tool for surgical atom edits (replace, insert after, append, replace all) usable by Claude and other MCP clients

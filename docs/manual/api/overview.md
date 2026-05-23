@@ -84,7 +84,9 @@ Website deployments can override that source with `PUBLIC_ATOMIC_OPENAPI_URL`, w
 | Tags | `/api/tags`, children, auto-tag targets |
 | Search | `/api/search`, `/api/search/global` |
 | Wiki | `/api/wiki`, generate, update, propose, proposal accept/dismiss, related tags, links, versions |
-| Briefings | `/api/briefings/latest`, `/api/briefings`, `/api/briefings/run`, `/api/briefings/{id}` |
+| Reports | `/api/reports`, `/api/reports/{id}`, `/api/reports/{id}/enabled`, `/api/reports/{id}/run`, `/api/reports/{id}/findings` |
+| Findings | `/api/findings/{atom_id}/citations` |
+| Dashboard | `/api/dashboard/featured-report` |
 | Chat | `/api/conversations`, scopes, messages |
 | Canvas | `/api/canvas/positions`, `/api/canvas/level`, `/api/canvas/global` |
 | Graph | `/api/graph/edges`, `/api/graph/neighborhood/{atom_id}`, rebuild edges |

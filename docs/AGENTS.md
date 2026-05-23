@@ -27,7 +27,7 @@ Because the sync is a wholesale `cp -R docs/manual src/content/docs`, never put 
 
 Verify docs against implementation before editing:
 
-- Product architecture and domain behavior: `crates/atomic-core/src/lib.rs`, `crates/atomic-core/src/models.rs`, and focused modules such as `embedding.rs`, `search.rs`, `wiki/`, `agent.rs`, `canvas_level.rs`, `briefing/`, `scheduler/`, and `ingest/`.
+- Product architecture and domain behavior: `crates/atomic-core/src/lib.rs`, `crates/atomic-core/src/models.rs`, and focused modules such as `embedding.rs`, `search.rs`, `wiki/`, `agent.rs`, `canvas_level.rs`, `reports/`, `scheduler/`, and `ingest/`.
 - REST routes and request/response behavior: `crates/atomic-server/src/routes/mod.rs`, the individual files in `crates/atomic-server/src/routes/`, and the generated OpenAPI annotations in those files.
 - API explorer and OpenAPI URL: `GET /api/docs/openapi.json` and `/api/docs` from `crates/atomic-server/src/main.rs`.
 - Frontend command names, argument transforms, and event subscriptions: `src/lib/transport/command-map.ts`, `src/lib/transport/event-normalizer.ts`, `src/stores/`, and the relevant components in `src/components/`.
@@ -55,7 +55,7 @@ Good manual pages are specific, verifiable, and task-oriented:
 - Show request bodies and important response fields for API workflows.
 - Explain background behavior that affects user expectations, especially async embedding/tagging, WebSocket events, scheduled jobs, feed polling, and multi-database scope.
 - Include verification steps such as checking `/health`, `/api/docs`, `/api/embeddings/status`, token list output, or UI state.
-- Include failure modes when they are common: missing provider key, Ollama not running, stale token, duplicate source URL, no new briefing content, sqlite-vec issues, CORS/reverse proxy problems, or mobile server reachability.
+- Include failure modes when they are common: missing provider key, Ollama not running, stale token, duplicate source URL, empty-scope report runs, sqlite-vec issues, CORS/reverse proxy problems, or mobile server reachability.
 - Link related pages with site-relative manual links such as `/getting-started/ai-providers/`.
 - Keep descriptions accurate across desktop, headless server, web, and iOS. Do not imply a UI flow exists on every client unless code confirms it.
 
@@ -103,11 +103,11 @@ Do not force every page into this structure. Concept pages can be shorter, but t
 
 The current manual is intentionally small and several implemented features need fuller coverage. When improving docs, prioritize these gaps:
 
-- Daily briefings: scheduled task, run-now endpoint, citations, settings keys, empty-window behavior, and `briefing-ready` event.
+- Reports primitive: CRUD endpoints, schedule + scope semantics, run-now behavior, finding atoms (`kind = 'report'`), citation rows, dashboard featured pointer, the curated template gallery, and migrating from the legacy daily-briefing routes.
 - Setup and first-run claiming flow for self-hosted/web instances.
 - Multi-database behavior: active vs default database, per-database settings caveats, export jobs, stats, and mobile/MCP implications.
 - Full API workflows beyond the overview: atoms, tags, search modes, wiki proposal/version lifecycle, chat streaming, canvas/graph/clustering, feeds, ingestion, imports, exports, logs, and embedding maintenance.
-- WebSocket events: embedding/tagging pipeline, chat streaming/tool events, ingestion/feed events, queue progress, atom lifecycle events, lag handling, and briefing events.
+- WebSocket events: embedding/tagging pipeline, chat streaming/tool events, ingestion/feed events, queue progress, atom lifecycle events (including report findings flowing through `AtomCreated`), `DashboardFeaturedChanged`, and lag handling.
 - AI providers: OpenRouter, Ollama, and OpenAI-compatible providers, including model defaults, embedding dimensions, context length, connection tests, and re-embedding implications.
 - Browser extension configuration and real installation/build steps from `extension/`.
 - MCP remote OAuth/discovery behavior, Streamable HTTP endpoint details, bridge environment variables, and multi-database `db` query use.

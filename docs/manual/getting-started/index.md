@@ -30,7 +30,7 @@ This happens in the background. You can keep writing while Atomic processes the 
 - **Agentic Chat** - Converse with your knowledge base using RAG.
 - **Spatial Canvas** - Visualize atoms and relationships as a force-directed graph.
 - **Auto-Tagging** - Extract hierarchical tags from new content.
-- **Daily Briefings** - Summarize recently captured atoms with citations.
+- **Reports** - Scheduled research over your notes; each run produces a cited finding atom.
 - **RSS and URL Ingestion** - Save web pages and subscribe to feeds.
 - **MCP Integration** - Connect Claude and other AI assistants.
 - **Mobile Access** - Connect the iOS app to a self-hosted server.

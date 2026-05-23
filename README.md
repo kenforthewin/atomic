@@ -35,6 +35,7 @@ https://github.com/user-attachments/assets/1992fcf7-1d6b-41b1-a177-2da2e8b57676
 - **Semantic Search** — Vector search over your knowledge base using sqlite-vec
 - **Canvas** — Force-directed spatial visualization where semantic similarity determines layout
 - **Wiki Synthesis** — LLM-generated articles with inline citations, built from your notes
+- **Reports** — Scheduled research tasks that turn your atoms into recurring cited findings (daily briefings, contradiction scans, open-question tracking)
 - **Chat** — Agentic RAG interface that searches your knowledge base during conversation
 - **Auto-Tagging** — LLM-powered tag extraction organized into hierarchical categories
 - **Multiple AI Providers** — OpenRouter, Ollama, or any OpenAI-compatible provider for embeddings and LLMs
