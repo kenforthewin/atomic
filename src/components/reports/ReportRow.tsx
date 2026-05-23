@@ -1,7 +1,9 @@
-import { memo, useMemo } from 'react';
+import { memo, useMemo, useState } from 'react';
+import { MoreVertical, Pencil, Power, Trash2 } from 'lucide-react';
 import { Report, ReportFindingWithAtom } from '../../stores/reports';
 import { StatusBadge } from './StatusBadge';
 import { ScheduleStrip } from './ScheduleStrip';
+import { ContextMenu } from '../ui/ContextMenu';
 
 interface ReportRowProps {
   report: Report;
@@ -14,6 +16,12 @@ interface ReportRowProps {
   /// column when true. Wired up in 4c; 4a always passes false.
   isFeatured?: boolean;
   onClick?: (reportId: string) => void;
+  /// Row-level actions. When any is provided, an overflow (⋮) button
+  /// appears in the status column. Omit them all (4a) to render a
+  /// read-only row.
+  onEdit?: (reportId: string) => void;
+  onToggleEnabled?: (reportId: string, next: boolean) => void;
+  onDelete?: (reportId: string) => void;
 }
 
 /// One row in the reports list. Three-column geometry:
@@ -36,6 +44,9 @@ export const ReportRow = memo(function ReportRow({
   isRunning = false,
   isFeatured = false,
   onClick,
+  onEdit,
+  onToggleEnabled,
+  onDelete,
 }: ReportRowProps) {
   const excerpt = useMemo(() => {
     if (lastFinding === undefined) return null;        // loading
@@ -44,6 +55,35 @@ export const ReportRow = memo(function ReportRow({
   }, [lastFinding]);
 
   const interactive = Boolean(onClick);
+  const hasActions = Boolean(onEdit || onToggleEnabled || onDelete);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+
+  const menuItems = useMemo(() => {
+    const items = [];
+    if (onEdit) {
+      items.push({
+        label: 'Edit…',
+        icon: <Pencil className="w-3.5 h-3.5" strokeWidth={2} />,
+        onClick: () => onEdit(report.id),
+      });
+    }
+    if (onToggleEnabled) {
+      items.push({
+        label: report.enabled ? 'Pause' : 'Enable',
+        icon: <Power className="w-3.5 h-3.5" strokeWidth={2} />,
+        onClick: () => onToggleEnabled(report.id, !report.enabled),
+      });
+    }
+    if (onDelete) {
+      items.push({
+        label: 'Delete',
+        icon: <Trash2 className="w-3.5 h-3.5" strokeWidth={2} />,
+        onClick: () => onDelete(report.id),
+        danger: true,
+      });
+    }
+    return items;
+  }, [onEdit, onToggleEnabled, onDelete, report.id, report.enabled]);
 
   return (
     <div
@@ -104,9 +144,39 @@ export const ReportRow = memo(function ReportRow({
       </div>
 
       {/* Status column */}
-      <div className="shrink-0">
+      <div className="shrink-0 flex items-center gap-2">
         <StatusBadge report={report} isRunning={isRunning} />
+        {hasActions && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              // Anchor the menu at the button's bottom-right corner.
+              // ContextMenu nudges itself into the viewport on overflow.
+              setMenuPos({ x: rect.right - 160, y: rect.bottom + 4 });
+            }}
+            title="Report actions"
+            aria-label="Report actions"
+            className="
+              p-1 rounded-md text-[var(--color-text-tertiary)]
+              hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]
+              transition-colors
+              opacity-0 group-hover:opacity-100 focus:opacity-100
+            "
+          >
+            <MoreVertical className="w-4 h-4" strokeWidth={2} />
+          </button>
+        )}
       </div>
+
+      {menuPos && (
+        <ContextMenu
+          items={menuItems}
+          position={menuPos}
+          onClose={() => setMenuPos(null)}
+        />
+      )}
     </div>
   );
 });

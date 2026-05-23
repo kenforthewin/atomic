@@ -74,6 +74,7 @@ import { importAppleNotes, AppleNotesImportError } from '../../lib/import-apple-
 const MACOS_FULL_DISK_ACCESS_URL =
   'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles';
 import { formatRelativeDate } from '../../lib/date';
+import { getBrowserTimeZone, getSupportedTimeZones } from '../../lib/tz';
 import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../stores/databases';
 import { OverrideControls } from './OverrideControls';
 
@@ -88,34 +89,6 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'integrations', label: 'Integrations' },
   { id: 'databases', label: 'Databases' },
 ];
-
-const FALLBACK_TIMEZONES = [
-  'UTC',
-  'America/New_York',
-  'America/Chicago',
-  'America/Denver',
-  'America/Los_Angeles',
-  'Europe/London',
-  'Europe/Paris',
-  'Asia/Tokyo',
-  'Australia/Sydney',
-];
-
-function getBrowserTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-}
-
-function getSupportedTimeZones(): string[] {
-  const supportedValuesOf = (Intl as any).supportedValuesOf;
-  if (typeof supportedValuesOf === 'function') {
-    try {
-      return supportedValuesOf('timeZone');
-    } catch {
-      return FALLBACK_TIMEZONES;
-    }
-  }
-  return FALLBACK_TIMEZONES;
-}
 
 function TagCategoriesTab() {
   const tags = useTagsStore(s => s.tags);

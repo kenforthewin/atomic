@@ -9,6 +9,9 @@ interface ReportsListProps {
   lastFindingByReport: Record<string, ReportFindingWithAtom | null>;
   isLoading: boolean;
   onRowClick?: (reportId: string) => void;
+  onEdit?: (reportId: string) => void;
+  onToggleEnabled?: (reportId: string, next: boolean) => void;
+  onDelete?: (reportId: string) => void;
 }
 
 /// Row height target. Two lines of identity (name + excerpt) + the
@@ -22,6 +25,9 @@ export const ReportsList = memo(function ReportsList({
   lastFindingByReport,
   isLoading,
   onRowClick,
+  onEdit,
+  onToggleEnabled,
+  onDelete,
 }: ReportsListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -84,6 +90,9 @@ export const ReportsList = memo(function ReportsList({
                 report={report}
                 lastFinding={lastFindingByReport[report.id]}
                 onClick={onRowClick}
+                onEdit={onEdit}
+                onToggleEnabled={onToggleEnabled}
+                onDelete={onDelete}
               />
             </div>
           );

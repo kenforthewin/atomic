@@ -256,6 +256,33 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'GET',
     path: '/api/reports',
   },
+  get_report: {
+    method: 'GET',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
+  },
+  create_report: {
+    method: 'POST',
+    path: '/api/reports',
+    argsMode: 'body',
+    // Caller passes the CreateReportRequest shape directly. Serde
+    // derives accept the exact snake_case keys we use in TS, so the
+    // body is the args object verbatim.
+  },
+  update_report: {
+    method: 'PUT',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
+    argsMode: 'body',
+    // The PUT body is just the UpdateReportRequest object. We strip the
+    // report_id key because it lives in the path, not the body.
+    transformArgs: (a) => {
+      const { report_id: _omit, ...rest } = a;
+      return rest;
+    },
+  },
+  delete_report: {
+    method: 'DELETE',
+    path: (a) => `/api/reports/${encodeURIComponent(a.report_id as string)}`,
+  },
   list_findings_for_report: {
     method: 'GET',
     path: (a) => {
