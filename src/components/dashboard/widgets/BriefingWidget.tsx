@@ -56,13 +56,14 @@ export function BriefingWidget() {
   const createAtom = useAtomsStore(s => s.createAtom);
   const suggestedArticles = useWikiStore(s => s.suggestedArticles);
   const articles = useWikiStore(s => s.articles);
-  const openAndGenerate = useWikiStore(s => s.openAndGenerate);
+  const fetchAllArticles = useWikiStore(s => s.fetchAllArticles);
   const openReader = useUIStore(s => s.openReader);
   const openReaderEditing = useUIStore(s => s.openReaderEditing);
   const openWikiReader = useUIStore(s => s.openWikiReader);
   const setViewMode = useUIStore(s => s.setViewMode);
   const isMobile = useIsMobile();
   const [attentionSignals, setAttentionSignals] = useState<KnowledgeSignal<AttentionSignalEvidence>[]>([]);
+  const [activeAttentionActionId, setActiveAttentionActionId] = useState<string | null>(null);
 
   const handleCreateAtom = async () => {
     try {
@@ -168,13 +169,32 @@ export function BriefingWidget() {
     setAnchorRect(null);
   };
 
-  const handleAttentionAction = (signal: KnowledgeSignal<AttentionSignalEvidence>) => {
+  const handleAttentionAction = async (signal: KnowledgeSignal<AttentionSignalEvidence>) => {
     const action = signal.suggested_actions?.[0];
     if (signal.target.kind !== 'tag') return;
     const tagId = signal.evidence?.tag_id ?? signal.target.id;
     const tagName = signal.evidence?.tag_name ?? signal.target.label;
     if (action?.id === 'generate_wiki') {
-      openAndGenerate(tagId, tagName);
+      if (activeAttentionActionId) return;
+      setActiveAttentionActionId(signal.id);
+      try {
+        await getTransport().invoke('apply_knowledge_signal_action', {
+          signalKey: signal.id,
+          action: 'generate_wiki',
+        });
+        await fetchAllArticles();
+        openWikiReader(tagId, tagName);
+        window.dispatchEvent(new CustomEvent('knowledge-signals:changed', { detail: { signalKey: signal.id } }));
+        const signals = await getTransport().invoke<KnowledgeSignal<AttentionSignalEvidence>[]>(
+          'list_knowledge_signals',
+          { surface: 'briefing', limit: 4 }
+        );
+        setAttentionSignals(signals);
+      } catch (err) {
+        console.error('Failed to generate wiki from briefing suggestion:', err);
+      } finally {
+        setActiveAttentionActionId(null);
+      }
     } else {
       openWikiReader(tagId, tagName);
     }
@@ -297,15 +317,17 @@ export function BriefingWidget() {
               <div className="space-y-2">
                 {attentionSignals.map(signal => {
                   const primaryAction = signal.suggested_actions?.[0];
+                  const isGeneratingThisSignal = activeAttentionActionId === signal.id;
+                  const actionDisabled = isGeneratingThisSignal || (primaryAction?.id === 'generate_wiki' && activeAttentionActionId !== null);
+                  const actionLabel = primaryAction?.id === 'generate_wiki'
+                    ? (isGeneratingThisSignal ? 'Generating...' : 'Generate wiki')
+                    : (primaryAction?.label ?? 'Open');
                   return (
                     <div
                       key={signal.id}
                       className="group flex items-start justify-between gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)]/45 px-3 py-2"
                     >
-                      <button
-                        onClick={() => handleAttentionAction(signal)}
-                        className="min-w-0 flex-1 text-left"
-                      >
+                      <div className="min-w-0 flex-1">
                         <span className="block truncate text-sm font-medium text-[var(--color-text-primary)]">
                           {signal.title}
                         </span>
@@ -314,19 +336,22 @@ export function BriefingWidget() {
                             {signal.reasons.slice(0, 2).map(reason => reason.label).join(' / ')}
                           </span>
                         )}
-                      </button>
+                      </div>
                       <div className="flex shrink-0 items-center gap-1">
                         <button
                           onClick={() => handleAttentionAction(signal)}
-                          title={primaryAction?.label ?? 'Open'}
-                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text-primary)]"
+                          disabled={actionDisabled}
+                          title={actionLabel}
+                          className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text-primary)] disabled:cursor-wait disabled:opacity-60"
                         >
-                          <BookOpen className="h-3.5 w-3.5" strokeWidth={2} />
+                          <BookOpen className={`h-3.5 w-3.5 ${isGeneratingThisSignal ? 'animate-pulse' : ''}`} strokeWidth={2} />
+                          <span>{actionLabel}</span>
                         </button>
                         <button
                           onClick={() => dismissAttentionSignal(signal.id)}
+                          disabled={isGeneratingThisSignal}
                           title="Dismiss suggestion"
-                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-tertiary)] opacity-70 transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text-primary)]"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-tertiary)] opacity-70 transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text-primary)] disabled:cursor-wait disabled:opacity-40"
                         >
                           <X className="h-3.5 w-3.5" strokeWidth={2} />
                         </button>

@@ -7,6 +7,7 @@ import { useTagsStore } from '../../stores/tags';
 import type {
   EmptyTagEvidence,
   KnowledgeSignal,
+  KnowledgeSignalActionResult,
   TagCleanupTagEvidence,
   TagRedundancyEvidence,
 } from '../../types/knowledgeSignals';
@@ -53,7 +54,6 @@ export function TagCleanupReview({ signalKey, onClose }: TagCleanupReviewProps) 
   const [error, setError] = useState<string | null>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const fetchTags = useTagsStore(s => s.fetchTags);
-  const deleteTag = useTagsStore(s => s.deleteTag);
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -136,14 +136,10 @@ export function TagCleanupReview({ signalKey, onClose }: TagCleanupReviewProps) 
     setShowMergeConfirm(false);
   }, [mergeChoice?.source.id, mergeChoice?.target.id]);
 
-  const dismissSignal = async () => {
-    await getTransport().invoke('dismiss_knowledge_signal', { signalKey });
-  };
-
   const handleKeep = async () => {
     setIsApplying(true);
     try {
-      await dismissSignal();
+      await getTransport().invoke('dismiss_knowledge_signal', { signalKey });
       emitSignalChanged(signalKey);
       onClose();
     } catch (err) {
@@ -156,15 +152,18 @@ export function TagCleanupReview({ signalKey, onClose }: TagCleanupReviewProps) 
     if (!mergeChoice) return;
     setIsApplying(true);
     try {
-      const result = await getTransport().invoke<MergeTagsResult>('merge_tags', {
-        sourceTagId: mergeChoice.source.id,
-        targetTagId: mergeChoice.target.id,
+      const actionResult = await getTransport().invoke<KnowledgeSignalActionResult<MergeTagsResult>>('apply_knowledge_signal_action', {
+        signalKey,
+        action: 'merge_tags',
+        payload: {
+          sourceTagId: mergeChoice.source.id,
+          targetTagId: mergeChoice.target.id,
+        },
       });
-      await dismissSignal();
       await fetchTags();
       emitSignalChanged(signalKey);
       toast.success('Tags merged', {
-        description: `${result.atoms_retagged} atoms retagged`,
+        description: `${actionResult.result?.atoms_retagged ?? 0} atoms retagged`,
       });
       onClose();
     } catch (err) {
@@ -177,8 +176,11 @@ export function TagCleanupReview({ signalKey, onClose }: TagCleanupReviewProps) 
     if (!empty) return;
     setIsApplying(true);
     try {
-      await deleteTag(empty.tag.id, false);
-      await dismissSignal();
+      await getTransport().invoke('apply_knowledge_signal_action', {
+        signalKey,
+        action: 'delete_empty_tag',
+      });
+      await fetchTags();
       emitSignalChanged(signalKey);
       toast.success('Tag deleted');
       onClose();

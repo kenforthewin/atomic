@@ -417,6 +417,18 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
       return `/api/knowledge-signals${params.toString() ? `?${params}` : ''}`;
     },
   },
+  list_dashboard_knowledge_signals: {
+    method: 'GET',
+    path: (a) => {
+      const params = new URLSearchParams();
+      if (a.limit != null) params.set('limit', String(a.limit));
+      return `/api/knowledge-signals/dashboard${params.toString() ? `?${params}` : ''}`;
+    },
+  },
+  list_knowledge_signal_provider_configs: {
+    method: 'GET',
+    path: '/api/knowledge-signals/providers',
+  },
   dismiss_knowledge_signal: {
     method: 'POST',
     path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/dismiss`,
@@ -436,6 +448,19 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
   restore_knowledge_signal: {
     method: 'POST',
     path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/restore`,
+  },
+  apply_knowledge_signal_action: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/actions`,
+    argsMode: 'body',
+    transformArgs: (a) => ({
+      action: a.action,
+      payload: a.payload ?? {},
+    }),
+  },
+  undo_knowledge_signal_action: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/actions/${encodeURIComponent(a.actionLogId as string)}/undo`,
   },
 
   // ==================== Settings ====================

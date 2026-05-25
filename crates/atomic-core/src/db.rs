@@ -211,7 +211,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 23;
+    const LATEST_VERSION: i32 = 24;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -1053,6 +1053,36 @@ impl Database {
                     ON knowledge_signal_feedback(provider_id);
                 CREATE INDEX IF NOT EXISTS idx_knowledge_signal_feedback_target
                     ON knowledge_signal_feedback(target_type, target_id);
+                "#,
+            )?;
+            conn.execute_batch("PRAGMA user_version = 23;")?;
+        }
+
+        // --- V23 → V24: Knowledge-quality signal action audit log ---
+        if version < 24 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS knowledge_signal_action_log (
+                    id TEXT PRIMARY KEY,
+                    signal_key TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT,
+                    before_state_json TEXT,
+                    after_state_json TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    executed_at TEXT NOT NULL,
+                    undone_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_signal_action_log_signal
+                    ON knowledge_signal_action_log(signal_key);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_signal_action_log_provider
+                    ON knowledge_signal_action_log(provider_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_signal_action_log_status
+                    ON knowledge_signal_action_log(status);
                 "#,
             )?;
             conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;

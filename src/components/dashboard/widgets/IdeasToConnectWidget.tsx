@@ -3,10 +3,12 @@ import { Check, FileText, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Section } from '../Section';
 import { getTransport } from '../../../lib/transport';
-import { useAtomsStore, type AtomWithTags } from '../../../stores/atoms';
+import { useAtomsStore } from '../../../stores/atoms';
 import { useTagsStore } from '../../../stores/tags';
 import { useUIStore } from '../../../stores/ui';
-import type { KnowledgeSignal, MissingTagOverlapEvidence } from '../../../types/knowledgeSignals';
+import type { KnowledgeSignal, KnowledgeSignalActionResult, MissingTagOverlapEvidence } from '../../../types/knowledgeSignals';
+import { IdeasToConnectHelp } from '../signalHelpContent';
+import { useDashboardSignals } from '../DashboardSignalsContext';
 
 const MAX_ITEMS = 5;
 
@@ -20,12 +22,20 @@ export function IdeasToConnectWidget() {
   const openReader = useUIStore(s => s.openReader);
   const fetchAtoms = useAtomsStore(s => s.fetchAtoms);
   const fetchTags = useTagsStore(s => s.fetchTags);
-  const [signals, setSignals] = useState<MissingTagSignal[]>([]);
+  const dashboardSignals = useDashboardSignals();
+  const hasDashboardSignals = dashboardSignals !== null;
+  const [localSignals, setLocalSignals] = useState<MissingTagSignal[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isApplying, setIsApplying] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const signals = dashboardSignals
+    ? dashboardSignals.getProviderSignals<MissingTagOverlapEvidence>('missing_tag_overlap').slice(0, MAX_ITEMS)
+    : localSignals;
+  const loading = dashboardSignals ? dashboardSignals.isLoading : isLoading;
+  const loadError = dashboardSignals ? dashboardSignals.error : error;
 
   useEffect(() => {
+    if (hasDashboardSignals) return;
     let cancelled = false;
 
     async function fetchSignals() {
@@ -37,7 +47,7 @@ export function IdeasToConnectWidget() {
           limit: MAX_ITEMS,
         });
         if (!cancelled) {
-          setSignals(result);
+          setLocalSignals(result);
           setIsLoading(false);
         }
       } catch (err) {
@@ -53,10 +63,14 @@ export function IdeasToConnectWidget() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hasDashboardSignals]);
 
   const removeSignal = (signalKey: string) => {
-    setSignals(current => current.filter(signal => signal.id !== signalKey));
+    if (dashboardSignals) {
+      dashboardSignals.removeSignal(signalKey);
+    } else {
+      setLocalSignals(current => current.filter(signal => signal.id !== signalKey));
+    }
   };
 
   const dismissSignal = async (signalKey: string) => {
@@ -64,9 +78,14 @@ export function IdeasToConnectWidget() {
     removeSignal(signalKey);
     try {
       await getTransport().invoke('dismiss_knowledge_signal', { signalKey });
+      window.dispatchEvent(new CustomEvent('knowledge-signals:changed', { detail: { signalKey } }));
     } catch (err) {
       console.error('Failed to dismiss connection suggestion:', err);
-      setSignals(previous);
+      if (dashboardSignals) {
+        void dashboardSignals.refreshProvider('missing_tag_overlap', MAX_ITEMS);
+      } else {
+        setLocalSignals(previous);
+      }
     }
   };
 
@@ -77,18 +96,38 @@ export function IdeasToConnectWidget() {
     setIsApplying(signal.id);
     removeSignal(signal.id);
     try {
-      await getTransport().invoke<AtomWithTags>('add_tag_to_atom', {
-        atomId: evidence.atom_id,
-        tagId: evidence.suggested_tag.id,
+      const result = await getTransport().invoke<KnowledgeSignalActionResult>('apply_knowledge_signal_action', {
+        signalKey: signal.id,
+        action: 'add_tag_to_atom',
       });
-      await getTransport().invoke('dismiss_knowledge_signal', { signalKey: signal.id });
       await Promise.all([fetchAtoms(), fetchTags()]);
+      window.dispatchEvent(new CustomEvent('knowledge-signals:changed', { detail: { signalKey: signal.id } }));
       toast.success('Tag added', {
         description: `${evidence.suggested_tag.name} added to ${evidence.atom_title}`,
+        action: result.undo_supported
+          ? {
+              label: 'Undo',
+              onClick: async () => {
+                try {
+                  await getTransport().invoke('undo_knowledge_signal_action', {
+                    actionLogId: result.action_log_id,
+                  });
+                  await Promise.all([fetchAtoms(), fetchTags()]);
+                  toast.success('Tag removed');
+                } catch (err) {
+                  toast.error('Failed to undo tag add', { description: String(err) });
+                }
+              },
+            }
+          : undefined,
       });
     } catch (err) {
       console.error('Failed to add suggested tag:', err);
-      setSignals(previous);
+      if (dashboardSignals) {
+        void dashboardSignals.refreshProvider('missing_tag_overlap', MAX_ITEMS);
+      } else {
+        setLocalSignals(previous);
+      }
       toast.error('Failed to add tag', { description: String(err) });
     } finally {
       setIsApplying(null);
@@ -96,10 +135,10 @@ export function IdeasToConnectWidget() {
   };
 
   return (
-    <Section label="Ideas to connect">
-      {isLoading ? (
+    <Section label="Ideas to connect" action={<IdeasToConnectHelp />}>
+      {loading ? (
         <div className="py-6 text-sm text-[var(--color-text-tertiary)]">Loading connection ideas...</div>
-      ) : error ? (
+      ) : loadError ? (
         <div className="py-6 text-sm text-[var(--color-text-tertiary)]">Could not load connection ideas.</div>
       ) : signals.length === 0 ? (
         <div className="py-6 text-sm text-[var(--color-text-tertiary)]">No connection suggestions.</div>
@@ -140,7 +179,7 @@ export function IdeasToConnectWidget() {
                   <button
                     onClick={() => dismissSignal(signal.id)}
                     title="Dismiss suggestion"
-                    className="rounded p-1 text-[var(--color-text-tertiary)] opacity-0 transition-opacity hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] group-hover:opacity-100 focus:opacity-100"
+                    className="rounded p-1 text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)]"
                   >
                     <X className="h-3.5 w-3.5" strokeWidth={2} />
                   </button>

@@ -33,6 +33,54 @@ export interface KnowledgeSignal<Evidence = Record<string, unknown>> {
   expires_at?: string | null;
 }
 
+export interface KnowledgeSignalActionResult<Result = Record<string, unknown>> {
+  action_log_id: string;
+  signal_key: string;
+  provider_id: string;
+  action: string;
+  status: string;
+  undo_supported: boolean;
+  result?: Result;
+}
+
+export interface KnowledgeSignalProviderConfig {
+  provider_id: string;
+  enabled: boolean;
+  weight: number;
+  min_score: number;
+  min_confidence: number;
+  show_on_dashboard: boolean;
+  include_in_briefing: boolean;
+  config_json?: Record<string, unknown>;
+}
+
+export interface KnowledgeSignalProviderSettings {
+  provider_id: string;
+  name: string;
+  config: KnowledgeSignalProviderConfig;
+}
+
+export interface DashboardKnowledgeSignalGroup {
+  provider_id: string;
+  name: string;
+  evaluation_ms: number;
+  signals: KnowledgeSignal[];
+}
+
+export interface DashboardKnowledgeSignalError {
+  provider_id: string;
+  name: string;
+  evaluation_ms: number;
+  message: string;
+}
+
+export interface DashboardKnowledgeSignals {
+  generated_at: string;
+  provider_settings: KnowledgeSignalProviderSettings[];
+  groups: DashboardKnowledgeSignalGroup[];
+  errors: DashboardKnowledgeSignalError[];
+}
+
 export interface WikiCandidateEvidence {
   schema?: string;
   schema_version?: number;
@@ -103,6 +151,75 @@ export interface MissingTagOverlapEvidence {
   nearby_tagged_atom_count: number;
   strongest_similarity: number;
   average_similarity: number;
+}
+
+export interface NearDuplicateAtomEvidenceAtom {
+  id: string;
+  title: string;
+  source_url?: string | null;
+  content_length: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NearDuplicateTagEvidence {
+  id: string;
+  name: string;
+}
+
+export interface NearDuplicateAtomEvidence {
+  schema?: string;
+  schema_version?: number;
+  primary_atom: NearDuplicateAtomEvidenceAtom;
+  secondary_atom: NearDuplicateAtomEvidenceAtom;
+  semantic_similarity: number;
+  source_match: string;
+  title_similarity: number;
+  shared_tags: NearDuplicateTagEvidence[];
+  shared_tag_count: number;
+  content_length_ratio: number;
+}
+
+export interface SourceDuplicateEvidence {
+  schema?: string;
+  schema_version?: number;
+  primary_atom: NearDuplicateAtomEvidenceAtom;
+  secondary_atom: NearDuplicateAtomEvidenceAtom;
+  source_url: string;
+  normalized_source_url: string;
+  duplicate_count: number;
+  title_similarity: number;
+  content_length_ratio: number;
+}
+
+export interface UnderconnectedAtomEvidence {
+  schema?: string;
+  schema_version?: number;
+  atom_id: string;
+  atom_title: string;
+  source_url?: string | null;
+  content_length: number;
+  tag_count: number;
+  total_edge_count: number;
+  strong_edge_count: number;
+  strongest_similarity?: number | null;
+  average_similarity?: number | null;
+  captured_atom_count: number;
+  edges_status: string;
+}
+
+export interface BrokenInternalLinkEvidence {
+  schema?: string;
+  schema_version?: number;
+  link_id: string;
+  source_atom_id: string;
+  source_atom_title: string;
+  raw_target: string;
+  label?: string | null;
+  target_kind: string;
+  status: string;
+  start_offset?: number | null;
+  end_offset?: number | null;
 }
 
 export type TagCleanupEvidence = TagRedundancyEvidence | EmptyTagEvidence;

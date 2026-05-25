@@ -69,12 +69,16 @@ pub use export::{MarkdownArchiveFormat, MarkdownExportProgress, MarkdownExportRe
 pub use import::{ImportProgress, ImportResult};
 pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResult};
 pub use knowledge_signals::{
-    EmptyTagEvidence, KnowledgeSignal, KnowledgeSignalAction, KnowledgeSignalFilter,
-    KnowledgeSignalProviderConfig, KnowledgeSignalReason, KnowledgeSignalSeverity,
-    KnowledgeSignalTarget, MissingTagOverlapEvidence, TagCleanupTagEvidence, TagRedundancyEvidence,
-    WikiCandidateEvidence, WikiUpdateEvidence, EMPTY_TAG_PROVIDER_ID,
-    MISSING_TAG_OVERLAP_PROVIDER_ID, TAG_REDUNDANCY_PROVIDER_ID, WIKI_CANDIDATE_PROVIDER_ID,
-    WIKI_UPDATE_PROVIDER_ID,
+    DashboardKnowledgeSignalCache, DashboardKnowledgeSignalError, DashboardKnowledgeSignalGroup,
+    DashboardKnowledgeSignals, EmptyTagEvidence, KnowledgeSignal, KnowledgeSignalAction,
+    KnowledgeSignalActionLog, KnowledgeSignalActionRequest, KnowledgeSignalActionResult,
+    KnowledgeSignalFilter, KnowledgeSignalProviderConfig, KnowledgeSignalProviderSettings,
+    KnowledgeSignalReason, KnowledgeSignalSeverity, KnowledgeSignalTarget,
+    MissingTagOverlapEvidence, NearDuplicateAtomEvidence, NearDuplicateAtomEvidenceAtom,
+    NearDuplicateTagEvidence, TagCleanupTagEvidence, TagRedundancyEvidence,
+    UnderconnectedAtomEvidence, WikiCandidateEvidence, WikiUpdateEvidence, EMPTY_TAG_PROVIDER_ID,
+    MISSING_TAG_OVERLAP_PROVIDER_ID, NEAR_DUPLICATE_ATOM_PROVIDER_ID, TAG_REDUNDANCY_PROVIDER_ID,
+    UNDERCONNECTED_ATOM_PROVIDER_ID, WIKI_CANDIDATE_PROVIDER_ID, WIKI_UPDATE_PROVIDER_ID,
 };
 pub use manager::DatabaseManager;
 pub use models::*;
@@ -272,6 +276,9 @@ pub struct AtomicCore {
     /// In-memory cache for `compute_and_get_canvas_data`. Shared across clones
     /// so every handle sees the same cached payload.
     canvas_cache: CanvasCache,
+    /// Short-lived cache for dashboard signal groups. This prevents repeated
+    /// dashboard opens from recomputing every provider immediately.
+    dashboard_signal_cache: DashboardKnowledgeSignalCache,
 }
 
 impl AtomicCore {
@@ -284,6 +291,7 @@ impl AtomicCore {
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -358,6 +366,7 @@ impl AtomicCore {
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -371,6 +380,7 @@ impl AtomicCore {
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         core
@@ -488,6 +498,7 @@ impl AtomicCore {
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -941,6 +952,7 @@ impl AtomicCore {
 
         let atom_with_tags = self.storage.insert_atom_impl(&id, &request, &now).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         if !content.trim().is_empty() {
             let job = AtomPipelineJobRequest {
@@ -1023,6 +1035,7 @@ impl AtomicCore {
             .insert_atoms_bulk_impl(&atoms_to_insert)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         // Collect atom IDs for background embedding (don't clone content — read from DB later)
         let atom_ids: Vec<String> = atoms_with_tags
@@ -1068,6 +1081,7 @@ impl AtomicCore {
 
         let atom_with_tags = self.storage.update_atom_impl(id, &request, &now).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         let job = AtomPipelineJobRequest {
             atom_id: id.to_string(),
@@ -1102,6 +1116,7 @@ impl AtomicCore {
             .update_atom_if_unchanged_impl(id, &request, &now, expected_updated_at)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         let job = AtomPipelineJobRequest {
             atom_id: id.to_string(),
@@ -1138,6 +1153,7 @@ impl AtomicCore {
             .update_atom_content_only_impl(id, &request, &now)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         tracing::info!(
             atom_id = %id,
             had_content_before,
@@ -1253,6 +1269,7 @@ impl AtomicCore {
         }
 
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         self.get_atom(atom_id)
             .await?
             .ok_or_else(|| AtomicCoreError::NotFound("Atom not found".to_string()))
@@ -1262,6 +1279,7 @@ impl AtomicCore {
     pub async fn delete_atom(&self, id: &str) -> Result<(), AtomicCoreError> {
         self.storage.delete_atom_impl(id).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(())
     }
 
@@ -1358,7 +1376,9 @@ impl AtomicCore {
         name: &str,
         parent_id: Option<&str>,
     ) -> Result<Tag, AtomicCoreError> {
-        self.storage.create_tag_impl(name, parent_id).await
+        let tag = self.storage.create_tag_impl(name, parent_id).await?;
+        self.dashboard_signal_cache.invalidate();
+        Ok(tag)
     }
 
     /// Update a tag
@@ -1370,6 +1390,7 @@ impl AtomicCore {
     ) -> Result<Tag, AtomicCoreError> {
         let tag = self.storage.update_tag_impl(id, name, parent_id).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(tag)
     }
 
@@ -1377,6 +1398,7 @@ impl AtomicCore {
     pub async fn delete_tag(&self, id: &str, recursive: bool) -> Result<(), AtomicCoreError> {
         self.storage.delete_tag_impl(id, recursive).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(())
     }
 
@@ -1609,6 +1631,7 @@ impl AtomicCore {
             self.storage.delete_tag_impl(source_tag_id, false).await?;
         }
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(result)
     }
 
@@ -1892,6 +1915,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&result.article, &result.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         // Any pending proposal was computed against the previous live article
         // and is now meaningless — drop it. Log-and-continue on error; a stale
@@ -1965,6 +1989,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&result.article, &result.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         tracing::info!("[wiki] Article updated successfully");
         Ok(result)
@@ -2053,6 +2078,7 @@ impl AtomicCore {
         };
 
         self.storage.save_wiki_proposal_sync(&proposal).await?;
+        self.dashboard_signal_cache.invalidate();
         tracing::info!(
             tag_id,
             proposal_id = %proposal.id,
@@ -2136,6 +2162,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&article, &proposal.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         // Delete the proposal row after successful save.
         self.storage.delete_wiki_proposal_sync(tag_id).await?;
@@ -2180,6 +2207,7 @@ impl AtomicCore {
     /// longer exists).
     pub async fn delete_wiki(&self, tag_id: &str) -> Result<(), AtomicCoreError> {
         self.storage.delete_wiki_sync(tag_id).await?;
+        self.dashboard_signal_cache.invalidate();
         if let Err(e) = self.storage.delete_wiki_proposal_sync(tag_id).await {
             tracing::warn!(tag_id, error = %e, "[wiki] Failed to clean up pending proposal after delete");
         }
@@ -2934,6 +2962,7 @@ impl AtomicCore {
     /// that could change canvas output.
     pub fn invalidate_canvas_cache(&self) {
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
     }
 
     /// Wrap a user-provided embedding/tagging event callback so that
@@ -4192,6 +4221,21 @@ impl AtomicCore {
         knowledge_signals::list_knowledge_signals(self, filter).await
     }
 
+    /// List per-database provider settings for deterministic knowledge-quality signals.
+    pub async fn list_knowledge_signal_provider_configs(
+        &self,
+    ) -> Result<Vec<KnowledgeSignalProviderSettings>, AtomicCoreError> {
+        knowledge_signals::list_provider_configs(self).await
+    }
+
+    /// List dashboard-oriented signal groups in one provider-filtered pass.
+    pub async fn list_dashboard_knowledge_signals(
+        &self,
+        per_provider_limit: i32,
+    ) -> Result<DashboardKnowledgeSignals, AtomicCoreError> {
+        knowledge_signals::list_dashboard_knowledge_signals(self, per_provider_limit).await
+    }
+
     /// List deterministic knowledge-quality signals eligible for briefing attachment.
     pub async fn list_briefing_knowledge_signals(
         &self,
@@ -4229,6 +4273,23 @@ impl AtomicCore {
     /// Restore a dismissed or snoozed knowledge-quality signal.
     pub async fn restore_knowledge_signal(&self, signal_key: &str) -> Result<(), AtomicCoreError> {
         knowledge_signals::restore_signal(self, signal_key).await
+    }
+
+    /// Apply a signal-scoped action and record it in the signal action audit log.
+    pub async fn apply_knowledge_signal_action(
+        &self,
+        signal_key: &str,
+        request: KnowledgeSignalActionRequest,
+    ) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+        knowledge_signals::apply_signal_action(self, signal_key, request).await
+    }
+
+    /// Undo a previously applied signal action when that action defines safe undo semantics.
+    pub async fn undo_knowledge_signal_action(
+        &self,
+        action_log_id: &str,
+    ) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+        knowledge_signals::undo_signal_action(self, action_log_id).await
     }
 
     /// Recompute centroid embeddings for all tags that have atoms with embeddings.

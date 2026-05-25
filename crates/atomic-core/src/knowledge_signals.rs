@@ -9,17 +9,32 @@ use crate::storage::StorageBackend;
 use crate::AtomicCore;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 
 pub const WIKI_CANDIDATE_PROVIDER_ID: &str = "wiki_candidate";
 pub const WIKI_UPDATE_PROVIDER_ID: &str = "wiki_update";
 pub const TAG_REDUNDANCY_PROVIDER_ID: &str = "tag_redundancy";
 pub const EMPTY_TAG_PROVIDER_ID: &str = "empty_tag";
 pub const MISSING_TAG_OVERLAP_PROVIDER_ID: &str = "missing_tag_overlap";
+pub const NEAR_DUPLICATE_ATOM_PROVIDER_ID: &str = "near_duplicate_atom";
+pub const SOURCE_DUPLICATE_PROVIDER_ID: &str = "source_duplicate";
+pub const BROKEN_INTERNAL_LINK_PROVIDER_ID: &str = "broken_internal_link";
+pub const UNDERCONNECTED_ATOM_PROVIDER_ID: &str = "underconnected_atom";
+
+const TAG_REDUNDANCY_MAX_TAGS_PER_ATOM: i32 = 20;
+const TAG_REDUNDANCY_CANDIDATE_LIMIT: i32 = 1000;
+const MISSING_TAG_EDGE_CANDIDATE_LIMIT: i32 = 5000;
+const MISSING_TAG_CANDIDATE_LIMIT: i32 = 750;
+const SOURCE_DUPLICATE_GROUP_LIMIT: i32 = 500;
+const SOURCE_DUPLICATE_ATOMS_PER_GROUP: i32 = 6;
+const UNDERCONNECTED_CANDIDATE_ATOM_LIMIT: i32 = 5000;
+const DASHBOARD_SIGNAL_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -134,6 +149,87 @@ pub struct KnowledgeSignalProviderConfig {
     pub config_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KnowledgeSignalProviderSettings {
+    pub provider_id: String,
+    pub name: String,
+    pub config: KnowledgeSignalProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DashboardKnowledgeSignals {
+    pub generated_at: String,
+    pub provider_settings: Vec<KnowledgeSignalProviderSettings>,
+    pub groups: Vec<DashboardKnowledgeSignalGroup>,
+    pub errors: Vec<DashboardKnowledgeSignalError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DashboardKnowledgeSignalGroup {
+    pub provider_id: String,
+    pub name: String,
+    pub evaluation_ms: u64,
+    pub signals: Vec<KnowledgeSignal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DashboardKnowledgeSignalError {
+    pub provider_id: String,
+    pub name: String,
+    pub evaluation_ms: u64,
+    pub message: String,
+}
+
+#[derive(Clone, Default)]
+pub struct DashboardKnowledgeSignalCache {
+    inner: Arc<Mutex<Option<CachedDashboardKnowledgeSignals>>>,
+}
+
+#[derive(Clone)]
+struct CachedDashboardKnowledgeSignals {
+    per_provider_limit: i32,
+    cached_at: Instant,
+    response: DashboardKnowledgeSignals,
+}
+
+impl DashboardKnowledgeSignalCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, per_provider_limit: i32) -> Option<DashboardKnowledgeSignals> {
+        let guard = self.inner.lock().ok()?;
+        let cached = guard.as_ref()?;
+        if cached.per_provider_limit != per_provider_limit {
+            return None;
+        }
+        if cached.cached_at.elapsed() > DASHBOARD_SIGNAL_CACHE_TTL {
+            return None;
+        }
+        Some(cached.response.clone())
+    }
+
+    fn set(&self, per_provider_limit: i32, response: DashboardKnowledgeSignals) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(CachedDashboardKnowledgeSignals {
+                per_provider_limit,
+                cached_at: Instant::now(),
+                response,
+            });
+        }
+    }
+
+    pub fn invalidate(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = None;
+        }
+    }
+}
+
 impl KnowledgeSignalProviderConfig {
     fn default_for(provider_id: &str) -> Self {
         Self {
@@ -157,6 +253,46 @@ pub struct KnowledgeSignalFeedback {
     pub target_id: Option<String>,
     pub state: String,
     pub snoozed_until: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KnowledgeSignalActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KnowledgeSignalActionResult {
+    pub action_log_id: String,
+    pub signal_key: String,
+    pub provider_id: String,
+    pub action: String,
+    pub status: String,
+    pub undo_supported: bool,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KnowledgeSignalActionLog {
+    pub id: String,
+    pub signal_key: String,
+    pub provider_id: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub before_state: serde_json::Value,
+    #[serde(default)]
+    pub after_state: serde_json::Value,
+    pub status: String,
+    pub error: Option<String>,
+    pub executed_at: String,
+    pub undone_at: Option<String>,
 }
 
 #[async_trait]
@@ -245,6 +381,102 @@ pub async fn list_knowledge_signals(
     }
 
     Ok(out)
+}
+
+pub async fn list_provider_configs(
+    core: &AtomicCore,
+) -> Result<Vec<KnowledgeSignalProviderSettings>, AtomicCoreError> {
+    let providers = signal_providers();
+    let mut out = Vec::with_capacity(providers.len());
+    for provider in providers {
+        out.push(KnowledgeSignalProviderSettings {
+            provider_id: provider.id().to_string(),
+            name: provider.name().to_string(),
+            config: get_provider_config(core, provider.id()).await?,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn list_dashboard_knowledge_signals(
+    core: &AtomicCore,
+    per_provider_limit: i32,
+) -> Result<DashboardKnowledgeSignals, AtomicCoreError> {
+    if let Some(cached) = core.dashboard_signal_cache.get(per_provider_limit) {
+        return Ok(cached);
+    }
+
+    let providers = signal_providers();
+    let feedback = list_feedback(core).await?;
+    let now = Utc::now();
+    let generated_at = now.to_rfc3339();
+    let mut provider_settings = Vec::with_capacity(providers.len());
+    let mut groups = Vec::new();
+    let mut errors = Vec::new();
+
+    for provider in providers {
+        let provider_id = provider.id().to_string();
+        let name = provider.name().to_string();
+        let config = get_provider_config(core, &provider_id).await?;
+        provider_settings.push(KnowledgeSignalProviderSettings {
+            provider_id: provider_id.clone(),
+            name: name.clone(),
+            config: config.clone(),
+        });
+
+        if !config.enabled || !config.show_on_dashboard {
+            continue;
+        }
+
+        let started = Instant::now();
+        match provider.evaluate(core, &config).await {
+            Ok(mut signals) => {
+                apply_provider_weight(&mut signals, config.weight);
+                signals.retain(|signal| {
+                    signal.score >= config.min_score
+                        && signal.confidence >= config.min_confidence
+                        && signal_is_visible_with_feedback(feedback.get(&signal.id), now)
+                });
+                signals.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| {
+                            b.confidence
+                                .partial_cmp(&a.confidence)
+                                .unwrap_or(Ordering::Equal)
+                        })
+                });
+                if per_provider_limit >= 0 {
+                    signals.truncate(per_provider_limit as usize);
+                }
+                groups.push(DashboardKnowledgeSignalGroup {
+                    provider_id,
+                    name,
+                    evaluation_ms: started.elapsed().as_millis() as u64,
+                    signals,
+                });
+            }
+            Err(err) => {
+                errors.push(DashboardKnowledgeSignalError {
+                    provider_id,
+                    name,
+                    evaluation_ms: started.elapsed().as_millis() as u64,
+                    message: err.to_string(),
+                });
+            }
+        }
+    }
+
+    let response = DashboardKnowledgeSignals {
+        generated_at,
+        provider_settings,
+        groups,
+        errors,
+    };
+    core.dashboard_signal_cache
+        .set(per_provider_limit, response.clone());
+    Ok(response)
 }
 
 pub async fn list_briefing_knowledge_signals(
@@ -391,6 +623,7 @@ pub async fn set_provider_config(
             })
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??;
+            core.dashboard_signal_cache.invalidate();
             Ok(config)
         }
         #[cfg(feature = "postgres")]
@@ -425,6 +658,7 @@ pub async fn set_provider_config(
             .execute(&storage.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            core.dashboard_signal_cache.invalidate();
             Ok(config)
         }
     }
@@ -445,7 +679,7 @@ pub async fn restore_signal(core: &AtomicCore, signal_key: &str) -> Result<(), A
                     "DELETE FROM knowledge_signal_feedback WHERE signal_key = ?1",
                     params![key],
                 )?;
-                Ok(())
+                Ok::<(), AtomicCoreError>(())
             })
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
@@ -463,6 +697,237 @@ pub async fn restore_signal(core: &AtomicCore, signal_key: &str) -> Result<(), A
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
             Ok(())
         }
+    }?;
+    core.dashboard_signal_cache.invalidate();
+    Ok(())
+}
+
+pub async fn apply_signal_action(
+    core: &AtomicCore,
+    signal_key: &str,
+    request: KnowledgeSignalActionRequest,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    let signal = find_signal_for_action(core, signal_key).await?;
+    if !signal
+        .suggested_actions
+        .iter()
+        .any(|action| action.id == request.action)
+    {
+        return Err(AtomicCoreError::Validation(format!(
+            "Action '{}' is not available for this signal",
+            request.action
+        )));
+    }
+
+    let result = match request.action.as_str() {
+        "generate_wiki" => apply_generate_wiki_action(core, &signal).await?,
+        "update_wiki" => apply_update_wiki_action(core, &signal).await?,
+        "add_tag_to_atom" => apply_add_tag_to_atom_action(core, &signal).await?,
+        "delete_empty_tag" => apply_delete_empty_tag_action(core, &signal).await?,
+        "merge_tags" => apply_merge_tags_action(core, &signal, &request.payload).await?,
+        other => {
+            return Err(AtomicCoreError::Validation(format!(
+                "Unsupported knowledge signal action: {other}"
+            )));
+        }
+    };
+
+    set_feedback(core, signal_key, "dismissed", None).await?;
+    Ok(result)
+}
+
+async fn apply_generate_wiki_action(
+    core: &AtomicCore,
+    signal: &KnowledgeSignal,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    if signal.provider_id != WIKI_CANDIDATE_PROVIDER_ID {
+        return Err(AtomicCoreError::Validation(
+            "generate_wiki is only supported for wiki-candidate signals".to_string(),
+        ));
+    }
+    let evidence: WikiCandidateEvidence = serde_json::from_value(signal.evidence.clone())?;
+    let action_log_id = uuid::Uuid::new_v4().to_string();
+    let executed_at = Utc::now().to_rfc3339();
+    let tag_id = evidence.tag_id.clone();
+    let tag_name = evidence.tag_name.clone();
+
+    insert_pending_action_log(
+        core,
+        KnowledgeSignalActionLog {
+            id: action_log_id.clone(),
+            signal_key: signal.id.clone(),
+            provider_id: signal.provider_id.clone(),
+            action: "generate_wiki".to_string(),
+            target_type: signal.target.kind.clone(),
+            target_id: Some(tag_id.clone()),
+            before_state: json!({
+                "tag_id": tag_id.clone(),
+                "tag_name": tag_name.clone(),
+                "had_wiki": false,
+                "atom_count": evidence.atom_count,
+            }),
+            after_state: json!({}),
+            status: "pending".to_string(),
+            error: None,
+            executed_at,
+            undone_at: None,
+        },
+    )
+    .await?;
+
+    match core.generate_wiki(&tag_id, &tag_name).await {
+        Ok(article) => {
+            let after = json!({
+                "tag_id": tag_id.clone(),
+                "tag_name": tag_name.clone(),
+                "article_id": article.article.id,
+                "citation_count": article.citations.len(),
+            });
+            update_action_log_status(core, &action_log_id, "applied", after.clone(), None).await?;
+            Ok(KnowledgeSignalActionResult {
+                action_log_id,
+                signal_key: signal.id.clone(),
+                provider_id: signal.provider_id.clone(),
+                action: "generate_wiki".to_string(),
+                status: "applied".to_string(),
+                undo_supported: false,
+                result: after,
+            })
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let _ = update_action_log_status(
+                core,
+                &action_log_id,
+                "failed",
+                json!({}),
+                Some(message.clone()),
+            )
+            .await;
+            Err(AtomicCoreError::Validation(message))
+        }
+    }
+}
+
+async fn apply_update_wiki_action(
+    core: &AtomicCore,
+    signal: &KnowledgeSignal,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    if signal.provider_id != WIKI_UPDATE_PROVIDER_ID {
+        return Err(AtomicCoreError::Validation(
+            "update_wiki is only supported for wiki-update signals".to_string(),
+        ));
+    }
+    let evidence: WikiUpdateEvidence = serde_json::from_value(signal.evidence.clone())?;
+    let action_log_id = uuid::Uuid::new_v4().to_string();
+    let executed_at = Utc::now().to_rfc3339();
+    let tag_id = evidence.tag_id.clone();
+    let tag_name = evidence.tag_name.clone();
+
+    insert_pending_action_log(
+        core,
+        KnowledgeSignalActionLog {
+            id: action_log_id.clone(),
+            signal_key: signal.id.clone(),
+            provider_id: signal.provider_id.clone(),
+            action: "update_wiki".to_string(),
+            target_type: signal.target.kind.clone(),
+            target_id: Some(tag_id.clone()),
+            before_state: json!({
+                "tag_id": tag_id.clone(),
+                "tag_name": tag_name.clone(),
+                "article_id": evidence.article_id,
+                "article_atom_count": evidence.article_atom_count,
+                "current_atom_count": evidence.current_atom_count,
+                "new_atom_count": evidence.new_atom_count,
+            }),
+            after_state: json!({}),
+            status: "pending".to_string(),
+            error: None,
+            executed_at,
+            undone_at: None,
+        },
+    )
+    .await?;
+
+    match core.propose_wiki_update(&tag_id, &tag_name).await {
+        Ok(Some(proposal)) => {
+            let after = json!({
+                "tag_id": tag_id.clone(),
+                "tag_name": tag_name.clone(),
+                "status": "proposal_created",
+                "proposal_id": proposal.id,
+                "new_atom_count": proposal.new_atom_count,
+            });
+            update_action_log_status(core, &action_log_id, "applied", after.clone(), None).await?;
+            Ok(KnowledgeSignalActionResult {
+                action_log_id,
+                signal_key: signal.id.clone(),
+                provider_id: signal.provider_id.clone(),
+                action: "update_wiki".to_string(),
+                status: "applied".to_string(),
+                undo_supported: false,
+                result: after,
+            })
+        }
+        Ok(None) => {
+            let after = json!({
+                "tag_id": tag_id.clone(),
+                "tag_name": tag_name.clone(),
+                "status": "no_update_needed",
+            });
+            update_action_log_status(core, &action_log_id, "applied", after.clone(), None).await?;
+            Ok(KnowledgeSignalActionResult {
+                action_log_id,
+                signal_key: signal.id.clone(),
+                provider_id: signal.provider_id.clone(),
+                action: "update_wiki".to_string(),
+                status: "applied".to_string(),
+                undo_supported: false,
+                result: after,
+            })
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let _ = update_action_log_status(
+                core,
+                &action_log_id,
+                "failed",
+                json!({}),
+                Some(message.clone()),
+            )
+            .await;
+            Err(AtomicCoreError::Validation(message))
+        }
+    }
+}
+
+pub async fn undo_signal_action(
+    core: &AtomicCore,
+    action_log_id: &str,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    let log = get_action_log(core, action_log_id).await?;
+    if log.status == "undone" {
+        return Ok(KnowledgeSignalActionResult {
+            action_log_id: log.id,
+            signal_key: log.signal_key,
+            provider_id: log.provider_id,
+            action: log.action.clone(),
+            status: "undone".to_string(),
+            undo_supported: log.action == "add_tag_to_atom",
+            result: json!({ "already_undone": true }),
+        });
+    }
+    if log.status != "applied" {
+        return Err(AtomicCoreError::Validation(
+            "Only applied signal actions can be undone".to_string(),
+        ));
+    }
+    match log.action.as_str() {
+        "add_tag_to_atom" => undo_add_tag_to_atom_action(core, &log).await,
+        _ => Err(AtomicCoreError::Validation(
+            "Undo is not supported for this signal action".to_string(),
+        )),
     }
 }
 
@@ -574,6 +1039,26 @@ fn default_provider_config(provider_id: &str) -> KnowledgeSignalProviderConfig {
         config.min_score = 50.0;
         config.min_confidence = 0.65;
     }
+    if provider_id == NEAR_DUPLICATE_ATOM_PROVIDER_ID {
+        config.include_in_briefing = false;
+        config.min_score = 55.0;
+        config.min_confidence = 0.60;
+    }
+    if provider_id == SOURCE_DUPLICATE_PROVIDER_ID {
+        config.include_in_briefing = false;
+        config.min_score = 60.0;
+        config.min_confidence = 0.80;
+    }
+    if provider_id == BROKEN_INTERNAL_LINK_PROVIDER_ID {
+        config.include_in_briefing = false;
+        config.min_score = 35.0;
+        config.min_confidence = 0.65;
+    }
+    if provider_id == UNDERCONNECTED_ATOM_PROVIDER_ID {
+        config.include_in_briefing = false;
+        config.min_score = 55.0;
+        config.min_confidence = 0.60;
+    }
     config
 }
 
@@ -584,6 +1069,10 @@ fn signal_providers() -> Vec<Box<dyn KnowledgeSignalProvider>> {
         Box::new(TagRedundancyProvider),
         Box::new(EmptyTagProvider),
         Box::new(MissingTagOverlapProvider),
+        Box::new(NearDuplicateAtomProvider),
+        Box::new(SourceDuplicateProvider),
+        Box::new(BrokenInternalLinkProvider),
+        Box::new(UnderconnectedAtomProvider),
     ]
 }
 
@@ -699,7 +1188,7 @@ async fn set_feedback(
                         now
                     ],
                 )?;
-                Ok(())
+                Ok::<(), AtomicCoreError>(())
             })
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
@@ -730,7 +1219,9 @@ async fn set_feedback(
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
             Ok(())
         }
-    }
+    }?;
+    core.dashboard_signal_cache.invalidate();
+    Ok(())
 }
 
 fn parse_signal_key(signal_key: &str) -> Result<(String, String, Option<String>), AtomicCoreError> {
@@ -744,6 +1235,851 @@ fn parse_signal_key(signal_key: &str) -> Result<(String, String, Option<String>)
     let target_type = parts[1].to_string();
     let target_id = parts.get(2).map(|s| s.to_string());
     Ok((provider_id, target_type, target_id))
+}
+
+async fn find_signal_for_action(
+    core: &AtomicCore,
+    signal_key: &str,
+) -> Result<KnowledgeSignal, AtomicCoreError> {
+    let (provider_id, _, _) = parse_signal_key(signal_key)?;
+    let providers = signal_providers();
+    let provider = providers
+        .into_iter()
+        .find(|provider| provider.id() == provider_id)
+        .ok_or_else(|| AtomicCoreError::Validation("Unknown signal provider".to_string()))?;
+    let config = get_provider_config(core, provider.id()).await?;
+    if !config.enabled {
+        return Err(AtomicCoreError::Validation(
+            "This signal provider is disabled".to_string(),
+        ));
+    }
+    let feedback = list_feedback(core).await?;
+    let now = Utc::now();
+    let mut signals = provider.evaluate(core, &config).await?;
+    apply_provider_weight(&mut signals, config.weight);
+    signals.retain(|signal| {
+        signal.score >= config.min_score
+            && signal.confidence >= config.min_confidence
+            && signal_is_visible_with_feedback(feedback.get(&signal.id), now)
+    });
+    signals
+        .into_iter()
+        .find(|signal| signal.id == signal_key)
+        .ok_or_else(|| {
+            AtomicCoreError::Validation(
+                "This knowledge signal is no longer available to act on".to_string(),
+            )
+        })
+}
+
+async fn apply_add_tag_to_atom_action(
+    core: &AtomicCore,
+    signal: &KnowledgeSignal,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    if signal.provider_id != MISSING_TAG_OVERLAP_PROVIDER_ID {
+        return Err(AtomicCoreError::Validation(
+            "add_tag_to_atom is only supported for missing-tag signals".to_string(),
+        ));
+    }
+    let evidence: MissingTagOverlapEvidence = serde_json::from_value(signal.evidence.clone())?;
+    let action_log_id = uuid::Uuid::new_v4().to_string();
+    let executed_at = Utc::now().to_rfc3339();
+
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            let signal = signal.clone();
+            let evidence = evidence.clone();
+            let action_log_id_for_task = action_log_id.clone();
+            let executed_at_for_task = executed_at.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = storage
+                    .database()
+                    .conn
+                    .lock()
+                    .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                let tx = conn.unchecked_transaction()?;
+                let previous_updated_at: String = tx
+                    .query_row(
+                        "SELECT updated_at FROM atoms WHERE id = ?1",
+                        [&evidence.atom_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| AtomicCoreError::NotFound("Atom not found".to_string()))?;
+                let tag_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                    [&evidence.suggested_tag.id],
+                    |row| row.get(0),
+                )?;
+                if !tag_exists {
+                    return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                }
+                let assignment_existed_before: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM atom_tags WHERE atom_id = ?1 AND tag_id = ?2)",
+                    rusqlite::params![&evidence.atom_id, &evidence.suggested_tag.id],
+                    |row| row.get(0),
+                )?;
+                let inserted = tx.execute(
+                    "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source)
+                     VALUES (?1, ?2, 'manual')",
+                    rusqlite::params![&evidence.atom_id, &evidence.suggested_tag.id],
+                )? as i32;
+                let updated_at = Utc::now().to_rfc3339();
+                if inserted > 0 {
+                    tx.execute(
+                        "UPDATE atoms SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![&updated_at, &evidence.atom_id],
+                    )?;
+                }
+                let before = json!({
+                    "atom_id": evidence.atom_id,
+                    "tag_id": evidence.suggested_tag.id,
+                    "assignment_existed": assignment_existed_before,
+                    "atom_updated_at": previous_updated_at,
+                });
+                let after = json!({
+                    "atom_id": evidence.atom_id,
+                    "tag_id": evidence.suggested_tag.id,
+                    "assignment_exists": true,
+                    "action_added_assignment": inserted > 0,
+                    "atom_updated_at": if inserted > 0 { updated_at } else { previous_updated_at },
+                });
+                insert_action_log_sqlite(
+                    &tx,
+                    &KnowledgeSignalActionLog {
+                        id: action_log_id_for_task,
+                        signal_key: signal.id,
+                        provider_id: signal.provider_id,
+                        action: "add_tag_to_atom".to_string(),
+                        target_type: signal.target.kind,
+                        target_id: Some(evidence.atom_id),
+                        before_state: before,
+                        after_state: after,
+                        status: "applied".to_string(),
+                        error: None,
+                        executed_at: executed_at_for_task,
+                        undone_at: None,
+                    },
+                )?;
+                tx.commit()?;
+                Ok::<(), AtomicCoreError>(())
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??;
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            let mut tx = storage
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let previous_updated_at: Option<String> =
+                sqlx::query_scalar("SELECT updated_at FROM atoms WHERE id = $1 AND db_id = $2")
+                    .bind(&evidence.atom_id)
+                    .bind(&storage.db_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let previous_updated_at = previous_updated_at
+                .ok_or_else(|| AtomicCoreError::NotFound("Atom not found".to_string()))?;
+            let tag_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id = $1 AND db_id = $2)",
+            )
+            .bind(&evidence.suggested_tag.id)
+            .bind(&storage.db_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            if !tag_exists {
+                return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+            }
+            let assignment_existed_before: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM atom_tags WHERE atom_id = $1 AND tag_id = $2 AND db_id = $3)",
+            )
+            .bind(&evidence.atom_id)
+            .bind(&evidence.suggested_tag.id)
+            .bind(&storage.db_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let inserted = sqlx::query(
+                "INSERT INTO atom_tags (atom_id, tag_id, db_id, source)
+                 VALUES ($1, $2, $3, 'manual')
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&evidence.atom_id)
+            .bind(&evidence.suggested_tag.id)
+            .bind(&storage.db_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            .rows_affected();
+            let updated_at = Utc::now().to_rfc3339();
+            if inserted > 0 {
+                sqlx::query("UPDATE atoms SET updated_at = $1 WHERE id = $2 AND db_id = $3")
+                    .bind(&updated_at)
+                    .bind(&evidence.atom_id)
+                    .bind(&storage.db_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            }
+            let before = json!({
+                "atom_id": evidence.atom_id,
+                "tag_id": evidence.suggested_tag.id,
+                "assignment_existed": assignment_existed_before,
+                "atom_updated_at": previous_updated_at,
+            });
+            let after = json!({
+                "atom_id": evidence.atom_id,
+                "tag_id": evidence.suggested_tag.id,
+                "assignment_exists": true,
+                "action_added_assignment": inserted > 0,
+                "atom_updated_at": if inserted > 0 { updated_at } else { previous_updated_at },
+            });
+            insert_action_log_postgres(
+                &mut tx,
+                &storage.db_id,
+                &KnowledgeSignalActionLog {
+                    id: action_log_id.clone(),
+                    signal_key: signal.id.clone(),
+                    provider_id: signal.provider_id.clone(),
+                    action: "add_tag_to_atom".to_string(),
+                    target_type: signal.target.kind.clone(),
+                    target_id: Some(evidence.atom_id.clone()),
+                    before_state: before,
+                    after_state: after,
+                    status: "applied".to_string(),
+                    error: None,
+                    executed_at: executed_at.clone(),
+                    undone_at: None,
+                },
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        }
+    }
+
+    core.canvas_cache.invalidate();
+    Ok(KnowledgeSignalActionResult {
+        action_log_id,
+        signal_key: signal.id.clone(),
+        provider_id: signal.provider_id.clone(),
+        action: "add_tag_to_atom".to_string(),
+        status: "applied".to_string(),
+        undo_supported: true,
+        result: json!({
+            "atom_id": evidence.atom_id,
+            "tag_id": evidence.suggested_tag.id,
+        }),
+    })
+}
+
+async fn apply_delete_empty_tag_action(
+    core: &AtomicCore,
+    signal: &KnowledgeSignal,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    if signal.provider_id != EMPTY_TAG_PROVIDER_ID {
+        return Err(AtomicCoreError::Validation(
+            "delete_empty_tag is only supported for empty-tag signals".to_string(),
+        ));
+    }
+    let evidence: EmptyTagEvidence = serde_json::from_value(signal.evidence.clone())?;
+    let action_log_id = uuid::Uuid::new_v4().to_string();
+    let executed_at = Utc::now().to_rfc3339();
+
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            let signal = signal.clone();
+            let evidence = evidence.clone();
+            let action_log_id_for_task = action_log_id.clone();
+            let executed_at_for_task = executed_at.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = storage
+                    .database()
+                    .conn
+                    .lock()
+                    .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                let tx = conn.unchecked_transaction()?;
+                let tag_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                    [&evidence.tag.id],
+                    |row| row.get(0),
+                )?;
+                if !tag_exists {
+                    return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                }
+                let atom_assignment_count: i32 = tx.query_row(
+                    "SELECT COUNT(*) FROM atom_tags WHERE tag_id = ?1",
+                    [&evidence.tag.id],
+                    |row| row.get(0),
+                )?;
+                let child_count: i32 = tx.query_row(
+                    "SELECT COUNT(*) FROM tags WHERE parent_id = ?1",
+                    [&evidence.tag.id],
+                    |row| row.get(0),
+                )?;
+                if atom_assignment_count != 0 || child_count != 0 {
+                    return Err(AtomicCoreError::Validation(
+                        "Tag is no longer empty".to_string(),
+                    ));
+                }
+                tx.execute("DELETE FROM tags WHERE id = ?1", [&evidence.tag.id])?;
+                insert_action_log_sqlite(
+                    &tx,
+                    &KnowledgeSignalActionLog {
+                        id: action_log_id_for_task,
+                        signal_key: signal.id,
+                        provider_id: signal.provider_id,
+                        action: "delete_empty_tag".to_string(),
+                        target_type: signal.target.kind,
+                        target_id: Some(evidence.tag.id.clone()),
+                        before_state: json!({ "tag": evidence.tag }),
+                        after_state: json!({ "deleted": true }),
+                        status: "applied".to_string(),
+                        error: None,
+                        executed_at: executed_at_for_task,
+                        undone_at: None,
+                    },
+                )?;
+                tx.commit()?;
+                Ok::<(), AtomicCoreError>(())
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??;
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            let mut tx = storage
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let tag_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id = $1 AND db_id = $2)",
+            )
+            .bind(&evidence.tag.id)
+            .bind(&storage.db_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            if !tag_exists {
+                return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+            }
+            let atom_assignment_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM atom_tags WHERE tag_id = $1 AND db_id = $2",
+            )
+            .bind(&evidence.tag.id)
+            .bind(&storage.db_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let child_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE parent_id = $1 AND db_id = $2")
+                    .bind(&evidence.tag.id)
+                    .bind(&storage.db_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            if atom_assignment_count != 0 || child_count != 0 {
+                return Err(AtomicCoreError::Validation(
+                    "Tag is no longer empty".to_string(),
+                ));
+            }
+            sqlx::query("DELETE FROM tags WHERE id = $1 AND db_id = $2")
+                .bind(&evidence.tag.id)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            insert_action_log_postgres(
+                &mut tx,
+                &storage.db_id,
+                &KnowledgeSignalActionLog {
+                    id: action_log_id.clone(),
+                    signal_key: signal.id.clone(),
+                    provider_id: signal.provider_id.clone(),
+                    action: "delete_empty_tag".to_string(),
+                    target_type: signal.target.kind.clone(),
+                    target_id: Some(evidence.tag.id.clone()),
+                    before_state: json!({ "tag": evidence.tag }),
+                    after_state: json!({ "deleted": true }),
+                    status: "applied".to_string(),
+                    error: None,
+                    executed_at: executed_at.clone(),
+                    undone_at: None,
+                },
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        }
+    }
+
+    core.canvas_cache.invalidate();
+    Ok(KnowledgeSignalActionResult {
+        action_log_id,
+        signal_key: signal.id.clone(),
+        provider_id: signal.provider_id.clone(),
+        action: "delete_empty_tag".to_string(),
+        status: "applied".to_string(),
+        undo_supported: false,
+        result: json!({ "tag_id": evidence.tag.id }),
+    })
+}
+
+async fn apply_merge_tags_action(
+    core: &AtomicCore,
+    signal: &KnowledgeSignal,
+    payload: &Value,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    if signal.provider_id != TAG_REDUNDANCY_PROVIDER_ID {
+        return Err(AtomicCoreError::Validation(
+            "merge_tags is only supported for tag-redundancy signals".to_string(),
+        ));
+    }
+    let evidence: TagRedundancyEvidence = serde_json::from_value(signal.evidence.clone())?;
+    let source_tag_id = payload
+        .get("source_tag_id")
+        .or_else(|| payload.get("sourceTagId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AtomicCoreError::Validation("source_tag_id is required".to_string()))?;
+    let target_tag_id = payload
+        .get("target_tag_id")
+        .or_else(|| payload.get("targetTagId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AtomicCoreError::Validation("target_tag_id is required".to_string()))?;
+    let source_in_pair =
+        source_tag_id == evidence.primary_tag.id || source_tag_id == evidence.secondary_tag.id;
+    let target_in_pair =
+        target_tag_id == evidence.primary_tag.id || target_tag_id == evidence.secondary_tag.id;
+    if !source_in_pair || !target_in_pair || source_tag_id == target_tag_id {
+        return Err(AtomicCoreError::Validation(
+            "Merge tags must match the reviewed signal pair".to_string(),
+        ));
+    }
+
+    let action_log_id = uuid::Uuid::new_v4().to_string();
+    let executed_at = Utc::now().to_rfc3339();
+    let before = json!({
+        "primary_tag": evidence.primary_tag,
+        "secondary_tag": evidence.secondary_tag,
+        "source_tag_id": source_tag_id,
+        "target_tag_id": target_tag_id,
+        "shared_atom_count": evidence.shared_atom_count,
+        "primary_unique_atom_count": evidence.primary_unique_atom_count,
+        "secondary_unique_atom_count": evidence.secondary_unique_atom_count,
+    });
+
+    insert_pending_action_log(
+        core,
+        KnowledgeSignalActionLog {
+            id: action_log_id.clone(),
+            signal_key: signal.id.clone(),
+            provider_id: signal.provider_id.clone(),
+            action: "merge_tags".to_string(),
+            target_type: signal.target.kind.clone(),
+            target_id: Some(target_tag_id.to_string()),
+            before_state: before,
+            after_state: json!({}),
+            status: "pending".to_string(),
+            error: None,
+            executed_at: executed_at.clone(),
+            undone_at: None,
+        },
+    )
+    .await?;
+
+    match core.merge_tags(source_tag_id, target_tag_id).await {
+        Ok(result) => {
+            let result_json = serde_json::to_value(&result)?;
+            update_action_log_status(core, &action_log_id, "applied", result_json.clone(), None)
+                .await?;
+            Ok(KnowledgeSignalActionResult {
+                action_log_id,
+                signal_key: signal.id.clone(),
+                provider_id: signal.provider_id.clone(),
+                action: "merge_tags".to_string(),
+                status: "applied".to_string(),
+                undo_supported: false,
+                result: result_json,
+            })
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let _ = update_action_log_status(
+                core,
+                &action_log_id,
+                "failed",
+                json!({}),
+                Some(message.clone()),
+            )
+            .await;
+            Err(AtomicCoreError::Validation(message))
+        }
+    }
+}
+
+async fn undo_add_tag_to_atom_action(
+    core: &AtomicCore,
+    log: &KnowledgeSignalActionLog,
+) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+    let atom_id = log
+        .after_state
+        .get("atom_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AtomicCoreError::Validation("Action log missing atom_id".to_string()))?;
+    let tag_id = log
+        .after_state
+        .get("tag_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AtomicCoreError::Validation("Action log missing tag_id".to_string()))?;
+    let action_added_assignment = log
+        .after_state
+        .get("action_added_assignment")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            let log_id = log.id.clone();
+            let atom_id = atom_id.to_string();
+            let tag_id = tag_id.to_string();
+            let action_added_assignment = action_added_assignment;
+            tokio::task::spawn_blocking(move || {
+                let conn = storage
+                    .database()
+                    .conn
+                    .lock()
+                    .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                let tx = conn.unchecked_transaction()?;
+                if action_added_assignment {
+                    tx.execute(
+                        "DELETE FROM atom_tags WHERE atom_id = ?1 AND tag_id = ?2",
+                        rusqlite::params![&atom_id, &tag_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE atoms SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![Utc::now().to_rfc3339(), &atom_id],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE knowledge_signal_action_log
+                     SET status = 'undone', undone_at = ?1
+                     WHERE id = ?2 AND status = 'applied'",
+                    rusqlite::params![Utc::now().to_rfc3339(), &log_id],
+                )?;
+                tx.commit()?;
+                Ok::<(), AtomicCoreError>(())
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??;
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            let mut tx = storage
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            if action_added_assignment {
+                sqlx::query(
+                    "DELETE FROM atom_tags WHERE atom_id = $1 AND tag_id = $2 AND db_id = $3",
+                )
+                .bind(atom_id)
+                .bind(tag_id)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                sqlx::query("UPDATE atoms SET updated_at = $1 WHERE id = $2 AND db_id = $3")
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(atom_id)
+                    .bind(&storage.db_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            }
+            sqlx::query(
+                "UPDATE knowledge_signal_action_log
+                 SET status = 'undone', undone_at = $1
+                 WHERE db_id = $2 AND id = $3 AND status = 'applied'",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(&storage.db_id)
+            .bind(&log.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        }
+    }
+    core.canvas_cache.invalidate();
+    Ok(KnowledgeSignalActionResult {
+        action_log_id: log.id.clone(),
+        signal_key: log.signal_key.clone(),
+        provider_id: log.provider_id.clone(),
+        action: log.action.clone(),
+        status: "undone".to_string(),
+        undo_supported: true,
+        result: json!({
+            "atom_id": atom_id,
+            "tag_id": tag_id,
+            "removed_assignment": action_added_assignment,
+        }),
+    })
+}
+
+fn insert_action_log_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    log: &KnowledgeSignalActionLog,
+) -> Result<(), AtomicCoreError> {
+    tx.execute(
+        "INSERT INTO knowledge_signal_action_log
+            (id, signal_key, provider_id, action, target_type, target_id,
+             before_state_json, after_state_json, status, error, executed_at, undone_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            log.id,
+            log.signal_key,
+            log.provider_id,
+            log.action,
+            log.target_type,
+            log.target_id,
+            serde_json::to_string(&log.before_state)?,
+            serde_json::to_string(&log.after_state)?,
+            log.status,
+            log.error,
+            log.executed_at,
+            log.undone_at,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+async fn insert_action_log_postgres(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db_id: &str,
+    log: &KnowledgeSignalActionLog,
+) -> Result<(), AtomicCoreError> {
+    sqlx::query(
+        "INSERT INTO knowledge_signal_action_log
+            (db_id, id, signal_key, provider_id, action, target_type, target_id,
+             before_state_json, after_state_json, status, error, executed_at, undone_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+    )
+    .bind(db_id)
+    .bind(&log.id)
+    .bind(&log.signal_key)
+    .bind(&log.provider_id)
+    .bind(&log.action)
+    .bind(&log.target_type)
+    .bind(&log.target_id)
+    .bind(serde_json::to_string(&log.before_state)?)
+    .bind(serde_json::to_string(&log.after_state)?)
+    .bind(&log.status)
+    .bind(&log.error)
+    .bind(&log.executed_at)
+    .bind(&log.undone_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+    Ok(())
+}
+
+async fn insert_pending_action_log(
+    core: &AtomicCore,
+    log: KnowledgeSignalActionLog,
+) -> Result<(), AtomicCoreError> {
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = storage
+                    .database()
+                    .conn
+                    .lock()
+                    .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                let tx = conn.unchecked_transaction()?;
+                insert_action_log_sqlite(&tx, &log)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            let mut tx = storage
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            insert_action_log_postgres(&mut tx, &storage.db_id, &log).await?;
+            tx.commit()
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+async fn update_action_log_status(
+    core: &AtomicCore,
+    action_log_id: &str,
+    status: &str,
+    after_state: Value,
+    error: Option<String>,
+) -> Result<(), AtomicCoreError> {
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            let id = action_log_id.to_string();
+            let status = status.to_string();
+            let after_state_json = serde_json::to_string(&after_state)?;
+            tokio::task::spawn_blocking(move || {
+                let conn = storage
+                    .database()
+                    .conn
+                    .lock()
+                    .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                conn.execute(
+                    "UPDATE knowledge_signal_action_log
+                     SET status = ?1, after_state_json = ?2, error = ?3
+                     WHERE id = ?4",
+                    rusqlite::params![status, after_state_json, error, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            sqlx::query(
+                "UPDATE knowledge_signal_action_log
+                 SET status = $1, after_state_json = $2, error = $3
+                 WHERE db_id = $4 AND id = $5",
+            )
+            .bind(status)
+            .bind(serde_json::to_string(&after_state)?)
+            .bind(error)
+            .bind(&storage.db_id)
+            .bind(action_log_id)
+            .execute(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+async fn get_action_log(
+    core: &AtomicCore,
+    action_log_id: &str,
+) -> Result<KnowledgeSignalActionLog, AtomicCoreError> {
+    match &core.storage {
+        StorageBackend::Sqlite(storage) => {
+            let storage = storage.clone();
+            let id = action_log_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let conn = storage.database().read_conn()?;
+                conn.query_row(
+                    "SELECT id, signal_key, provider_id, action, target_type, target_id,
+                            before_state_json, after_state_json, status, error, executed_at, undone_at
+                     FROM knowledge_signal_action_log
+                     WHERE id = ?1",
+                    [&id],
+                    |row| {
+                        let before: String = row.get(6)?;
+                        let after: String = row.get(7)?;
+                        Ok(KnowledgeSignalActionLog {
+                            id: row.get(0)?,
+                            signal_key: row.get(1)?,
+                            provider_id: row.get(2)?,
+                            action: row.get(3)?,
+                            target_type: row.get(4)?,
+                            target_id: row.get(5)?,
+                            before_state: serde_json::from_str(&before).unwrap_or_else(|_| json!({})),
+                            after_state: serde_json::from_str(&after).unwrap_or_else(|_| json!({})),
+                            status: row.get(8)?,
+                            error: row.get(9)?,
+                            executed_at: row.get(10)?,
+                            undone_at: row.get(11)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| AtomicCoreError::NotFound("Action log not found".to_string()))
+            })
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres(storage) => {
+            let row: Option<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT id, signal_key, provider_id, action, target_type, target_id,
+                        before_state_json, after_state_json, status, error, executed_at, undone_at
+                 FROM knowledge_signal_action_log
+                 WHERE db_id = $1 AND id = $2",
+            )
+            .bind(&storage.db_id)
+            .bind(action_log_id)
+            .fetch_optional(&storage.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            let Some(row) = row else {
+                return Err(AtomicCoreError::NotFound(
+                    "Action log not found".to_string(),
+                ));
+            };
+            Ok(KnowledgeSignalActionLog {
+                id: row.0,
+                signal_key: row.1,
+                provider_id: row.2,
+                action: row.3,
+                target_type: row.4,
+                target_id: row.5,
+                before_state: row
+                    .6
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_else(|| json!({})),
+                after_state: row
+                    .7
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_else(|| json!({})),
+                status: row.8,
+                error: row.9,
+                executed_at: row.10,
+                undone_at: row.11,
+            })
+        }
+    }
 }
 
 struct WikiCandidateProvider;
@@ -1662,6 +2998,144 @@ impl KnowledgeSignalProvider for MissingTagOverlapProvider {
     }
 }
 
+struct NearDuplicateAtomProvider;
+
+#[async_trait]
+impl KnowledgeSignalProvider for NearDuplicateAtomProvider {
+    fn id(&self) -> &'static str {
+        NEAR_DUPLICATE_ATOM_PROVIDER_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Near-duplicate atoms"
+    }
+
+    async fn evaluate(
+        &self,
+        core: &AtomicCore,
+        _config: &KnowledgeSignalProviderConfig,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        match &core.storage {
+            StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = storage.database().read_conn()?;
+                    evaluate_near_duplicate_atoms_sqlite(&conn)
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(storage) => {
+                evaluate_near_duplicate_atoms_postgres(storage).await
+            }
+        }
+    }
+}
+
+struct SourceDuplicateProvider;
+
+#[async_trait]
+impl KnowledgeSignalProvider for SourceDuplicateProvider {
+    fn id(&self) -> &'static str {
+        SOURCE_DUPLICATE_PROVIDER_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Source duplicates"
+    }
+
+    async fn evaluate(
+        &self,
+        core: &AtomicCore,
+        _config: &KnowledgeSignalProviderConfig,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        match &core.storage {
+            StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = storage.database().read_conn()?;
+                    evaluate_source_duplicates_sqlite(&conn)
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(storage) => evaluate_source_duplicates_postgres(storage).await,
+        }
+    }
+}
+
+struct BrokenInternalLinkProvider;
+
+#[async_trait]
+impl KnowledgeSignalProvider for BrokenInternalLinkProvider {
+    fn id(&self) -> &'static str {
+        BROKEN_INTERNAL_LINK_PROVIDER_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Broken internal links"
+    }
+
+    async fn evaluate(
+        &self,
+        core: &AtomicCore,
+        _config: &KnowledgeSignalProviderConfig,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        match &core.storage {
+            StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = storage.database().read_conn()?;
+                    evaluate_broken_internal_links_sqlite(&conn)
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(storage) => {
+                evaluate_broken_internal_links_postgres(storage).await
+            }
+        }
+    }
+}
+
+struct UnderconnectedAtomProvider;
+
+#[async_trait]
+impl KnowledgeSignalProvider for UnderconnectedAtomProvider {
+    fn id(&self) -> &'static str {
+        UNDERCONNECTED_ATOM_PROVIDER_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Underconnected atoms"
+    }
+
+    async fn evaluate(
+        &self,
+        core: &AtomicCore,
+        _config: &KnowledgeSignalProviderConfig,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        match &core.storage {
+            StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = storage.database().read_conn()?;
+                    evaluate_underconnected_atoms_sqlite(&conn)
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+            }
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(storage) => {
+                evaluate_underconnected_atoms_postgres(storage).await
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TagCleanupTag {
     id: String,
@@ -1748,6 +3222,95 @@ impl KnowledgeSignalEvidence for MissingTagOverlapEvidence {
     const SCHEMA: &'static str = "missing_tag_overlap";
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NearDuplicateAtomEvidence {
+    pub primary_atom: NearDuplicateAtomEvidenceAtom,
+    pub secondary_atom: NearDuplicateAtomEvidenceAtom,
+    pub semantic_similarity: f32,
+    pub source_match: String,
+    pub title_similarity: f32,
+    pub shared_tags: Vec<NearDuplicateTagEvidence>,
+    pub shared_tag_count: i32,
+    pub content_length_ratio: f32,
+}
+
+impl KnowledgeSignalEvidence for NearDuplicateAtomEvidence {
+    const SCHEMA: &'static str = "near_duplicate_atom";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceDuplicateEvidence {
+    pub primary_atom: NearDuplicateAtomEvidenceAtom,
+    pub secondary_atom: NearDuplicateAtomEvidenceAtom,
+    pub source_url: String,
+    pub normalized_source_url: String,
+    pub duplicate_count: i32,
+    pub title_similarity: f32,
+    pub content_length_ratio: f32,
+}
+
+impl KnowledgeSignalEvidence for SourceDuplicateEvidence {
+    const SCHEMA: &'static str = "source_duplicate";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NearDuplicateAtomEvidenceAtom {
+    pub id: String,
+    pub title: String,
+    pub source_url: Option<String>,
+    pub content_length: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NearDuplicateTagEvidence {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct UnderconnectedAtomEvidence {
+    pub atom_id: String,
+    pub atom_title: String,
+    pub source_url: Option<String>,
+    pub content_length: i32,
+    pub tag_count: i32,
+    pub total_edge_count: i32,
+    pub strong_edge_count: i32,
+    pub strongest_similarity: Option<f32>,
+    pub average_similarity: Option<f32>,
+    pub captured_atom_count: i32,
+    pub edges_status: String,
+}
+
+impl KnowledgeSignalEvidence for UnderconnectedAtomEvidence {
+    const SCHEMA: &'static str = "underconnected_atom";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BrokenInternalLinkEvidence {
+    pub link_id: String,
+    pub source_atom_id: String,
+    pub source_atom_title: String,
+    pub raw_target: String,
+    pub label: Option<String>,
+    pub target_kind: String,
+    pub status: String,
+    pub start_offset: Option<i32>,
+    pub end_offset: Option<i32>,
+}
+
+impl KnowledgeSignalEvidence for BrokenInternalLinkEvidence {
+    const SCHEMA: &'static str = "broken_internal_link";
+}
+
 #[derive(Debug, Clone)]
 struct TagPairCandidate {
     tag_a_id: String,
@@ -1765,28 +3328,106 @@ struct MissingTagCandidate {
     average_similarity: f32,
 }
 
+#[derive(Debug, Clone)]
+struct NearDuplicateAtomCandidate {
+    primary: NearDuplicateAtomInfo,
+    secondary: NearDuplicateAtomInfo,
+    semantic_similarity: f32,
+}
+
+#[derive(Debug, Clone)]
+struct NearDuplicateAtomInfo {
+    id: String,
+    title: String,
+    source_url: Option<String>,
+    content_length: i32,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceDuplicateCandidate {
+    primary: NearDuplicateAtomInfo,
+    secondary: NearDuplicateAtomInfo,
+    normalized_source_url: String,
+    duplicate_count: i32,
+}
+
+#[derive(Debug, Clone)]
+struct AtomTagInfo {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct BrokenInternalLinkCandidate {
+    link_id: String,
+    source_atom_id: String,
+    source_atom_title: String,
+    raw_target: String,
+    label: Option<String>,
+    target_kind: String,
+    status: String,
+    start_offset: Option<i32>,
+    end_offset: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct UnderconnectedAtomCandidate {
+    atom_id: String,
+    atom_title: String,
+    source_url: Option<String>,
+    content_length: i32,
+    tag_count: i32,
+    total_edge_count: i32,
+    strong_edge_count: i32,
+    strongest_similarity: Option<f32>,
+    average_similarity: Option<f32>,
+    captured_atom_count: i32,
+    edges_status: String,
+}
+
 fn evaluate_tag_redundancy_sqlite(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
     let tags = load_sqlite_tag_cleanup_tags(conn)?;
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT at1.tag_id, at2.tag_id, COUNT(*) as shared_count
-         FROM atom_tags at1
+        "WITH eligible_atom_tags AS (
+            SELECT at.atom_id, at.tag_id
+            FROM atom_tags at
+            JOIN atoms a ON a.id = at.atom_id AND a.kind = 'captured'
+            WHERE at.atom_id IN (
+                SELECT at_inner.atom_id
+                FROM atom_tags at_inner
+                JOIN atoms a_inner ON a_inner.id = at_inner.atom_id AND a_inner.kind = 'captured'
+                GROUP BY at_inner.atom_id
+                HAVING COUNT(*) BETWEEN 2 AND ?1
+            )
+         )
+         SELECT at1.tag_id, at2.tag_id, COUNT(*) as shared_count
+         FROM eligible_atom_tags at1
          JOIN atom_tags at2
            ON at1.atom_id = at2.atom_id
           AND at1.tag_id < at2.tag_id
-         JOIN atoms a ON a.id = at1.atom_id AND a.kind = 'captured'
          GROUP BY at1.tag_id, at2.tag_id
-         HAVING COUNT(*) >= 3",
+         HAVING COUNT(*) >= 3
+         ORDER BY shared_count DESC
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(TagPairCandidate {
-            tag_a_id: row.get(0)?,
-            tag_b_id: row.get(1)?,
-            shared_atom_count: row.get(2)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![
+            TAG_REDUNDANCY_MAX_TAGS_PER_ATOM,
+            TAG_REDUNDANCY_CANDIDATE_LIMIT
+        ],
+        |row| {
+            Ok(TagPairCandidate {
+                tag_a_id: row.get(0)?,
+                tag_b_id: row.get(1)?,
+                shared_atom_count: row.get(2)?,
+            })
+        },
+    )?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -1843,14 +3484,19 @@ fn evaluate_missing_tag_overlap_sqlite(
     let current_tags = load_sqlite_atom_tag_ids(conn)?;
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "WITH neighbor_edges AS (
-            SELECT source_atom_id as atom_id, target_atom_id as neighbor_atom_id, similarity_score
+        "WITH high_edges AS (
+            SELECT source_atom_id, target_atom_id, similarity_score
             FROM semantic_edges
             WHERE similarity_score >= 0.55
+            ORDER BY similarity_score DESC
+            LIMIT ?1
+         ),
+         neighbor_edges AS (
+            SELECT source_atom_id as atom_id, target_atom_id as neighbor_atom_id, similarity_score
+            FROM high_edges
             UNION ALL
             SELECT target_atom_id as atom_id, source_atom_id as neighbor_atom_id, similarity_score
-            FROM semantic_edges
-            WHERE similarity_score >= 0.55
+            FROM high_edges
          )
          SELECT
             ne.atom_id,
@@ -1868,18 +3514,26 @@ fn evaluate_missing_tag_overlap_sqlite(
           AND existing.tag_id = nt.tag_id
          WHERE existing.tag_id IS NULL
          GROUP BY ne.atom_id, a.title, nt.tag_id
-         HAVING COUNT(DISTINCT ne.neighbor_atom_id) >= 3",
+         HAVING COUNT(DISTINCT ne.neighbor_atom_id) >= 3
+         ORDER BY average_similarity DESC, nearby_tagged_atom_count DESC
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(MissingTagCandidate {
-            atom_id: row.get(0)?,
-            atom_title: row.get(1)?,
-            tag_id: row.get(2)?,
-            nearby_tagged_atom_count: row.get(3)?,
-            strongest_similarity: row.get::<_, f32>(4)?,
-            average_similarity: row.get::<_, f32>(5)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![
+            MISSING_TAG_EDGE_CANDIDATE_LIMIT,
+            MISSING_TAG_CANDIDATE_LIMIT
+        ],
+        |row| {
+            Ok(MissingTagCandidate {
+                atom_id: row.get(0)?,
+                atom_title: row.get(1)?,
+                tag_id: row.get(2)?,
+                nearby_tagged_atom_count: row.get(3)?,
+                strongest_similarity: row.get::<_, f32>(4)?,
+                average_similarity: row.get::<_, f32>(5)?,
+            })
+        },
+    )?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -1896,6 +3550,336 @@ fn evaluate_missing_tag_overlap_sqlite(
         }
     }
     limit_missing_tag_signals(out)
+}
+
+fn evaluate_near_duplicate_atoms_sqlite(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT
+            e.source_atom_id,
+            COALESCE(a.title, ''),
+            a.source_url,
+            LENGTH(a.content),
+            a.created_at,
+            a.updated_at,
+            e.target_atom_id,
+            COALESCE(b.title, ''),
+            b.source_url,
+            LENGTH(b.content),
+            b.created_at,
+            b.updated_at,
+            e.similarity_score
+         FROM semantic_edges e
+         JOIN atoms a ON a.id = e.source_atom_id AND a.kind = 'captured'
+         JOIN atoms b ON b.id = e.target_atom_id AND b.kind = 'captured'
+         WHERE e.similarity_score >= 0.84
+         ORDER BY e.similarity_score DESC
+         LIMIT 250",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(NearDuplicateAtomCandidate {
+            primary: NearDuplicateAtomInfo {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                source_url: row.get(2)?,
+                content_length: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            },
+            secondary: NearDuplicateAtomInfo {
+                id: row.get(6)?,
+                title: row.get(7)?,
+                source_url: row.get(8)?,
+                content_length: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            },
+            semantic_similarity: row.get(12)?,
+        })
+    })?;
+
+    let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+    let candidate_atom_ids = collect_near_duplicate_atom_ids(&candidates);
+    let atom_tags = load_sqlite_atom_tag_info_for_atoms(conn, &candidate_atom_ids)?;
+
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let shared_tags =
+            shared_atom_tags(&candidate.primary.id, &candidate.secondary.id, &atom_tags);
+        if let Some(signal) = near_duplicate_atom_signal(&candidate, shared_tags, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_near_duplicate_atom_signals(out)
+}
+
+fn evaluate_source_duplicates_sqlite(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "WITH source_atoms AS (
+            SELECT
+                id,
+                COALESCE(title, '') as title,
+                source_url,
+                lower(rtrim(source_url, '/')) as normalized_source_url,
+                LENGTH(content) as content_length,
+                created_at,
+                updated_at
+            FROM atoms
+            WHERE kind = 'captured'
+              AND source_url IS NOT NULL
+              AND TRIM(source_url) != ''
+         ),
+         duplicate_sources AS (
+            SELECT
+                normalized_source_url,
+                COUNT(*) as duplicate_count,
+                MAX(updated_at) as latest_updated
+            FROM source_atoms
+            GROUP BY normalized_source_url
+            HAVING COUNT(*) >= 2
+            ORDER BY latest_updated DESC
+            LIMIT ?1
+         ),
+         ranked_source_atoms AS (
+            SELECT
+                sa.*,
+                ds.duplicate_count,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sa.normalized_source_url
+                    ORDER BY sa.updated_at DESC
+                ) as source_rank
+            FROM source_atoms sa
+            JOIN duplicate_sources ds
+              ON ds.normalized_source_url = sa.normalized_source_url
+         )
+         SELECT
+            id,
+            title,
+            source_url,
+            normalized_source_url,
+            content_length,
+            created_at,
+            updated_at,
+            duplicate_count
+         FROM ranked_source_atoms
+         WHERE source_rank <= ?2
+         ORDER BY normalized_source_url, updated_at DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            SOURCE_DUPLICATE_GROUP_LIMIT,
+            SOURCE_DUPLICATE_ATOMS_PER_GROUP
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(3)?,
+                row.get::<_, i32>(7)?,
+                NearDuplicateAtomInfo {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    source_url: row.get(2)?,
+                    content_length: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                },
+            ))
+        },
+    )?;
+
+    let mut by_source: HashMap<String, Vec<NearDuplicateAtomInfo>> = HashMap::new();
+    let mut duplicate_counts: HashMap<String, i32> = HashMap::new();
+    for row in rows {
+        let (source, duplicate_count, atom) = row?;
+        duplicate_counts.insert(source.clone(), duplicate_count);
+        by_source.entry(source).or_default().push(atom);
+    }
+
+    let mut out = Vec::new();
+    for (normalized_source_url, mut atoms) in by_source {
+        if atoms.len() < 2 {
+            continue;
+        }
+        atoms.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let duplicate_count = duplicate_counts
+            .get(&normalized_source_url)
+            .copied()
+            .unwrap_or(atoms.len() as i32);
+        let primary = atoms[0].clone();
+        for secondary in atoms.iter().skip(1).take(5) {
+            let candidate = SourceDuplicateCandidate {
+                primary: primary.clone(),
+                secondary: secondary.clone(),
+                normalized_source_url: normalized_source_url.clone(),
+                duplicate_count,
+            };
+            if let Some(signal) = source_duplicate_signal(&candidate, &now)? {
+                out.push(signal);
+            }
+        }
+    }
+    limit_near_duplicate_atom_signals(out)
+}
+
+fn evaluate_broken_internal_links_sqlite(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT
+            al.id,
+            al.source_atom_id,
+            COALESCE(a.title, ''),
+            al.raw_target,
+            al.label,
+            al.target_kind,
+            al.status,
+            al.start_offset,
+            al.end_offset
+         FROM atom_links al
+         JOIN atoms a ON a.id = al.source_atom_id AND a.kind = 'captured'
+         WHERE (
+             (al.target_kind = 'atom_id' AND al.status = 'missing')
+             OR (al.target_kind = 'text' AND al.status = 'unresolved')
+         )
+         ORDER BY
+             CASE WHEN al.status = 'missing' THEN 0 ELSE 1 END,
+             a.updated_at DESC,
+             al.start_offset ASC
+         LIMIT 150",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(BrokenInternalLinkCandidate {
+            link_id: row.get(0)?,
+            source_atom_id: row.get(1)?,
+            source_atom_title: row.get(2)?,
+            raw_target: row.get(3)?,
+            label: row.get(4)?,
+            target_kind: row.get(5)?,
+            status: row.get(6)?,
+            start_offset: row.get(7)?,
+            end_offset: row.get(8)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(signal) = broken_internal_link_signal(&row?, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_broken_internal_link_signals(out)
+}
+
+fn evaluate_underconnected_atoms_sqlite(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "WITH eligible_atoms AS (
+            SELECT id
+            FROM atoms
+            WHERE kind = 'captured'
+              AND edges_status = 'complete'
+              AND LENGTH(content) >= 180
+            ORDER BY updated_at DESC
+            LIMIT ?1
+         ),
+         db_size AS (
+            SELECT COUNT(*) as captured_atom_count
+            FROM atoms
+            WHERE kind = 'captured'
+              AND edges_status = 'complete'
+         ),
+         edge_summary AS (
+            SELECT
+                atom_id,
+                COUNT(*) as total_edge_count,
+                SUM(CASE WHEN similarity_score >= 0.55 THEN 1 ELSE 0 END) as strong_edge_count,
+                MAX(similarity_score) as strongest_similarity,
+                AVG(similarity_score) as average_similarity
+            FROM (
+                SELECT e.source_atom_id as atom_id, e.similarity_score
+                FROM semantic_edges e
+                JOIN eligible_atoms ea ON ea.id = e.source_atom_id
+                JOIN atoms source ON source.id = e.source_atom_id AND source.kind = 'captured'
+                JOIN atoms target ON target.id = e.target_atom_id AND target.kind = 'captured'
+                UNION ALL
+                SELECT e.target_atom_id as atom_id, e.similarity_score
+                FROM semantic_edges e
+                JOIN eligible_atoms ea ON ea.id = e.target_atom_id
+                JOIN atoms source ON source.id = e.source_atom_id AND source.kind = 'captured'
+                JOIN atoms target ON target.id = e.target_atom_id AND target.kind = 'captured'
+            )
+            GROUP BY atom_id
+         ),
+         tag_counts AS (
+            SELECT at.atom_id, COUNT(DISTINCT at.tag_id) as tag_count
+            FROM atom_tags at
+            JOIN eligible_atoms ea ON ea.id = at.atom_id
+            GROUP BY at.atom_id
+         )
+         SELECT
+            a.id,
+            COALESCE(a.title, ''),
+            a.source_url,
+            LENGTH(a.content),
+            COALESCE(tc.tag_count, 0),
+            COALESCE(es.total_edge_count, 0),
+            COALESCE(es.strong_edge_count, 0),
+            es.strongest_similarity,
+            es.average_similarity,
+            db_size.captured_atom_count,
+            a.edges_status
+         FROM atoms a
+         JOIN eligible_atoms ea ON ea.id = a.id
+         CROSS JOIN db_size
+         LEFT JOIN edge_summary es ON es.atom_id = a.id
+         LEFT JOIN tag_counts tc ON tc.atom_id = a.id
+         WHERE a.kind = 'captured'
+           AND a.edges_status = 'complete'
+           AND db_size.captured_atom_count >= 8
+           AND LENGTH(a.content) >= 180
+           AND (
+                COALESCE(es.strong_edge_count, 0) = 0
+                OR (
+                    COALESCE(es.strong_edge_count, 0) <= 1
+                    AND COALESCE(tc.tag_count, 0) <= 1
+                    AND COALESCE(es.strongest_similarity, 0.0) < 0.62
+                )
+           )
+         ORDER BY COALESCE(es.strong_edge_count, 0) ASC,
+                  COALESCE(es.strongest_similarity, 0.0) ASC,
+                  LENGTH(a.content) DESC
+         LIMIT 100",
+    )?;
+    let rows = stmt.query_map(params![UNDERCONNECTED_CANDIDATE_ATOM_LIMIT], |row| {
+        Ok(UnderconnectedAtomCandidate {
+            atom_id: row.get(0)?,
+            atom_title: row.get(1)?,
+            source_url: row.get(2)?,
+            content_length: row.get(3)?,
+            tag_count: row.get(4)?,
+            total_edge_count: row.get(5)?,
+            strong_edge_count: row.get(6)?,
+            strongest_similarity: row.get(7)?,
+            average_similarity: row.get(8)?,
+            captured_atom_count: row.get(9)?,
+            edges_status: row.get(10)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(signal) = underconnected_atom_signal(&row?, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_underconnected_atom_signals(out)
 }
 
 fn load_sqlite_atom_tag_ids(
@@ -1915,6 +3899,54 @@ fn load_sqlite_atom_tag_ids(
         out.entry(atom_id).or_default().push(tag_id);
     }
     Ok(out)
+}
+
+fn load_sqlite_atom_tag_info_for_atoms(
+    conn: &rusqlite::Connection,
+    atom_ids: &[String],
+) -> Result<HashMap<String, Vec<AtomTagInfo>>, AtomicCoreError> {
+    if atom_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(atom_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT at.atom_id, t.id, t.name
+         FROM atom_tags at
+         JOIN tags t ON t.id = at.tag_id
+         WHERE at.atom_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(atom_ids), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            AtomTagInfo {
+                id: row.get(1)?,
+                name: row.get(2)?,
+            },
+        ))
+    })?;
+    let mut out: HashMap<String, Vec<AtomTagInfo>> = HashMap::new();
+    for row in rows {
+        let (atom_id, tag) = row?;
+        out.entry(atom_id).or_default().push(tag);
+    }
+    Ok(out)
+}
+
+fn collect_near_duplicate_atom_ids(candidates: &[NearDuplicateAtomCandidate]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for candidate in candidates {
+        if !ids.contains(&candidate.primary.id) {
+            ids.push(candidate.primary.id.clone());
+        }
+        if !ids.contains(&candidate.secondary.id) {
+            ids.push(candidate.secondary.id.clone());
+        }
+    }
+    ids
 }
 
 fn load_sqlite_tag_cleanup_tags(
@@ -1972,21 +4004,40 @@ async fn evaluate_tag_redundancy_postgres(
     let tags = load_postgres_tag_cleanup_tags(storage).await?;
     let now = Utc::now().to_rfc3339();
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT at1.tag_id, at2.tag_id, COUNT(*) as shared_count
-         FROM atom_tags at1
+        "WITH eligible_atom_tags AS (
+            SELECT at.atom_id, at.tag_id
+            FROM atom_tags at
+            JOIN atoms a
+              ON a.id = at.atom_id
+             AND a.db_id = at.db_id
+             AND a.kind = 'captured'
+            WHERE at.db_id = $1
+              AND at.atom_id IN (
+                SELECT at_inner.atom_id
+                FROM atom_tags at_inner
+                JOIN atoms a_inner
+                  ON a_inner.id = at_inner.atom_id
+                 AND a_inner.db_id = at_inner.db_id
+                 AND a_inner.kind = 'captured'
+                WHERE at_inner.db_id = $1
+                GROUP BY at_inner.atom_id
+                HAVING COUNT(*) BETWEEN 2 AND $2
+              )
+         )
+         SELECT at1.tag_id, at2.tag_id, COUNT(*) as shared_count
+         FROM eligible_atom_tags at1
          JOIN atom_tags at2
            ON at1.atom_id = at2.atom_id
           AND at1.tag_id < at2.tag_id
-          AND at1.db_id = at2.db_id
-         JOIN atoms a
-           ON a.id = at1.atom_id
-          AND a.db_id = at1.db_id
-          AND a.kind = 'captured'
-         WHERE at1.db_id = $1
+          AND at2.db_id = $1
          GROUP BY at1.tag_id, at2.tag_id
-         HAVING COUNT(*) >= 3",
+         HAVING COUNT(*) >= 3
+         ORDER BY shared_count DESC
+         LIMIT $3",
     )
     .bind(&storage.db_id)
+    .bind(TAG_REDUNDANCY_MAX_TAGS_PER_ATOM as i64)
+    .bind(TAG_REDUNDANCY_CANDIDATE_LIMIT as i64)
     .fetch_all(&storage.pool)
     .await
     .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -2049,14 +4100,19 @@ async fn evaluate_missing_tag_overlap_postgres(
     let current_tags = load_postgres_atom_tag_ids(storage).await?;
     let now = Utc::now().to_rfc3339();
     let rows: Vec<(String, String, String, i64, f32, f32)> = sqlx::query_as(
-        "WITH neighbor_edges AS (
-            SELECT source_atom_id as atom_id, target_atom_id as neighbor_atom_id, similarity_score
+        "WITH high_edges AS (
+            SELECT source_atom_id, target_atom_id, similarity_score
             FROM semantic_edges
             WHERE similarity_score >= 0.55 AND db_id = $1
+            ORDER BY similarity_score DESC
+            LIMIT $2
+         ),
+         neighbor_edges AS (
+            SELECT source_atom_id as atom_id, target_atom_id as neighbor_atom_id, similarity_score
+            FROM high_edges
             UNION ALL
             SELECT target_atom_id as atom_id, source_atom_id as neighbor_atom_id, similarity_score
-            FROM semantic_edges
-            WHERE similarity_score >= 0.55 AND db_id = $1
+            FROM high_edges
          )
          SELECT
             ne.atom_id,
@@ -2078,9 +4134,13 @@ async fn evaluate_missing_tag_overlap_postgres(
           AND existing.db_id = $1
          WHERE existing.tag_id IS NULL
          GROUP BY ne.atom_id, a.title, nt.tag_id
-         HAVING COUNT(DISTINCT ne.neighbor_atom_id) >= 3",
+         HAVING COUNT(DISTINCT ne.neighbor_atom_id) >= 3
+         ORDER BY average_similarity DESC, nearby_tagged_atom_count DESC
+         LIMIT $3",
     )
     .bind(&storage.db_id)
+    .bind(MISSING_TAG_EDGE_CANDIDATE_LIMIT as i64)
+    .bind(MISSING_TAG_CANDIDATE_LIMIT as i64)
     .fetch_all(&storage.pool)
     .await
     .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -2115,6 +4175,469 @@ async fn evaluate_missing_tag_overlap_postgres(
 }
 
 #[cfg(feature = "postgres")]
+async fn evaluate_near_duplicate_atoms_postgres(
+    storage: &crate::storage::postgres::PostgresStorage,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        i32,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i32,
+        String,
+        String,
+        f32,
+    )> = sqlx::query_as(
+        "SELECT
+            e.source_atom_id,
+            COALESCE(a.title, ''),
+            a.source_url,
+            LENGTH(a.content)::INTEGER,
+            a.created_at,
+            a.updated_at,
+            e.target_atom_id,
+            COALESCE(b.title, ''),
+            b.source_url,
+            LENGTH(b.content)::INTEGER,
+            b.created_at,
+            b.updated_at,
+            e.similarity_score
+         FROM semantic_edges e
+         JOIN atoms a
+           ON a.id = e.source_atom_id
+          AND a.db_id = e.db_id
+          AND a.kind = 'captured'
+         JOIN atoms b
+           ON b.id = e.target_atom_id
+          AND b.db_id = e.db_id
+          AND b.kind = 'captured'
+         WHERE e.db_id = $1
+           AND e.similarity_score >= 0.84
+         ORDER BY e.similarity_score DESC
+         LIMIT 250",
+    )
+    .bind(&storage.db_id)
+    .fetch_all(&storage.pool)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+    let candidates = rows
+        .into_iter()
+        .map(
+            |(
+                primary_id,
+                primary_title,
+                primary_source_url,
+                primary_content_length,
+                primary_created_at,
+                primary_updated_at,
+                secondary_id,
+                secondary_title,
+                secondary_source_url,
+                secondary_content_length,
+                secondary_created_at,
+                secondary_updated_at,
+                semantic_similarity,
+            )| NearDuplicateAtomCandidate {
+                primary: NearDuplicateAtomInfo {
+                    id: primary_id,
+                    title: primary_title,
+                    source_url: primary_source_url,
+                    content_length: primary_content_length,
+                    created_at: primary_created_at,
+                    updated_at: primary_updated_at,
+                },
+                secondary: NearDuplicateAtomInfo {
+                    id: secondary_id,
+                    title: secondary_title,
+                    source_url: secondary_source_url,
+                    content_length: secondary_content_length,
+                    created_at: secondary_created_at,
+                    updated_at: secondary_updated_at,
+                },
+                semantic_similarity,
+            },
+        )
+        .collect::<Vec<_>>();
+    let candidate_atom_ids = collect_near_duplicate_atom_ids(&candidates);
+    let atom_tags = load_postgres_atom_tag_info_for_atoms(storage, &candidate_atom_ids).await?;
+
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let shared_tags =
+            shared_atom_tags(&candidate.primary.id, &candidate.secondary.id, &atom_tags);
+        if let Some(signal) = near_duplicate_atom_signal(&candidate, shared_tags, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_near_duplicate_atom_signals(out)
+}
+
+#[cfg(feature = "postgres")]
+async fn evaluate_source_duplicates_postgres(
+    storage: &crate::storage::postgres::PostgresStorage,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        String,
+        i32,
+        String,
+        String,
+        i64,
+    )> = sqlx::query_as(
+        "WITH source_atoms AS (
+            SELECT
+                id,
+                COALESCE(title, '') as title,
+                source_url,
+                lower(rtrim(source_url, '/')) as normalized_source_url,
+                LENGTH(content)::INTEGER as content_length,
+                created_at,
+                updated_at
+            FROM atoms
+            WHERE db_id = $1
+              AND kind = 'captured'
+              AND source_url IS NOT NULL
+              AND BTRIM(source_url) != ''
+         ),
+         duplicate_sources AS (
+            SELECT
+                normalized_source_url,
+                COUNT(*)::BIGINT as duplicate_count,
+                MAX(updated_at) as latest_updated
+            FROM source_atoms
+            GROUP BY normalized_source_url
+            HAVING COUNT(*) >= 2
+            ORDER BY latest_updated DESC
+            LIMIT $2
+         ),
+         ranked_source_atoms AS (
+            SELECT
+                sa.*,
+                ds.duplicate_count,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sa.normalized_source_url
+                    ORDER BY sa.updated_at DESC
+                ) as source_rank
+            FROM source_atoms sa
+            JOIN duplicate_sources ds
+              ON ds.normalized_source_url = sa.normalized_source_url
+         )
+         SELECT
+            id,
+            title,
+            source_url,
+            normalized_source_url,
+            content_length,
+            created_at,
+            updated_at,
+            duplicate_count
+         FROM ranked_source_atoms
+         WHERE source_rank <= $3
+         ORDER BY normalized_source_url, updated_at DESC",
+    )
+    .bind(&storage.db_id)
+    .bind(SOURCE_DUPLICATE_GROUP_LIMIT as i64)
+    .bind(SOURCE_DUPLICATE_ATOMS_PER_GROUP as i64)
+    .fetch_all(&storage.pool)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+    let mut by_source: HashMap<String, Vec<NearDuplicateAtomInfo>> = HashMap::new();
+    let mut duplicate_counts: HashMap<String, i32> = HashMap::new();
+    for (
+        id,
+        title,
+        source_url,
+        normalized_source_url,
+        content_length,
+        created_at,
+        updated_at,
+        duplicate_count,
+    ) in rows
+    {
+        duplicate_counts.insert(normalized_source_url.clone(), duplicate_count as i32);
+        by_source
+            .entry(normalized_source_url)
+            .or_default()
+            .push(NearDuplicateAtomInfo {
+                id,
+                title,
+                source_url,
+                content_length,
+                created_at,
+                updated_at,
+            });
+    }
+
+    let mut out = Vec::new();
+    for (normalized_source_url, mut atoms) in by_source {
+        if atoms.len() < 2 {
+            continue;
+        }
+        atoms.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let duplicate_count = duplicate_counts
+            .get(&normalized_source_url)
+            .copied()
+            .unwrap_or(atoms.len() as i32);
+        let primary = atoms[0].clone();
+        for secondary in atoms.iter().skip(1).take(5) {
+            let candidate = SourceDuplicateCandidate {
+                primary: primary.clone(),
+                secondary: secondary.clone(),
+                normalized_source_url: normalized_source_url.clone(),
+                duplicate_count,
+            };
+            if let Some(signal) = source_duplicate_signal(&candidate, &now)? {
+                out.push(signal);
+            }
+        }
+    }
+    limit_near_duplicate_atom_signals(out)
+}
+
+#[cfg(feature = "postgres")]
+async fn evaluate_broken_internal_links_postgres(
+    storage: &crate::storage::postgres::PostgresStorage,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<i32>,
+        Option<i32>,
+    )> = sqlx::query_as(
+        "SELECT
+            al.id,
+            al.source_atom_id,
+            COALESCE(a.title, ''),
+            al.raw_target,
+            al.label,
+            al.target_kind,
+            al.status,
+            al.start_offset,
+            al.end_offset
+         FROM atom_links al
+         JOIN atoms a
+           ON a.id = al.source_atom_id
+          AND a.db_id = al.db_id
+          AND a.kind = 'captured'
+         WHERE al.db_id = $1
+           AND (
+             (al.target_kind = 'atom_id' AND al.status = 'missing')
+             OR (al.target_kind = 'text' AND al.status = 'unresolved')
+           )
+         ORDER BY
+             CASE WHEN al.status = 'missing' THEN 0 ELSE 1 END,
+             a.updated_at DESC,
+             al.start_offset ASC
+         LIMIT 150",
+    )
+    .bind(&storage.db_id)
+    .fetch_all(&storage.pool)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for (
+        link_id,
+        source_atom_id,
+        source_atom_title,
+        raw_target,
+        label,
+        target_kind,
+        status,
+        start_offset,
+        end_offset,
+    ) in rows
+    {
+        let candidate = BrokenInternalLinkCandidate {
+            link_id,
+            source_atom_id,
+            source_atom_title,
+            raw_target,
+            label,
+            target_kind,
+            status,
+            start_offset,
+            end_offset,
+        };
+        if let Some(signal) = broken_internal_link_signal(&candidate, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_broken_internal_link_signals(out)
+}
+
+#[cfg(feature = "postgres")]
+async fn evaluate_underconnected_atoms_postgres(
+    storage: &crate::storage::postgres::PostgresStorage,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    let now = Utc::now().to_rfc3339();
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        i32,
+        i64,
+        i64,
+        i64,
+        Option<f32>,
+        Option<f32>,
+        i64,
+        String,
+    )> = sqlx::query_as(
+        "WITH eligible_atoms AS (
+            SELECT id
+            FROM atoms
+            WHERE db_id = $1
+              AND kind = 'captured'
+              AND edges_status = 'complete'
+              AND LENGTH(content) >= 180
+            ORDER BY updated_at DESC
+            LIMIT $2
+         ),
+         db_size AS (
+            SELECT COUNT(*)::BIGINT as captured_atom_count
+            FROM atoms
+            WHERE db_id = $1
+              AND kind = 'captured'
+              AND edges_status = 'complete'
+         ),
+         edge_summary AS (
+            SELECT
+                atom_id,
+                COUNT(*)::BIGINT as total_edge_count,
+                SUM(CASE WHEN similarity_score >= 0.55 THEN 1 ELSE 0 END)::BIGINT as strong_edge_count,
+                MAX(similarity_score)::REAL as strongest_similarity,
+                AVG(similarity_score)::REAL as average_similarity
+            FROM (
+                SELECT e.source_atom_id as atom_id, e.similarity_score
+                FROM semantic_edges e
+                JOIN eligible_atoms ea ON ea.id = e.source_atom_id
+                JOIN atoms source
+                  ON source.id = e.source_atom_id
+                 AND source.db_id = e.db_id
+                 AND source.kind = 'captured'
+                JOIN atoms target
+                  ON target.id = e.target_atom_id
+                 AND target.db_id = e.db_id
+                 AND target.kind = 'captured'
+                WHERE e.db_id = $1
+                UNION ALL
+                SELECT e.target_atom_id as atom_id, e.similarity_score
+                FROM semantic_edges e
+                JOIN eligible_atoms ea ON ea.id = e.target_atom_id
+                JOIN atoms source
+                  ON source.id = e.source_atom_id
+                 AND source.db_id = e.db_id
+                 AND source.kind = 'captured'
+                JOIN atoms target
+                  ON target.id = e.target_atom_id
+                 AND target.db_id = e.db_id
+                 AND target.kind = 'captured'
+                WHERE e.db_id = $1
+            ) edges
+            GROUP BY atom_id
+         ),
+         tag_counts AS (
+            SELECT at.atom_id, COUNT(DISTINCT at.tag_id)::BIGINT as tag_count
+            FROM atom_tags at
+            JOIN eligible_atoms ea ON ea.id = at.atom_id
+            WHERE at.db_id = $1
+            GROUP BY at.atom_id
+         )
+         SELECT
+            a.id,
+            COALESCE(a.title, ''),
+            a.source_url,
+            LENGTH(a.content)::INTEGER,
+            COALESCE(tc.tag_count, 0)::BIGINT,
+            COALESCE(es.total_edge_count, 0)::BIGINT,
+            COALESCE(es.strong_edge_count, 0)::BIGINT,
+            es.strongest_similarity,
+            es.average_similarity,
+            db_size.captured_atom_count,
+            a.edges_status
+         FROM atoms a
+         JOIN eligible_atoms ea ON ea.id = a.id
+         CROSS JOIN db_size
+         LEFT JOIN edge_summary es ON es.atom_id = a.id
+         LEFT JOIN tag_counts tc ON tc.atom_id = a.id
+         WHERE a.db_id = $1
+           AND a.kind = 'captured'
+           AND a.edges_status = 'complete'
+           AND db_size.captured_atom_count >= 8
+           AND LENGTH(a.content) >= 180
+           AND (
+                COALESCE(es.strong_edge_count, 0) = 0
+                OR (
+                    COALESCE(es.strong_edge_count, 0) <= 1
+                    AND COALESCE(tc.tag_count, 0) <= 1
+                    AND COALESCE(es.strongest_similarity, 0.0) < 0.62
+                )
+           )
+         ORDER BY COALESCE(es.strong_edge_count, 0) ASC,
+                  COALESCE(es.strongest_similarity, 0.0) ASC,
+                  LENGTH(a.content) DESC
+         LIMIT 100",
+    )
+    .bind(&storage.db_id)
+    .bind(UNDERCONNECTED_CANDIDATE_ATOM_LIMIT as i64)
+    .fetch_all(&storage.pool)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for (
+        atom_id,
+        atom_title,
+        source_url,
+        content_length,
+        tag_count,
+        total_edge_count,
+        strong_edge_count,
+        strongest_similarity,
+        average_similarity,
+        captured_atom_count,
+        edges_status,
+    ) in rows
+    {
+        let candidate = UnderconnectedAtomCandidate {
+            atom_id,
+            atom_title,
+            source_url,
+            content_length,
+            tag_count: tag_count as i32,
+            total_edge_count: total_edge_count as i32,
+            strong_edge_count: strong_edge_count as i32,
+            strongest_similarity,
+            average_similarity,
+            captured_atom_count: captured_atom_count as i32,
+            edges_status,
+        };
+        if let Some(signal) = underconnected_atom_signal(&candidate, &now)? {
+            out.push(signal);
+        }
+    }
+    limit_underconnected_atom_signals(out)
+}
+
+#[cfg(feature = "postgres")]
 async fn load_postgres_atom_tag_ids(
     storage: &crate::storage::postgres::PostgresStorage,
 ) -> Result<HashMap<String, Vec<String>>, AtomicCoreError> {
@@ -2131,6 +4654,37 @@ async fn load_postgres_atom_tag_ids(
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for (atom_id, tag_id) in rows {
         out.entry(atom_id).or_default().push(tag_id);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "postgres")]
+async fn load_postgres_atom_tag_info_for_atoms(
+    storage: &crate::storage::postgres::PostgresStorage,
+    atom_ids: &[String],
+) -> Result<HashMap<String, Vec<AtomTagInfo>>, AtomicCoreError> {
+    if atom_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids = atom_ids.to_vec();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT at.atom_id, t.id, t.name
+         FROM atom_tags at
+         JOIN tags t ON t.id = at.tag_id AND t.db_id = at.db_id
+         WHERE at.db_id = $1
+           AND at.atom_id = ANY($2)",
+    )
+    .bind(&storage.db_id)
+    .bind(ids)
+    .fetch_all(&storage.pool)
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+    let mut out: HashMap<String, Vec<AtomTagInfo>> = HashMap::new();
+    for (atom_id, tag_id, tag_name) in rows {
+        out.entry(atom_id).or_default().push(AtomTagInfo {
+            id: tag_id,
+            name: tag_name,
+        });
     }
     Ok(out)
 }
@@ -2347,6 +4901,434 @@ fn missing_tag_signal(
     }))
 }
 
+fn near_duplicate_atom_signal(
+    candidate: &NearDuplicateAtomCandidate,
+    shared_tags: Vec<AtomTagInfo>,
+    now: &str,
+) -> Result<Option<KnowledgeSignal>, AtomicCoreError> {
+    let title_similarity = name_similarity(&candidate.primary.title, &candidate.secondary.title);
+    let source_match = source_match_status(
+        candidate.primary.source_url.as_deref(),
+        candidate.secondary.source_url.as_deref(),
+    );
+    let shared_tag_count = shared_tags.len() as i32;
+    let content_length_ratio = content_length_ratio(
+        candidate.primary.content_length,
+        candidate.secondary.content_length,
+    );
+
+    let same_source = source_match == "same_source";
+    let strong_support = same_source || title_similarity >= 0.75 || shared_tag_count >= 2;
+    if candidate.semantic_similarity < 0.92
+        && !(candidate.semantic_similarity >= 0.86 && strong_support)
+    {
+        return Ok(None);
+    }
+
+    let source_component = if same_source { 1.0 } else { 0.0 };
+    let shared_tag_component = (shared_tag_count as f32 / 4.0).min(1.0);
+    let score = (100.0
+        * (0.62 * candidate.semantic_similarity
+            + 0.14 * source_component
+            + 0.10 * title_similarity
+            + 0.08 * shared_tag_component
+            + 0.06 * content_length_ratio))
+        .clamp(0.0, 100.0);
+    let confidence = (0.55 * candidate.semantic_similarity
+        + 0.16 * source_component
+        + 0.12 * title_similarity
+        + 0.10 * shared_tag_component
+        + 0.07 * content_length_ratio)
+        .clamp(0.0, 1.0);
+
+    let (primary, secondary) = order_duplicate_atoms(&candidate.primary, &candidate.secondary);
+    let evidence = NearDuplicateAtomEvidence {
+        primary_atom: primary.into(),
+        secondary_atom: secondary.into(),
+        semantic_similarity: candidate.semantic_similarity,
+        source_match: source_match.to_string(),
+        title_similarity,
+        shared_tag_count,
+        shared_tags: shared_tags
+            .iter()
+            .map(|tag| NearDuplicateTagEvidence {
+                id: tag.id.clone(),
+                name: tag.name.clone(),
+            })
+            .collect(),
+        content_length_ratio,
+    };
+
+    let mut reasons = vec![KnowledgeSignalReason {
+        kind: "semantic_similarity".to_string(),
+        label: "Very similar meaning".to_string(),
+        value: json!(candidate.semantic_similarity),
+        contribution: candidate.semantic_similarity * 100.0,
+    }];
+    if same_source {
+        reasons.push(KnowledgeSignalReason {
+            kind: "source_match".to_string(),
+            label: "Same source".to_string(),
+            value: json!(source_match),
+            contribution: 100.0,
+        });
+    }
+    if title_similarity >= 0.70 {
+        reasons.push(KnowledgeSignalReason {
+            kind: "title_similarity".to_string(),
+            label: "Similar title".to_string(),
+            value: json!(title_similarity),
+            contribution: title_similarity * 100.0,
+        });
+    }
+    if shared_tag_count > 0 {
+        reasons.push(KnowledgeSignalReason {
+            kind: "shared_tags".to_string(),
+            label: format!("{shared_tag_count} shared tags"),
+            value: json!(shared_tag_count),
+            contribution: shared_tag_component * 100.0,
+        });
+    }
+
+    Ok(Some(KnowledgeSignal {
+        id: near_duplicate_atom_signal_key(&candidate.primary.id, &candidate.secondary.id),
+        provider_id: NEAR_DUPLICATE_ATOM_PROVIDER_ID.to_string(),
+        target: KnowledgeSignalTarget::atom(primary.id.clone(), primary.title.clone()),
+        score,
+        confidence,
+        severity: KnowledgeSignalSeverity::Review,
+        title: format!(
+            "Review similar atoms: {} and {}",
+            primary.title, secondary.title
+        ),
+        summary: "These atoms appear to substantially overlap.".to_string(),
+        reasons,
+        evidence: evidence.to_value()?,
+        suggested_actions: vec![
+            KnowledgeSignalAction {
+                id: "review_pair".to_string(),
+                label: "Review pair".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "open_primary_atom".to_string(),
+                label: "Open first atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "open_secondary_atom".to_string(),
+                label: "Open second atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "keep_separate".to_string(),
+                label: "Keep separate".to_string(),
+                kind: "dismiss".to_string(),
+            },
+        ],
+        created_at: now.to_string(),
+        expires_at: None,
+    }))
+}
+
+fn source_duplicate_signal(
+    candidate: &SourceDuplicateCandidate,
+    now: &str,
+) -> Result<Option<KnowledgeSignal>, AtomicCoreError> {
+    let title_similarity = name_similarity(&candidate.primary.title, &candidate.secondary.title);
+    let content_length_ratio = content_length_ratio(
+        candidate.primary.content_length,
+        candidate.secondary.content_length,
+    );
+    let group_component = (candidate.duplicate_count as f32 / 4.0).min(1.0);
+    let score = (100.0
+        * (0.62 + 0.16 * title_similarity + 0.12 * content_length_ratio + 0.10 * group_component))
+        .clamp(0.0, 100.0);
+    let confidence =
+        (0.82 + 0.08 * title_similarity + 0.06 * content_length_ratio + 0.04 * group_component)
+            .clamp(0.0, 1.0);
+
+    let (primary, secondary) = order_duplicate_atoms(&candidate.primary, &candidate.secondary);
+    let source_url = primary
+        .source_url
+        .clone()
+        .or_else(|| secondary.source_url.clone())
+        .unwrap_or_else(|| candidate.normalized_source_url.clone());
+    let evidence = SourceDuplicateEvidence {
+        primary_atom: primary.into(),
+        secondary_atom: secondary.into(),
+        source_url,
+        normalized_source_url: candidate.normalized_source_url.clone(),
+        duplicate_count: candidate.duplicate_count,
+        title_similarity,
+        content_length_ratio,
+    };
+
+    let mut reasons = vec![KnowledgeSignalReason {
+        kind: "source_match".to_string(),
+        label: "Same source URL".to_string(),
+        value: json!(candidate.normalized_source_url),
+        contribution: 100.0,
+    }];
+    if candidate.duplicate_count > 2 {
+        reasons.push(KnowledgeSignalReason {
+            kind: "duplicate_count".to_string(),
+            label: format!("{} captures share this source", candidate.duplicate_count),
+            value: json!(candidate.duplicate_count),
+            contribution: group_component * 100.0,
+        });
+    }
+    if title_similarity >= 0.65 {
+        reasons.push(KnowledgeSignalReason {
+            kind: "title_similarity".to_string(),
+            label: "Similar title".to_string(),
+            value: json!(title_similarity),
+            contribution: title_similarity * 100.0,
+        });
+    }
+
+    Ok(Some(KnowledgeSignal {
+        id: source_duplicate_signal_key(&candidate.primary.id, &candidate.secondary.id),
+        provider_id: SOURCE_DUPLICATE_PROVIDER_ID.to_string(),
+        target: KnowledgeSignalTarget::atom(primary.id.clone(), primary.title.clone()),
+        score,
+        confidence,
+        severity: KnowledgeSignalSeverity::Review,
+        title: format!(
+            "Review duplicate source captures: {} and {}",
+            primary.title, secondary.title
+        ),
+        summary: "These atoms were captured from the same source URL.".to_string(),
+        reasons,
+        evidence: evidence.to_value()?,
+        suggested_actions: vec![
+            KnowledgeSignalAction {
+                id: "review_pair".to_string(),
+                label: "Review pair".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "open_primary_atom".to_string(),
+                label: "Open first atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "open_secondary_atom".to_string(),
+                label: "Open second atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "keep_separate".to_string(),
+                label: "Keep separate".to_string(),
+                kind: "dismiss".to_string(),
+            },
+        ],
+        created_at: now.to_string(),
+        expires_at: None,
+    }))
+}
+
+fn broken_internal_link_signal(
+    candidate: &BrokenInternalLinkCandidate,
+    now: &str,
+) -> Result<Option<KnowledgeSignal>, AtomicCoreError> {
+    let is_missing_atom = candidate.target_kind == "atom_id" && candidate.status == "missing";
+    let (score, confidence, title_prefix, summary) = if is_missing_atom {
+        (
+            72.0,
+            0.95,
+            "Fix missing atom link",
+            "This atom links to an atom id that does not exist.",
+        )
+    } else {
+        (
+            42.0,
+            0.70,
+            "Review unresolved note link",
+            "This atom contains a text wikilink that has not been resolved to an atom.",
+        )
+    };
+
+    let evidence = BrokenInternalLinkEvidence {
+        link_id: candidate.link_id.clone(),
+        source_atom_id: candidate.source_atom_id.clone(),
+        source_atom_title: candidate.source_atom_title.clone(),
+        raw_target: candidate.raw_target.clone(),
+        label: candidate.label.clone(),
+        target_kind: candidate.target_kind.clone(),
+        status: candidate.status.clone(),
+        start_offset: candidate.start_offset,
+        end_offset: candidate.end_offset,
+    };
+
+    Ok(Some(KnowledgeSignal {
+        id: format!(
+            "{}:link:{}",
+            BROKEN_INTERNAL_LINK_PROVIDER_ID, candidate.link_id
+        ),
+        provider_id: BROKEN_INTERNAL_LINK_PROVIDER_ID.to_string(),
+        target: KnowledgeSignalTarget::atom(
+            candidate.source_atom_id.clone(),
+            candidate.source_atom_title.clone(),
+        ),
+        score,
+        confidence,
+        severity: KnowledgeSignalSeverity::Review,
+        title: format!("{title_prefix}: {}", candidate.raw_target),
+        summary: summary.to_string(),
+        reasons: vec![
+            KnowledgeSignalReason {
+                kind: "link_status".to_string(),
+                label: if is_missing_atom {
+                    "Target atom is missing".to_string()
+                } else {
+                    "Text link is unresolved".to_string()
+                },
+                value: json!(candidate.status),
+                contribution: score,
+            },
+            KnowledgeSignalReason {
+                kind: "target_kind".to_string(),
+                label: candidate.target_kind.replace('_', " "),
+                value: json!(candidate.target_kind),
+                contribution: if is_missing_atom { 25.0 } else { 10.0 },
+            },
+        ],
+        evidence: evidence.to_value()?,
+        suggested_actions: vec![
+            KnowledgeSignalAction {
+                id: "open_atom".to_string(),
+                label: "Open atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "dismiss".to_string(),
+                label: "Dismiss".to_string(),
+                kind: "dismiss".to_string(),
+            },
+        ],
+        created_at: now.to_string(),
+        expires_at: None,
+    }))
+}
+
+fn underconnected_atom_signal(
+    candidate: &UnderconnectedAtomCandidate,
+    now: &str,
+) -> Result<Option<KnowledgeSignal>, AtomicCoreError> {
+    if candidate.edges_status != "complete" || candidate.captured_atom_count < 8 {
+        return Ok(None);
+    }
+
+    let edge_isolation = if candidate.strong_edge_count == 0 {
+        1.0
+    } else {
+        (1.0 - (candidate.strong_edge_count as f32 / 3.0)).clamp(0.0, 1.0)
+    };
+    let similarity_gap = candidate
+        .strongest_similarity
+        .map(|similarity| (1.0 - (similarity / 0.65)).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    let sparse_tags = match candidate.tag_count {
+        0 => 1.0,
+        1 => 0.70,
+        2 => 0.35,
+        _ => 0.0,
+    };
+    let content_substance = (candidate.content_length as f32 / 1200.0).clamp(0.0, 1.0);
+    let db_size_confidence = (candidate.captured_atom_count as f32 / 25.0).clamp(0.0, 1.0);
+
+    let score = (100.0
+        * (0.42 * edge_isolation
+            + 0.28 * similarity_gap
+            + 0.20 * sparse_tags
+            + 0.10 * content_substance))
+        .clamp(0.0, 100.0);
+    let confidence = (0.40 * edge_isolation
+        + 0.24 * similarity_gap
+        + 0.18 * sparse_tags
+        + 0.10 * content_substance
+        + 0.08 * db_size_confidence)
+        .clamp(0.0, 1.0);
+
+    let evidence = UnderconnectedAtomEvidence {
+        atom_id: candidate.atom_id.clone(),
+        atom_title: candidate.atom_title.clone(),
+        source_url: candidate.source_url.clone(),
+        content_length: candidate.content_length,
+        tag_count: candidate.tag_count,
+        total_edge_count: candidate.total_edge_count,
+        strong_edge_count: candidate.strong_edge_count,
+        strongest_similarity: candidate.strongest_similarity,
+        average_similarity: candidate.average_similarity,
+        captured_atom_count: candidate.captured_atom_count,
+        edges_status: candidate.edges_status.clone(),
+    };
+
+    let mut reasons = vec![KnowledgeSignalReason {
+        kind: "strong_edges".to_string(),
+        label: match candidate.strong_edge_count {
+            0 => "No strong semantic connections".to_string(),
+            1 => "Only 1 strong semantic connection".to_string(),
+            count => format!("Only {count} strong semantic connections"),
+        },
+        value: json!(candidate.strong_edge_count),
+        contribution: edge_isolation * 100.0,
+    }];
+    if let Some(strongest) = candidate.strongest_similarity {
+        reasons.push(KnowledgeSignalReason {
+            kind: "strongest_similarity".to_string(),
+            label: format!("Closest note is {:.0}% similar", strongest * 100.0),
+            value: json!(strongest),
+            contribution: similarity_gap * 100.0,
+        });
+    }
+    if candidate.tag_count <= 1 {
+        reasons.push(KnowledgeSignalReason {
+            kind: "tag_count".to_string(),
+            label: match candidate.tag_count {
+                0 => "No tags".to_string(),
+                1 => "Only 1 tag".to_string(),
+                count => format!("{count} tags"),
+            },
+            value: json!(candidate.tag_count),
+            contribution: sparse_tags * 100.0,
+        });
+    }
+
+    Ok(Some(KnowledgeSignal {
+        id: format!("underconnected_atom:atom:{}", candidate.atom_id),
+        provider_id: UNDERCONNECTED_ATOM_PROVIDER_ID.to_string(),
+        target: KnowledgeSignalTarget::atom(
+            candidate.atom_id.clone(),
+            candidate.atom_title.clone(),
+        ),
+        score,
+        confidence,
+        severity: KnowledgeSignalSeverity::Review,
+        title: format!("Review underconnected atom: {}", candidate.atom_title),
+        summary:
+            "This atom has little semantic or tag connection to the rest of the knowledge base."
+                .to_string(),
+        reasons,
+        evidence: evidence.to_value()?,
+        suggested_actions: vec![
+            KnowledgeSignalAction {
+                id: "open_atom".to_string(),
+                label: "Open atom".to_string(),
+                kind: "open".to_string(),
+            },
+            KnowledgeSignalAction {
+                id: "dismiss".to_string(),
+                label: "Dismiss".to_string(),
+                kind: "dismiss".to_string(),
+            },
+        ],
+        created_at: now.to_string(),
+        expires_at: None,
+    }))
+}
+
 fn limit_missing_tag_signals(
     mut signals: Vec<KnowledgeSignal>,
 ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
@@ -2365,6 +5347,96 @@ fn limit_missing_tag_signals(
     signals.retain(|signal| {
         let count = per_atom.entry(signal.target.id.clone()).or_default();
         if *count >= 2 {
+            return false;
+        }
+        *count += 1;
+        true
+    });
+    signals.truncate(100);
+    Ok(signals)
+}
+
+fn limit_near_duplicate_atom_signals(
+    mut signals: Vec<KnowledgeSignal>,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    signals.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut per_atom: HashMap<String, usize> = HashMap::new();
+    signals.retain(|signal| {
+        let Some(evidence) = signal.evidence.as_object() else {
+            return true;
+        };
+        let Some(primary_id) = evidence
+            .get("primary_atom")
+            .and_then(|atom| atom.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return true;
+        };
+        let Some(secondary_id) = evidence
+            .get("secondary_atom")
+            .and_then(|atom| atom.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return true;
+        };
+        let primary_count = *per_atom.get(primary_id).unwrap_or(&0);
+        let secondary_count = *per_atom.get(secondary_id).unwrap_or(&0);
+        if primary_count >= 3 || secondary_count >= 3 {
+            return false;
+        }
+        *per_atom.entry(primary_id.to_string()).or_default() += 1;
+        *per_atom.entry(secondary_id.to_string()).or_default() += 1;
+        true
+    });
+    signals.truncate(100);
+    Ok(signals)
+}
+
+fn limit_underconnected_atom_signals(
+    mut signals: Vec<KnowledgeSignal>,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    signals.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    signals.truncate(100);
+    Ok(signals)
+}
+
+fn limit_broken_internal_link_signals(
+    mut signals: Vec<KnowledgeSignal>,
+) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+    signals.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut per_atom: HashMap<String, usize> = HashMap::new();
+    signals.retain(|signal| {
+        let count = per_atom.entry(signal.target.id.clone()).or_default();
+        if *count >= 3 {
             return false;
         }
         *count += 1;
@@ -2601,6 +5673,87 @@ fn tag_pair_signal_key(a: &str, b: &str) -> String {
     format!("tag_redundancy:pair:{:x}", digest)
 }
 
+fn near_duplicate_atom_signal_key(a: &str, b: &str) -> String {
+    let (left, right) = if a <= b { (a, b) } else { (b, a) };
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{left}:{right}").as_bytes());
+    format!("near_duplicate_atom:pair:{:x}", digest)
+}
+
+fn source_duplicate_signal_key(a: &str, b: &str) -> String {
+    let (left, right) = if a <= b { (a, b) } else { (b, a) };
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{left}:{right}").as_bytes());
+    format!("source_duplicate:pair:{:x}", digest)
+}
+
+impl From<&NearDuplicateAtomInfo> for NearDuplicateAtomEvidenceAtom {
+    fn from(atom: &NearDuplicateAtomInfo) -> Self {
+        Self {
+            id: atom.id.clone(),
+            title: atom.title.clone(),
+            source_url: atom.source_url.clone(),
+            content_length: atom.content_length,
+            created_at: atom.created_at.clone(),
+            updated_at: atom.updated_at.clone(),
+        }
+    }
+}
+
+fn order_duplicate_atoms<'a>(
+    a: &'a NearDuplicateAtomInfo,
+    b: &'a NearDuplicateAtomInfo,
+) -> (&'a NearDuplicateAtomInfo, &'a NearDuplicateAtomInfo) {
+    if a.updated_at >= b.updated_at {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn shared_atom_tags(
+    atom_a: &str,
+    atom_b: &str,
+    atom_tags: &HashMap<String, Vec<AtomTagInfo>>,
+) -> Vec<AtomTagInfo> {
+    let Some(tags_a) = atom_tags.get(atom_a) else {
+        return Vec::new();
+    };
+    let Some(tags_b) = atom_tags.get(atom_b) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tag_a in tags_a {
+        if tags_b.iter().any(|tag_b| tag_b.id == tag_a.id) {
+            out.push(tag_a.clone());
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn source_match_status(a: Option<&str>, b: Option<&str>) -> &'static str {
+    match (normalize_source_url(a), normalize_source_url(b)) {
+        (Some(left), Some(right)) if left == right => "same_source",
+        (Some(_), Some(_)) => "different_source",
+        _ => "missing_source",
+    }
+}
+
+fn normalize_source_url(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.trim_end_matches('/').to_ascii_lowercase())
+}
+
+fn content_length_ratio(a: i32, b: i32) -> f32 {
+    let min = a.min(b).max(0) as f32;
+    let max = a.max(b).max(1) as f32;
+    (min / max).clamp(0.0, 1.0)
+}
+
 fn is_structural_tag(tag: &TagCleanupTag) -> bool {
     tag.parent_id.is_none()
         && (tag.is_autotag_target
@@ -2777,6 +5930,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_signal_cache_invalidates_after_feedback() {
+        let (core, _temp) = test_core().await;
+        let tag = create_child_tag(&core, "Cache Invalidation").await;
+
+        for i in 0..3 {
+            core.create_atom(
+                CreateAtomRequest {
+                    content: long_note(&format!("Cache Invalidation {i}")),
+                    source_url: Some(format!("https://example.com/cache/{i}")),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let first = list_dashboard_knowledge_signals(&core, 20).await.unwrap();
+        let signal_id = first
+            .groups
+            .iter()
+            .flat_map(|group| group.signals.iter())
+            .find(|signal| signal.id == format!("wiki_candidate:tag:{}", tag.id))
+            .expect("cached dashboard signal")
+            .id
+            .clone();
+
+        dismiss_signal(&core, &signal_id).await.unwrap();
+
+        let after_dismiss = list_dashboard_knowledge_signals(&core, 20).await.unwrap();
+        assert!(!after_dismiss
+            .groups
+            .iter()
+            .flat_map(|group| group.signals.iter())
+            .any(|signal| signal.id == signal_id));
+    }
+
+    #[tokio::test]
     async fn dismissed_wiki_candidate_is_hidden_until_included_or_restored() {
         let (core, _temp) = test_core().await;
         let tag = create_child_tag(&core, "Compiler Design").await;
@@ -2926,6 +6119,45 @@ mod tests {
         .await
         .unwrap();
         assert!(hidden.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_config_listing_returns_defaults_and_saved_preferences() {
+        let (core, _temp) = test_core().await;
+
+        let configs = core.list_knowledge_signal_provider_configs().await.unwrap();
+        let wiki_update = configs
+            .iter()
+            .find(|provider| provider.provider_id == WIKI_UPDATE_PROVIDER_ID)
+            .expect("wiki update provider config");
+        assert_eq!(wiki_update.name, "Wiki updates");
+        assert!(wiki_update.config.enabled);
+        assert!(wiki_update.config.include_in_briefing);
+
+        core.set_knowledge_signal_provider_config(
+            WIKI_UPDATE_PROVIDER_ID,
+            KnowledgeSignalProviderConfig {
+                provider_id: WIKI_UPDATE_PROVIDER_ID.to_string(),
+                enabled: false,
+                weight: 1.0,
+                min_score: 25.0,
+                min_confidence: 0.4,
+                show_on_dashboard: false,
+                include_in_briefing: false,
+                config_json: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let updated = core.list_knowledge_signal_provider_configs().await.unwrap();
+        let wiki_update = updated
+            .iter()
+            .find(|provider| provider.provider_id == WIKI_UPDATE_PROVIDER_ID)
+            .expect("updated wiki update provider config");
+        assert!(!wiki_update.config.enabled);
+        assert!(!wiki_update.config.show_on_dashboard);
+        assert_eq!(wiki_update.config.min_score, 25.0);
     }
 
     #[tokio::test]
@@ -3215,6 +6447,456 @@ mod tests {
             .unwrap();
         assert!(updated.tags.iter().any(|tag| tag.id == suggested.id));
         assert!(updated.tags.iter().any(|tag| tag.id == existing.id));
+    }
+
+    #[tokio::test]
+    async fn signal_action_add_tag_is_audited_dismissed_and_undoable() {
+        let (core, _temp) = test_core().await;
+        let parent = core.create_tag("Topics", None).await.unwrap();
+        let suggested = core
+            .create_tag("Distributed Systems", Some(&parent.id))
+            .await
+            .unwrap();
+        let existing = core
+            .create_tag("Databases", Some(&parent.id))
+            .await
+            .unwrap();
+
+        let target = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("Consensus overview"),
+                    tag_ids: vec![existing.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut neighbors = Vec::new();
+        for i in 0..3 {
+            let atom = core
+                .create_atom(
+                    CreateAtomRequest {
+                        content: long_note(&format!("Distributed systems neighbor {i}")),
+                        tag_ids: vec![suggested.id.clone()],
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            neighbors.push(atom.atom.id);
+        }
+
+        let storage = match core.storage() {
+            crate::storage::StorageBackend::Sqlite(storage) => storage,
+            #[cfg(feature = "postgres")]
+            crate::storage::StorageBackend::Postgres(_) => panic!("test uses SQLite storage"),
+        };
+        {
+            let conn = storage.database().conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            for (idx, neighbor_id) in neighbors.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO semantic_edges
+                        (id, source_atom_id, target_atom_id, similarity_score,
+                         source_chunk_index, target_chunk_index, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                    params![
+                        format!("action-edge-{idx}"),
+                        target.atom.id,
+                        neighbor_id,
+                        0.82_f32,
+                        now
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let signal = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(MISSING_TAG_OVERLAP_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|signal| signal.target.id == target.atom.id)
+        .expect("missing tag signal");
+
+        let result = apply_signal_action(
+            &core,
+            &signal.id,
+            KnowledgeSignalActionRequest {
+                action: "add_tag_to_atom".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.action, "add_tag_to_atom");
+        assert!(result.undo_supported);
+
+        let updated = core.get_atom(&target.atom.id).await.unwrap().unwrap();
+        assert!(updated.tags.iter().any(|tag| tag.id == suggested.id));
+        assert!(updated.tags.iter().any(|tag| tag.id == existing.id));
+
+        let visible_after_apply = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(MISSING_TAG_OVERLAP_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!visible_after_apply.iter().any(|item| item.id == signal.id));
+
+        {
+            let conn = storage.database().conn.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM knowledge_signal_action_log WHERE id = ?1",
+                    [&result.action_log_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "applied");
+        }
+
+        let undo = undo_signal_action(&core, &result.action_log_id)
+            .await
+            .unwrap();
+        assert_eq!(undo.status, "undone");
+        let undone = core.get_atom(&target.atom.id).await.unwrap().unwrap();
+        assert!(!undone.tags.iter().any(|tag| tag.id == suggested.id));
+        assert!(undone.tags.iter().any(|tag| tag.id == existing.id));
+
+        let second_undo = undo_signal_action(&core, &result.action_log_id)
+            .await
+            .unwrap();
+        assert_eq!(second_undo.status, "undone");
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_atom_signal_has_typed_evidence_and_review_actions() {
+        let (core, _temp) = test_core().await;
+        let tag = create_child_tag(&core, "LLM Evaluation").await;
+
+        let first = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("LLM Evaluation Notes"),
+                    source_url: Some("https://example.com/evals".to_string()),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let second = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("LLM Evaluation Notes"),
+                    source_url: Some("https://example.com/evals/".to_string()),
+                    tag_ids: vec![tag.id.clone()],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let storage = match core.storage() {
+            crate::storage::StorageBackend::Sqlite(storage) => storage,
+            #[cfg(feature = "postgres")]
+            crate::storage::StorageBackend::Postgres(_) => panic!("test uses SQLite storage"),
+        };
+        {
+            let conn = storage.database().conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO semantic_edges
+                    (id, source_atom_id, target_atom_id, similarity_score,
+                     source_chunk_index, target_chunk_index, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                params![
+                    "duplicate-edge",
+                    first.atom.id,
+                    second.atom.id,
+                    0.91_f32,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(NEAR_DUPLICATE_ATOM_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| {
+                signal.evidence["primary_atom"]["id"] == first.atom.id
+                    || signal.evidence["secondary_atom"]["id"] == first.atom.id
+            })
+            .expect("near duplicate atom signal");
+        assert_eq!(signal.provider_id, NEAR_DUPLICATE_ATOM_PROVIDER_ID);
+        assert!(signal.id.starts_with("near_duplicate_atom:pair:"));
+        assert_eq!(signal.evidence["schema"], "near_duplicate_atom");
+        assert_eq!(signal.evidence["schema_version"], 1);
+        let semantic_similarity = signal.evidence["semantic_similarity"].as_f64().unwrap();
+        assert!((semantic_similarity - 0.91).abs() < 0.001);
+        assert_eq!(signal.evidence["source_match"], "same_source");
+        assert_eq!(signal.evidence["shared_tag_count"], 1);
+        assert!(signal
+            .suggested_actions
+            .iter()
+            .any(|action| action.id == "keep_separate"));
+
+        dismiss_signal(&core, &signal.id).await.unwrap();
+        let hidden = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(NEAR_DUPLICATE_ATOM_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(hidden.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_duplicate_signal_detects_same_source_url() {
+        let (core, _temp) = test_core().await;
+
+        let first = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("Capture from duplicate source"),
+                    source_url: Some("https://example.com/articles/source".to_string()),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let second = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("Capture from duplicate source"),
+                    source_url: Some("https://EXAMPLE.com/articles/source/".to_string()),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(SOURCE_DUPLICATE_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| {
+                signal.evidence["primary_atom"]["id"] == first.atom.id
+                    || signal.evidence["secondary_atom"]["id"] == first.atom.id
+            })
+            .expect("source duplicate signal");
+        assert_eq!(signal.provider_id, SOURCE_DUPLICATE_PROVIDER_ID);
+        assert!(signal.id.starts_with("source_duplicate:pair:"));
+        assert_eq!(signal.evidence["schema"], "source_duplicate");
+        assert_eq!(signal.evidence["schema_version"], 1);
+        assert_eq!(
+            signal.evidence["normalized_source_url"],
+            "https://example.com/articles/source"
+        );
+        assert_eq!(signal.evidence["duplicate_count"], 2);
+        assert!(
+            signal.evidence["primary_atom"]["id"] == second.atom.id
+                || signal.evidence["secondary_atom"]["id"] == second.atom.id
+        );
+        assert!(signal
+            .suggested_actions
+            .iter()
+            .any(|action| action.id == "keep_separate"));
+    }
+
+    #[tokio::test]
+    async fn broken_internal_link_signal_detects_missing_atom_link() {
+        let (core, _temp) = test_core().await;
+        let missing_id = "550e8400-e29b-41d4-a716-446655440000";
+        let atom = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: format!(
+                        "# Broken Links\n\nThis note points to [[{missing_id}|a deleted note]]."
+                    ),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(BROKEN_INTERNAL_LINK_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| signal.target.id == atom.atom.id)
+            .expect("broken internal link signal");
+        assert_eq!(signal.provider_id, BROKEN_INTERNAL_LINK_PROVIDER_ID);
+        assert!(signal.id.starts_with("broken_internal_link:link:"));
+        assert_eq!(signal.evidence["schema"], "broken_internal_link");
+        assert_eq!(signal.evidence["schema_version"], 1);
+        assert_eq!(signal.evidence["source_atom_id"], atom.atom.id);
+        assert_eq!(signal.evidence["raw_target"], missing_id);
+        assert_eq!(signal.evidence["label"], "a deleted note");
+        assert_eq!(signal.evidence["target_kind"], "atom_id");
+        assert_eq!(signal.evidence["status"], "missing");
+        assert!(signal
+            .suggested_actions
+            .iter()
+            .any(|action| action.id == "open_atom"));
+    }
+
+    #[tokio::test]
+    async fn underconnected_atom_signal_requires_completed_edges() {
+        let (core, _temp) = test_core().await;
+        let parent = core.create_tag("Research Areas", None).await.unwrap();
+        let tag_a = core
+            .create_tag("Connected Systems", Some(&parent.id))
+            .await
+            .unwrap();
+        let tag_b = core
+            .create_tag("Architecture", Some(&parent.id))
+            .await
+            .unwrap();
+
+        let isolated = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("Standalone architecture note"),
+                    tag_ids: vec![],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut connected = Vec::new();
+        for i in 0..7 {
+            let atom = core
+                .create_atom(
+                    CreateAtomRequest {
+                        content: long_note(&format!("Connected systems note {i}")),
+                        tag_ids: vec![tag_a.id.clone(), tag_b.id.clone()],
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            connected.push(atom.atom.id);
+        }
+
+        let storage = match core.storage() {
+            crate::storage::StorageBackend::Sqlite(storage) => storage,
+            #[cfg(feature = "postgres")]
+            crate::storage::StorageBackend::Postgres(_) => panic!("test uses SQLite storage"),
+        };
+        {
+            let conn = storage.database().conn.lock().unwrap();
+            conn.execute("UPDATE atoms SET edges_status = 'complete'", [])
+                .unwrap();
+            let now = Utc::now().to_rfc3339();
+            for idx in 0..connected.len() - 1 {
+                conn.execute(
+                    "INSERT INTO semantic_edges
+                        (id, source_atom_id, target_atom_id, similarity_score,
+                         source_chunk_index, target_chunk_index, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                    params![
+                        format!("connected-edge-{idx}"),
+                        connected[idx],
+                        connected[idx + 1],
+                        0.82_f32,
+                        now
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(UNDERCONNECTED_ATOM_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| signal.target.id == isolated.atom.id)
+            .expect("underconnected atom signal");
+        assert_eq!(signal.provider_id, UNDERCONNECTED_ATOM_PROVIDER_ID);
+        assert_eq!(
+            signal.id,
+            format!("underconnected_atom:atom:{}", isolated.atom.id)
+        );
+        assert_eq!(signal.evidence["schema"], "underconnected_atom");
+        assert_eq!(signal.evidence["schema_version"], 1);
+        assert_eq!(signal.evidence["strong_edge_count"], 0);
+        assert_eq!(signal.evidence["tag_count"], 0);
+        assert_eq!(signal.evidence["edges_status"], "complete");
+        assert!(signal
+            .suggested_actions
+            .iter()
+            .any(|action| action.id == "open_atom"));
+        assert!(!signals
+            .iter()
+            .any(|signal| connected.iter().any(|id| id == &signal.target.id)));
     }
 
     fn flatten_test_tags(tags: &[crate::TagWithCount]) -> Vec<crate::Tag> {

@@ -77,14 +77,16 @@ import { formatRelativeDate } from '../../lib/date';
 import { getBrowserTimeZone, getSupportedTimeZones } from '../../lib/tz';
 import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../stores/databases';
 import { OverrideControls } from './OverrideControls';
+import { KnowledgeSignalsSettingsTab } from './KnowledgeSignalsSettingsTab';
 
-export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts';
+export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'signals' | 'connection' | 'integrations' | 'databases' | 'prompts';
 
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
   { id: 'ai', label: 'AI Models' },
   { id: 'prompts', label: 'Prompts' },
   { id: 'tag-categories', label: 'Tags' },
+  { id: 'signals', label: 'Signals' },
   { id: 'connection', label: 'Connection' },
   { id: 'integrations', label: 'Integrations' },
   { id: 'databases', label: 'Databases' },
@@ -2509,6 +2511,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                   <TagCategoriesTab />
                 </>
               )}
+
+              {/* ===== SIGNALS TAB ===== */}
+              {activeTab === 'signals' && <KnowledgeSignalsSettingsTab />}
 
               {/* ===== CONNECTION TAB ===== */}
               {activeTab === 'connection' && (

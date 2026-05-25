@@ -140,6 +140,14 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::get().to(knowledge_signals::list_knowledge_signals),
     );
     cfg.route(
+        "/knowledge-signals/dashboard",
+        web::get().to(knowledge_signals::list_dashboard_knowledge_signals),
+    );
+    cfg.route(
+        "/knowledge-signals/providers",
+        web::get().to(knowledge_signals::list_knowledge_signal_provider_configs),
+    );
+    cfg.route(
         "/knowledge-signals/providers/{provider_id}",
         web::put().to(knowledge_signals::set_knowledge_signal_provider_config),
     );
@@ -154,6 +162,14 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route(
         "/knowledge-signals/{signal_key}/restore",
         web::post().to(knowledge_signals::restore_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/actions",
+        web::post().to(knowledge_signals::apply_knowledge_signal_action),
+    );
+    cfg.route(
+        "/knowledge-signals/actions/{action_log_id}/undo",
+        web::post().to(knowledge_signals::undo_knowledge_signal_action),
     );
 
     // Dashboard

@@ -617,6 +617,27 @@ Before any direct mutation ships, add an action audit path:
 
 This borrows the useful part of PR #182's fix audit system without adopting automatic remediation as a product default.
 
+### Action Audit Foundation
+
+Signal-driven mutations should go through a dedicated action endpoint rather than through the general app mutation routes:
+
+```text
+POST /api/knowledge-signals/{signal_key}/actions
+POST /api/knowledge-signals/actions/{action_log_id}/undo
+```
+
+This keeps audit and undo semantics scoped to knowledge-quality actions. Normal tag, atom, and wiki operations should remain normal user actions and should not be retroactively treated as signal remediations.
+
+The first action-log slice should support:
+
+- `add_tag_to_atom`: audited and undoable.
+- `delete_empty_tag`: audited, not undoable yet.
+- `merge_tags`: audited, not undoable yet.
+
+Undo support is action-specific. The initial undo contract only covers `add_tag_to_atom`: undo removes the tag assignment only when the signal action actually created that assignment. Tag deletion and tag merge need more complete restoration semantics before undo should be exposed.
+
+Successful signal actions should dismiss the originating signal so completed work does not immediately reappear.
+
 ## Computation Strategy
 
 Start with manual/on-demand evaluation:
@@ -634,7 +655,10 @@ The dashboard's briefing surface should use the same signal infrastructure, but 
 
 Do not make the LLM responsible for deciding which knowledge-quality suggestions to show. It can summarize recent atoms; deterministic providers should pick the actions.
 
-Add caching once evaluation becomes expensive. A simple cache invalidation model is enough:
+Add caching before broad user rollout. Live evaluation is useful during initial
+development, but dashboard load should not repeatedly recompute every visible
+provider for users with large databases. A simple cache invalidation model is
+enough:
 
 - atom created/updated/deleted
 - atom tags changed
@@ -642,7 +666,11 @@ Add caching once evaluation becomes expensive. A simple cache invalidation model
 - wiki generated/updated
 - semantic edges rebuilt
 
-For v1, it is acceptable to recompute all enabled deterministic dashboard providers for the active database when the dashboard opens, then cache for a short period. Historical report findings do not snapshot these suggestions in the first implementation; signals are current maintenance prompts, not part of generated report content.
+For early development, it is acceptable to recompute deterministic providers
+for the active database when the dashboard opens. Before releasing this broadly,
+dashboard evaluation should move to a bounded, cache-aware path. Historical
+report findings do not snapshot these suggestions in the first implementation;
+signals are current maintenance prompts, not part of generated report content.
 
 ## API Surface
 
@@ -654,21 +682,21 @@ Core:
 - `AtomicCore::dismiss_knowledge_signal(signal_key)`
 - `AtomicCore::snooze_knowledge_signal(signal_key, until)`
 - `AtomicCore::restore_knowledge_signal(signal_key)`
+- `AtomicCore::apply_knowledge_signal_action(signal_key, action)`
+- `AtomicCore::undo_knowledge_signal_action(action_log_id)` for actions with defined undo semantics
 - Later: `AtomicCore::preview_custom_signal_rule(rule)`
-- Later: `AtomicCore::apply_knowledge_signal_action(signal_key, action)`
-- Later: `AtomicCore::undo_knowledge_signal_action(action_log_id)`
 
 Server:
 
 - `GET /api/knowledge-signals`
 - `GET /api/knowledge-signals?surface=briefing`
-- `PATCH /api/knowledge-signals/providers/:provider_id`
+- `PUT /api/knowledge-signals/providers/:provider_id`
 - `POST /api/knowledge-signals/:signal_key/dismiss`
 - `POST /api/knowledge-signals/:signal_key/snooze`
 - `POST /api/knowledge-signals/:signal_key/restore`
+- `POST /api/knowledge-signals/:signal_key/actions`
+- `POST /api/knowledge-signals/actions/:action_log_id/undo`
 - Later: `POST /api/knowledge-signals/custom/preview`
-- Later: `POST /api/knowledge-signals/:signal_key/actions`
-- Later: `POST /api/knowledge-signals/actions/:action_log_id/undo`
 
 Frontend transport should expose these as normal commands. The React page should stay transport-agnostic.
 
@@ -887,15 +915,410 @@ Suggested actions:
 
 This action is low risk enough to ship before undo infrastructure because it only adds a normal manual tag assignment. Durable dismiss still applies so accepted or rejected suggestions do not immediately reappear.
 
+#### Milestone 5B - Underconnected Atoms
+
+Implement `UnderconnectedAtomProvider` as a conservative dashboard-first review signal.
+
+Provider behavior:
+
+- Consider captured atoms only.
+- Require `edges_status = complete` so unprocessed atoms are not surfaced as knowledge-quality issues.
+- Require a minimum active database size before emitting signals, since isolated notes in tiny databases are expected.
+- Suppress tiny notes where lack of connection is not meaningful.
+- Rank atoms with few or no strong semantic edges, low closest-neighbor similarity, and sparse tag context.
+- Keep briefing eligibility disabled by default.
+
+Typed evidence should include:
+
+- atom ID, title, source URL, and content length
+- tag count
+- total semantic edge count
+- strong semantic edge count
+- strongest and average similarity when available
+- captured atom count for the active database
+- edge status used to qualify the signal
+
+Suggested actions:
+
+- `open_atom`
+- `dismiss`
+
+This provider should not imply that every standalone note is wrong. It should be framed as a review opportunity for atoms that may be misfiled, obsolete, or worth connecting through tags or follow-up notes.
+
 ### Milestone 6 - Link And Source Quality
 
+- Add near-duplicate atom detection as a pulled-forward deterministic cleanup provider.
 - Add broken internal link detection as a dashboard-first provider.
 - Add source URL duplicate and content-overlap providers.
 - Add boilerplate/source-pollution detection where the signal can be deterministic.
 - Add reviewed proposal flow for any content rewrite or boilerplate stripping action.
 - Add audit/undo infrastructure before any direct mutating action ships.
+- After source duplicates and broken internal links, pause new signal expansion and shift effort to action quality, review flows, undo coverage, and dashboard polish.
 
 Exit criteria: Atomic can surface link and source-quality issues with concrete evidence and safe review actions, without treating them as system health failures or auto-fixing content by default.
+
+#### Milestone 6A - Near-Duplicate Atoms
+
+Implement `NearDuplicateAtomProvider` as the first content-cleanup provider.
+
+Provider behavior:
+
+- Use existing semantic edges for candidate generation rather than all-pairs atom comparison.
+- Consider captured atoms only, so report findings and other system atoms do not pollute the queue.
+- Score pairs using semantic similarity, exact normalized source match, title similarity, shared tags, and content-length compatibility.
+- Require either very high semantic similarity or high semantic similarity plus another supporting signal.
+- Use stable keys: `near_duplicate_atom:pair:{canonical_sorted_atom_ids_hash}`.
+- Keep briefing eligibility disabled by default.
+
+Typed evidence should include:
+
+- both atom IDs, titles, source URLs, content lengths, and timestamps
+- semantic similarity
+- source match status
+- title similarity
+- shared tag names and count
+- content-length ratio
+
+Suggested actions:
+
+- `review_pair`
+- `open_primary_atom`
+- `open_secondary_atom`
+- `keep_separate`
+
+This first slice should not merge, archive, or rewrite atom content automatically. Those actions need an audit/undo path first because they mutate the user's actual knowledge content rather than organization metadata.
+
+#### Milestone 6B - Source Duplicates In Similar Notes
+
+Implement `SourceDuplicateProvider` as a deterministic companion to near-duplicate atoms, rendered inside the existing Similar Notes widget rather than as a separate dashboard widget.
+
+Provider behavior:
+
+- Consider captured atoms only.
+- Group atoms by normalized exact source URL, ignoring empty or missing sources.
+- Score same-source pairs highly, with title similarity, content-length compatibility, and duplicate-group size used only for ranking.
+- Avoid all-pairs explosions by pairing the newest capture for a source against a bounded number of older captures.
+- Use stable keys: `source_duplicate:pair:{canonical_sorted_atom_ids_hash}`.
+- Keep briefing eligibility disabled by default.
+
+Typed evidence should include:
+
+- both atom IDs, titles, source URLs, content lengths, and timestamps
+- canonical source URL and normalized source URL
+- duplicate count for that source
+- title similarity
+- content-length ratio
+
+Suggested actions:
+
+- `review_pair`
+- `open_primary_atom`
+- `open_secondary_atom`
+- `keep_separate`
+
+The first UI pass should present this as another kind of "similar note" so users do not have to understand the distinction between semantic overlap and exact source overlap before deciding whether to review the pair.
+
+#### Milestone 6C - Broken Internal Links
+
+Implement `BrokenInternalLinkProvider` as a dashboard-first link quality provider.
+
+Provider behavior:
+
+- Consider links from captured atoms only.
+- Surface UUID-shaped atom links whose target atom is missing as the highest-confidence case.
+- Surface unresolved text wikilinks more conservatively, because some users intentionally create links to future notes.
+- Use stable keys based on the materialized atom link row: `broken_internal_link:link:{link_id}`.
+- Bound results per source atom so a single messy note does not dominate the dashboard.
+- Keep briefing eligibility disabled by default.
+
+Typed evidence should include:
+
+- link ID
+- source atom ID and title
+- raw link target and optional link label
+- target kind
+- link status
+- source offsets when available
+
+Suggested actions:
+
+- `open_atom`
+- `dismiss`
+
+This provider should not rewrite links or create placeholder atoms in v1. The useful first action is to take the user directly to the source atom with enough context to fix or intentionally keep the link.
+
+#### Milestone 6D - Signal Productization
+
+After the first set of deterministic providers is in place, pause new signal expansion and make the existing feature set feel coherent, configurable, and action-oriented.
+
+This milestone is the bridge between "we can detect useful things" and "users can safely act on useful things." It should finish before profile presets or custom rule providers, because profiles and custom rules will inherit the same action, feedback, and customization patterns.
+
+Workstreams:
+
+- **Surface refinement:** make dashboard widgets and briefing suggestions visually and behaviorally consistent.
+- **Action expansion:** turn the most obvious next steps into explicit, audited actions.
+- **Customization:** expose provider-level controls in settings so users can tune the system without editing configuration or waiting for custom rules.
+- **Undo and audit maturity:** expand undo only where the restoration semantics are well-defined.
+
+Implementation order:
+
+1. Add a provider-settings read API so the frontend can render real per-database provider preferences.
+2. Add a Settings → Signals tab for provider enablement, dashboard visibility, briefing visibility, and simple sensitivity controls.
+3. Normalize current dashboard widget interaction patterns and loading states.
+4. Move wiki generate/update through explicit signal actions with duplicate-job protection.
+5. Review tag cleanup and missing-tag actions for consistent audit, success, failure, and undo behavior.
+6. Run the audit sweep before adding profile presets or custom providers.
+
+##### 6D.1 - Surface Refinement
+
+Current widgets should follow the same interaction rules:
+
+- Rows should not perform surprising mutations on click.
+- Mutating or long-running actions should be explicit buttons with loading/disabled states.
+- Dismiss buttons should use consistent labels and icons.
+- Empty states should be neutral and not guilt-oriented.
+- Each signal widget should have a small help affordance explaining what the signal means and which deterministic evidence drives it.
+- Reasons should use user-facing language, not implementation metrics such as "Jaccard" or "containment."
+- Review modals should use persistent bottom action bars when the content can scroll.
+- Dashboard widgets should use the same compact half-width layout unless a specific workflow needs full width.
+- Briefing suggestions should stay capped and should not crowd out the generated briefing content.
+
+Exit criteria: every shipped signal widget has clear action affordances, durable dismiss behavior, loading states for long-running work, and copy that explains the opportunity in product language.
+
+##### 6D.2 - Action Expansion
+
+Prioritize actions that are high-value, explicit, and easy to make safe.
+
+Near-term action candidates:
+
+- `generate_wiki` for wiki candidate signals.
+- `update_wiki` for wiki update signals.
+- `add_tag_to_atom` for missing-tag overlap, already audited and undoable.
+- `delete_empty_tag` for empty-tag cleanup, audited with confirmation.
+- `merge_tags` for tag redundancy, audited with preview and confirmation.
+- `open_atom` for broken links, underconnected atoms, and similar-note review.
+- `keep_separate` / `dismiss` for pairs the user has reviewed.
+
+Duplicate atom resolution needs a dedicated review outcome, not a bare delete button. The final phase should define a conservative `resolve_duplicate_atom` path before any destructive action appears. The first shippable mutation should likely be an archive/remove-one action for high-confidence same-source duplicates only, and only if Atomic has reversible delete/restore semantics. Full atom merge should stay deferred until content, tags, source URLs, links, citations, and undo behavior have a clear preview and restore model.
+
+Defer or treat as proposal-only until the UX and undo model are strong:
+
+- atom merge
+- atom archive/delete from duplicate-note signals
+- link rewrite or link removal
+- placeholder atom creation from unresolved text links
+- boilerplate stripping or content rewrite
+
+Implementation expectations:
+
+- Mutating signal actions should go through `POST /api/knowledge-signals/{signal_key}/actions`.
+- Successful actions should dismiss the originating signal.
+- Actions that can be triggered repeatedly should have client-side and server-side idempotency or in-flight protection.
+- Undo should be exposed only when the undo semantics are specific and reliable.
+- Every new action should document its before/after state and whether undo is supported.
+
+Exit criteria: the core wiki and tag cleanup suggestions can be completed from the dashboard through explicit actions, and users receive accurate loading, success, failure, and undo feedback.
+
+##### 6D.3 - Provider Customization UI
+
+Expose the existing provider preference model through a settings surface.
+
+Initial controls:
+
+- enable or disable each provider
+- show or hide each provider on the dashboard
+- include or exclude each provider from the briefing
+- choose a simple sensitivity level where possible, mapped to `min_score` and `min_confidence`
+- restore dismissed signals or show dismissed signals for review
+
+Keep advanced controls conservative:
+
+- Raw provider weights can remain hidden initially unless the UI has a clear ranking model.
+- Provider-specific config should appear only when there is a product-facing concept to configure.
+- Profile presets should wait until defaults have been tested against real usage.
+
+The settings surface should describe what each provider does in terms of user value:
+
+- Wiki opportunities
+- Wiki updates
+- Tag cleanup
+- Ideas to connect
+- Similar notes
+- Broken links
+- Underconnected notes
+
+Exit criteria: a user can make the signal system quieter, louder, dashboard-only, or briefing-aware without database edits, and preferences remain per-database.
+
+##### 6D.4 - Review And Audit Sweep
+
+Before moving to profile presets or custom providers, run a review pass across the whole feature set.
+
+Backend checks:
+
+- provider preferences are honored consistently on dashboard and briefing paths
+- feedback state filters all widgets and briefing suggestions
+- Postgres and SQLite emit the same evidence shape
+- per-database state is purged when a logical database is deleted
+- mutating actions are audited and only expose undo when implemented
+
+Frontend checks:
+
+- widgets do not duplicate the same opportunity in confusing ways
+- action buttons are discoverable and do not rely on row-click side effects
+- dismissed or completed signals do not reappear on refresh
+- loading and error states are present for every async action
+- copy stays away from system-health framing and overall scores
+
+Exit criteria: current deterministic signals feel like one feature set rather than a collection of experimental widgets.
+
+### Milestone 6E - Performance Hardening
+
+Before broad rollout, make signal evaluation safe for real user databases with
+tens of thousands of atoms. This milestone should happen after the current
+signal/action set stabilizes and before profiles or custom providers, because
+every later module will inherit the same evaluation path.
+
+The current development implementation is intentionally direct: dashboard
+widgets request their provider data independently, and each provider evaluates
+live. That is acceptable while the surface is changing, but it has two rollout
+risks:
+
+- dashboard load fans out into several HTTP requests
+- `limit` is applied after provider evaluation in many paths, so small widgets
+  can still trigger large scans or aggregations
+
+Performance work should preserve the modular provider model while changing how
+the dashboard asks for and caches results.
+
+Implemented groundwork:
+
+- Dashboard widgets now load through a single aggregate signal request instead
+  of one initial request per widget/provider.
+- Hidden or disabled dashboard providers are filtered before their widgets mount.
+- The aggregate response is cached briefly per database/core handle and
+  invalidated by signal feedback, provider settings, primary atom mutations,
+  tag mutations, and wiki mutations.
+- The highest-risk live providers now have explicit candidate budgets:
+  tag-pair generation, missing-tag overlap, source duplicate groups,
+  underconnected atom candidates, and near-duplicate shared-tag loading.
+
+#### 6E.1 - Dashboard Aggregation API
+
+Add one dashboard-oriented read path that evaluates the visible dashboard
+providers for the active database and returns grouped results.
+
+Candidate API:
+
+- `AtomicCore::list_dashboard_knowledge_signals(options)`
+- `GET /api/knowledge-signals/dashboard`
+
+The response should include:
+
+- provider settings used for filtering
+- grouped signal results keyed by provider id
+- per-provider timing metadata in debug/development builds
+- errors isolated per provider, so one slow or broken provider does not blank the dashboard
+
+The existing provider-specific `GET /api/knowledge-signals?provider_id=...`
+route should remain for drilldowns, compatibility, and targeted refreshes. The
+dashboard should prefer the aggregate route.
+
+Frontend changes:
+
+- Load provider settings before mounting signal widgets, or have the aggregate
+  endpoint decide widget visibility so hidden/disabled widgets never fire their
+  provider requests.
+- Replace widget-level initial fetches with a shared dashboard signal store or
+  context populated by the aggregate endpoint.
+- Keep targeted refresh after an action, but refresh only the affected provider
+  or signal group when possible.
+
+Exit criteria: opening the dashboard makes one signal request for the dashboard
+signal groups, plus targeted follow-up requests only after user actions.
+
+#### 6E.2 - Provider Query Budgets
+
+Each provider needs an explicit cost model and a hard result/candidate budget.
+Do not rely on frontend `limit` alone.
+
+Initial provider expectations:
+
+- **Wiki candidates:** aggregate by tag using indexed joins; cap returned
+  candidates after scoring. Consider prefiltering to tags with enough atoms or
+  recent activity before joining semantic-edge summaries.
+- **Wiki updates:** evaluate only existing wiki articles; keep bounded by wiki
+  article count rather than atom count where possible.
+- **Tag redundancy:** highest risk. Avoid unbounded tag-pair self-joins on dense
+  `atom_tags`; generate candidates from tags with meaningful atom counts and cap
+  per-tag comparisons.
+- **Empty tags:** cheap enough to run live, but still bounded and indexed.
+- **Missing tag overlap:** use stored semantic edges, not raw embedding all-pairs;
+  cap candidate rows before Rust-side evidence expansion.
+- **Near duplicates:** already based on high-similarity semantic edges; keep the
+  edge query bounded and avoid loading all atom tag metadata if only 250 pairs
+  are being reviewed.
+- **Source duplicates:** avoid scanning and normalizing every source URL on each
+  dashboard load. Prefer a normalized-source column, index, or materialized
+  duplicate-source summary.
+- **Broken internal links:** keep status-filtered and result-bounded.
+- **Underconnected atoms:** cap semantic-edge aggregation work or materialize
+  per-atom edge summaries; this can otherwise scan the semantic edge table on
+  every dashboard load.
+
+Exit criteria: every provider documents the dominant table scans/joins it uses,
+has a bounded candidate strategy, and applies limits as early as practical in
+SQLite and Postgres.
+
+#### 6E.3 - Cache Or Materialized Snapshot
+
+Introduce a per-database signal cache once the dashboard aggregate API exists.
+The cache can start simple:
+
+- cache key: database id, provider id, provider config hash, relevant data version
+- cache value: normalized `KnowledgeSignal` rows plus evaluation timestamp
+- short TTL for dashboard reads
+- explicit invalidation on atom, tag, wiki, link, semantic-edge, provider-config,
+  feedback, and signal-action changes
+
+If invalidation becomes hard to reason about, prefer a materialized snapshot
+table over in-memory cache. The existing `knowledge_signal_feedback` and action
+log tables should remain the source of truth for user decisions; cached signal
+rows are derived data and can be rebuilt.
+
+Exit criteria: repeated dashboard opens within the cache window do not re-run
+expensive provider queries, and dismissed/completed signals are still filtered
+correctly.
+
+#### 6E.4 - Large-Database Validation
+
+Add a repeatable performance harness before rollout.
+
+Test targets:
+
+- synthetic SQLite database with 10k captured atoms
+- synthetic SQLite database with 50k captured atoms if fixture generation is practical
+- representative tag density, source URLs, atom links, wiki articles, and
+  semantic edges capped the same way production edge generation caps them
+- Postgres check for query parity and obvious missing indexes
+
+Measure:
+
+- dashboard aggregate endpoint latency, cold and warm
+- per-provider evaluation time
+- number of SQL statements per dashboard load
+- peak rows considered before final widget limits
+- frontend request count on dashboard open
+
+Initial rollout budget:
+
+- dashboard signal request count: 1
+- warm dashboard signal load: comfortably sub-second on 10k atoms
+- no provider should perform an unbounded all-pairs atom or tag comparison
+- hidden or disabled providers should do no evaluation work
+
+Exit criteria: the feature has measured performance on large synthetic data,
+clear provider-level timing visibility, and no known unbounded dashboard-load
+query path.
 
 ### Milestone 7 - Profiles And Tuning
 

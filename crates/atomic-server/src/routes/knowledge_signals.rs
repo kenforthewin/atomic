@@ -52,6 +52,34 @@ pub async fn list_knowledge_signals(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/knowledge-signals/dashboard",
+    params(KnowledgeSignalsQuery),
+    responses((status = 200, description = "Dashboard knowledge-quality signal groups", body = atomic_core::DashboardKnowledgeSignals)),
+    tag = "knowledge-signals"
+)]
+pub async fn list_dashboard_knowledge_signals(
+    db: Db,
+    query: web::Query<KnowledgeSignalsQuery>,
+) -> HttpResponse {
+    let q = query.into_inner();
+    ok_or_error(
+        db.0.list_dashboard_knowledge_signals(q.limit.unwrap_or(20))
+            .await,
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/knowledge-signals/providers",
+    responses((status = 200, description = "Knowledge-quality signal provider settings", body = Vec<atomic_core::KnowledgeSignalProviderSettings>)),
+    tag = "knowledge-signals"
+)]
+pub async fn list_knowledge_signal_provider_configs(db: Db) -> HttpResponse {
+    ok_or_error(db.0.list_knowledge_signal_provider_configs().await)
+}
+
+#[utoipa::path(
     put,
     path = "/api/knowledge-signals/providers/{provider_id}",
     params(("provider_id" = String, Path, description = "Signal provider id")),
@@ -114,4 +142,34 @@ pub async fn snooze_knowledge_signal(
 )]
 pub async fn restore_knowledge_signal(db: Db, path: web::Path<String>) -> HttpResponse {
     ok_or_error(db.0.restore_knowledge_signal(&path.into_inner()).await)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/knowledge-signals/{signal_key}/actions",
+    params(("signal_key" = String, Path, description = "Stable signal key")),
+    request_body = atomic_core::KnowledgeSignalActionRequest,
+    responses((status = 200, description = "Signal action applied", body = atomic_core::KnowledgeSignalActionResult)),
+    tag = "knowledge-signals"
+)]
+pub async fn apply_knowledge_signal_action(
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<atomic_core::KnowledgeSignalActionRequest>,
+) -> HttpResponse {
+    ok_or_error(
+        db.0.apply_knowledge_signal_action(&path.into_inner(), body.into_inner())
+            .await,
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/knowledge-signals/actions/{action_log_id}/undo",
+    params(("action_log_id" = String, Path, description = "Signal action log ID")),
+    responses((status = 200, description = "Signal action undone", body = atomic_core::KnowledgeSignalActionResult)),
+    tag = "knowledge-signals"
+)]
+pub async fn undo_knowledge_signal_action(db: Db, path: web::Path<String>) -> HttpResponse {
+    ok_or_error(db.0.undo_knowledge_signal_action(&path.into_inner()).await)
 }
