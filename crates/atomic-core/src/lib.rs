@@ -1628,6 +1628,17 @@ impl AtomicCore {
                 .await
                 .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
                 .rows_affected() as i32;
+                sqlx::query(
+                    "UPDATE wiki_links
+                     SET target_tag_id = $1
+                     WHERE target_tag_id = $2 AND db_id = $3",
+                )
+                .bind(&target)
+                .bind(&source)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
                 if source_wiki_deleted {
                     sqlx::query("DELETE FROM wiki_articles WHERE tag_id = $1 AND db_id = $2")
                         .bind(&source)

@@ -2568,7 +2568,8 @@ impl KnowledgeSignalProvider for WikiUpdateProvider {
                         JOIN tags t ON t.id = wa.tag_id
                         LEFT JOIN tag_atoms ta ON ta.tag_id = wa.tag_id
                         LEFT JOIN inbound_mentions im ON im.tag_id = wa.tag_id
-                        WHERE COALESCE(ta.new_atom_count, 0) > 0",
+                        WHERE COALESCE(ta.new_atom_count, 0) > 0
+                           OR COALESCE(ta.current_atom_count, 0) > wa.atom_count",
                     )?;
 
                     let rows = stmt.query_map(params![recent_cutoff], |row| {
@@ -2668,7 +2669,10 @@ impl KnowledgeSignalProvider for WikiUpdateProvider {
                     LEFT JOIN tag_atoms ta ON ta.tag_id = wa.tag_id
                     LEFT JOIN inbound_mentions im ON im.tag_id = wa.tag_id
                     WHERE wa.db_id = $2
-                      AND COALESCE(ta.new_atom_count, 0) > 0",
+                      AND (
+                        COALESCE(ta.new_atom_count, 0) > 0
+                        OR COALESCE(ta.current_atom_count, 0) > wa.atom_count
+                      )",
                 )
                 .bind(recent_cutoff)
                 .bind(&storage.db_id)
@@ -2752,21 +2756,24 @@ impl KnowledgeSignalEvidence for WikiUpdateEvidence {
 
 impl WikiUpdateRow {
     fn into_signal(self, now: &str) -> Result<KnowledgeSignal, AtomicCoreError> {
-        let new_atom_volume = scaled_ln(self.new_atom_count, 12.0);
+        let update_atom_count = self
+            .new_atom_count
+            .max((self.current_atom_count - self.article_atom_count).max(0));
+        let new_atom_volume = scaled_ln(update_atom_count, 12.0);
         let growth_ratio = if self.article_atom_count <= 0 {
             1.0
         } else {
-            (self.new_atom_count as f32 / self.article_atom_count as f32 / 0.5).min(1.0)
+            (update_atom_count as f32 / self.article_atom_count as f32 / 0.5).min(1.0)
         };
-        let source_diversity = if self.new_atom_count <= 1 {
+        let source_diversity = if update_atom_count <= 1 {
             0.0
         } else {
-            (self.new_source_count as f32 / self.new_atom_count.min(8) as f32).min(1.0)
+            (self.new_source_count as f32 / update_atom_count.min(8) as f32).min(1.0)
         };
-        let substantive = if self.new_atom_count == 0 {
+        let substantive = if update_atom_count == 0 {
             0.0
         } else {
-            (self.new_substantive_count as f32 / self.new_atom_count as f32).min(1.0)
+            (self.new_substantive_count as f32 / update_atom_count as f32).min(1.0)
         };
         let recent_growth = (self.new_recent_count as f32 / 5.0).min(1.0);
         let inbound_strength = (self.inbound_link_count as f32 / 5.0).min(1.0);
@@ -2789,11 +2796,11 @@ impl WikiUpdateRow {
             KnowledgeSignalReason {
                 kind: "new_atom_volume".to_string(),
                 label: format!(
-                    "{} new atom{}",
-                    self.new_atom_count,
-                    if self.new_atom_count == 1 { "" } else { "s" }
+                    "{} atom{} not reflected",
+                    update_atom_count,
+                    if update_atom_count == 1 { "" } else { "s" }
                 ),
-                value: json!(self.new_atom_count),
+                value: json!(update_atom_count),
                 contribution: new_atom_volume,
             },
             KnowledgeSignalReason {
@@ -2803,12 +2810,13 @@ impl WikiUpdateRow {
                     if self.article_atom_count <= 0 {
                         100.0
                     } else {
-                        (self.new_atom_count as f32 / self.article_atom_count as f32) * 100.0
+                        (update_atom_count as f32 / self.article_atom_count as f32) * 100.0
                     }
                 ),
                 value: json!({
                     "article_atom_count": self.article_atom_count,
                     "new_atom_count": self.new_atom_count,
+                    "current_atom_count": self.current_atom_count,
                 }),
                 contribution: growth_ratio,
             },
@@ -2875,7 +2883,7 @@ impl WikiUpdateRow {
             confidence,
             severity: KnowledgeSignalSeverity::Opportunity,
             title: format!("Update the wiki for {}", self.tag_name),
-            summary: "New source material has accumulated since this wiki was last updated."
+            summary: "Tagged material has accumulated that is not reflected in this wiki."
                 .to_string(),
             reasons,
             evidence: evidence.to_value()?,
@@ -6245,6 +6253,77 @@ mod tests {
             .suggested_actions
             .iter()
             .any(|action| action.id == "update_wiki"));
+    }
+
+    #[tokio::test]
+    async fn wiki_update_signal_includes_retagged_existing_atoms() {
+        let (core, _temp) = test_core().await;
+        let tag = create_child_tag(&core, "Research").await;
+
+        core.create_atom(
+            CreateAtomRequest {
+                content: long_note("Research baseline"),
+                source_url: Some("https://example.com/research/baseline".to_string()),
+                tag_ids: vec![tag.id.clone()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let retagged_atom = core
+            .create_atom(
+                CreateAtomRequest {
+                    content: long_note("Research note that was classified later"),
+                    source_url: Some("https://example.com/research/retagged".to_string()),
+                    tag_ids: vec![],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        sleep(TokioDuration::from_millis(5)).await;
+
+        let storage = match core.storage() {
+            crate::storage::StorageBackend::Sqlite(storage) => storage,
+            #[cfg(feature = "postgres")]
+            crate::storage::StorageBackend::Postgres(_) => panic!("test uses SQLite storage"),
+        };
+        storage
+            .save_wiki_sync(&tag.id, "Existing wiki", &[], 1)
+            .unwrap();
+
+        core.add_tag_to_atom(&retagged_atom.atom.id, &tag.id)
+            .await
+            .unwrap();
+
+        let signals = list_knowledge_signals(
+            &core,
+            KnowledgeSignalFilter {
+                provider_id: Some(WIKI_UPDATE_PROVIDER_ID.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let signal = signals
+            .iter()
+            .find(|signal| signal.target.id == tag.id)
+            .expect("wiki update signal for retagged atom");
+
+        assert_eq!(signal.evidence["article_atom_count"], 1);
+        assert_eq!(signal.evidence["current_atom_count"], 2);
+        assert_eq!(signal.evidence["new_atom_count"], 0);
+        assert!(signal.score > 0.0);
+        assert!(signal.reasons.iter().any(|reason| {
+            reason.kind == "new_atom_volume" && reason.label == "1 atom not reflected"
+        }));
     }
 
     #[tokio::test]
