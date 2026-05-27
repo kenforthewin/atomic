@@ -2,13 +2,14 @@
 
 All notable changes to Atomic are documented here.
 
-## Unreleased
+## v1.39.0 — 2026-05-27
 
-- Add **Reports** — scheduled research over your knowledge base, with each run writing a single cited finding as a first-class atom. Reports are configurable from a new top-nav view: schedule (cron + timezone, with presets and a custom escape hatch), source scope (tags + time window), context scope (same-as-source / all / specific tags), and citation policy (source-only / source-and-context).
-- Add a curated template gallery for new reports: Daily Briefing, Weekly Contradiction Scan, Open Questions Status, and Themes This Month — each ships with a hand-written research prompt that pre-fills the editor.
-- Add a dashboard featured-report picker so any report (not just the seeded Daily Briefing) can fill the dashboard widget. The pointer is per-database and syncs across windows via a new `dashboard-featured-changed` WebSocket event.
-- Collapse the legacy daily briefing into Reports. The Daily Briefing is now the default seeded report (one per database); your existing briefing schedule, prompt, and history were migrated in place. Past briefings became finding atoms with their citations preserved. The `/api/briefings/*` REST routes and `BriefingReady` event are removed; equivalent functionality lives at `/api/reports/*` and the standard `atom-created` event filtered on `kind === 'report'`.
-- Add a Run Now button on each report's detail view, with optimistic running state that clears via the success event or a periodic poll for the failure path.
+- Add Reports — a new first-class primitive for automated, scheduled research over your knowledge base. Create reports with custom research prompts, cron schedules, scoped source/context tags, and citation policies. Four curated templates ship built-in: Daily Briefing, Weekly Contradiction Scan, Open Questions Status, and Monthly Themes
+- Add a full Reports authoring UI: template gallery for quick starts, report editor with schedule/scope/citation-policy fields, detail view with findings list, Run Now button, and a featured-report picker for the dashboard widget. The legacy Daily Briefing settings are retired — existing briefings are automatically migrated to report findings
+- Add a dedicated Finding reader for report outputs, with inline citation popovers, parent-report breadcrumb navigation, and a mini knowledge-graph canvas showing cited atoms
+- Add keyboard navigation to report dropdowns and overflow menus; improve mobile layout for the report detail view header
+- Fix canvas crashes caused by WebGL context exhaustion when rapidly navigating local graph views
+- Improve citation marker styling — inline [N] markers now use the primary text color instead of purple accent for better readability
 
 ## v1.38.0 — 2026-05-16
 
