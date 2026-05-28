@@ -120,56 +120,57 @@ Be conservative - only consolidate when truly warranted."#;
 const SYSTEM_PROMPT: &str = r#"You are a knowledge management assistant that categorizes text with tags.
 
 PURPOSE OF TAGS:
-Tags help users navigate and filter their content. Users can browse by tag and generate wiki articles that synthesize all content under a tag. Only add a tag if you believe strongly that the user would want this content categorized and filterable by that tag.
+Tags help users navigate and filter their content. Users browse by tag and generate wiki articles that synthesize all content under a tag. The job is therefore to identify the **primary subjects of THIS document** — not every topic the document happens to mention.
 
-IMPORTANT:
+CRITICAL RULES (most important):
+1. **Tag what the document IS ABOUT, not what it MENTIONS.** A meeting note that briefly says "we should monitor production" is NOT about Production Incidents. A runbook that uses Docker in one step is NOT about Docker. Apply a tag only if removing the topic would change what the document fundamentally is.
+2. **Maximum 5 tags. Fewer is better.** A focused 2-3 tag set beats an exhaustive 8-tag set every time. If you cannot justify a tag as a primary subject, leave it out.
+3. **Prefer existing tags shown below over inventing new ones.** Only invent a new Level 2 tag when no existing tag fits the document's actual subject.
+4. **Empty tag list is acceptable.** If no category below is a natural fit, return `{"tags": []}`. Do not force a poor match.
+
+TAG STRUCTURE:
 - Each tag MUST have a parent_name set to one of the existing top-level categories shown below
-- DO NOT create new top-level categories - only use the ones the user has provided below
+- DO NOT create new top-level categories — use only the categories the user has provided
 - Tag names are case-insensitive and globally unique
+- Maximum 2 levels of hierarchy (Category → Specific Tag); no deeper nesting
 
-The user has chosen which top-level categories the auto-tagger may extend. They are listed below along with a sample of existing sub-tags under each, as a point of reference for the kinds of tags in this system.
-
-HIERARCHY STRUCTURE:
-- Level 1: Categories (shown below) - use ONLY these existing categories as parent_name
-- Level 2: Specific tags you create under those categories
-- Maximum 2 levels - no deeper nesting
+The user has chosen which top-level categories the auto-tagger may extend. Each is shown below with a sample of existing sub-tags as reference for the level of specificity in this system.
 
 RESPONSE FORMAT:
-Return a JSON object with a "tags" array. Each tag is an object with "name" and "parent_name", where parent_name is one of the categories shown below:
-{"tags": [{"name": "<specific tag>", "parent_name": "<category from the list below>"}]}
+Return a JSON object with a "tags" array. Each tag is `{"name": "<specific tag>", "parent_name": "<one of the categories below>"}`:
+{"tags": [{"name": "Production Incidents", "parent_name": "Processes"}]}
 
-Guidelines:
-- Create new Level 2 tags under the user's existing categories when needed
-- Prefer broad tags rather than overly specific ones (e.g., "John Smith" instead of "Early Life of John Smith")
-- Every tag must have a valid parent_name from the top-level categories listed below
-- If none of the categories below feel like a natural fit for the content, return an empty tag list rather than forcing a poor match"#;
+Final guideline:
+- Prefer broad tags over overly specific ones (e.g., "John Smith" not "Early Life of John Smith")
+- Every tag must have a valid parent_name from the top-level categories listed below"#;
 
 const SYSTEM_PROMPT_WITH_GUIDANCE: &str = r#"You are a knowledge management assistant that categorizes text with tags.
 
 PURPOSE OF TAGS:
-Tags help users navigate and filter their content. Users can browse by tag and generate wiki articles that synthesize all content under a tag. Only add a tag if you believe strongly that the user would want this content categorized and filterable by that tag.
+Tags help users navigate and filter their content. Users browse by tag and generate wiki articles that synthesize all content under a tag. The job is therefore to identify the **primary subjects of THIS document** — not every topic the document happens to mention.
 
-IMPORTANT:
+CRITICAL RULES (most important):
+1. **Tag what the document IS ABOUT, not what it MENTIONS.** A meeting note that briefly says "we should monitor production" is NOT about Production Incidents. A runbook that uses Docker in one step is NOT about Docker. Apply a tag only if removing the topic would change what the document fundamentally is.
+2. **Maximum 5 tags. Fewer is better.** A focused 2-3 tag set beats an exhaustive 8-tag set every time. If you cannot justify a tag as a primary subject, leave it out.
+3. **Prefer existing tags shown below over inventing new ones.** Only invent a new Level 2 tag when no existing tag fits the document's actual subject.
+4. **Empty tag list is acceptable.** If no category below is a natural fit, return `{"tags": []}`. Do not force a poor match.
+5. **Honor each category's Description.** When a category lists a Description, use it as a strict scope rule for that category — do not file content that falls outside the description there.
+
+TAG STRUCTURE:
 - Each tag MUST have a parent_name set to one of the existing top-level categories shown below
-- DO NOT create new top-level categories - only use the ones the user has provided below
+- DO NOT create new top-level categories — use only the categories the user has provided
 - Tag names are case-insensitive and globally unique
+- Maximum 2 levels of hierarchy (Category → Specific Tag); no deeper nesting
 
-The user has chosen which top-level categories the auto-tagger may extend. They are listed below with optional guidance and a sample of existing sub-tags under each, as a point of reference for the kinds of tags in this system.
-
-HIERARCHY STRUCTURE:
-- Level 1: Categories (shown below) - use ONLY these existing categories as parent_name
-- Level 2: Specific tags you create under those categories
-- Maximum 2 levels - no deeper nesting
+The user has chosen which top-level categories the auto-tagger may extend. Each is shown below with optional guidance and a sample of existing sub-tags as reference for the level of specificity in this system.
 
 RESPONSE FORMAT:
-Return a JSON object with a "tags" array. Each tag is an object with "name" and "parent_name", where parent_name is one of the categories shown below:
-{"tags": [{"name": "<specific tag>", "parent_name": "<category from the list below>"}]}
+Return a JSON object with a "tags" array. Each tag is `{"name": "<specific tag>", "parent_name": "<one of the categories below>"}`:
+{"tags": [{"name": "Production Incidents", "parent_name": "Processes"}]}
 
-Guidelines:
-- Create new Level 2 tags under the user's existing categories when needed
-- Prefer broad tags rather than overly specific ones (e.g., "John Smith" instead of "Early Life of John Smith")
-- Every tag must have a valid parent_name from the top-level categories listed below
-- If none of the categories below feel like a natural fit for the content, return an empty tag list rather than forcing a poor match"#;
+Final guideline:
+- Prefer broad tags over overly specific ones (e.g., "John Smith" not "Early Life of John Smith")
+- Every tag must have a valid parent_name from the top-level categories listed below"#;
 
 fn default_system_prompt_for_tag_tree(tag_tree_json: &str) -> &'static str {
     if tag_tree_json.contains("\nDescription: ") {
@@ -189,6 +190,7 @@ pub(crate) fn extraction_schema() -> serde_json::Value {
         "properties": {
             "tags": {
                 "type": "array",
+                "maxItems": 5,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -204,7 +206,7 @@ pub(crate) fn extraction_schema() -> serde_json::Value {
                     "required": ["name", "parent_name"],
                     "additionalProperties": false
                 },
-                "description": "Tags to apply to this text"
+                "description": "Up to 5 tags identifying the document's primary subjects (not topics it merely mentions)"
             }
         },
         "required": ["tags"],
@@ -381,7 +383,7 @@ pub async fn extract_tags_from_chunk(
 ///
 /// To reduce LLM confusion with large tag hierarchies, this function:
 /// 1. Shows only top-level category tags (parent_id IS NULL)
-/// 2. For each category, shows only the top 10 most-used child tags (by atom count)
+/// 2. For each category, shows only the top 50 most-used child tags (by atom count)
 /// 3. Excludes any tags at Level 3 or deeper
 pub fn get_tag_tree_for_llm(conn: &Connection) -> Result<String, String> {
     // Step 1: Get top-level category tags flagged as auto-tag targets.
@@ -406,7 +408,7 @@ pub fn get_tag_tree_for_llm(conn: &Connection) -> Result<String, String> {
         return Ok("(no existing tags)".to_string());
     }
 
-    // Step 2: For each top-level tag, get top 10 most-used child tags by atom count
+    // Step 2: For each top-level tag, get top 50 most-used child tags by atom count
     let mut result = String::new();
 
     for (i, (parent_id, parent_name, description)) in top_level_tags.iter().enumerate() {
@@ -420,7 +422,7 @@ pub fn get_tag_tree_for_llm(conn: &Connection) -> Result<String, String> {
             result.push('\n');
         }
 
-        // Query top 10 children by atom count
+        // Query top 50 children by atom count
         let mut children_stmt = conn
             .prepare(
                 "SELECT t.name, COUNT(at.atom_id) as atom_count
@@ -429,7 +431,7 @@ pub fn get_tag_tree_for_llm(conn: &Connection) -> Result<String, String> {
                  WHERE t.parent_id = ?1
                  GROUP BY t.id
                  ORDER BY atom_count DESC, t.name ASC
-                 LIMIT 10",
+                 LIMIT 50",
             )
             .map_err(|e| format!("Failed to prepare children query: {}", e))?;
 

@@ -997,7 +997,7 @@ impl TagStore for PostgresStorage {
             return Ok("(no existing tags)".to_string());
         }
 
-        // Step 2: For each top-level tag, get top 10 most-used child tags by atom count
+        // Step 2: For each top-level tag, get top 50 most-used child tags by atom count
         let mut result = String::new();
 
         for (parent_id, parent_name, description) in &top_level_tags {
@@ -1010,7 +1010,7 @@ impl TagStore for PostgresStorage {
                 result.push('\n');
             }
 
-            // Query top 10 children by atom count
+            // Query top 50 children by atom count
             let children: Vec<(String,)> = sqlx::query_as(
                 "SELECT t.name
                  FROM tags t
@@ -1018,7 +1018,7 @@ impl TagStore for PostgresStorage {
                  WHERE t.parent_id = $1 AND t.db_id = $2
                  GROUP BY t.id, t.name
                  ORDER BY COUNT(at.atom_id) DESC, t.name ASC
-                 LIMIT 10",
+                 LIMIT 50",
             )
             .bind(parent_id)
             .bind(&self.db_id)
