@@ -565,8 +565,6 @@ dispatch! {
         => sqlite: get_wiki_version_sync, pg_trait: WikiStore, pg_method: get_wiki_version;
     fn get_all_wiki_articles_sync(&self) -> Result<Vec<WikiArticleSummary>, AtomicCoreError>
         => sqlite: get_all_wiki_articles_sync, pg_trait: WikiStore, pg_method: get_all_wiki_articles;
-    fn get_suggested_wiki_articles_sync(&self, limit: i32) -> Result<Vec<SuggestedArticle>, AtomicCoreError>
-        => sqlite: get_suggested_wiki_articles_sync, pg_trait: WikiStore, pg_method: get_suggested_wiki_articles;
     fn get_wiki_source_chunks_sync(&self, tag_id: &str, max_source_tokens: usize) -> Result<(Vec<ChunkWithContext>, i32), AtomicCoreError>
         => sqlite: get_wiki_source_chunks_sync, pg_trait: WikiStore, pg_method: get_wiki_source_chunks;
     fn get_wiki_update_chunks_sync(&self, tag_id: &str, last_update: &str, max_source_tokens: usize) -> Result<Option<(Vec<ChunkWithContext>, i32)>, AtomicCoreError>

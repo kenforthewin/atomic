@@ -130,14 +130,6 @@ impl SqliteStorage {
         wiki::load_all_wiki_articles(&conn).map_err(|e| AtomicCoreError::Wiki(e))
     }
 
-    pub(crate) fn get_suggested_wiki_articles_sync(
-        &self,
-        limit: i32,
-    ) -> StorageResult<Vec<SuggestedArticle>> {
-        let conn = self.db.read_conn()?;
-        wiki::get_suggested_wiki_articles(&conn, limit).map_err(|e| AtomicCoreError::Wiki(e))
-    }
-
     pub(crate) fn get_wiki_source_chunks_sync(
         &self,
         tag_id: &str,
@@ -586,16 +578,6 @@ impl WikiStore for SqliteStorage {
     async fn get_all_wiki_articles(&self) -> StorageResult<Vec<WikiArticleSummary>> {
         let storage = self.clone();
         tokio::task::spawn_blocking(move || storage.get_all_wiki_articles_sync())
-            .await
-            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
-    }
-
-    async fn get_suggested_wiki_articles(
-        &self,
-        limit: i32,
-    ) -> StorageResult<Vec<SuggestedArticle>> {
-        let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.get_suggested_wiki_articles_sync(limit))
             .await
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }

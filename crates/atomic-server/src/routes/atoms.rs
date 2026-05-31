@@ -492,6 +492,42 @@ pub async fn update_atom_content_only(
     )
 }
 
+#[derive(Deserialize, Serialize, ToSchema)]
+pub struct AddTagToAtomRequest {
+    pub tag_id: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/atoms/{id}/tags",
+    params(
+        ("id" = String, Path, description = "Atom ID"),
+    ),
+    request_body = AddTagToAtomRequest,
+    responses(
+        (status = 200, description = "Updated atom", body = AtomWithTags),
+        (status = 404, description = "Atom or tag not found", body = ApiErrorResponse),
+    ),
+    tag = "atoms",
+)]
+pub async fn add_tag_to_atom(
+    state: web::Data<AppState>,
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<AddTagToAtomRequest>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    match db.0.add_tag_to_atom(&id, &body.tag_id).await {
+        Ok(atom) => {
+            let _ = state
+                .event_tx
+                .send(ServerEvent::AtomUpdated { atom: atom.clone() });
+            HttpResponse::Ok().json(atom)
+        }
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/atoms/{id}/process",
@@ -674,6 +710,30 @@ pub async fn delete_tag(
     let id = path.into_inner();
     let recursive = query.get("recursive").map(|v| v == "true").unwrap_or(false);
     ok_or_error(db.0.delete_tag(&id, recursive).await)
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+pub struct MergeTagsRequest {
+    pub source_tag_id: String,
+    pub target_tag_id: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/tags/merge",
+    request_body = MergeTagsRequest,
+    responses(
+        (status = 200, description = "Tags merged", body = atomic_core::MergeTagsResult),
+        (status = 400, description = "Validation error", body = ApiErrorResponse),
+    ),
+    tag = "tags",
+)]
+pub async fn merge_tags(db: Db, body: web::Json<MergeTagsRequest>) -> HttpResponse {
+    let req = body.into_inner();
+    ok_or_error(
+        db.0.merge_tags(&req.source_tag_id, &req.target_tag_id)
+            .await,
+    )
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

@@ -22,6 +22,7 @@ import { FilterSheet } from '../atoms/FilterSheet';
 import { SigmaCanvas } from '../canvas/SigmaCanvas';
 import { LocalGraphView } from '../canvas/LocalGraphView';
 import { DashboardView } from '../dashboard/DashboardView';
+import { TagCleanupReview } from '../dashboard/TagCleanupReview';
 import { FAB } from '../ui/FAB';
 import { WikiFullView } from '../wiki/WikiFullView';
 import { WikiReader } from '../wiki/WikiReader';
@@ -70,6 +71,8 @@ export function MainView() {
   const reportsDetailState = useUIStore(s => s.reportsDetailState);
   const findingReaderState = useUIStore(s => s.findingReaderState);
   const localGraph = useUIStore(s => s.localGraph);
+  const tagCleanupReviewState = useUIStore(s => s.tagCleanupReviewState);
+  const closeTagCleanupReview = useUIStore(s => s.closeTagCleanupReview);
 
   const openSearchPalette = useUIStore(s => s.openSearchPalette);
 
@@ -469,6 +472,13 @@ export function MainView() {
           />
         )}
       </div>
+
+      {tagCleanupReviewState.isOpen && tagCleanupReviewState.signalKey && (
+        <TagCleanupReview
+          signalKey={tagCleanupReviewState.signalKey}
+          onClose={closeTagCleanupReview}
+        />
+      )}
 
       {/* FAB — on atoms + dashboard base views only (no active tab) */}
       {onBaseView && (viewMode === 'atoms' || viewMode === 'dashboard') && <FAB onClick={handleNewAtom} title="Create new atom" />}

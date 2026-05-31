@@ -137,6 +137,14 @@ function projectActiveEntry(entry: TabEntry | null) {
   };
 }
 
+function tagIdFromParsed(parsed: ParsedRoute, fallback: string | null): string | null {
+  if (parsed.kind === 'wiki-reader') return fallback;
+  if (parsed.kind === 'view' || parsed.kind === 'reader' || parsed.kind === 'graph') {
+    return parsed.tagId ?? fallback;
+  }
+  return fallback;
+}
+
 /// For a parsed overlay-kind URL, decide which tab should be active and
 /// what its stack should look like. Strategy:
 ///   1. Active tab's current entry already matches → no-op.
@@ -266,12 +274,7 @@ export function RouterBridge() {
       useUIStore.setState((s) => ({
         tabs: reconciled.tabs,
         activeTabId: reconciled.activeTabId,
-        selectedTagId:
-          parsed.kind === 'wiki-reader' ||
-          parsed.kind === 'reports-detail' ||
-          parsed.kind === 'finding-reader'
-            ? s.selectedTagId
-            : (parsed.tagId ?? s.selectedTagId),
+        selectedTagId: tagIdFromParsed(parsed, s.selectedTagId),
         ...projected,
         localGraph: { ...s.localGraph, ...projected.localGraphPatch },
       }));
@@ -295,12 +298,7 @@ export function RouterBridge() {
       tabs: [...s.tabs, newTab],
       activeTabId: tabId,
       nextTabOrdinal: s.nextTabOrdinal + 1,
-      selectedTagId:
-        parsed.kind === 'wiki-reader' ||
-        parsed.kind === 'reports-detail' ||
-        parsed.kind === 'finding-reader'
-          ? s.selectedTagId
-          : (parsed.tagId ?? s.selectedTagId),
+      selectedTagId: tagIdFromParsed(parsed, s.selectedTagId),
       ...projected,
       localGraph: { ...s.localGraph, ...projected.localGraphPatch },
     }));

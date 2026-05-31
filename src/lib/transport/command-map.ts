@@ -83,6 +83,12 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     argsMode: 'body',
     transformArgs: atomBody,
   },
+  add_tag_to_atom: {
+    method: 'POST',
+    path: (a) => `/api/atoms/${encodeURIComponent(a.atomId as string)}/tags`,
+    argsMode: 'body',
+    transformArgs: (a) => ({ tag_id: a.tagId }),
+  },
   process_atom_pipeline: {
     method: 'POST',
     path: (a) => `/api/atoms/${encodeURIComponent(a.id as string)}/process`,
@@ -141,6 +147,15 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
   delete_tag: {
     method: 'DELETE',
     path: (a) => `/api/tags/${encodeURIComponent(a.id as string)}${a.recursive ? '?recursive=true' : ''}`,
+  },
+  merge_tags: {
+    method: 'POST',
+    path: '/api/tags/merge',
+    argsMode: 'body',
+    transformArgs: (a) => ({
+      source_tag_id: a.sourceTagId,
+      target_tag_id: a.targetTagId,
+    }),
   },
   set_tag_autotag_target: {
     method: 'PUT',
@@ -375,10 +390,6 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'GET',
     path: (a) => `/api/wiki/${encodeURIComponent(a.tagId as string)}/links`,
   },
-  get_suggested_wiki_articles: {
-    method: 'GET',
-    path: (a) => `/api/wiki/suggestions?limit=${a.limit ?? 10}`,
-  },
   get_wiki_versions: {
     method: 'GET',
     path: (a) => `/api/wiki/${encodeURIComponent(a.tagId as string)}/versions`,
@@ -391,6 +402,65 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'POST',
     path: '/api/wiki/recompute-tag-embeddings',
     transformResponse: (d: any) => d.count as number,
+  },
+
+  // ==================== Knowledge Signals ====================
+  list_knowledge_signals: {
+    method: 'GET',
+    path: (a) => {
+      const params = new URLSearchParams();
+      if (a.providerId) params.set('provider_id', a.providerId as string);
+      if (a.includeDismissed != null) params.set('include_dismissed', String(a.includeDismissed));
+      if (a.includeSnoozed != null) params.set('include_snoozed', String(a.includeSnoozed));
+      if (a.limit != null) params.set('limit', String(a.limit));
+      if (a.surface) params.set('surface', a.surface as string);
+      return `/api/knowledge-signals${params.toString() ? `?${params}` : ''}`;
+    },
+  },
+  list_dashboard_knowledge_signals: {
+    method: 'GET',
+    path: (a) => {
+      const params = new URLSearchParams();
+      if (a.limit != null) params.set('limit', String(a.limit));
+      return `/api/knowledge-signals/dashboard${params.toString() ? `?${params}` : ''}`;
+    },
+  },
+  list_knowledge_signal_provider_configs: {
+    method: 'GET',
+    path: '/api/knowledge-signals/providers',
+  },
+  dismiss_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/dismiss`,
+  },
+  set_knowledge_signal_provider_config: {
+    method: 'PUT',
+    path: (a) => `/api/knowledge-signals/providers/${encodeURIComponent(a.providerId as string)}`,
+    argsMode: 'body',
+    transformArgs: (a) => a.config,
+  },
+  snooze_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/snooze`,
+    argsMode: 'body',
+    transformArgs: (a) => ({ until: a.until }),
+  },
+  restore_knowledge_signal: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/restore`,
+  },
+  apply_knowledge_signal_action: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/${encodeURIComponent(a.signalKey as string)}/actions`,
+    argsMode: 'body',
+    transformArgs: (a) => ({
+      action: a.action,
+      payload: a.payload ?? {},
+    }),
+  },
+  undo_knowledge_signal_action: {
+    method: 'POST',
+    path: (a) => `/api/knowledge-signals/actions/${encodeURIComponent(a.actionLogId as string)}/undo`,
   },
 
   // ==================== Settings ====================

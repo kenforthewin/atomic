@@ -13,6 +13,7 @@ pub mod feeds;
 pub mod graph;
 pub mod import;
 pub mod ingest;
+pub mod knowledge_signals;
 pub mod logs;
 pub mod oauth;
 pub mod ollama;
@@ -46,6 +47,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/atoms/{id}/content",
         web::put().to(atoms::update_atom_content_only),
     );
+    cfg.route("/atoms/{id}/tags", web::post().to(atoms::add_tag_to_atom));
     cfg.route(
         "/atoms/{id}/process",
         web::post().to(atoms::process_atom_pipeline),
@@ -76,6 +78,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/tags/{id}/autotag-description",
         web::put().to(atoms::set_tag_autotag_description),
     );
+    cfg.route("/tags/merge", web::post().to(atoms::merge_tags));
     cfg.route("/tags/{id}", web::put().to(atoms::update_tag));
     cfg.route("/tags/{id}", web::delete().to(atoms::delete_tag));
 
@@ -129,6 +132,44 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route(
         "/wiki/recompute-tag-embeddings",
         web::post().to(wiki::recompute_all_tag_embeddings),
+    );
+
+    // Knowledge-quality signals
+    cfg.route(
+        "/knowledge-signals",
+        web::get().to(knowledge_signals::list_knowledge_signals),
+    );
+    cfg.route(
+        "/knowledge-signals/dashboard",
+        web::get().to(knowledge_signals::list_dashboard_knowledge_signals),
+    );
+    cfg.route(
+        "/knowledge-signals/providers",
+        web::get().to(knowledge_signals::list_knowledge_signal_provider_configs),
+    );
+    cfg.route(
+        "/knowledge-signals/providers/{provider_id}",
+        web::put().to(knowledge_signals::set_knowledge_signal_provider_config),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/dismiss",
+        web::post().to(knowledge_signals::dismiss_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/snooze",
+        web::post().to(knowledge_signals::snooze_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/restore",
+        web::post().to(knowledge_signals::restore_knowledge_signal),
+    );
+    cfg.route(
+        "/knowledge-signals/{signal_key}/actions",
+        web::post().to(knowledge_signals::apply_knowledge_signal_action),
+    );
+    cfg.route(
+        "/knowledge-signals/actions/{action_log_id}/undo",
+        web::post().to(knowledge_signals::undo_knowledge_signal_action),
     );
 
     // Dashboard

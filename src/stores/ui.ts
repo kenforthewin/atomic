@@ -46,6 +46,12 @@ interface FindingReaderState {
   atomId: string | null;
 }
 
+interface TagCleanupReviewState {
+  isOpen: boolean;
+  signalKey: string | null;
+  title: string | null;
+}
+
 /// A single navigation entry within a tab's stack. Tabs hold the user's
 /// per-context history through atoms, wiki articles, and graphs.
 ///
@@ -120,6 +126,7 @@ interface UIStore {
   commandPaletteInitialQuery: string;
   searchPaletteOpen: boolean;
   searchPaletteInitialQuery: string;
+  tagCleanupReviewState: TagCleanupReviewState;
   // Reader theme
   readerTheme: 'light' | 'dark';
   // Actions
@@ -163,6 +170,8 @@ interface UIStore {
   /// AtomReader. The active tab is morphed in place (same tab id,
   /// same ordinal, history.replaceState semantics on the URL).
   redirectAtomTabToFinding: (atomId: string) => void;
+  openTagCleanupReview: (signalKey: string, title: string, opts?: { newTab?: boolean }) => void;
+  closeTagCleanupReview: () => void;
   overlayNavigate: (entry: OverlayNavEntry, opts?: { newTab?: boolean }) => void;
   overlayBack: () => void;
   overlayForward: () => void;
@@ -351,6 +360,11 @@ export const useUIStore = create<UIStore>()(
       commandPaletteInitialQuery: '',
       searchPaletteOpen: false,
       searchPaletteInitialQuery: '',
+      tagCleanupReviewState: {
+        isOpen: false,
+        signalKey: null,
+        title: null,
+      },
       readerTheme: 'dark' as 'light' | 'dark',
 
       setLeftPanelOpen: (open: boolean) => set({ leftPanelOpen: open }),
@@ -787,6 +801,24 @@ export const useUIStore = create<UIStore>()(
         navigateTo(entryUrl(findingEntry), { replace: true });
       },
 
+      openTagCleanupReview: (signalKey, title) =>
+        set({
+          tagCleanupReviewState: {
+            isOpen: true,
+            signalKey,
+            title,
+          },
+        }),
+
+      closeTagCleanupReview: () =>
+        set({
+          tagCleanupReviewState: {
+            isOpen: false,
+            signalKey: null,
+            title: null,
+          },
+        }),
+
       overlayNavigate: (entry, opts) => {
         if (entry.type === 'reader') {
           get().openEntry(
@@ -998,7 +1030,7 @@ export const useUIStore = create<UIStore>()(
     }),
     {
       name: 'atomic-ui-storage',
-      version: 2,
+      version: 3,
       partialize: (state) => ({
         viewMode: state.viewMode,
         atomsLayout: state.atomsLayout,
@@ -1015,6 +1047,7 @@ export const useUIStore = create<UIStore>()(
       // collapsed into a single 'atoms' view with a separate atomsLayout field.
       // v1 → v2: tabs introduced. No data migration needed — older sessions
       // without persisted tabs simply start with [].
+      // v2 → v3: tag cleanup moved from tab entries to modal-only state.
       migrate: (persistedState: unknown, version: number) => {
         const state = (persistedState ?? {}) as Record<string, unknown>;
         if (version < 1) {
@@ -1027,6 +1060,34 @@ export const useUIStore = create<UIStore>()(
           state.tabs = [];
           state.activeTabId = null;
           state.nextTabOrdinal = 1;
+        }
+        if (version < 3) {
+          const tabs = Array.isArray(state.tabs) ? state.tabs : [];
+          const nextTabs = tabs
+            .map((tab) => {
+              if (!tab || typeof tab !== 'object') return null;
+              const rawTab = tab as Record<string, unknown>;
+              const stack = Array.isArray(rawTab.stack)
+                ? rawTab.stack.filter((entry) => {
+                    return !entry || typeof entry !== 'object'
+                      ? false
+                      : (entry as Record<string, unknown>).type !== 'tag-cleanup';
+                  })
+                : [];
+              if (stack.length === 0) return null;
+              const stackIndex = Math.min(
+                Math.max(Number(rawTab.stackIndex) || 0, 0),
+                stack.length - 1,
+              );
+              return { ...rawTab, stack, stackIndex };
+            })
+            .filter(Boolean);
+          const activeTabStillExists = nextTabs.some((tab) => {
+            return (tab as Record<string, unknown>).id === state.activeTabId;
+          });
+          state.tabs = nextTabs;
+          state.activeTabId = activeTabStillExists ? state.activeTabId : null;
+          if (!state.nextTabOrdinal) state.nextTabOrdinal = 1;
         }
         return state;
       },

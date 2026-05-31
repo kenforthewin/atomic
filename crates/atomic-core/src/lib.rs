@@ -44,6 +44,7 @@ pub mod extraction;
 pub mod graph_maintenance;
 pub mod import;
 pub mod ingest;
+pub mod knowledge_signals;
 pub mod manager;
 pub mod models;
 pub mod pipeline_task;
@@ -67,6 +68,18 @@ pub use error::AtomicCoreError;
 pub use export::{MarkdownArchiveFormat, MarkdownExportProgress, MarkdownExportResult};
 pub use import::{ImportProgress, ImportResult};
 pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResult};
+pub use knowledge_signals::{
+    DashboardKnowledgeSignalCache, DashboardKnowledgeSignalError, DashboardKnowledgeSignalGroup,
+    DashboardKnowledgeSignals, EmptyTagEvidence, KnowledgeSignal, KnowledgeSignalAction,
+    KnowledgeSignalActionLog, KnowledgeSignalActionRequest, KnowledgeSignalActionResult,
+    KnowledgeSignalFilter, KnowledgeSignalProviderConfig, KnowledgeSignalProviderSettings,
+    KnowledgeSignalReason, KnowledgeSignalSeverity, KnowledgeSignalTarget,
+    MissingTagOverlapEvidence, NearDuplicateAtomEvidence, NearDuplicateAtomEvidenceAtom,
+    NearDuplicateTagEvidence, TagCleanupTagEvidence, TagRedundancyEvidence,
+    UnderconnectedAtomEvidence, WikiCandidateEvidence, WikiUpdateEvidence, EMPTY_TAG_PROVIDER_ID,
+    MISSING_TAG_OVERLAP_PROVIDER_ID, NEAR_DUPLICATE_ATOM_PROVIDER_ID, TAG_REDUNDANCY_PROVIDER_ID,
+    UNDERCONNECTED_ATOM_PROVIDER_ID, WIKI_CANDIDATE_PROVIDER_ID, WIKI_UPDATE_PROVIDER_ID,
+};
 pub use manager::DatabaseManager;
 pub use models::*;
 pub use providers::{ProviderConfig, ProviderType};
@@ -90,6 +103,16 @@ pub struct CreateAtomRequest {
     pub tag_ids: Vec<String>,
     /// When true, silently skip creation if an atom with the same source_url already exists.
     pub skip_if_source_exists: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct MergeTagsResult {
+    pub source_tag_id: String,
+    pub target_tag_id: String,
+    pub atoms_retagged: i32,
+    pub children_reparented: i32,
+    pub source_wiki_deleted: bool,
 }
 
 /// Request to update an existing atom
@@ -253,6 +276,9 @@ pub struct AtomicCore {
     /// In-memory cache for `compute_and_get_canvas_data`. Shared across clones
     /// so every handle sees the same cached payload.
     canvas_cache: CanvasCache,
+    /// Short-lived cache for dashboard signal groups. This prevents repeated
+    /// dashboard opens from recomputing every provider immediately.
+    dashboard_signal_cache: DashboardKnowledgeSignalCache,
 }
 
 impl AtomicCore {
@@ -265,6 +291,7 @@ impl AtomicCore {
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -339,6 +366,7 @@ impl AtomicCore {
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -352,6 +380,7 @@ impl AtomicCore {
             registry: None,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         core
@@ -469,6 +498,7 @@ impl AtomicCore {
             registry,
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
+            dashboard_signal_cache: DashboardKnowledgeSignalCache::new(),
         };
         core.register_canvas_rebuilder();
         Ok(core)
@@ -922,6 +952,7 @@ impl AtomicCore {
 
         let atom_with_tags = self.storage.insert_atom_impl(&id, &request, &now).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         if !content.trim().is_empty() {
             let job = AtomPipelineJobRequest {
@@ -1004,6 +1035,7 @@ impl AtomicCore {
             .insert_atoms_bulk_impl(&atoms_to_insert)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         // Collect atom IDs for background embedding (don't clone content — read from DB later)
         let atom_ids: Vec<String> = atoms_with_tags
@@ -1049,6 +1081,7 @@ impl AtomicCore {
 
         let atom_with_tags = self.storage.update_atom_impl(id, &request, &now).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         let job = AtomPipelineJobRequest {
             atom_id: id.to_string(),
@@ -1083,6 +1116,7 @@ impl AtomicCore {
             .update_atom_if_unchanged_impl(id, &request, &now, expected_updated_at)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
 
         let job = AtomPipelineJobRequest {
             atom_id: id.to_string(),
@@ -1119,6 +1153,7 @@ impl AtomicCore {
             .update_atom_content_only_impl(id, &request, &now)
             .await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         tracing::info!(
             atom_id = %id,
             had_content_before,
@@ -1130,10 +1165,121 @@ impl AtomicCore {
         Ok(result)
     }
 
+    /// Add one existing tag to one atom without rerunning the embedding or
+    /// auto-tagging pipeline.
+    pub async fn add_tag_to_atom(
+        &self,
+        atom_id: &str,
+        tag_id: &str,
+    ) -> Result<AtomWithTags, AtomicCoreError> {
+        match &self.storage {
+            storage::StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                let atom_id = atom_id.to_string();
+                let tag_id = tag_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let now = Utc::now().to_rfc3339();
+                    let conn = storage
+                        .database()
+                        .conn
+                        .lock()
+                        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+                    let atom_exists: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM atoms WHERE id = ?1)",
+                        [&atom_id],
+                        |row| row.get(0),
+                    )?;
+                    let tag_exists: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                        [&tag_id],
+                        |row| row.get(0),
+                    )?;
+                    if !atom_exists {
+                        return Err(AtomicCoreError::NotFound("Atom not found".to_string()));
+                    }
+                    if !tag_exists {
+                        return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                    }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source)
+                         VALUES (?1, ?2, 'manual')",
+                        rusqlite::params![&atom_id, &tag_id],
+                    )?;
+                    conn.execute(
+                        "UPDATE atoms SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![now, &atom_id],
+                    )?;
+                    Ok::<(), AtomicCoreError>(())
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??;
+            }
+            #[cfg(feature = "postgres")]
+            storage::StorageBackend::Postgres(storage) => {
+                let atom_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM atoms WHERE id = $1 AND db_id = $2)",
+                )
+                .bind(atom_id)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                let tag_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM tags WHERE id = $1 AND db_id = $2)",
+                )
+                .bind(tag_id)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                if !atom_exists {
+                    return Err(AtomicCoreError::NotFound("Atom not found".to_string()));
+                }
+                if !tag_exists {
+                    return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                }
+                let now = Utc::now().to_rfc3339();
+                let mut tx = storage
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO atom_tags (atom_id, tag_id, db_id, source)
+                     VALUES ($1, $2, $3, 'manual')
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(atom_id)
+                .bind(tag_id)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                sqlx::query("UPDATE atoms SET updated_at = $1 WHERE id = $2 AND db_id = $3")
+                    .bind(now)
+                    .bind(atom_id)
+                    .bind(&storage.db_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+            }
+        }
+
+        self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
+        self.get_atom(atom_id)
+            .await?
+            .ok_or_else(|| AtomicCoreError::NotFound("Atom not found".to_string()))
+    }
+
     /// Delete an atom
     pub async fn delete_atom(&self, id: &str) -> Result<(), AtomicCoreError> {
         self.storage.delete_atom_impl(id).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(())
     }
 
@@ -1230,7 +1376,9 @@ impl AtomicCore {
         name: &str,
         parent_id: Option<&str>,
     ) -> Result<Tag, AtomicCoreError> {
-        self.storage.create_tag_impl(name, parent_id).await
+        let tag = self.storage.create_tag_impl(name, parent_id).await?;
+        self.dashboard_signal_cache.invalidate();
+        Ok(tag)
     }
 
     /// Update a tag
@@ -1242,6 +1390,7 @@ impl AtomicCore {
     ) -> Result<Tag, AtomicCoreError> {
         let tag = self.storage.update_tag_impl(id, name, parent_id).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(tag)
     }
 
@@ -1249,7 +1398,278 @@ impl AtomicCore {
     pub async fn delete_tag(&self, id: &str, recursive: bool) -> Result<(), AtomicCoreError> {
         self.storage.delete_tag_impl(id, recursive).await?;
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
         Ok(())
+    }
+
+    /// Merge one source tag into one target tag.
+    ///
+    /// The target tag remains. Atoms assigned to the source gain the target tag,
+    /// source children are reparented to the target, then the source tag is
+    /// deleted through the normal tag-delete path.
+    pub async fn merge_tags(
+        &self,
+        source_tag_id: &str,
+        target_tag_id: &str,
+    ) -> Result<MergeTagsResult, AtomicCoreError> {
+        if source_tag_id == target_tag_id {
+            return Err(AtomicCoreError::Validation(
+                "source and target tags must be different".to_string(),
+            ));
+        }
+
+        let result = match &self.storage {
+            storage::StorageBackend::Sqlite(storage) => {
+                let storage = storage.clone();
+                let source = source_tag_id.to_string();
+                let target = target_tag_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let conn = storage
+                        .database()
+                        .conn
+                        .lock()
+                        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+
+                    let source_exists: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                        [&source],
+                        |row| row.get(0),
+                    )?;
+                    let target_exists: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                        [&target],
+                        |row| row.get(0),
+                    )?;
+                    if !source_exists || !target_exists {
+                        return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                    }
+
+                    let source_contains_target: bool = conn.query_row(
+                        "WITH RECURSIVE descendants(id) AS (
+                            SELECT id FROM tags WHERE id = ?1
+                            UNION ALL
+                            SELECT t.id FROM tags t JOIN descendants d ON t.parent_id = d.id
+                         )
+                         SELECT EXISTS(SELECT 1 FROM descendants WHERE id = ?2)",
+                        rusqlite::params![&source, &target],
+                        |row| row.get(0),
+                    )?;
+                    let target_contains_source: bool = conn.query_row(
+                        "WITH RECURSIVE descendants(id) AS (
+                            SELECT id FROM tags WHERE id = ?1
+                            UNION ALL
+                            SELECT t.id FROM tags t JOIN descendants d ON t.parent_id = d.id
+                         )
+                         SELECT EXISTS(SELECT 1 FROM descendants WHERE id = ?2)",
+                        rusqlite::params![&target, &source],
+                        |row| row.get(0),
+                    )?;
+                    if source_contains_target || target_contains_source {
+                        return Err(AtomicCoreError::Validation(
+                            "Cannot merge ancestor and descendant tags".to_string(),
+                        ));
+                    }
+
+                    let source_wiki_deleted: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM wiki_articles WHERE tag_id = ?1)",
+                        [&source],
+                        |row| row.get(0),
+                    )?;
+
+                    let tx = conn.unchecked_transaction()?;
+                    let atoms_retagged = tx.execute(
+                        "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source)
+                         SELECT atom_id, ?2, 'manual'
+                         FROM atom_tags
+                         WHERE tag_id = ?1",
+                        rusqlite::params![&source, &target],
+                    )? as i32;
+                    let children_reparented = tx.execute(
+                        "UPDATE tags SET parent_id = ?1 WHERE parent_id = ?2",
+                        rusqlite::params![&target, &source],
+                    )? as i32;
+                    tx.execute(
+                        "UPDATE wiki_links SET target_tag_id = ?1 WHERE target_tag_id = ?2",
+                        rusqlite::params![&target, &source],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM wiki_citations
+                         WHERE wiki_article_id IN (
+                            SELECT id FROM wiki_articles WHERE tag_id = ?1
+                         )",
+                        [&source],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM wiki_links
+                         WHERE source_article_id IN (
+                            SELECT id FROM wiki_articles WHERE tag_id = ?1
+                         )",
+                        [&source],
+                    )?;
+                    tx.execute("DELETE FROM wiki_articles_fts WHERE tag_id = ?1", [&source])?;
+                    tx.execute(
+                        "DELETE FROM wiki_article_versions WHERE tag_id = ?1",
+                        [&source],
+                    )?;
+                    tx.execute("DELETE FROM wiki_proposals WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM wiki_articles WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM atom_tags WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM tag_embeddings WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM conversation_tags WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM tags WHERE id = ?1", [&source])?;
+                    tx.commit()?;
+
+                    Ok(MergeTagsResult {
+                        source_tag_id: source,
+                        target_tag_id: target,
+                        atoms_retagged,
+                        children_reparented,
+                        source_wiki_deleted,
+                    })
+                })
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))??
+            }
+            #[cfg(feature = "postgres")]
+            storage::StorageBackend::Postgres(storage) => {
+                let source = source_tag_id.to_string();
+                let target = target_tag_id.to_string();
+                let source_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM tags WHERE id = $1 AND db_id = $2)",
+                )
+                .bind(&source)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                let target_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM tags WHERE id = $1 AND db_id = $2)",
+                )
+                .bind(&target)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                if !source_exists || !target_exists {
+                    return Err(AtomicCoreError::NotFound("Tag not found".to_string()));
+                }
+
+                let source_contains_target: bool = sqlx::query_scalar(
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT id FROM tags WHERE id = $1 AND db_id = $3
+                        UNION ALL
+                        SELECT t.id FROM tags t JOIN descendants d ON t.parent_id = d.id
+                        WHERE t.db_id = $3
+                     )
+                     SELECT EXISTS(SELECT 1 FROM descendants WHERE id = $2)",
+                )
+                .bind(&source)
+                .bind(&target)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                let target_contains_source: bool = sqlx::query_scalar(
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT id FROM tags WHERE id = $1 AND db_id = $3
+                        UNION ALL
+                        SELECT t.id FROM tags t JOIN descendants d ON t.parent_id = d.id
+                        WHERE t.db_id = $3
+                     )
+                     SELECT EXISTS(SELECT 1 FROM descendants WHERE id = $2)",
+                )
+                .bind(&target)
+                .bind(&source)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                if source_contains_target || target_contains_source {
+                    return Err(AtomicCoreError::Validation(
+                        "Cannot merge ancestor and descendant tags".to_string(),
+                    ));
+                }
+
+                let source_wiki_deleted: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM wiki_articles WHERE tag_id = $1 AND db_id = $2)",
+                )
+                .bind(&source)
+                .bind(&storage.db_id)
+                .fetch_one(&storage.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+                let mut tx = storage
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                let atoms_retagged = sqlx::query(
+                    "INSERT INTO atom_tags (atom_id, tag_id, db_id, source)
+                     SELECT atom_id, $2, db_id, 'manual'
+                     FROM atom_tags
+                     WHERE tag_id = $1 AND db_id = $3
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&source)
+                .bind(&target)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+                .rows_affected() as i32;
+                let children_reparented = sqlx::query(
+                    "UPDATE tags SET parent_id = $1 WHERE parent_id = $2 AND db_id = $3",
+                )
+                .bind(&target)
+                .bind(&source)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+                .rows_affected() as i32;
+                sqlx::query(
+                    "UPDATE wiki_links
+                     SET target_tag_id = $1
+                     WHERE target_tag_id = $2 AND db_id = $3",
+                )
+                .bind(&target)
+                .bind(&source)
+                .bind(&storage.db_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                if source_wiki_deleted {
+                    sqlx::query("DELETE FROM wiki_articles WHERE tag_id = $1 AND db_id = $2")
+                        .bind(&source)
+                        .bind(&storage.db_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                }
+                sqlx::query("DELETE FROM tags WHERE id = $1 AND db_id = $2")
+                    .bind(&source)
+                    .bind(&storage.db_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+                MergeTagsResult {
+                    source_tag_id: source,
+                    target_tag_id: target,
+                    atoms_retagged,
+                    children_reparented,
+                    source_wiki_deleted,
+                }
+            }
+        };
+
+        self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
+        Ok(result)
     }
 
     /// Mark or unmark a top-level tag as a candidate for AI auto-tagging to extend.
@@ -1532,6 +1952,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&result.article, &result.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         // Any pending proposal was computed against the previous live article
         // and is now meaningless — drop it. Log-and-continue on error; a stale
@@ -1605,6 +2026,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&result.article, &result.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         tracing::info!("[wiki] Article updated successfully");
         Ok(result)
@@ -1693,6 +2115,7 @@ impl AtomicCore {
         };
 
         self.storage.save_wiki_proposal_sync(&proposal).await?;
+        self.dashboard_signal_cache.invalidate();
         tracing::info!(
             tag_id,
             proposal_id = %proposal.id,
@@ -1776,6 +2199,7 @@ impl AtomicCore {
         self.storage
             .save_wiki_with_links_sync(&article, &proposal.citations, &wiki_links)
             .await?;
+        self.dashboard_signal_cache.invalidate();
 
         // Delete the proposal row after successful save.
         self.storage.delete_wiki_proposal_sync(tag_id).await?;
@@ -1820,6 +2244,7 @@ impl AtomicCore {
     /// longer exists).
     pub async fn delete_wiki(&self, tag_id: &str) -> Result<(), AtomicCoreError> {
         self.storage.delete_wiki_sync(tag_id).await?;
+        self.dashboard_signal_cache.invalidate();
         if let Err(e) = self.storage.delete_wiki_proposal_sync(tag_id).await {
             tracing::warn!(tag_id, error = %e, "[wiki] Failed to clean up pending proposal after delete");
         }
@@ -2574,6 +2999,7 @@ impl AtomicCore {
     /// that could change canvas output.
     pub fn invalidate_canvas_cache(&self) {
         self.canvas_cache.invalidate();
+        self.dashboard_signal_cache.invalidate();
     }
 
     /// Wrap a user-provided embedding/tagging event callback so that
@@ -3824,12 +4250,83 @@ impl AtomicCore {
             .await;
     }
 
-    /// Get suggested wiki articles (tags without articles, ranked by demand)
-    pub async fn get_suggested_wiki_articles(
+    /// List deterministic knowledge-quality signals for the active database.
+    pub async fn list_knowledge_signals(
         &self,
+        filter: KnowledgeSignalFilter,
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        knowledge_signals::list_knowledge_signals(self, filter).await
+    }
+
+    /// List per-database provider settings for deterministic knowledge-quality signals.
+    pub async fn list_knowledge_signal_provider_configs(
+        &self,
+    ) -> Result<Vec<KnowledgeSignalProviderSettings>, AtomicCoreError> {
+        knowledge_signals::list_provider_configs(self).await
+    }
+
+    /// List dashboard-oriented signal groups in one provider-filtered pass.
+    pub async fn list_dashboard_knowledge_signals(
+        &self,
+        per_provider_limit: i32,
+    ) -> Result<DashboardKnowledgeSignals, AtomicCoreError> {
+        knowledge_signals::list_dashboard_knowledge_signals(self, per_provider_limit).await
+    }
+
+    /// List deterministic knowledge-quality signals eligible for briefing attachment.
+    pub async fn list_briefing_knowledge_signals(
+        &self,
+        window_start: chrono::DateTime<chrono::Utc>,
+        window_end: chrono::DateTime<chrono::Utc>,
         limit: i32,
-    ) -> Result<Vec<SuggestedArticle>, AtomicCoreError> {
-        self.storage.get_suggested_wiki_articles_sync(limit).await
+    ) -> Result<Vec<KnowledgeSignal>, AtomicCoreError> {
+        knowledge_signals::list_briefing_knowledge_signals(self, window_start, window_end, limit)
+            .await
+    }
+
+    /// Dismiss a knowledge-quality signal until its identity changes or it is restored.
+    pub async fn dismiss_knowledge_signal(&self, signal_key: &str) -> Result<(), AtomicCoreError> {
+        knowledge_signals::dismiss_signal(self, signal_key).await
+    }
+
+    /// Snooze a knowledge-quality signal until an RFC3339 timestamp.
+    pub async fn snooze_knowledge_signal(
+        &self,
+        signal_key: &str,
+        until: &str,
+    ) -> Result<(), AtomicCoreError> {
+        knowledge_signals::snooze_signal(self, signal_key, until).await
+    }
+
+    /// Persist per-database configuration for a knowledge signal provider.
+    pub async fn set_knowledge_signal_provider_config(
+        &self,
+        provider_id: &str,
+        config: KnowledgeSignalProviderConfig,
+    ) -> Result<KnowledgeSignalProviderConfig, AtomicCoreError> {
+        knowledge_signals::set_provider_config(self, provider_id, config).await
+    }
+
+    /// Restore a dismissed or snoozed knowledge-quality signal.
+    pub async fn restore_knowledge_signal(&self, signal_key: &str) -> Result<(), AtomicCoreError> {
+        knowledge_signals::restore_signal(self, signal_key).await
+    }
+
+    /// Apply a signal-scoped action and record it in the signal action audit log.
+    pub async fn apply_knowledge_signal_action(
+        &self,
+        signal_key: &str,
+        request: KnowledgeSignalActionRequest,
+    ) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+        knowledge_signals::apply_signal_action(self, signal_key, request).await
+    }
+
+    /// Undo a previously applied signal action when that action defines safe undo semantics.
+    pub async fn undo_knowledge_signal_action(
+        &self,
+        action_log_id: &str,
+    ) -> Result<KnowledgeSignalActionResult, AtomicCoreError> {
+        knowledge_signals::undo_signal_action(self, action_log_id).await
     }
 
     /// Recompute centroid embeddings for all tags that have atoms with embeddings.

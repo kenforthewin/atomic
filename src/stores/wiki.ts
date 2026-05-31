@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { toast } from 'sonner';
 import { getTransport } from '../lib/transport';
+import type { KnowledgeSignal, WikiCandidateEvidence } from '../types/knowledgeSignals';
 
 // Types matching the Rust structs
 export interface WikiArticle {
@@ -65,6 +66,11 @@ export interface SuggestedArticle {
   atom_count: number;
   mention_count: number;
   score: number;
+  signal_id?: string;
+  confidence?: number;
+  reasons?: string[];
+  source_count?: number;
+  recent_count?: number;
 }
 
 export interface WikiVersionSummary {
@@ -142,11 +148,12 @@ interface WikiStore {
   error: string | null;
 
   // List actions
-  fetchAllArticles: () => Promise<void>;
+  fetchAllArticles: (options?: { refreshSuggestions?: boolean }) => Promise<void>;
   fetchSuggestedArticles: () => Promise<void>;
+  dismissSuggestedArticle: (signalKey: string) => Promise<void>;
   showList: () => void;
   openArticle: (tagId: string, tagName: string) => void;
-  openAndGenerate: (tagId: string, tagName: string) => void;
+  openAndGenerate: (tagId: string, tagName: string) => Promise<void>;
   goBack: () => void;
 
   // Article actions
@@ -204,13 +211,15 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   isUpdating: false,
   error: null,
 
-  fetchAllArticles: async () => {
+  fetchAllArticles: async (options) => {
     set({ isLoadingList: true, error: null });
     try {
       const articles = await getTransport().invoke<WikiArticleSummary[]>('get_all_wiki_articles');
       set({ articles, isLoadingList: false });
       // Refresh suggestions after a brief yield so the list renders first
-      setTimeout(() => get().fetchSuggestedArticles(), 50);
+      if (options?.refreshSuggestions !== false) {
+        setTimeout(() => get().fetchSuggestedArticles(), 50);
+      }
     } catch (error) {
       set({ error: String(error), isLoadingList: false });
     }
@@ -219,12 +228,42 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   fetchSuggestedArticles: async () => {
     set({ isLoadingSuggestions: true });
     try {
-      const suggestions = await getTransport().invoke<SuggestedArticle[]>('get_suggested_wiki_articles', { limit: 100 });
+      const signals = await getTransport().invoke<KnowledgeSignal<WikiCandidateEvidence>[]>('list_knowledge_signals', {
+        providerId: 'wiki_candidate',
+        limit: 100,
+      });
+      const suggestions: SuggestedArticle[] = signals.map(signal => ({
+        tag_id: signal.evidence?.tag_id ?? signal.target.id,
+        tag_name: signal.evidence?.tag_name ?? signal.target.label,
+        atom_count: signal.evidence?.atom_count ?? 0,
+        mention_count: signal.evidence?.mention_count ?? 0,
+        score: signal.score,
+        signal_id: signal.id,
+        confidence: signal.confidence,
+        reasons: signal.reasons.map(reason => reason.label),
+        source_count: signal.evidence?.source_count ?? 0,
+        recent_count: signal.evidence?.recent_count ?? 0,
+      }));
       set({ suggestedArticles: suggestions, isLoadingSuggestions: false });
     } catch (error) {
       console.error('Failed to fetch suggested articles:', error);
       toast.error('Failed to load suggested articles', { id: 'wiki-suggestions-error', description: String(error) });
       set({ isLoadingSuggestions: false });
+    }
+  },
+
+  dismissSuggestedArticle: async (signalKey: string) => {
+    const previous = get().suggestedArticles;
+    set({
+      suggestedArticles: previous.filter(s => s.signal_id !== signalKey),
+    });
+    try {
+      await getTransport().invoke('dismiss_knowledge_signal', { signalKey });
+      window.dispatchEvent(new CustomEvent('knowledge-signals:changed', { detail: { signalKey } }));
+    } catch (error) {
+      console.error('Failed to dismiss wiki suggestion:', error);
+      set({ suggestedArticles: previous });
+      toast.error('Failed to dismiss suggestion', { description: String(error) });
     }
   },
 
@@ -269,7 +308,8 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   },
 
   // Open article view and immediately start generating (for new wikis)
-  openAndGenerate: (tagId: string, tagName: string) => {
+  openAndGenerate: async (tagId: string, tagName: string) => {
+    if (get().isGenerating) return;
     set({
       view: 'article',
       currentTagId: tagId,
@@ -285,9 +325,9 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
       error: null,
     });
     // Fetch status for display during generation
-    get().fetchArticleStatus(tagId);
+    await get().fetchArticleStatus(tagId);
     // Start generation
-    get().generateArticle(tagId, tagName);
+    await get().generateArticle(tagId, tagName);
   },
 
   goBack: () => {
