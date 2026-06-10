@@ -242,6 +242,15 @@ From the post-implementation adversarial review. The claim-query backoff
 gate (a sweeper's stale snapshot could claim a row whose backoff a peer had
 just re-armed) was fixed on the spot; these remain:
 
+Accepted residue from the migration-022 verification (2026-06-10): the
+backfill patterns skip `briefings.migrated_to_findings` / `briefing_prompt`
+— traced safe (the briefings→findings migration re-runs idempotently per DB
+and re-suppresses itself scoped; only a pre-021 deployment with a custom
+legacy prompt that never seeded would fall back to the default prompt, and
+no such deployment exists). Test gap: 021 and 022 are each pinned
+separately but no test drives the full pre-021 → 021 → 022 chain; add one
+if either migration is ever touched again.
+
 - ~~**Postgres settings are global across `db_id`s**~~ — **fixed**
   (pg-settings-scope branch): migration 021 adds `db_id` to `settings`
   with PK `(db_id, key)` and an explicit `'_global'` tier for
