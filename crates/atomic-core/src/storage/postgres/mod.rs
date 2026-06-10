@@ -240,10 +240,32 @@ impl PostgresStorage {
         // Advisory lock key — arbitrary fixed i64 to serialize migrations
         const MIGRATION_LOCK_KEY: i64 = 0x61746f6d69635f6d; // "atomic_m"
 
-        // Acquire advisory lock (session-level, blocks until available)
+        // The advisory lock is session-level, so the lock and unlock must run
+        // on the same connection. Taken through the pool, the unlock can land
+        // on a different session than acquired the lock — silently failing
+        // and leaving the lock held forever by an idle pooled connection,
+        // deadlocking every later caller. Pin the lock to a connection
+        // detached from the pool: detaching means a cancelled future drops
+        // the owned connection, closing its session and releasing the lock,
+        // instead of returning a lock-holding connection to the pool.
+        //
+        // The migration statements themselves still run through the pool —
+        // the lock serializes callers; the statements don't need its session.
+        let mut lock_conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| {
+                AtomicCoreError::DatabaseOperation(format!(
+                    "Failed to acquire migration lock connection: {}",
+                    e
+                ))
+            })?
+            .detach();
+
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(MIGRATION_LOCK_KEY)
-            .execute(&self.pool)
+            .execute(&mut lock_conn)
             .await
             .map_err(|e| {
                 AtomicCoreError::DatabaseOperation(format!(
@@ -254,12 +276,10 @@ impl PostgresStorage {
 
         let result = self.run_migrations_inner(migrations).await;
 
-        // Release advisory lock regardless of outcome
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(MIGRATION_LOCK_KEY)
-            .execute(&self.pool)
-            .await
-            .ok();
+        // Closing the lock connection ends its session, which releases the
+        // advisory lock even if an explicit unlock would have failed.
+        use sqlx::Connection;
+        let _ = lock_conn.close().await;
 
         result
     }
@@ -268,8 +288,8 @@ impl PostgresStorage {
         &self,
         migrations: &[(i32, &str)],
     ) -> Result<(), AtomicCoreError> {
-        // Errors reading the current version must propagate, never default to
-        // 0: treating a failed read as "fresh database" re-runs every
+        // Errors reading the current version must propagate, never default
+        // to 0: treating a failed read as "fresh database" re-runs every
         // migration against an already-populated schema.
         let table_exists: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'schema_version')"
