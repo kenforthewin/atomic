@@ -1,5 +1,23 @@
 # Durable Task Runs
 
+## Status (2026-06-09)
+
+Phase 1 is **landed**: the `task_runs` table exists in both SQLite and
+Postgres storage, and `scheduler::ledger` provides `claim_or_create` with
+durable leases, heartbeating, and crash reclaim (race-tested). Reports
+already dispatch through the ledger (the "phase 1.5" runner in
+`atomic-server/src/main.rs`).
+
+Outstanding: phases 2–4 below, plus **wiki regen** (added to scope by
+`docs/plans/atomic-cloud.md` — currently fire-and-forget on tag change).
+Note `daily_briefing` no longer exists as a scheduled task — it collapsed
+into a seeded report (see `reports-phase-3-briefing-collapse.md`) — so
+phase 2 covers `draft_pipeline` and `graph_maintenance` only.
+
+This workstream is a prerequisite for Atomic Cloud's dispatcher, which
+relies on `task_runs` being the single source of pending background work.
+It should land and ride to production in self-hosted first.
+
 ## Context
 
 Atomic has three half-overlapping patterns for background work:
@@ -143,11 +161,20 @@ Retention knobs follow the existing `task.{id}.*` settings convention so server/
 
 Each phase is independently shippable and testable.
 
-1. **Schema + helpers.** V17→V18 migration; `scheduler::runs` module with claim / transition / crash-recovery query. No behavior change yet.
-2. **Retrofit system tasks.** Route `daily_briefing`, `draft_pipeline`, `graph_maintenance` through `task_runs` (claim-and-record). Delivers retry + backoff + history to existing tasks; fixes the retry-storm bug. Keep `last_run` fast-path. In-memory lock demoted to optimization.
+1. **Schema + helpers.** ✅ Landed (as `scheduler::ledger`; reports dispatch
+   through it).
+2. **Retrofit system tasks.** Route `draft_pipeline` and `graph_maintenance`
+   through `task_runs` (claim-and-record). Delivers retry + backoff + history
+   to existing tasks; fixes the retry-storm bug. Keep `last_run` fast-path.
+   In-memory lock demoted to optimization. (`daily_briefing` is gone — it's
+   a seeded report now and already rides the ledger.)
 3. **Fold in feed polling.** `feed_poll` runs with `subject_id`; demote `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop claims/records.
-4. **Retention GC.** `task_runs_gc` scheduled task with the policy + batched deletes above.
-5. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
+4. **Wiki regen.** Replace fire-and-forget regen on tag change with a
+   `task_runs` row (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).
+   Subject-keying gives natural per-tag dedup via the live-lease check;
+   retry/backoff replaces silent loss on LLM failure.
+5. **Retention GC.** `task_runs_gc` scheduled task with the policy + batched deletes above.
+6. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
 
 ## Risks & mitigations
 
