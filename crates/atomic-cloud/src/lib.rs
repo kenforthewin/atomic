@@ -25,7 +25,17 @@
 
 pub mod control_plane;
 pub mod error;
+pub mod provision;
 pub mod reserved_subdomains;
+pub mod tokens;
 
 pub use control_plane::ControlPlane;
 pub use error::CloudError;
+pub use provision::{
+    delete_account, provision_account, tenant_db_name, ClusterConfig, NewAccount,
+    ProvisionedAccount,
+};
+pub use tokens::{
+    create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,
+    TokenScope,
+};

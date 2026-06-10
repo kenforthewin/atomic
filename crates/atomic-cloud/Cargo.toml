@@ -22,8 +22,9 @@ atomic-core = { path = "../atomic-core", features = ["postgres"] }
 # Web framework — same major as atomic-server so middleware composes.
 actix-web = "4.9"
 
-# Database — version/features match atomic-core's postgres feature exactly.
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"] }
+# Database — version/features match atomic-core's postgres feature exactly,
+# plus `chrono` for TIMESTAMPTZ decode on control-plane rows.
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
@@ -38,7 +39,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Error handling
 thiserror = "1"
 
-[dev-dependencies]
+# Control-plane primitives — versions match the rest of the workspace.
+chrono = "0.4"
+data-encoding = "2"     # base32 tenant-database names; hex token hashes
+rand = "0.8"            # OsRng for token/session secrets
+sha2 = "0.10"           # SHA-256 token/session hashing
+url = "2"               # tenant-database URL construction
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
 # `FutureExt::catch_unwind` powers the test-database cleanup guard.
 futures = "0.3"

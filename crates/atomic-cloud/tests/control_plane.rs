@@ -1,112 +1,13 @@
 //! Control-plane integration tests.
 //!
-//! Postgres-gated, mirroring the workspace convention: every test that needs
-//! a cluster skips with a message when `ATOMIC_TEST_DATABASE_URL` is unset.
-//! Run them single-threaded against the test cluster:
-//!
-//! ```sh
-//! ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic_test@localhost:5433/atomic_test \
-//!     cargo test -p atomic-cloud -- --test-threads=1
-//! ```
-//!
-//! Each test creates a uniquely named control-plane database under the
-//! `atomic_cloud_test_` prefix and drops it afterwards even when the test
-//! body panics ([`with_control_db`] catches the unwind, cleans up, then
-//! resumes it). A once-per-process sweep drops leftovers stranded by prior
-//! crashed runs.
+//! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
+//! conventions and the run command.
 
-use std::future::Future;
-use std::panic::AssertUnwindSafe;
+mod support;
 
 use atomic_cloud::reserved_subdomains::is_reserved;
 use atomic_cloud::ControlPlane;
-use futures::FutureExt;
-use sqlx::{Connection, PgConnection};
-
-/// Dedicated prefix for databases created by this suite — the startup sweep
-/// matches it and nothing else, so a sweep can never touch real data.
-const TEST_DB_PREFIX: &str = "atomic_cloud_test_";
-
-/// Swap the database name in the test-cluster URL. The conventional test URL
-/// (`postgres://atomic:atomic_test@localhost:5433/atomic_test`) always ends
-/// in `/<database>` with no query string, so a path swap is a string splice.
-fn with_db_name(base_url: &str, db_name: &str) -> String {
-    let (prefix, _) = base_url
-        .rsplit_once('/')
-        .expect("test database URL ends in /<database>");
-    format!("{prefix}/{db_name}")
-}
-
-/// Best-effort drop of leftover `atomic_cloud_test_*` databases from prior
-/// crashed runs. Runs once per test process, before the first database is
-/// created, so it cannot race a live test under `--test-threads=1` (or any
-/// schedule — every creation happens after the sweep completes).
-async fn sweep_leftovers(base_url: &str) {
-    static SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    SWEEP
-        .get_or_init(|| async {
-            let Ok(mut conn) = PgConnection::connect(base_url).await else {
-                return;
-            };
-            let pattern = format!("{}%", TEST_DB_PREFIX);
-            let leftovers: Vec<String> =
-                sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname LIKE $1")
-                    .bind(&pattern)
-                    .fetch_all(&mut conn)
-                    .await
-                    .unwrap_or_default();
-            for db_name in leftovers {
-                eprintln!("sweeping leftover test database {db_name}");
-                let _ = sqlx::raw_sql(&format!(
-                    "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-                ))
-                .execute(&mut conn)
-                .await;
-            }
-            let _ = conn.close().await;
-        })
-        .await;
-}
-
-async fn drop_database(base_url: &str, db_name: &str) {
-    let mut conn = PgConnection::connect(base_url)
-        .await
-        .expect("connect for test-database cleanup");
-    // WITH (FORCE) terminates any straggler pool connections; sqlx pool drop
-    // is asynchronous, so some may still be open when cleanup runs.
-    sqlx::raw_sql(&format!(
-        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
-    .execute(&mut conn)
-    .await
-    .expect("drop test database");
-    let _ = conn.close().await;
-}
-
-/// Run `test` against a fresh, uniquely named control-plane database URL,
-/// dropping the database afterwards — panic or not. Skips (with a message)
-/// when `ATOMIC_TEST_DATABASE_URL` is unset.
-async fn with_control_db<F, Fut>(test_name: &str, test: F)
-where
-    F: FnOnce(String) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let Ok(base_url) = std::env::var("ATOMIC_TEST_DATABASE_URL") else {
-        eprintln!("{test_name}: skipping (ATOMIC_TEST_DATABASE_URL not set)");
-        return;
-    };
-    sweep_leftovers(&base_url).await;
-
-    let db_name = format!("{TEST_DB_PREFIX}{}", uuid::Uuid::new_v4().simple());
-    let control_url = with_db_name(&base_url, &db_name);
-
-    let result = AssertUnwindSafe(test(control_url)).catch_unwind().await;
-
-    drop_database(&base_url, &db_name).await;
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
-}
+use support::with_control_db;
 
 const SLICE_1_TABLES: &[&str] = &[
     "accounts",

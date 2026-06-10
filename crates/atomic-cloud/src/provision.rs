@@ -1,0 +1,521 @@
+//! Account provisioning and deletion (plan: "Provisioning lifecycle").
+//!
+//! These are pure library functions — no HTTP, no email, no provider keys.
+//! The signup HTTP flow and magic links arrive with the signup slice; managed
+//! OpenRouter keys with the provider-management slice (plan: "Provider
+//! management"). Callers compose them under whatever transport they like.
+//!
+//! # Idempotency
+//!
+//! Every provisioning step is independently idempotent so a crashed signup
+//! can be re-run to completion (plan: "Signup" → "Idempotency"):
+//!
+//! - The subdomain claim resumes an account stuck in `status='provisioning'`
+//!   when the email matches; any other conflict is [`CloudError::SubdomainTaken`].
+//! - `CREATE DATABASE` checks `pg_database` first and treats a concurrent
+//!   creator's `duplicate_database` as success.
+//! - Tenant migrations and seeding run through `DatabaseManager::new_postgres`
+//!   — atomic-core's own advisory-locked, versioned migration runner and
+//!   default-KB seeding, not a cloud reimplementation.
+//! - Control-plane inserts use `ON CONFLICT DO NOTHING`.
+//!
+//! Deletion is likewise idempotent under retry: every step tolerates an
+//! already-dropped database and already-deleted rows, and the freed
+//! subdomain is reserved *before* the accounts row is hard-deleted so a
+//! crash between the two can't lose the 90-day reservation.
+
+use std::str::FromStr;
+
+use atomic_core::DatabaseManager;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, PgConnection};
+use uuid::Uuid;
+
+use crate::control_plane::ControlPlane;
+use crate::error::CloudError;
+use crate::reserved_subdomains;
+
+/// Where tenant databases live: the shared Postgres cluster.
+///
+/// `cluster_id` is recorded on every `account_databases` row from day one so
+/// a future shard split is mechanical (plan: "Tenant model"). v1 runs a
+/// single cluster, so there is exactly one of these per deployment.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// Identifier stored in `account_databases.cluster_id`.
+    pub cluster_id: String,
+    /// Postgres URL of the shared tenant cluster. The database path
+    /// component is replaced per-tenant; the user must be able to
+    /// `CREATE DATABASE`. Query parameters (e.g. `sslmode`) are preserved.
+    pub cluster_url: String,
+}
+
+impl ClusterConfig {
+    /// Connection URL for a tenant database on this cluster.
+    pub fn tenant_db_url(&self, db_name: &str) -> Result<String, CloudError> {
+        let mut url = url::Url::parse(&self.cluster_url)
+            .map_err(|e| CloudError::InvalidUrl(e.to_string()))?;
+        url.set_path(db_name);
+        Ok(url.into())
+    }
+
+    /// Short-lived connection to the cluster's `postgres` maintenance
+    /// database, for `CREATE DATABASE` / `DROP DATABASE` / `pg_database`
+    /// queries that can't run against the database they target.
+    async fn connect_maintenance(&self) -> Result<PgConnection, CloudError> {
+        let opts = PgConnectOptions::from_str(&self.cluster_url)
+            .map_err(|e| CloudError::InvalidUrl(e.to_string()))?
+            .database("postgres");
+        PgConnection::connect_with(&opts)
+            .await
+            .map_err(CloudError::db("connecting to cluster maintenance database"))
+    }
+}
+
+/// Signup input for [`provision_account`].
+#[derive(Debug, Clone)]
+pub struct NewAccount {
+    pub email: String,
+    pub subdomain: String,
+}
+
+/// Result of a successful [`provision_account`] run.
+#[derive(Debug, Clone)]
+pub struct ProvisionedAccount {
+    /// Account UUID (hyphenated lowercase), as stored in `accounts.id`.
+    pub account_id: String,
+    pub subdomain: String,
+    /// Tenant database name on the cluster (see [`tenant_db_name`]).
+    pub db_name: String,
+}
+
+/// Derive an account's tenant database name: `acct_<base32(uuid)>`.
+///
+/// The encoding is RFC 4648 base32 without padding, lowercased: the UUID's
+/// 16 bytes become exactly 26 characters of `[a-z2-7]`, for a fixed 31-char
+/// name. That makes the name a safe Postgres identifier by construction —
+/// starts with a letter, lowercase-only (so quoted and unquoted forms
+/// agree), well under the 63-byte identifier limit — and, being the UUID
+/// rather than the subdomain, it survives future subdomain renames and
+/// leaks nothing (plan: "Tenant model", decisions log 2026-05-25).
+pub fn tenant_db_name(account_id: Uuid) -> String {
+    let encoded = data_encoding::BASE32_NOPAD.encode(account_id.as_bytes());
+    format!("acct_{}", encoded.to_ascii_lowercase())
+}
+
+/// Whether `name` has exactly the shape [`tenant_db_name`] generates.
+///
+/// Database names cannot be bound as statement parameters, so every
+/// `CREATE DATABASE` / `DROP DATABASE` here interpolates the name into SQL.
+/// This check is the guard on that interpolation: only names matching
+/// `acct_` + 26 chars of `[a-z2-7]` ever reach DDL, even if a control-plane
+/// row is corrupted.
+pub fn is_tenant_db_name(name: &str) -> bool {
+    name.strip_prefix("acct_").is_some_and(|suffix| {
+        suffix.len() == 26 && suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+    })
+}
+
+/// Validate and assert a tenant database name before SQL interpolation.
+fn checked_tenant_db_name(name: &str) -> Result<&str, CloudError> {
+    if !is_tenant_db_name(name) {
+        return Err(CloudError::InvalidDatabaseName(name.to_string()));
+    }
+    Ok(name)
+}
+
+/// Signup slug rule from the plan: 3-32 chars of `[a-z0-9-]`.
+fn subdomain_format_ok(subdomain: &str) -> bool {
+    (3..=32).contains(&subdomain.len())
+        && subdomain
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+}
+
+/// Minimal email shape check: non-empty local and domain parts, the domain
+/// containing a dot, no whitespace. Real verification is the magic link
+/// (signup slice) — clicking it proves ownership; this only rejects obvious
+/// garbage before we burn an account row on it.
+fn email_format_ok(email: &str) -> bool {
+    if email.chars().any(char::is_whitespace) {
+        return false;
+    }
+    matches!(email.split_once('@'),
+        Some((local, domain)) if !local.is_empty() && domain.contains('.'))
+}
+
+/// Provision a new account end-to-end: claim the subdomain, create the
+/// tenant database, run tenant migrations, seed the default knowledge base,
+/// record the tenant mapping, and activate the account.
+///
+/// Implements signup steps 1, 3, 4, 5, 6, 10 and 11 from the plan
+/// ("Provisioning lifecycle" → "Signup"). The remaining steps live in later
+/// slices: 2 (magic link — signup slice), 7 (cloud-curated per-DB settings;
+/// atomic-core's own defaults are seeded here as part of opening the
+/// tenant), 8 (default report — reports slice), 9 (managed OpenRouter key —
+/// provider-management slice), 12 (session + redirect — signup slice).
+///
+/// Re-running for an account stuck in `status='provisioning'` (same email,
+/// same subdomain) resumes and completes it without duplicating rows. The
+/// synchronous-signup concurrency cap (4-8 in-flight per process) belongs
+/// to the HTTP layer, not here.
+pub async fn provision_account(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    new_account: NewAccount,
+) -> Result<ProvisionedAccount, CloudError> {
+    let NewAccount { email, subdomain } = new_account;
+
+    // Step 1 — validate. The static blocklist and the active holds in
+    // `subdomains_reserved` are distinct mechanisms (see
+    // reserved_subdomains.rs); check both. Expired holds don't count.
+    if !email_format_ok(&email) {
+        return Err(CloudError::InvalidEmail(email));
+    }
+    if !subdomain_format_ok(&subdomain) {
+        return Err(CloudError::InvalidSubdomain(subdomain));
+    }
+    if reserved_subdomains::is_reserved(&subdomain) {
+        return Err(CloudError::SubdomainReserved(subdomain));
+    }
+    let actively_reserved: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM subdomains_reserved \
+         WHERE subdomain = $1 AND expires_at > NOW())",
+    )
+    .bind(&subdomain)
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db("checking subdomain reservation"))?;
+    if actively_reserved {
+        return Err(CloudError::SubdomainReserved(subdomain));
+    }
+
+    // Step 3 — claim the subdomain atomically. The UNIQUE constraint on
+    // accounts.subdomain is what makes "taken" race-free: losers of a
+    // concurrent claim see SQLSTATE 23505. A conflicting row that is still
+    // 'provisioning' for the same email is a crashed earlier attempt —
+    // resume it. Anything else (active account, different email, a 'failed'
+    // row awaiting the reaper) reports taken.
+    let account_id = Uuid::new_v4();
+    let claim = sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan) \
+         VALUES ($1, $2, $3, 'provisioning', 'free')",
+    )
+    .bind(account_id.to_string())
+    .bind(&subdomain)
+    .bind(&email)
+    .execute(control.pool())
+    .await;
+
+    let account_id = match claim {
+        Ok(_) => account_id,
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            let existing: Option<(String, String, String)> =
+                sqlx::query_as("SELECT id, email, status FROM accounts WHERE subdomain = $1")
+                    .bind(&subdomain)
+                    .fetch_optional(control.pool())
+                    .await
+                    .map_err(CloudError::db("looking up conflicting subdomain claim"))?;
+            match existing {
+                Some((id, row_email, status)) if status == "provisioning" && row_email == email => {
+                    Uuid::parse_str(&id).map_err(|_| {
+                        CloudError::Invariant(format!("accounts.id {id:?} is not a UUID"))
+                    })?
+                }
+                _ => return Err(CloudError::SubdomainTaken(subdomain)),
+            }
+        }
+        Err(e) => return Err(CloudError::db("claiming subdomain")(e)),
+    };
+
+    // Step 4 — create the tenant database. Identifiers can't be bound as
+    // parameters, hence the pg_database check, the shape assertion, and the
+    // quoted interpolation.
+    let db_name = tenant_db_name(account_id);
+    let db_name = checked_tenant_db_name(&db_name)?.to_string();
+    let mut conn = cluster.connect_maintenance().await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&db_name)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(CloudError::db("checking tenant database existence"))?;
+    if !exists {
+        match sqlx::raw_sql(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => tracing::info!(db_name, "created tenant database"),
+            // 42P04 duplicate_database: a concurrent provision won the race.
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P04") => {}
+            Err(e) => return Err(CloudError::db("creating tenant database")(e)),
+        }
+    }
+    let _ = conn.close().await;
+
+    // Steps 5 + 6 — run tenant migrations and seed the default knowledge
+    // base, via the same production code path the self-hosted Postgres
+    // server boots through. `new_postgres` connects, applies atomic-core's
+    // versioned migrations under its advisory lock, and seeds the default
+    // `databases` row when the table is empty — no seeding logic duplicated
+    // here. The manager (and its pool) is dropped immediately; the cloud
+    // request path opens tenants through the AccountCache instead.
+    let tenant_url = cluster.tenant_db_url(&db_name)?;
+    let manager = DatabaseManager::new_postgres(".", &tenant_url)
+        .await
+        .map_err(CloudError::core(
+            "running tenant migrations and seeding defaults",
+        ))?;
+    drop(manager);
+
+    // Step 10 — record the account → tenant-database mapping. ON CONFLICT
+    // keeps a resumed provision from duplicating the row.
+    sqlx::query(
+        "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
+         VALUES ($1, $2, $3, 'active') \
+         ON CONFLICT (account_id, db_name) DO NOTHING",
+    )
+    .bind(account_id.to_string())
+    .bind(&cluster.cluster_id)
+    .bind(&db_name)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("recording account database"))?;
+
+    // Step 11 — activate.
+    sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
+        .bind(account_id.to_string())
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("activating account"))?;
+
+    tracing::info!(
+        account_id = %account_id,
+        subdomain,
+        db_name,
+        "provisioned account"
+    );
+
+    Ok(ProvisionedAccount {
+        account_id: account_id.to_string(),
+        subdomain,
+        db_name,
+    })
+}
+
+/// Hard-delete an account: revoke its tokens, delete its sessions, drop its
+/// tenant database, remove its control-plane rows, and park the freed
+/// subdomain in `subdomains_reserved` for 90 days.
+///
+/// Implements the plan's deletion sequence ("Provisioning lifecycle" →
+/// "Account deletion") minus the steps owned by later slices:
+///
+/// - Managed-provider-key deletion (step 3) — provider-management slice.
+/// - The final logical dump to `backups/final/` before the drop (step 4) —
+///   backups slice (plan: "Backups & disaster recovery"); until it lands,
+///   deletion is genuinely unrecoverable.
+/// - AccountCache eviction (step 5) — the serving composition layer owns
+///   the cache and must evict before calling this.
+///
+/// Idempotent under retry: an already-dropped database, already-deleted
+/// rows, and an already-reserved subdomain are all no-ops, so calling this
+/// for an unknown `account_id` succeeds quietly. One deliberate ordering
+/// deviation from the plan: the subdomain reservation is written *before*
+/// the accounts row is hard-deleted — the reverse order could crash between
+/// the two and lose the reservation, since the subdomain is only knowable
+/// from the row being deleted.
+pub async fn delete_account(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    // 1 — revoke all tokens. The accounts-row delete below cascades these
+    // away entirely; revoking first closes the crash window where tokens
+    // would still verify while the tenant database is being dropped.
+    sqlx::query(
+        "UPDATE cloud_tokens SET revoked_at = NOW() \
+         WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("revoking account tokens"))?;
+
+    // 2 — invalidate all sessions.
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(account_id)
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("deleting account sessions"))?;
+
+    // 3 — find the tenant database(s). `account_databases` is the source of
+    // truth; the name derived from the account UUID is unioned in so a
+    // provision that crashed before step 10 (database created, mapping row
+    // not yet written) still gets cleaned up.
+    let mut db_names: Vec<String> =
+        sqlx::query_scalar("SELECT db_name FROM account_databases WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_all(control.pool())
+            .await
+            .map_err(CloudError::db("listing account databases"))?;
+    if let Ok(uuid) = Uuid::parse_str(account_id) {
+        let derived = tenant_db_name(uuid);
+        if !db_names.contains(&derived) {
+            db_names.push(derived);
+        }
+    }
+
+    // 4 — terminate stragglers and drop. WITH (FORCE) alone would do it,
+    // but explicit termination keeps the drop from racing a reconnecting
+    // pool, and is harmless when no backends exist.
+    if !db_names.is_empty() {
+        let mut conn = cluster.connect_maintenance().await?;
+        for db_name in &db_names {
+            let db_name = checked_tenant_db_name(db_name)?;
+            sqlx::query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = $1 AND pid <> pg_backend_pid()",
+            )
+            .bind(db_name)
+            .execute(&mut conn)
+            .await
+            .map_err(CloudError::db("terminating tenant database backends"))?;
+            sqlx::raw_sql(&format!(
+                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(CloudError::db("dropping tenant database"))?;
+        }
+        let _ = conn.close().await;
+    }
+
+    // 5 — remove the mapping rows.
+    sqlx::query("DELETE FROM account_databases WHERE account_id = $1")
+        .bind(account_id)
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("deleting account database rows"))?;
+
+    // 6 — reserve the freed subdomain for 90 days (stale RSS readers and
+    // MCP configs pointing at the old name must not silently reach a
+    // stranger), then hard-delete the account row, cascading any remaining
+    // token rows away.
+    let subdomain: Option<String> =
+        sqlx::query_scalar("SELECT subdomain FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(control.pool())
+            .await
+            .map_err(CloudError::db("reading subdomain for reservation"))?;
+    if let Some(subdomain) = subdomain {
+        sqlx::query(
+            "INSERT INTO subdomains_reserved (subdomain, expires_at) \
+             VALUES ($1, NOW() + INTERVAL '90 days') \
+             ON CONFLICT (subdomain) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+        )
+        .bind(&subdomain)
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("reserving freed subdomain"))?;
+
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(control.pool())
+            .await
+            .map_err(CloudError::db("deleting account row"))?;
+
+        tracing::info!(account_id, subdomain, "deleted account");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_db_name_is_fixed_shape() {
+        let uuid = Uuid::new_v4();
+        let name = tenant_db_name(uuid);
+        assert_eq!(name.len(), 31, "acct_ + 26 base32 chars");
+        assert!(name.starts_with("acct_"));
+        assert!(is_tenant_db_name(&name), "generated names pass the guard");
+        // Deterministic, and distinct per UUID.
+        assert_eq!(name, tenant_db_name(uuid));
+        assert_ne!(name, tenant_db_name(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn tenant_db_name_known_vector() {
+        // base32(00000000-0000-0000-0000-000000000000) = 26 'a's.
+        let nil = Uuid::nil();
+        assert_eq!(tenant_db_name(nil), format!("acct_{}", "a".repeat(26)));
+    }
+
+    #[test]
+    fn tenant_db_name_guard_rejects_everything_else() {
+        for bad in [
+            "",
+            "acct_",
+            "acct_short",
+            "default",
+            "atomic_cloud_control",
+            // Right length, wrong charset (base32 has no 0/1/8/9, no uppercase).
+            &format!("acct_{}", "0".repeat(26)),
+            &format!("acct_{}", "A".repeat(26)),
+            // Injection attempts.
+            "acct_\"; DROP DATABASE x; --",
+            &format!("acct_{}x", "a".repeat(26)),
+        ] {
+            assert!(!is_tenant_db_name(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn subdomain_format_rule() {
+        for ok in ["abc", "my-notes", "a-1", "kenny", &"a".repeat(32)] {
+            assert!(subdomain_format_ok(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",
+            "ab",            // too short
+            &"a".repeat(33), // too long
+            "Has-Upper",
+            "under_score",
+            "dotted.name",
+            "spaced name",
+            "émoji",
+        ] {
+            assert!(!subdomain_format_ok(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn email_shape_rule() {
+        for ok in ["k@example.com", "a.b+tag@sub.example.org"] {
+            assert!(email_format_ok(ok), "{ok:?} should pass");
+        }
+        for bad in [
+            "",
+            "no-at.example.com",
+            "@example.com",
+            "k@nodot",
+            "a b@x.com",
+        ] {
+            assert!(!email_format_ok(bad), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn tenant_db_url_replaces_path_and_keeps_query() {
+        let cluster = ClusterConfig {
+            cluster_id: "c1".into(),
+            cluster_url: "postgres://u:p@host:5433/atomic_test?sslmode=require".into(),
+        };
+        assert_eq!(
+            cluster.tenant_db_url("acct_abc").unwrap(),
+            "postgres://u:p@host:5433/acct_abc?sslmode=require"
+        );
+    }
+}
