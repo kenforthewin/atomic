@@ -856,8 +856,16 @@ pub trait FeedStore: Send + Sync {
     /// Get feeds that are due for polling.
     async fn get_due_feeds(&self) -> StorageResult<Vec<Feed>>;
 
-    /// Record that a feed was polled (update timestamp and error).
+    /// Record that a poll *settled*: advance `last_polled_at` (the due
+    /// check's fast-path) and set or clear `last_error`. Callers must only
+    /// invoke this for terminal outcomes — success, or a feed-poll run that
+    /// exhausted its retry budget.
     async fn mark_feed_polled(&self, id: &str, error: Option<&str>) -> StorageResult<()>;
+
+    /// Stamp `last_error` without touching `last_polled_at` — used for
+    /// retryable poll failures so the feed stays due while the `task_runs`
+    /// backoff window decides when the retry fires.
+    async fn set_feed_error(&self, id: &str, error: &str) -> StorageResult<()>;
 
     /// Atomically claim a feed item GUID. Returns true if this call claimed it.
     async fn claim_feed_item(&self, feed_id: &str, guid: &str) -> StorageResult<bool>;

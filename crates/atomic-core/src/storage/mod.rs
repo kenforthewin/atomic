@@ -599,6 +599,8 @@ dispatch! {
         => sqlite: get_due_feeds_sync, pg_trait: FeedStore, pg_method: get_due_feeds;
     fn mark_feed_polled_sync(&self, id: &str, error: Option<&str>) -> Result<(), AtomicCoreError>
         => sqlite: mark_feed_polled_sync, pg_trait: FeedStore, pg_method: mark_feed_polled;
+    fn set_feed_error_sync(&self, id: &str, error: &str) -> Result<(), AtomicCoreError>
+        => sqlite: set_feed_error_sync, pg_trait: FeedStore, pg_method: set_feed_error;
     fn claim_feed_item_sync(&self, feed_id: &str, guid: &str) -> Result<bool, AtomicCoreError>
         => sqlite: claim_feed_item_sync, pg_trait: FeedStore, pg_method: claim_feed_item;
     fn complete_feed_item_sync(&self, feed_id: &str, guid: &str, atom_id: &str) -> Result<(), AtomicCoreError>

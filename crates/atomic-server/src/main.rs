@@ -457,7 +457,13 @@ async fn run_server(
         });
     }
 
-    // Spawn feed polling scheduler (ticks every 60 seconds, polls all databases)
+    // Spawn feed polling scheduler (ticks every 60 seconds, polls all
+    // databases). Each due feed's poll is dispatched through the `task_runs`
+    // ledger (`task_id = "feed_poll"`, `subject_id = <feed id>`): the durable
+    // lease dedups overlapping sweeps (and peer processes) per feed, and a
+    // failed poll retries with backoff via `next_attempt_at` instead of
+    // waiting out the feed's full poll_interval. `feeds.last_polled_at`
+    // stays the fast-path cache the hot due-feeds query reads.
     {
         let poll_manager = Arc::clone(&manager);
         let poll_tx = event_tx.clone();

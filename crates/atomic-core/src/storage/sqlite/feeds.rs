@@ -313,6 +313,19 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub(crate) fn set_feed_error_sync(&self, id: &str, error: &str) -> StorageResult<()> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE feeds SET last_error = ?1 WHERE id = ?2",
+            rusqlite::params![error, id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn claim_feed_item_sync(&self, feed_id: &str, guid: &str) -> StorageResult<bool> {
         let conn = self
             .db
@@ -433,6 +446,10 @@ impl FeedStore for SqliteStorage {
 
     async fn mark_feed_polled(&self, id: &str, error: Option<&str>) -> StorageResult<()> {
         self.mark_feed_polled_sync(id, error)
+    }
+
+    async fn set_feed_error(&self, id: &str, error: &str) -> StorageResult<()> {
+        self.set_feed_error_sync(id, error)
     }
 
     async fn claim_feed_item(&self, feed_id: &str, guid: &str) -> StorageResult<bool> {

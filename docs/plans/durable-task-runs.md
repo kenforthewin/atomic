@@ -20,7 +20,18 @@ keys are shared between DBs on Postgres. The ledger itself *is*
 per-database on both backends; scoping PG settings is its own
 follow-up work item.
 
-Outstanding: phases 3–5 below, plus **wiki regen** (added to scope by
+Phase 3 is **landed**: every feed poll dispatches through the ledger as a
+`task_id = "feed_poll"` run with `subject_id = <feed id>`
+(`ingest::poller`, the sweep body the 60s loop drives; manual polls ride
+the same path with `trigger = manual`). `feeds.last_polled_at` /
+`last_error` are demoted to the fast-path cache: `last_polled_at`
+advances only when a poll settles (success, or abandonment after the
+retry budget — abandonment parks a persistently broken feed until its
+next interval), so retryable failures leave the feed due and the row's
+`next_attempt_at` drives backed-off retries. The hot due-feeds query is
+unchanged.
+
+Outstanding: phases 4–5 below, plus **wiki regen** (added to scope by
 `docs/plans/atomic-cloud.md` — currently fire-and-forget on tag change).
 Note `daily_briefing` no longer exists as a scheduled task — it collapsed
 into a seeded report (see `reports-phase-3-briefing-collapse.md`).
@@ -180,7 +191,10 @@ Each phase is independently shippable and testable.
    tasks; fixes the retry-storm bug. Keep `last_run` fast-path. In-memory
    lock demoted to optimization. (`daily_briefing` is gone — it's a seeded
    report now and already rides the ledger.)
-3. **Fold in feed polling.** `feed_poll` runs with `subject_id`; demote `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop claims/records.
+3. **Fold in feed polling.** ✅ Landed (as `ingest::poller`; see Status).
+   `feed_poll` runs with `subject_id`; demote
+   `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop
+   claims/records.
 4. **Wiki regen.** Replace fire-and-forget regen on tag change with a
    `task_runs` row (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).
    Subject-keying gives natural per-tag dedup via the live-lease check;

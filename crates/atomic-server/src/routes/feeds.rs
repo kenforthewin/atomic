@@ -55,7 +55,7 @@ pub async fn delete_feed(db: Db, path: web::Path<String>) -> HttpResponse {
     }
 }
 
-#[utoipa::path(post, path = "/api/feeds/{id}/poll", params(("id" = String, Path, description = "Feed ID")), responses((status = 200, description = "Poll results")), tag = "feeds")]
+#[utoipa::path(post, path = "/api/feeds/{id}/poll", params(("id" = String, Path, description = "Feed ID")), responses((status = 200, description = "Poll results"), (status = 409, description = "A poll for this feed is already in flight or backing off after a failure", body = ApiErrorResponse)), tag = "feeds")]
 pub async fn poll_feed(
     state: web::Data<AppState>,
     db: Db,
@@ -65,8 +65,27 @@ pub async fn poll_feed(
     let on_ingest = ingestion_event_callback(state.event_tx.clone());
     let on_embed = embedding_event_callback(state.event_tx.clone());
 
-    match db.0.poll_feed(&feed_id, on_ingest, on_embed).await {
-        Ok(result) => HttpResponse::Ok().json(result),
+    // Manual polls ride the same `task_runs` ledger as the 60s sweep, so
+    // a poll already in flight (live lease) or a failed poll inside its
+    // backoff window comes back as `Skipped` instead of double-polling.
+    match db
+        .0
+        .poll_feed(
+            &feed_id,
+            atomic_core::TaskRunTrigger::Manual,
+            on_ingest,
+            on_embed,
+        )
+        .await
+    {
+        Ok(atomic_core::PollOutcome::Polled(result)) => HttpResponse::Ok().json(result),
+        Ok(atomic_core::PollOutcome::Failed { error }) => {
+            crate::error::error_response(atomic_core::AtomicCoreError::Ingestion(error))
+        }
+        Ok(atomic_core::PollOutcome::Skipped) => HttpResponse::Conflict().json(ApiErrorResponse {
+            error: "a poll for this feed is already in flight or backing off after a failure"
+                .to_string(),
+        }),
         Err(e) => crate::error::error_response(e),
     }
 }

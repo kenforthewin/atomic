@@ -66,6 +66,7 @@ pub use embedding::{EmbeddingEvent, EmbeddingStrategy, TaggingStrategy};
 pub use error::AtomicCoreError;
 pub use export::{MarkdownArchiveFormat, MarkdownExportProgress, MarkdownExportResult};
 pub use import::{ImportProgress, ImportResult};
+pub use ingest::poller::PollOutcome;
 pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResult};
 pub use manager::DatabaseManager;
 pub use models::*;
@@ -3705,11 +3706,14 @@ impl AtomicCore {
             )
             .await?;
 
-        // Poll immediately after creation
+        // Poll immediately after creation — through the ledger like any
+        // other poll, so the kickoff run shows up in `feed_poll` history.
         let core = self.clone();
         let feed_id = feed.id.clone();
         executor::spawn(async move {
-            let _ = core.poll_feed(&feed_id, on_ingest, on_embed).await;
+            let _ = core
+                .poll_feed(&feed_id, TaskRunTrigger::Manual, on_ingest, on_embed)
+                .await;
         });
 
         Ok(feed)
@@ -3747,8 +3751,30 @@ impl AtomicCore {
         self.storage.delete_feed_sync(id).await
     }
 
-    /// Poll a single feed: fetch XML, parse, dedup via feed_items, ingest new articles.
+    /// Poll a single feed through the `task_runs` ledger: one run per poll
+    /// with `task_id = "feed_poll"` and `subject_id = <feed id>`. Returns
+    /// [`PollOutcome::Skipped`] when another worker already holds the
+    /// feed's run, or a failed poll is still inside its backoff window.
+    /// See [`ingest::poller`] for the full lifecycle.
     pub async fn poll_feed<F, G>(
+        &self,
+        feed_id: &str,
+        trigger: TaskRunTrigger,
+        on_ingest: F,
+        on_embed: G,
+    ) -> Result<PollOutcome, AtomicCoreError>
+    where
+        F: Fn(ingest::IngestionEvent) + Send + Sync + Clone + 'static,
+        G: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
+    {
+        ingest::poller::run_feed_poll(self, feed_id, trigger, on_ingest, on_embed).await
+    }
+
+    /// Fetch a feed's XML, parse it, dedup via `feed_items`, and ingest new
+    /// articles. Pure mechanism: no ledger interaction and no writes to the
+    /// `feeds` fast-path cache (`last_polled_at` / `last_error`) —
+    /// [`ingest::poller`] owns both.
+    pub(crate) async fn fetch_and_ingest_feed<F, G>(
         &self,
         feed_id: &str,
         on_ingest: F,
@@ -3765,7 +3791,6 @@ impl AtomicCore {
             Ok(bytes) => bytes,
             Err(e) => {
                 let err = format!("Cannot fetch feed: {}", e);
-                self.update_feed_error(feed_id, &err).await;
                 on_ingest(ingest::IngestionEvent::FeedPollFailed {
                     feed_id: feed_id.to_string(),
                     error: err.clone(),
@@ -3777,7 +3802,6 @@ impl AtomicCore {
         let parsed = match ingest::rss::parse_feed(&feed_data) {
             Ok(p) => p,
             Err(e) => {
-                self.update_feed_error(feed_id, &e).await;
                 on_ingest(ingest::IngestionEvent::FeedPollFailed {
                     feed_id: feed_id.to_string(),
                     error: e.clone(),
@@ -3851,8 +3875,6 @@ impl AtomicCore {
             }
         }
 
-        // Update feed metadata
-        self.storage.mark_feed_polled_sync(feed_id, None).await?;
         // Backfill title/site_url from feed data if not already set
         if parsed.title.is_some() || parsed.site_url.is_some() {
             self.storage
@@ -3881,7 +3903,9 @@ impl AtomicCore {
         Ok(result)
     }
 
-    /// Poll all feeds that are due (not paused, enough time elapsed).
+    /// Poll all feeds that are due (not paused, enough time elapsed), each
+    /// through its own `task_runs` row. This is the sweep body the server's
+    /// 60s loop drives; see [`ingest::poller::poll_due_feeds`].
     pub async fn poll_due_feeds<F, G>(
         &self,
         on_ingest: F,
@@ -3891,24 +3915,7 @@ impl AtomicCore {
         F: Fn(ingest::IngestionEvent) + Send + Sync + Clone + 'static,
         G: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let due_feed_ids: Vec<String> = match self.storage.get_due_feeds_sync().await {
-            Ok(feeds) => feeds.into_iter().map(|f| f.id).collect(),
-            Err(_) => return vec![],
-        };
-
-        let mut results = Vec::new();
-        for feed_id in due_feed_ids {
-            match self
-                .poll_feed(&feed_id, on_ingest.clone(), on_embed.clone())
-                .await
-            {
-                Ok(r) => results.push(r),
-                Err(e) => {
-                    tracing::error!(feed_id = %feed_id, error = %e, "Feed poll failed");
-                }
-            }
-        }
-        results
+        ingest::poller::poll_due_feeds(self, on_ingest, on_embed).await
     }
 
     /// Atomically claim a feed item GUID. Returns true if this call claimed it,
@@ -3939,14 +3946,6 @@ impl AtomicCore {
         self.storage
             .mark_feed_item_skipped_sync(feed_id, guid, reason)
             .await
-    }
-
-    /// Helper: update a feed's last_error field.
-    async fn update_feed_error(&self, feed_id: &str, error: &str) {
-        let _ = self
-            .storage
-            .mark_feed_polled_sync(feed_id, Some(error))
-            .await;
     }
 
     /// Get suggested wiki articles (tags without articles, ranked by demand)
@@ -7139,6 +7138,210 @@ mod tests {
 
         graph_maintenance::run_now(&db).await.unwrap();
         assert!(!task.is_due(&db).await, "processed dirt clears due-ness");
+    }
+
+    // ==================== Feed polling via the ledger (phase 3) ====================
+    //
+    // Feed polls ride the same `task_runs` ledger as system tasks, keyed
+    // per feed via `subject_id`. These tests drive
+    // `ingest::poller::poll_due_feeds` — the sweep body the server's 60s
+    // loop runs — and pin the phase-3 contract: one run row per poll with
+    // the feed id as subject, retryable failures back off without touching
+    // `last_polled_at` (the feed stays due; the ledger throttles),
+    // abandonment parks the feed until its next interval, and overlapping
+    // sweeps dedup on the live lease.
+
+    use crate::ingest::poller::{self, PollOutcome, FEED_POLL_TASK_ID};
+    use atomic_test_support::MockUrlServer;
+
+    /// One poll sweep with noop event callbacks — the deterministic
+    /// stand-in for the server's 60s timer tick.
+    async fn poll_sweep(db: &AtomicCore) -> Vec<ingest::FeedPollResult> {
+        poller::poll_due_feeds(db, |_| {}, |_| {}).await
+    }
+
+    /// Seed a feed definition directly in storage — no create-time fetch or
+    /// kickoff poll, so tests own every poll explicitly. `poll_interval` is
+    /// minutes; 0 means due on every sweep.
+    async fn seed_feed(db: &AtomicCore, url: &str, poll_interval: i32) -> Feed {
+        db.storage
+            .create_feed_sync(url, Some("Test feed"), None, poll_interval, &[])
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn feed_poll_sweep_records_run_per_feed_with_subject() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        // Same mock document under two distinct URL strings — the `feeds`
+        // table has a uniqueness check on `url`.
+        let feed_a = seed_feed(&db, &mock.feed_url(), 0).await;
+        let feed_b = seed_feed(&db, &format!("{}?b", mock.feed_url()), 0).await;
+
+        let results = poll_sweep(&db).await;
+        assert_eq!(results.len(), 2, "both due feeds polled");
+
+        for feed in [&feed_a, &feed_b] {
+            let history = db
+                .list_task_runs(FEED_POLL_TASK_ID, Some(&feed.id), 10)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1, "one ledger row per poll");
+            let run = &history[0];
+            assert_eq!(run.subject_id.as_deref(), Some(feed.id.as_str()));
+            assert_eq!(run.state, TaskRunState::Succeeded);
+            assert_eq!(run.trigger, TaskRunTrigger::Schedule);
+            assert!(run.finished_at.is_some());
+
+            let refreshed = db.get_feed(&feed.id).await.unwrap();
+            assert!(
+                refreshed.last_polled_at.is_some(),
+                "success advances the fast-path"
+            );
+            assert!(refreshed.last_error.is_none());
+        }
+
+        // Subject scoping: listing without a subject spans both feeds.
+        let all = db
+            .list_task_runs(FEED_POLL_TASK_ID, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn feed_poll_failure_backs_off_while_healthy_feed_keeps_polling() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let healthy = seed_feed(&db, &mock.feed_url(), 0).await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 0).await;
+
+        let results = poll_sweep(&db).await;
+        assert_eq!(results.len(), 1, "only the healthy poll completes");
+
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(run.attempts, 1);
+        assert!(run.last_error.is_some());
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        let broken_feed = db.get_feed(&broken.id).await.unwrap();
+        assert!(
+            broken_feed.last_polled_at.is_none(),
+            "retryable failure must not advance the fast-path — the feed stays due"
+        );
+        assert!(broken_feed.last_error.is_some());
+
+        // Subsequent sweeps: the broken feed is still due but inside its
+        // backoff window — no re-attempt, no new rows. The healthy feed
+        // (interval 0) keeps polling, untouched by its broken sibling.
+        for _ in 0..2 {
+            poll_sweep(&db).await;
+        }
+        let broken_history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            broken_history.len(),
+            1,
+            "backed-off row is reused, not duplicated"
+        );
+        assert_eq!(
+            broken_history[0].attempts, 1,
+            "no re-attempt inside the backoff window"
+        );
+        let healthy_history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&healthy.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy_history.len(),
+            3,
+            "healthy feed polled on every sweep"
+        );
+        assert!(healthy_history
+            .iter()
+            .all(|r| r.state == TaskRunState::Succeeded));
+
+        // Manual polls respect the same backoff gate as the sweep.
+        let outcome = db
+            .poll_feed(&broken.id, TaskRunTrigger::Manual, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PollOutcome::Skipped));
+    }
+
+    #[tokio::test]
+    async fn feed_poll_abandonment_parks_feed_until_next_interval() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 60).await;
+
+        // Exhaust the retry budget, forcing each backoff window open the
+        // same way the scheduler dispatch tests do. A never-polled feed
+        // stays due throughout (last_polled_at never advances on a
+        // retryable failure), so each sweep reaches the claim.
+        for attempt in 1..=poller::MAX_ATTEMPTS {
+            let results = poll_sweep(&db).await;
+            assert!(results.is_empty(), "failed polls return no results");
+            let run = &db
+                .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+                .await
+                .unwrap()[0];
+            assert_eq!(run.attempts, attempt, "one attempt per opened window");
+            force_retry_due(&db, FEED_POLL_TASK_ID).await;
+        }
+
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Abandoned);
+        assert_eq!(run.attempts, poller::MAX_ATTEMPTS);
+
+        // Abandonment settles the sweep: `last_polled_at` advances, so the
+        // feed is parked until poll_interval elapses instead of opening a
+        // fresh retry cycle on the very next sweep.
+        let feed = db.get_feed(&broken.id).await.unwrap();
+        assert!(feed.last_polled_at.is_some());
+        assert!(feed.last_error.is_some());
+
+        poll_sweep(&db).await;
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "parked feed is not due — no new row");
+    }
+
+    #[tokio::test]
+    async fn feed_poll_concurrent_sweeps_poll_each_due_feed_once() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let feed = seed_feed(&db, &mock.slow_feed_url(), 0).await;
+
+        // Two sweeps in flight at once (two server processes sharing one
+        // database, or overlapping ticks). The slow fixture keeps the
+        // winner's poll running long enough that the loser's claim
+        // deterministically sees a live lease.
+        let (a, b) = tokio::join!(poll_sweep(&db), poll_sweep(&db));
+        assert_eq!(a.len() + b.len(), 1, "exactly one sweep polled the feed");
+
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&feed.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "single run row — no double poll");
+        assert_eq!(history[0].state, TaskRunState::Succeeded);
+        assert_eq!(history[0].attempts, 1);
     }
 
     // ==================== Reports primitive (V20) ====================

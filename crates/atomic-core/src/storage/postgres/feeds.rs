@@ -382,6 +382,18 @@ impl FeedStore for PostgresStorage {
         Ok(())
     }
 
+    async fn set_feed_error(&self, id: &str, error: &str) -> StorageResult<()> {
+        sqlx::query("UPDATE feeds SET last_error = $1 WHERE id = $2 AND db_id = $3")
+            .bind(error)
+            .bind(id)
+            .bind(&self.db_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn claim_feed_item(&self, feed_id: &str, guid: &str) -> StorageResult<bool> {
         let now = chrono::Utc::now().to_rfc3339();
 
