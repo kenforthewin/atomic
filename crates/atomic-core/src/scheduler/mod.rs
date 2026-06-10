@@ -5,10 +5,13 @@
 //! registry lives here so task implementations ship with core, while the
 //! ticking loop itself is owned by the caller.
 //!
-//! Tasks are responsible for their own enablement / due-ness checks, state
-//! persistence, and event reporting — see [`ScheduledTask::run`].
+//! Tasks own their work and their due-ness predicate; the [`runner`] module
+//! owns the execution lifecycle — `task_runs` ledger claim, retry/backoff,
+//! the `last_run` fast-path advance, and event emission. See
+//! [`runner::run_task`] for the claim-and-record contract.
 
 pub mod ledger;
+pub mod runner;
 pub mod state;
 
 use async_trait::async_trait;
@@ -19,15 +22,12 @@ use tokio::sync::Mutex as AsyncMutex;
 
 /// A unit of work that runs on a schedule.
 ///
-/// Implementations are registered in a [`TaskRegistry`] and invoked by the
-/// host runtime (typically one tick per minute). Each `run` call is
-/// responsible for:
-///
-/// 1. Checking enablement via [`state::is_enabled`]
-/// 2. Checking due-ness via [`state::is_due`]
-/// 3. Performing the work
-/// 4. Persisting `last_run` via [`state::set_last_run`] on success
-/// 5. Emitting a [`TaskEvent`] through `ctx.event_cb`
+/// Implementations are registered in a [`TaskRegistry`] and dispatched by
+/// [`runner::run_task`], which owns the full execution lifecycle: the
+/// `is_due` gate, the `task_runs` ledger claim (durable lease + retry +
+/// backoff), the `last_run` fast-path advance on terminal success, and
+/// [`TaskEvent`] emission. A task implementation only supplies the due-ness
+/// predicate and the work itself.
 #[async_trait]
 pub trait ScheduledTask: Send + Sync {
     /// Stable identifier used as the key for per-task state in the settings table.
@@ -39,13 +39,28 @@ pub trait ScheduledTask: Send + Sync {
     /// Default interval between runs when the per-task setting is absent.
     fn default_interval(&self) -> Duration;
 
-    /// Execute the task. The task is responsible for checking enablement,
-    /// reading its own state, and updating `last_run` on success.
+    /// Cheap pre-claim gate, evaluated every tick for every database. The
+    /// default covers interval tasks: enabled AND the configured interval
+    /// has elapsed since the last *successful* run. Override for tasks with
+    /// richer triggers (e.g. dirty-flag tasks).
+    ///
+    /// This is the hot path (N tasks × N databases per tick) — it must stay
+    /// settings-table-cheap and never query `task_runs`; the ledger is only
+    /// consulted after this returns `true`.
+    async fn is_due(&self, core: &crate::AtomicCore) -> bool {
+        state::is_due(core, self.id(), self.default_interval(), true).await
+    }
+
+    /// Execute the task. Runs only after [`Self::is_due`] passed and the
+    /// runner claimed a `task_runs` row. Return `Err` to let the ledger
+    /// schedule a backed-off retry; do not advance `last_run` here — the
+    /// runner does that on success.
     async fn run(&self, core: &crate::AtomicCore, ctx: &TaskContext) -> Result<(), TaskError>;
 }
 
 /// Context passed to each task run. Currently just a callback sink so tasks
 /// can emit events without knowing about the host transport.
+#[derive(Clone)]
 pub struct TaskContext {
     pub event_cb: Arc<dyn Fn(TaskEvent) + Send + Sync>,
     pub embedding_event_cb: Arc<dyn Fn(crate::EmbeddingEvent) + Send + Sync>,
@@ -73,17 +88,12 @@ pub enum TaskEvent {
     },
 }
 
-/// Errors returned by [`ScheduledTask::run`]. Non-failure outcomes use the
-/// `Disabled` / `NotDue` / `AlreadyRunning` variants so the host loop can
-/// silently skip them without logging at warn level.
+/// Errors returned by [`ScheduledTask::run`]. By the time `run` executes,
+/// the runner has already settled enablement and due-ness, so every error
+/// here is a genuine failure — it lands on the `task_runs` row as
+/// `last_error` and drives the retry/backoff decision.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
-    #[error("task disabled")]
-    Disabled,
-    #[error("task not due")]
-    NotDue,
-    #[error("task already running")]
-    AlreadyRunning,
     #[error("{0}")]
     Other(String),
 }
@@ -95,7 +105,14 @@ impl From<crate::AtomicCoreError> for TaskError {
 }
 
 /// Registry of scheduled tasks. Owns the task trait objects and the
-/// per-(task, database) lock map that prevents re-entry across ticks.
+/// per-(task, database) lock map.
+///
+/// The in-memory lock is a *fast-path optimization*, not a correctness
+/// guard: it lets a tick skip a task this process is already running
+/// without a storage round-trip. The durable `lease_until` on the task's
+/// `task_runs` row is the source of truth for "already running" — it also
+/// covers peers in other processes and survives restarts, which this map
+/// never did.
 pub struct TaskRegistry {
     tasks: Vec<Arc<dyn ScheduledTask>>,
     /// Per-task-per-database locks. A task that's still running when the next

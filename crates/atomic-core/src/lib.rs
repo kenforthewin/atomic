@@ -2215,6 +2215,21 @@ impl AtomicCore {
         graph_maintenance::run_now(self).await
     }
 
+    /// Recent execution history for a task from the `task_runs` ledger,
+    /// newest first. `subject_id = None` returns runs for every subject of
+    /// the task (the read shape history UIs want); pass `Some` to narrow to
+    /// one subject (e.g. a single feed).
+    pub async fn list_task_runs(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<TaskRun>, AtomicCoreError> {
+        self.storage
+            .list_recent_task_runs_sync(task_id, subject_id, limit)
+            .await
+    }
+
     /// Reset atoms stuck in 'processing' state back to 'pending'
     pub async fn reset_stuck_processing(&self) -> Result<i32, AtomicCoreError> {
         self.storage.reset_stuck_processing_sync().await
@@ -6834,6 +6849,291 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // ==================== Scheduler runner dispatch (phase 2) ====================
+    //
+    // System tasks ride the ledger through `scheduler::runner::run_task`.
+    // These tests pin the dispatch semantics the plan's Risks section calls
+    // out: backoff actually throttles a failing task, a crashed run (row
+    // left `running` with an expired lease) is reclaimed, and the
+    // `last_run` fast-path advances only on terminal success.
+
+    use crate::scheduler::runner::{self, DispatchOutcome};
+    use crate::scheduler::{state as sched_state, ScheduledTask, TaskContext, TaskError};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Test double: a task whose due-ness is the trait default (interval
+    /// elapsed since last success) and whose run outcome is toggled by a
+    /// shared flag. Counts invocations so tests can assert "did not run".
+    struct StubTask {
+        id: &'static str,
+        fail: Arc<AtomicBool>,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl StubTask {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                fail: Arc::new(AtomicBool::new(false)),
+                runs: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn failing(id: &'static str) -> Self {
+            let stub = Self::new(id);
+            stub.fail.store(true, Ordering::SeqCst);
+            stub
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScheduledTask for StubTask {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Stub task"
+        }
+        fn default_interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        async fn run(&self, _core: &AtomicCore, _ctx: &TaskContext) -> Result<(), TaskError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(TaskError::Other("stub failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn noop_ctx() -> TaskContext {
+        TaskContext {
+            event_cb: Arc::new(|_| {}),
+            embedding_event_cb: Arc::new(|_| {}),
+        }
+    }
+
+    /// Force a pending row's `next_attempt_at` into the past so a test can
+    /// step through retries without waiting out the real backoff window.
+    async fn force_retry_due(db: &AtomicCore, task_id: &str) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE task_runs SET next_attempt_at = ?1 WHERE task_id = ?2 AND state = 'pending'",
+            rusqlite::params![past, task_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_failing_task_backs_off_instead_of_retrying_every_tick() {
+        // The retry-storm fix: after a failure the row goes pending with
+        // `next_attempt_at` in the future, and subsequent dispatches skip
+        // it until the window passes — they must not re-run the task.
+        let (db, _temp) = create_test_db().await;
+        let task = StubTask::failing("stub_backoff");
+        let ctx = noop_ctx();
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+
+        let row = &db.list_task_runs("stub_backoff", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.last_error.as_deref(), Some("stub failure"));
+        assert!(
+            row.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        // Simulate the next few 15s ticks: still due (no last_run), but the
+        // backoff window gates the claim. No re-run.
+        for _ in 0..3 {
+            let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+            assert!(matches!(outcome, DispatchOutcome::Skipped));
+        }
+        assert_eq!(
+            task.runs.load(Ordering::SeqCst),
+            1,
+            "no re-attempt inside the backoff window"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_failing_task_abandons_after_max_attempts() {
+        // Step through the full retry budget by forcing each backoff window
+        // open, then confirm the row settles `abandoned` (terminal) and a
+        // later dispatch starts a fresh row rather than touching it.
+        let (db, _temp) = create_test_db().await;
+        let task = StubTask::failing("stub_abandon");
+        let ctx = noop_ctx();
+
+        for attempt in 1..=runner::DEFAULT_MAX_ATTEMPTS as usize {
+            let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+            assert!(
+                matches!(outcome, DispatchOutcome::Failed { .. }),
+                "attempt {attempt} should run and fail"
+            );
+            force_retry_due(&db, "stub_abandon").await;
+        }
+        assert_eq!(
+            task.runs.load(Ordering::SeqCst),
+            runner::DEFAULT_MAX_ATTEMPTS as usize
+        );
+
+        let row = &db.list_task_runs("stub_abandon", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Abandoned);
+        assert_eq!(row.attempts, runner::DEFAULT_MAX_ATTEMPTS);
+
+        // The abandoned row is terminal — the next dispatch opens a new one.
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        let history = db.list_task_runs("stub_abandon", None, 10).await.unwrap();
+        assert_eq!(history.len(), 2, "fresh row after abandonment");
+    }
+
+    #[tokio::test]
+    async fn dispatch_success_advances_last_run_failure_does_not() {
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+
+        let ok_task = StubTask::new("stub_ok");
+        let outcome = runner::run_task(&db, "test-db", &ok_task, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        assert!(
+            sched_state::get_last_run(&db, "stub_ok")
+                .await
+                .unwrap()
+                .is_some(),
+            "success advances the last_run fast-path"
+        );
+        let row = &db.list_task_runs("stub_ok", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Succeeded);
+
+        let bad_task = StubTask::failing("stub_bad");
+        let outcome = runner::run_task(&db, "test-db", &bad_task, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        assert!(
+            sched_state::get_last_run(&db, "stub_bad")
+                .await
+                .unwrap()
+                .is_none(),
+            "failure must not advance last_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_not_due_creates_no_ledger_rows() {
+        // The hot is_due gate runs before any ledger work: a just-succeeded
+        // task (within its interval) leaves task_runs completely untouched
+        // on subsequent ticks.
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+        let task = StubTask::new("stub_not_due");
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+        let history = db.list_task_runs("stub_not_due", None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "no new row for a not-due tick");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reclaims_running_row_with_expired_lease() {
+        // Simulated crash: a previous process claimed the row and died —
+        // the row is stuck `running` with a lease in the past. The next
+        // dispatch must reclaim it (same row, no attempt bump) and run.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let crashed = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: "stub_crash".to_string(),
+            subject_id: None,
+            state: TaskRunState::Running,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: Some((now - chrono::Duration::minutes(5)).to_rfc3339()),
+            next_attempt_at: now.to_rfc3339(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: Some((now - chrono::Duration::minutes(20)).to_rfc3339()),
+            finished_at: None,
+            created_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+            updated_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+        };
+        let crashed_id = crashed.id.clone();
+        db.storage.insert_task_run_sync(&crashed).await.unwrap();
+
+        let task = StubTask::new("stub_crash");
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+
+        let history = db.list_task_runs("stub_crash", None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "reclaimed the crashed row, no new row");
+        let row = db
+            .storage
+            .get_task_run_sync(&crashed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, TaskRunState::Succeeded);
+        assert_eq!(row.attempts, 1, "reclaim does not bump attempts");
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_when_peer_holds_live_lease() {
+        // The durable lease — not the in-memory registry lock — is the
+        // re-entry guard. A row claimed by a "peer" (live lease) makes a
+        // fresh dispatch skip without running the task.
+        let (db, _temp) = create_test_db().await;
+        let peer = ledger::claim_or_create(&db, "stub_lease", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("peer claims");
+
+        let task = StubTask::new("stub_lease");
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Skipped));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 0, "task must not run");
+
+        let _ = peer.complete(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graph_maintenance_is_due_tracks_dirty_flag() {
+        // GraphMaintenanceTask overrides the default interval gate with a
+        // dirty-flag trigger: clean graph → never due; marked dirty (with
+        // an idle pipeline) → due; processed → clean again.
+        let (db, _temp) = create_test_db().await;
+        let task = graph_maintenance::GraphMaintenanceTask;
+
+        assert!(!task.is_due(&db).await, "clean graph is never due");
+
+        graph_maintenance::mark_dirty(&db.storage).await.unwrap();
+        assert!(
+            task.is_due(&db).await,
+            "dirty graph with idle pipeline is due"
+        );
+
+        graph_maintenance::run_now(&db).await.unwrap();
+        assert!(!task.is_due(&db).await, "processed dirt clears due-ness");
     }
 
     // ==================== Reports primitive (V20) ====================

@@ -688,6 +688,7 @@ dependencies = [
  "actix-web",
  "actix-ws",
  "async-stream",
+ "async-trait",
  "atomic-core",
  "atomic-test-support",
  "base64 0.22.1",

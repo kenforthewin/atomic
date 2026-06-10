@@ -8,11 +8,22 @@ durable leases, heartbeating, and crash reclaim (race-tested). Reports
 already dispatch through the ledger (the "phase 1.5" runner in
 `atomic-server/src/main.rs`).
 
-Outstanding: phases 2–4 below, plus **wiki regen** (added to scope by
+Phase 2 is **landed**: `draft_pipeline` and `graph_maintenance` dispatch
+through the ledger via `scheduler::runner` (claim-and-record, extracted
+from the 15s tick so tests can drive ticks directly). The in-memory
+registry lock is demoted to a fast-path; `last_run` advances only on
+terminal success; failures back off via `next_attempt_at` — the
+retry-storm bug below is fixed. Known limitation surfaced by the
+multi-DB e2e: the Postgres backend's `settings` table is global across
+logical databases (no `db_id` scoping), so the `task.{id}.*` fast-path
+keys are shared between DBs on Postgres. The ledger itself *is*
+per-database on both backends; scoping PG settings is its own
+follow-up work item.
+
+Outstanding: phases 3–5 below, plus **wiki regen** (added to scope by
 `docs/plans/atomic-cloud.md` — currently fire-and-forget on tag change).
 Note `daily_briefing` no longer exists as a scheduled task — it collapsed
-into a seeded report (see `reports-phase-3-briefing-collapse.md`) — so
-phase 2 covers `draft_pipeline` and `graph_maintenance` only.
+into a seeded report (see `reports-phase-3-briefing-collapse.md`).
 
 This workstream is a prerequisite for Atomic Cloud's dispatcher, which
 relies on `task_runs` being the single source of pending background work.
@@ -163,11 +174,12 @@ Each phase is independently shippable and testable.
 
 1. **Schema + helpers.** ✅ Landed (as `scheduler::ledger`; reports dispatch
    through it).
-2. **Retrofit system tasks.** Route `draft_pipeline` and `graph_maintenance`
-   through `task_runs` (claim-and-record). Delivers retry + backoff + history
-   to existing tasks; fixes the retry-storm bug. Keep `last_run` fast-path.
-   In-memory lock demoted to optimization. (`daily_briefing` is gone — it's
-   a seeded report now and already rides the ledger.)
+2. **Retrofit system tasks.** ✅ Landed (as `scheduler::runner`; see Status).
+   Route `draft_pipeline` and `graph_maintenance` through `task_runs`
+   (claim-and-record). Delivers retry + backoff + history to existing
+   tasks; fixes the retry-storm bug. Keep `last_run` fast-path. In-memory
+   lock demoted to optimization. (`daily_briefing` is gone — it's a seeded
+   report now and already rides the ledger.)
 3. **Fold in feed polling.** `feed_poll` runs with `subject_id`; demote `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop claims/records.
 4. **Wiki regen.** Replace fire-and-forget regen on tag change with a
    `task_runs` row (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).

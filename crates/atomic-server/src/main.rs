@@ -496,9 +496,12 @@ async fn run_server(
     }
 
     // Spawn scheduled-tasks runner (ticks every 15 seconds across all databases).
-    // Each registered task checks its own due-ness and state; we just hand it
-    // a core + context. A per-(task, db) lock in the registry prevents the
-    // next tick from re-entering a still-running task.
+    // Each due task is dispatched through the `task_runs` ledger
+    // (claim-and-record, same shape as the reports loop below): the durable
+    // lease is the re-entry guard and failed runs back off via
+    // `next_attempt_at` instead of retrying every tick. The registry's
+    // in-memory per-(task, db) lock survives as a fast-path that skips
+    // tasks this process already has in flight without a storage round-trip.
     {
         let task_manager = Arc::clone(&manager);
         let task_tx = event_tx.clone();
@@ -512,48 +515,23 @@ async fn run_server(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,
             ));
             let registry = Arc::new(registry);
+            let ctx = atomic_core::scheduler::TaskContext {
+                event_cb: event_bridge::task_event_callback(task_tx.clone()),
+                embedding_event_cb: Arc::new(event_bridge::embedding_event_callback(task_tx)),
+            };
 
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let databases = match task_manager.list_databases().await {
-                    Ok((dbs, _)) => dbs,
-                    Err(_) => continue,
-                };
-                for db_info in &databases {
-                    let db_core = match task_manager.get_core(&db_info.id).await {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    for task in registry.tasks() {
-                        let Some(guard) = registry.try_lock(task.id(), &db_info.id) else {
-                            continue;
-                        };
-                        let task_clone = Arc::clone(task);
-                        let db_core_clone = db_core.clone();
-                        let tx = task_tx.clone();
-                        let embedding_tx = task_tx.clone();
-                        let db_id = db_info.id.clone();
-                        tokio::spawn(async move {
-                            let ctx = atomic_core::scheduler::TaskContext {
-                                event_cb: event_bridge::task_event_callback(tx),
-                                embedding_event_cb: Arc::new(
-                                    event_bridge::embedding_event_callback(embedding_tx),
-                                ),
-                            };
-                            if let Err(e) = task_clone.run(&db_core_clone, &ctx).await {
-                                tracing::debug!(
-                                    task = task_clone.id(),
-                                    db = %db_id,
-                                    error = %e,
-                                    "task run ended"
-                                );
-                            }
-                            drop(guard);
-                        });
-                    }
-                }
+                // Handles are dropped, not awaited: a slow task must not
+                // stall the next tick. The lease + lock keep re-entry safe.
+                let _ = atomic_core::scheduler::runner::tick_all_databases(
+                    &task_manager,
+                    &registry,
+                    &ctx,
+                )
+                .await;
             }
         });
     }
