@@ -549,10 +549,13 @@ ship). Self-hosted benefits from the unification too: one durable ledger
 with the existing claim/lease/crash-recovery semantics replaces several
 ad-hoc loops.
 
-This deserves its own plan doc (`docs/plans/task-runs-unification.md`) and a
-separate workstream. Its outputs feed atomic-cloud's dispatcher but the work
-itself lives in atomic-core/atomic-server, cleanly. Atomic-cloud just relies
-on `task_runs` being the single source of pending work.
+The plan for this already exists: `docs/plans/durable-task-runs.md`. As of
+2026-06-09, its phase 1 (ledger schema + claim/lease helpers) is landed and
+reports already dispatch through it; the remaining work is retrofitting
+`DraftPipelineTask`/`GraphMaintenanceTask`, folding in feed polling, adding
+wiki regen (added to scope by this plan), and the retention GC. The work
+lives in atomic-core/atomic-server, cleanly. Atomic-cloud just relies on
+`task_runs` being the single source of pending work.
 
 Sequencing-wise: unification can land first, before atomic-cloud exists, and
 ride to production in self-hosted. By the time atomic-cloud's dispatcher is
@@ -1086,8 +1089,8 @@ and link the discussion if it lives in a memory file.
 - **2026-05-25** — Unify feed polling, DraftPipelineTask, GraphMaintenanceTask,
   and wiki regen onto `task_runs`. Cloud-driven but **not cloud-specific** —
   the refactor lives in atomic-core/atomic-server and benefits self-hosted.
-  Gets its own plan doc (`docs/plans/task-runs-unification.md`) and a
-  separate workstream that can land before atomic-cloud exists.
+  Planned in `docs/plans/durable-task-runs.md` (phase 1 + reports already
+  landed); a separate workstream that can finish before atomic-cloud exists.
 - **2026-05-25** — Provider keys encrypted at rest via app-side AES-256-GCM
   with master key in env (v1). Wrapped behind a `KeyVault` trait so KMS
   envelope encryption is a localized swap (v2). Schema doesn't change.
