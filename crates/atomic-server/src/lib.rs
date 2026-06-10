@@ -19,7 +19,6 @@ pub mod ws;
 
 use actix_web::{HttpResponse, Responder};
 use utoipa::OpenApi;
-pub use utoipa_scalar::{Scalar, Servable};
 
 #[derive(OpenApi)]
 #[openapi(

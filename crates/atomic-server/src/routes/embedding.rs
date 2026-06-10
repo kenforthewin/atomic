@@ -1,11 +1,11 @@
 //! Embedding management routes
 
-use crate::db_extractor::Db;
+use crate::db_extractor::{request_manager, Db};
 use crate::error::ApiErrorResponse;
 use crate::event_bridge::embedding_event_callback;
 use crate::event_channel::EventChannel;
 use crate::state::AppState;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use atomic_core::models::PipelineStatus;
 use atomic_core::registry::DatabaseInfo;
 use serde::Serialize;
@@ -117,15 +117,22 @@ pub async fn get_pipeline_status(db: Db) -> HttpResponse {
 }
 
 #[utoipa::path(get, path = "/api/embeddings/status/all", responses((status = 200, description = "Pipeline status summary for all databases", body = AllPipelineStatuses)), tag = "embeddings")]
-pub async fn get_all_pipeline_statuses(state: web::Data<AppState>) -> HttpResponse {
-    let (databases, _) = match state.manager.list_databases().await {
+pub async fn get_all_pipeline_statuses(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    // Cross-database fan-out: iterate the manager governing this request
+    // (honoring a composing layer's RequestDatabaseManager override), not
+    // AppState's unconditionally.
+    let manager = request_manager(&req, &state);
+    let (databases, _) = match manager.list_databases().await {
         Ok(result) => result,
         Err(e) => return crate::error::error_response(e),
     };
 
     let mut results = Vec::with_capacity(databases.len());
     for database in databases {
-        let core = match state.manager.get_core(&database.id).await {
+        let core = match manager.get_core(&database.id).await {
             Ok(core) => core,
             Err(e) => return crate::error::error_response(e),
         };

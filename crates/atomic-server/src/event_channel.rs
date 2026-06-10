@@ -31,6 +31,17 @@ use tokio::sync::broadcast;
 /// When absent (the standalone server installs no middleware that sets it),
 /// the extractor falls back to [`AppState`]'s channel, so compositions that
 /// don't need the override pay no per-request cost.
+///
+/// A second boundary, shared with
+/// [`RequestDatabaseManager`](crate::db_extractor::RequestDatabaseManager):
+/// the `/mcp` scope and the auth/registry plane (`BearerAuth`, `McpAuth`,
+/// WebSocket token verification, token CRUD, the OAuth flow, instance
+/// setup) bind to [`AppState`] at composition time — the MCP transport in
+/// particular captures its event channel in
+/// [`AtomicMcpTransport::new`](crate::mcp::AtomicMcpTransport::new) — and
+/// never consult this extension. A caller that needs those planes bound
+/// differently composes the granular pieces in [`crate::app`] with its own
+/// middleware and transport instead.
 #[derive(Clone)]
 pub struct RequestEventChannel(pub broadcast::Sender<ServerEvent>);
 

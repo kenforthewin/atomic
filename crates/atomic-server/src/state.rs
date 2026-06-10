@@ -101,6 +101,17 @@ impl AppState {
     /// Checks X-Atomic-Database header, then ?db= query param, then falls back to active.
     /// Delegates to [`crate::db_extractor::resolve_core`], which owns the
     /// per-request selection rules for any manager.
+    ///
+    /// **Warning:** this resolves against `self.manager` only — it never
+    /// consults the
+    /// [`RequestDatabaseManager`](crate::db_extractor::RequestDatabaseManager)
+    /// request extension, so it silently ignores a composing layer's
+    /// per-request manager override. Handler code should use the
+    /// [`Db`](crate::db_extractor::Db) extractor (or
+    /// [`request_manager`](crate::db_extractor::request_manager) +
+    /// `resolve_core`) instead; reach for this method only when you
+    /// explicitly want *this* state's manager regardless of the request's
+    /// composition context.
     pub async fn resolve_core(
         &self,
         req: &actix_web::HttpRequest,

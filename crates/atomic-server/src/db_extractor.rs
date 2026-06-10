@@ -25,8 +25,34 @@ use std::sync::Arc;
 /// When absent (the standalone server installs no middleware that sets it),
 /// the extractor falls back to [`AppState`]'s manager, so compositions that
 /// don't need the override pay no per-request cost.
+///
+/// Scope boundary: only the data plane honors this extension — handlers that
+/// resolve a database through the [`Db`] extractor or operate on the manager
+/// itself via [`request_manager`]. The `/mcp` scope and the auth/registry
+/// plane (`BearerAuth`, `McpAuth`, WebSocket token verification, token CRUD,
+/// the OAuth flow, instance setup) bind to [`AppState`] when the app is
+/// composed and never consult request extensions. A caller that needs a
+/// different identity story or MCP binding should compose the granular
+/// pieces in [`crate::app`] with its own middleware in their place, rather
+/// than expecting this extension to redirect those planes.
 #[derive(Clone)]
 pub struct RequestDatabaseManager(pub Arc<DatabaseManager>);
+
+/// Resolve the [`DatabaseManager`] governing `req`: the
+/// [`RequestDatabaseManager`] extension when a composing layer installed
+/// one, otherwise the manager in [`AppState`].
+///
+/// This is the single extension-lookup site. The [`Db`] extractor routes
+/// through it, and so must every handler that operates on the manager
+/// itself — database CRUD, cross-database listings, export jobs — rather
+/// than on one resolved core. Reading `state.manager` directly in a handler
+/// silently opts that route out of the composition contract.
+pub fn request_manager(req: &HttpRequest, state: &AppState) -> Arc<DatabaseManager> {
+    req.extensions()
+        .get::<RequestDatabaseManager>()
+        .map(|m| Arc::clone(&m.0))
+        .unwrap_or_else(|| Arc::clone(&state.manager))
+}
 
 /// Extractor that resolves the correct AtomicCore for the current request.
 pub struct Db(pub AtomicCore);
@@ -75,21 +101,10 @@ impl FromRequest for Db {
     fn from_request(req: &HttpRequest, _payload: &mut actix_web::dev::Payload) -> Self::Future {
         let req = req.clone();
         Box::pin(async move {
-            // A composing layer may have installed a per-request manager;
-            // otherwise resolve against the shared AppState.
-            let injected = req
-                .extensions()
-                .get::<RequestDatabaseManager>()
-                .map(|m| Arc::clone(&m.0));
-            let manager = match injected {
-                Some(manager) => manager,
-                None => {
-                    let state = req.app_data::<web::Data<AppState>>().ok_or_else(|| {
-                        actix_web::error::ErrorInternalServerError("AppState not configured")
-                    })?;
-                    Arc::clone(&state.manager)
-                }
-            };
+            let state = req.app_data::<web::Data<AppState>>().ok_or_else(|| {
+                actix_web::error::ErrorInternalServerError("AppState not configured")
+            })?;
+            let manager = request_manager(&req, state);
             resolve_core(&manager, &req).await.map(Db).map_err(|e| {
                 actix_web::error::ErrorBadRequest(format!("Database not found: {}", e))
             })

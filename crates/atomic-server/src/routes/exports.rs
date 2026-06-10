@@ -1,5 +1,6 @@
 //! Background export routes.
 
+use crate::db_extractor::request_manager;
 use crate::state::AppState;
 use actix_files::NamedFile;
 use actix_web::http::header::{
@@ -11,12 +12,17 @@ use utoipa::{IntoParams, ToSchema};
 
 #[utoipa::path(post, path = "/api/databases/{id}/exports/markdown", params(("id" = String, Path, description = "Database ID")), responses((status = 202, description = "Export job started")), tag = "databases")]
 pub async fn start_markdown_export(
+    req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
+    // The export job captures the manager that governs *this* request, so a
+    // composing layer's RequestDatabaseManager override carries through to
+    // the background work, not just the synchronous response.
+    let manager = request_manager(&req, &state);
     match state
         .export_jobs
-        .start_markdown_export(state.manager.clone(), path.into_inner())
+        .start_markdown_export(manager, path.into_inner())
         .await
     {
         Ok(job) => HttpResponse::Accepted().json(job),

@@ -16,11 +16,11 @@
 //! its own dedicated route that walks every inheriting DB and queues
 //! reembeds.
 
-use crate::db_extractor::Db;
+use crate::db_extractor::{request_manager, Db};
 use crate::error::{ok_or_error, ApiErrorResponse};
 use crate::event_channel::EventChannel;
 use crate::state::AppState;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -94,6 +94,7 @@ pub struct OverrideEntry {
 
 #[utoipa::path(get, path = "/api/settings/{key}/overrides", params(("key" = String, Path, description = "Setting key")), responses((status = 200, description = "List of databases overriding the key", body = Vec<OverrideEntry>)), tag = "settings")]
 pub async fn list_setting_overrides(
+    req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
@@ -105,14 +106,18 @@ pub async fn list_setting_overrides(
         return HttpResponse::Ok().json(Vec::<OverrideEntry>::new());
     }
 
-    let (databases, _active) = match state.manager.list_databases().await {
+    // Cross-database fan-out: iterate the manager governing this request
+    // (honoring a composing layer's RequestDatabaseManager override), not
+    // AppState's unconditionally.
+    let manager = request_manager(&req, &state);
+    let (databases, _active) = match manager.list_databases().await {
         Ok(v) => v,
         Err(e) => return crate::error::error_response(e),
     };
 
     let mut overrides: Vec<OverrideEntry> = Vec::new();
     for info in databases {
-        let core = match state.manager.get_core(&info.id).await {
+        let core = match manager.get_core(&info.id).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(db_id = %info.id, "Failed to load core for override lookup: {}", e);

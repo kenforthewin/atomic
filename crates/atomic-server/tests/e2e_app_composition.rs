@@ -10,6 +10,13 @@
 //! asserts the cross-scope layout directly so a regression in the
 //! composition itself (e.g. a route slipping inside the wrong auth scope)
 //! fails loudly rather than as a confusing downstream test error.
+//!
+//! It also pins the contracts a caller composing these routes relies on:
+//! the `RequestDatabaseManager` / `RequestEventChannel` request-extension
+//! overrides (for `Db` resolution, the manager-plane routes, handlers'
+//! event publishing, and the WS subscription), and the granular pieces
+//! (`configure_public_routes`, `mcp_scope`, `api_scope`) composing to the
+//! same behavior as the all-in-one `configure_app`.
 
 mod support;
 
@@ -21,9 +28,11 @@ use actix_web::middleware::{from_fn, Next};
 use actix_web::test as actix_test;
 use actix_web::{App, HttpMessage};
 use atomic_core::DatabaseManager;
-use atomic_server::app::configure_app;
+use atomic_server::app::{api_scope, configure_app, configure_public_routes, mcp_scope};
+use atomic_server::auth::BearerAuth;
 use atomic_server::db_extractor::RequestDatabaseManager;
 use atomic_server::event_channel::RequestEventChannel;
+use atomic_server::mcp_auth::McpAuth;
 use atomic_server::state::ServerEvent;
 use futures_util::SinkExt;
 use serde_json::{json, Value};
@@ -175,19 +184,7 @@ async fn run_injected_manager_resolution(backend: Backend) {
 
     // The same route table, wrapped in a middleware that installs the second
     // manager — the composition shape an embedder would use.
-    let injected = RequestDatabaseManager(Arc::clone(&manager));
-    let app = actix_test::init_service(
-        App::new()
-            .wrap(from_fn(move |req: ServiceRequest, next: Next<_>| {
-                let injected = injected.clone();
-                async move {
-                    req.extensions_mut().insert(injected);
-                    next.call(req).await
-                }
-            }))
-            .configure(configure_app(ctx.state.clone(), mcp_transport_for(&ctx))),
-    )
-    .await;
+    let app = init_app_with_injected_manager(&ctx, Arc::clone(&manager)).await;
 
     // The extractor now resolves against the injected manager, whose active
     // database is the probe — not AppState's default.
@@ -205,6 +202,297 @@ async fn run_injected_manager_resolution(backend: Backend) {
     assert!(
         ids.contains(&alpha_id) && !ids.contains(&beta_id),
         "X-Atomic-Database must select within the injected manager"
+    );
+}
+
+// ============= Injected manager: manager-plane routes =============
+
+#[actix_web::test]
+async fn databases_routes_honor_injected_manager_sqlite() {
+    run_databases_routes_honor_injected_manager(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn databases_routes_honor_injected_manager_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "databases_routes_honor_injected_manager_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_databases_routes_honor_injected_manager(Backend::Postgres).await;
+}
+
+/// The `/api/databases` handlers operate on the *manager*, not a resolved
+/// core, so they must resolve it through `request_manager` — honoring an
+/// injected [`RequestDatabaseManager`] exactly like the `Db` extractor.
+/// Before this contract they read `state.manager` directly, which made the
+/// manager-plane routes silently ignore the composition: a split brain
+/// where `/api/atoms` saw the injected manager but `/api/databases` saw
+/// AppState's.
+///
+/// On SQLite the injected manager comes from a second, fully disjoint
+/// `TestCtx`, so the test can also assert *negative* space: databases
+/// listed/created through the injected manager must not exist in
+/// AppState's. On Postgres both managers share one physical database (see
+/// `run_injected_manager_resolution`), so the disjointness assertions are
+/// SQLite-only; the per-manager in-memory active-database state (returned
+/// by GET, mutated by PUT activate) keeps the injection observable there.
+async fn run_databases_routes_honor_injected_manager(backend: Backend) {
+    let is_postgres = matches!(backend, Backend::Postgres);
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+
+    let (injected_manager, _disjoint_ctx) = second_manager(&ctx, is_postgres).await;
+    let probe = injected_manager
+        .create_database("injection-probe")
+        .await
+        .expect("create probe database in injected manager");
+    injected_manager
+        .set_active(&probe.id)
+        .await
+        .expect("activate probe database");
+    let state_active_before = ctx.state.manager.active_id().expect("state active id");
+
+    let app = init_app_with_injected_manager(&ctx, Arc::clone(&injected_manager)).await;
+
+    // GET /api/databases reflects the injected manager: its database list
+    // and its (per-manager, in-memory) active database.
+    let req = actix_test::TestRequest::get()
+        .uri("/api/databases")
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "GET /api/databases should succeed");
+    let body: Value = actix_test::read_body_json(resp).await;
+    let listed: std::collections::HashSet<String> = body["databases"]
+        .as_array()
+        .expect("databases array")
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        listed.contains(&probe.id),
+        "GET /api/databases must list the injected manager's databases"
+    );
+    assert_eq!(
+        body["active_id"], probe.id,
+        "GET /api/databases must report the injected manager's active database"
+    );
+    assert_ne!(
+        state_active_before, probe.id,
+        "sanity: AppState's active database must differ from the probe"
+    );
+    if !is_postgres {
+        let (state_dbs, _) = ctx
+            .state
+            .manager
+            .list_databases()
+            .await
+            .expect("state list");
+        assert!(
+            !state_dbs.iter().any(|d| d.id == probe.id),
+            "the probe database must not exist in AppState's manager"
+        );
+    }
+
+    // POST /api/databases creates in the injected manager.
+    let created_id = create_database(&app, &ctx, "created-through-injection").await;
+    let (injected_dbs, _) = injected_manager
+        .list_databases()
+        .await
+        .expect("injected list");
+    assert!(
+        injected_dbs.iter().any(|d| d.id == created_id),
+        "POST /api/databases must create in the injected manager"
+    );
+    if !is_postgres {
+        let (state_dbs, _) = ctx
+            .state
+            .manager
+            .list_databases()
+            .await
+            .expect("state list");
+        assert!(
+            !state_dbs.iter().any(|d| d.id == created_id),
+            "POST /api/databases must not create in AppState's manager"
+        );
+    }
+
+    // PUT activate mutates the injected manager's active database and
+    // leaves AppState's untouched — meaningful on both backends because
+    // active state lives in each manager, not in shared storage.
+    let req = actix_test::TestRequest::put()
+        .uri(&format!("/api/databases/{}/activate", created_id))
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "PUT activate should succeed");
+    assert_eq!(
+        injected_manager.active_id().expect("injected active id"),
+        created_id,
+        "activate must switch the injected manager"
+    );
+    assert_eq!(
+        ctx.state.manager.active_id().expect("state active id"),
+        state_active_before,
+        "activate must not touch AppState's manager"
+    );
+}
+
+#[actix_web::test]
+async fn pipeline_status_all_honors_injected_manager_sqlite() {
+    run_pipeline_status_all_honors_injected_manager(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn pipeline_status_all_honors_injected_manager_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "pipeline_status_all_honors_injected_manager_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_pipeline_status_all_honors_injected_manager(Backend::Postgres).await;
+}
+
+/// `GET /api/embeddings/status/all` fans out over every database of the
+/// manager governing the request — one of the cross-database routes that
+/// used to read `state.manager` directly. The same disjointness caveat as
+/// [`run_databases_routes_honor_injected_manager`] applies: only SQLite can
+/// construct truly disjoint managers, so the "not AppState's databases"
+/// assertion is SQLite-only, while the probe-inclusion assertion runs on
+/// both backends.
+async fn run_pipeline_status_all_honors_injected_manager(backend: Backend) {
+    let is_postgres = matches!(backend, Backend::Postgres);
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+
+    let (injected_manager, _disjoint_ctx) = second_manager(&ctx, is_postgres).await;
+    let probe = injected_manager
+        .create_database("status-probe")
+        .await
+        .expect("create probe database in injected manager");
+    // A database that exists only in AppState's manager (SQLite: the
+    // managers are disjoint, so this is invisible to the injected one).
+    let state_only = if is_postgres {
+        None
+    } else {
+        Some(
+            ctx.state
+                .manager
+                .create_database("state-only")
+                .await
+                .expect("create state-only database"),
+        )
+    };
+
+    let app = init_app_with_injected_manager(&ctx, Arc::clone(&injected_manager)).await;
+
+    let req = actix_test::TestRequest::get()
+        .uri("/api/embeddings/status/all")
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "GET status/all should succeed");
+    let body: Value = actix_test::read_body_json(resp).await;
+    let reported: std::collections::HashSet<String> = body["databases"]
+        .as_array()
+        .expect("databases array")
+        .iter()
+        .filter_map(|d| d["database"]["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        reported.contains(&probe.id),
+        "status/all must fan out over the injected manager's databases"
+    );
+    if let Some(state_only) = state_only {
+        assert!(
+            !reported.contains(&state_only.id),
+            "status/all must not enumerate AppState's manager"
+        );
+    }
+}
+
+// ==================== Granular composition ====================
+
+#[actix_web::test]
+async fn granular_composition_sqlite() {
+    run_granular_composition(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn granular_composition_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!("granular_composition_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        return;
+    }
+    run_granular_composition(Backend::Postgres).await;
+}
+
+/// `configure_app` is an all-in-one assembled from granular pieces —
+/// `configure_public_routes`, `mcp_scope`, `api_scope` — exposed so a
+/// caller can choose its own wrapping middleware per scope. This test
+/// composes the pieces by hand, applying `BearerAuth`/`McpAuth` itself the
+/// way `configure_app` does, and asserts the result behaves like the
+/// all-in-one: public `/health` answers, `/api` admits a valid token and
+/// rejects a missing one, `/mcp` 401s with OAuth discovery. If a route
+/// migrates between pieces (or a piece starts baking auth in), this fails
+/// before any embedder-side composition does.
+async fn run_granular_composition(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(
+        App::new()
+            .configure(configure_public_routes(ctx.state.clone()))
+            .service(mcp_scope(mcp_transport_for(&ctx)).wrap(McpAuth {
+                state: ctx.state.clone(),
+            }))
+            .service(api_scope().wrap(BearerAuth {
+                state: ctx.state.clone(),
+            })),
+    )
+    .await;
+
+    // Public piece: /health needs no credentials.
+    let req = actix_test::TestRequest::get().uri("/health").to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "/health must be public");
+
+    // API piece behind the test-applied BearerAuth: a valid token works...
+    let req = actix_test::TestRequest::get()
+        .uri("/api/atoms")
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "/api must work with a valid token");
+
+    // ...and the wrap actually gates: no token is rejected with 401.
+    let req = actix_test::TestRequest::get()
+        .uri("/api/atoms")
+        .to_request();
+    let err = match actix_test::try_call_service(&app, req).await {
+        Ok(resp) => panic!("/api must reject missing tokens, got {}", resp.status()),
+        Err(err) => err,
+    };
+    assert_eq!(err.as_response_error().error_response().status(), 401);
+
+    // MCP piece behind the test-applied McpAuth: unauthenticated requests
+    // get the OAuth-discovery 401, same as the all-in-one.
+    let req = actix_test::TestRequest::post().uri("/mcp").to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401, "/mcp must reject missing tokens");
+    assert!(
+        resp.headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("resource_metadata=")),
+        "MCP 401 must point at OAuth discovery"
     );
 }
 
@@ -423,6 +711,60 @@ async fn run_ws_streams_injected_event_channel(backend: Backend) {
         .await
         .ok();
     server.stop().await;
+}
+
+/// Build a second [`DatabaseManager`] for injection tests.
+///
+/// SQLite: a fully disjoint `TestCtx` — its own registry, databases, and
+/// settings — returned alongside the manager so its temp dir outlives the
+/// test. Postgres: a second manager over the *same* physical database (the
+/// backend shares one per process, so disjoint storage is not
+/// constructible; see `run_injected_manager_resolution`), distinguishable
+/// from AppState's only through per-manager in-memory state.
+async fn second_manager(
+    ctx: &TestCtx,
+    is_postgres: bool,
+) -> (Arc<DatabaseManager>, Option<TestCtx>) {
+    if is_postgres {
+        let url = std::env::var("ATOMIC_TEST_DATABASE_URL").expect("postgres url");
+        let manager = Arc::new(
+            DatabaseManager::new_postgres(ctx.data_dir(), &url)
+                .await
+                .expect("open second postgres manager"),
+        );
+        (manager, None)
+    } else {
+        let disjoint = TestCtx::new(Backend::Sqlite)
+            .await
+            .expect("sqlite ctx is always constructible");
+        (Arc::clone(&disjoint.state.manager), Some(disjoint))
+    }
+}
+
+/// Initialize an in-process app serving `configure_app`'s route table under
+/// a middleware that installs `manager` as every request's
+/// [`RequestDatabaseManager`] — the composition shape an embedder would use.
+async fn init_app_with_injected_manager(
+    ctx: &TestCtx,
+    manager: Arc<DatabaseManager>,
+) -> impl actix_web::dev::Service<
+    actix_http::Request,
+    Response = actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>,
+    Error = actix_web::Error,
+> {
+    let injected = RequestDatabaseManager(manager);
+    actix_test::init_service(
+        App::new()
+            .wrap(from_fn(move |req: ServiceRequest, next: Next<_>| {
+                let injected = injected.clone();
+                async move {
+                    req.extensions_mut().insert(injected);
+                    next.call(req).await
+                }
+            }))
+            .configure(configure_app(ctx.state.clone(), mcp_transport_for(ctx))),
+    )
+    .await
 }
 
 /// POST /api/atoms, optionally into a specific database, returning the id.
