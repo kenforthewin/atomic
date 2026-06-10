@@ -120,7 +120,8 @@ impl Default for PgPoolConfig {
 /// SQLite separates physically: registry-role rows (provider/model config,
 /// setup claim) live under this sentinel, per-DB rows (task.{id}.*
 /// scheduler state, seed flags) under their logical database id. Must stay
-/// in sync with the literal in `migrations/021_settings_db_id.sql`.
+/// in sync with the literal in `migrations/021_settings_db_id.sql` and
+/// `migrations/022_settings_db_id_backfill.sql`.
 #[cfg(feature = "postgres")]
 pub(crate) const GLOBAL_SETTINGS_DB_ID: &str = "_global";
 
@@ -246,6 +247,10 @@ impl PostgresStorage {
             ),
             (20, include_str!("migrations/020_atom_positions_double.sql")),
             (21, include_str!("migrations/021_settings_db_id.sql")),
+            (
+                22,
+                include_str!("migrations/022_settings_db_id_backfill.sql"),
+            ),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

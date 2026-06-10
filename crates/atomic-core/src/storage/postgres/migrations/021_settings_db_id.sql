@@ -11,9 +11,12 @@
 -- (see GLOBAL_SETTINGS_DB_ID in storage/postgres/mod.rs). Existing rows
 -- all land in '_global' — correct for the provider/model config they
 -- overwhelmingly are. Previously-collided per-DB keys (task.{id}.*,
--- reports.* seed flags) become orphaned global rows: scoped reads no
--- longer see them, so that state resets benignly (tasks re-run on the
--- next tick, seeds re-check) rather than staying cross-contaminated.
+-- reports.* seed flags, dashboard.featured_report_id) become orphaned
+-- global rows invisible to scoped reads — which is NOT benign: invisible
+-- seed flags re-seed a duplicate Daily Briefing report, and operator
+-- overrides (task.{id}.enabled, GC retention) revert to defaults.
+-- Migration 022 repairs this by replicating those orphans into every
+-- logical database and removing them from '_global'.
 --
 -- Statement-level idempotence (IF NOT EXISTS / IF EXISTS) keeps a
 -- partially-applied run safe to re-execute.

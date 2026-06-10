@@ -246,6 +246,21 @@ just re-armed) was fixed on the spot; these remain:
   (pg-settings-scope branch): migration 021 adds `db_id` to `settings`
   with PK `(db_id, key)` and an explicit `'_global'` tier for
   registry-role config; scoped/global accessor split on `SettingsStore`.
+- ~~**021's landing orphaned per-DB-role rows in `'_global'`**~~ —
+  **fixed**: adversarial review disproved the "seeds re-check benignly"
+  claim — invisible `reports.default_briefing_seeded` /
+  `dashboard.featured_report_id` rows made the boot seed create a
+  duplicate Daily Briefing (and resurrect user-deleted seeds), and
+  operator overrides (`task.{id}.enabled`, GC retention) reverted to
+  defaults. Migration 022 backfills the orphans (`task.%`, `reports.%`,
+  the featured-report pointer) into *every* logical database — the
+  faithful reading of the pre-021 shared table — and drops them from
+  `'_global'`. Pinned by
+  `pg_settings_backfill_replicates_orphaned_per_db_keys`.
+- ~~**`purge_database_data` leaks the purged DB's `task_runs`**~~ —
+  **fixed**: the purge now deletes the database's ledger rows too; a
+  deleted DB's GC never runs again, so they'd have leaked forever on a
+  shared cluster. Pinned by `pg_purge_database_data_deletes_task_runs`.
 - **Crash-loop bound.** Reclaim deliberately does *not* consume the retry
   budget (`ledger_expired_lease_reclaimed_without_bumping_attempts` pins
   this): desktop restarts mid-task are routine and must not abandon healthy

@@ -522,6 +522,10 @@ impl DatabaseStore for PostgresStorage {
             // Scoped settings rows (task.{id}.* state, seed flags). The
             // global tier is untouched: '_global' is never a database id.
             "settings",
+            // Ledger history. A deleted database's GC sweep never runs
+            // again, so any rows left behind would leak forever on a
+            // shared cluster.
+            "task_runs",
         ];
 
         for table in &tables {

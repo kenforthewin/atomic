@@ -1468,7 +1468,10 @@ mod postgres_tests {
     /// must land in the `'_global'` scope and the new composite primary key
     /// must hold. Rewinds the shared test schema to the old shape (legal
     /// because the suite runs with `--test-threads=1`), seeds legacy rows,
-    /// and re-runs `initialize()`.
+    /// and re-runs `initialize()` — which replays 021 *and* 022, so the
+    /// per-DB-role task key is lifted back out of `'_global'` by the
+    /// backfill (see `pg_settings_backfill_replicates_orphaned_per_db_keys`
+    /// for the fan-out itself).
     #[tokio::test]
     async fn pg_settings_migration_lands_existing_rows_in_global() {
         let Some(ref s) = postgres_storage().await else {
@@ -1502,25 +1505,21 @@ mod postgres_tests {
 
         s.initialize().await.unwrap();
 
-        // Every pre-existing row landed in the global tier…
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT db_id, key FROM settings ORDER BY key")
+        // The registry-role row landed in the global tier; the per-DB-role
+        // task key passed through it but was lifted out again by 022's
+        // backfill, so '_global' holds exactly the registry config.
+        let global_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT db_id, key FROM settings WHERE db_id = '_global' ORDER BY key")
                 .fetch_all(s.pool())
                 .await
                 .unwrap();
         assert_eq!(
-            rows,
-            vec![
-                ("_global".to_string(), "provider".to_string()),
-                (
-                    "_global".to_string(),
-                    "task.draft_pipeline.last_run".to_string()
-                ),
-            ]
+            global_rows,
+            vec![("_global".to_string(), "provider".to_string())]
         );
 
         // …visible through the global accessors and invisible to scoped
-        // reads (the orphaned task key benignly resets per-DB state).
+        // reads.
         assert_eq!(
             s.get_global_setting("provider").await.unwrap(),
             Some("ollama".to_string())
@@ -1536,6 +1535,151 @@ mod postgres_tests {
         .execute(s.pool())
         .await;
         assert!(dup.is_err(), "duplicate (db_id, key) must violate the PK");
+    }
+
+    /// Migration 022 on the post-021 orphaned state: per-DB-role keys
+    /// stranded in `'_global'` by 021's landing must be replicated into
+    /// every logical database — preserving the pre-021 "one shared table
+    /// applies everywhere" behavior, so no duplicate Daily Briefing
+    /// re-seed and no reverted operator overrides — and removed from
+    /// `'_global'`; genuinely-global registry keys stay put. Rewinds only
+    /// the 022 marker (the table already has the 021 shape), seeds the
+    /// orphans, and re-runs `initialize()`.
+    #[tokio::test]
+    async fn pg_settings_backfill_replicates_orphaned_per_db_keys() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        // Rewind the 022 marker. Settings are already empty (truncated by
+        // `postgres_storage()`); re-create this test's two logical
+        // databases so the fan-out has at least two targets.
+        sqlx::raw_sql(
+            "DELETE FROM schema_version WHERE version >= 22;
+             DELETE FROM databases WHERE id IN ('backfill_alpha', 'backfill_beta');",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO databases (id, name, is_default, created_at) VALUES
+                 ('backfill_alpha', 'Backfill Alpha', 0, $1),
+                 ('backfill_beta', 'Backfill Beta', 0, $1)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        // The post-021 orphaned state: per-DB-role keys stranded in
+        // '_global' alongside a genuinely-global registry key.
+        sqlx::query(
+            "INSERT INTO settings (db_id, key, value) VALUES
+                 ('_global', 'task.task_runs_gc.retain_days', '7'),
+                 ('_global', 'reports.default_briefing_seeded', 'true'),
+                 ('_global', 'dashboard.featured_report_id', 'report-1'),
+                 ('_global', 'ai_provider', 'openrouter')",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        s.initialize().await.unwrap();
+
+        let db_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM databases ORDER BY id")
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+        assert!(db_ids.len() >= 2, "the fan-out needs at least two targets");
+
+        for key in [
+            "task.task_runs_gc.retain_days",
+            "reports.default_briefing_seeded",
+            "dashboard.featured_report_id",
+        ] {
+            let scoped: Vec<String> = sqlx::query_scalar(
+                "SELECT db_id FROM settings WHERE key = $1 AND db_id <> '_global' ORDER BY db_id",
+            )
+            .bind(key)
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                scoped, db_ids,
+                "'{key}' must be replicated under every database id"
+            );
+            assert!(
+                s.get_global_setting(key).await.unwrap().is_none(),
+                "'{key}' must be gone from the '_global' tier"
+            );
+        }
+
+        // Values survive the move and surface through the scoped accessors
+        // — exactly what keeps the seed guard and operator overrides live.
+        assert_eq!(
+            s.with_db_id("backfill_alpha")
+                .get_setting("task.task_runs_gc.retain_days")
+                .await
+                .unwrap(),
+            Some("7".to_string())
+        );
+        assert_eq!(
+            s.with_db_id("backfill_beta")
+                .get_setting("reports.default_briefing_seeded")
+                .await
+                .unwrap(),
+            Some("true".to_string())
+        );
+
+        // The genuinely-global key is untouched: still global, never scoped.
+        assert_eq!(
+            s.get_global_setting("ai_provider").await.unwrap(),
+            Some("openrouter".to_string())
+        );
+        let scoped_provider: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM settings WHERE key = 'ai_provider' AND db_id <> '_global'",
+        )
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+        assert_eq!(scoped_provider, 0, "'ai_provider' must not be replicated");
+    }
+
+    /// `purge_database_data` must clear the purged database's ledger too:
+    /// a deleted DB's GC sweep never runs again, so surviving `task_runs`
+    /// rows would leak forever on a shared cluster. The sibling database's
+    /// history is untouched.
+    #[tokio::test]
+    async fn pg_purge_database_data_deletes_task_runs() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let doomed = s.with_db_id("purge_runs_doomed");
+        let survivor = s.with_db_id("purge_runs_survivor");
+
+        let task_id = format!("purge::{}", uuid::Uuid::new_v4());
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let doomed_row = task_run_row(&task_id, "subject", TaskRunState::Succeeded, &past, None);
+        let survivor_row = task_run_row(&task_id, "subject", TaskRunState::Succeeded, &past, None);
+        doomed.insert_task_run(&doomed_row).await.unwrap();
+        survivor.insert_task_run(&survivor_row).await.unwrap();
+
+        s.purge_database_data("purge_runs_doomed").await.unwrap();
+
+        assert!(
+            doomed.get_task_run(&doomed_row.id).await.unwrap().is_none(),
+            "the purged database's ledger rows must be deleted"
+        );
+        assert!(
+            survivor
+                .get_task_run(&survivor_row.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the sibling database's ledger must survive the purge"
+        );
     }
 
     /// Cross-`db_id` fencing for the ledger sweep: runnable rows are scoped
