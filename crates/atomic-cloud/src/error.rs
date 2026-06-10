@@ -52,6 +52,12 @@ pub enum CloudError {
     #[error("invalid email address {0:?}")]
     InvalidEmail(String),
 
+    /// No active `account_databases` row exists for an account the cache
+    /// was asked to load — either provisioning never finished or the row
+    /// was deleted out from under a live credential.
+    #[error("account {0} has no active tenant database")]
+    MissingTenantDatabase(String),
+
     /// A `cloud_tokens.scope` value didn't parse as a [`TokenScope`]
     /// (`account` | `database` | `mcp`).
     ///

@@ -23,12 +23,16 @@
 //! the magic-link flow, Mailgun and Stripe clients, and the signup frontend
 //! are salvageable from git history.
 
+pub mod account_cache;
+pub mod auth;
 pub mod control_plane;
 pub mod error;
 pub mod provision;
 pub mod reserved_subdomains;
 pub mod tokens;
 
+pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
+pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use control_plane::ControlPlane;
 pub use error::CloudError;
 pub use provision::{

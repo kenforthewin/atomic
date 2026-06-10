@@ -39,6 +39,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Error handling
 thiserror = "1"
 
+# Middleware plumbing — `LocalBoxFuture` for the actix Service impls and
+# JSON denial bodies; versions match atomic-server's usage of both.
+futures = "0.3"
+serde_json = "1"
+
 # Control-plane primitives — versions match the rest of the workspace.
 chrono = "0.4"
 data-encoding = "2"     # base32 tenant-database names; hex token hashes
@@ -48,5 +53,5 @@ url = "2"               # tenant-database URL construction
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-# `FutureExt::catch_unwind` powers the test-database cleanup guard.
-futures = "0.3"
+# (none beyond the regular dependencies — `futures` above also powers the
+# test-database cleanup guard's `FutureExt::catch_unwind`.)

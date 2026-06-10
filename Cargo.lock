@@ -613,6 +613,7 @@ dependencies = [
  "data-encoding",
  "futures",
  "rand 0.8.5",
+ "serde_json",
  "sha2",
  "sqlx",
  "thiserror 1.0.69",
