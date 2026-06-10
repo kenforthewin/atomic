@@ -92,6 +92,12 @@ The `atomic-cloud` binary composes `atomic-server`'s route registration with
 its own middleware, control-plane handle, and account-management routes. The
 self-hosted `atomic-server` binary keeps working exactly as before.
 
+An earlier, never-shipped management-plane prototype lives at
+`crates/atomic-cloud` on main (Fly machine-per-customer model). This plan
+supersedes its architecture wholesale: the Fly provisioning dies, but the
+magic-link flow, Mailgun and Stripe clients, and signup frontend are
+salvageable. Treat it as a parts bin, not a base.
+
 ## Tenant model
 
 - Each account owns one Postgres database on the shared cluster, named
@@ -133,8 +139,8 @@ oauth_clients       (account_id, client_id, client_secret_hash,
                      client_name, redirect_uris, created_at)
 oauth_codes         (code_hash, account_id, client_id, code_challenge,
                      redirect_uri, created_at, expires_at, used, token_id)
-provider_credentials (account_id, provider, encrypted_key, model_config,
-                      created_at, rotated_at)
+provider_credentials (account_id, provider, origin, external_key_id?,
+                      encrypted_key, model_config, created_at, rotated_at)
 ```
 
 Notes:
@@ -144,9 +150,8 @@ Notes:
   in self-hosted) — each subdomain has its own OAuth identity.
 - `cloud_tokens` is the single source of truth for all tokens (account-scope,
   KB-scope, MCP-scope). No per-tenant `api_tokens` table in cloud.
-- `provider_credentials.encrypted_key` — encrypted at rest. Mechanism TBD
-  (KMS vs pgcrypto vs sealed-secrets pattern); see provider key custody
-  section.
+- `provider_credentials.encrypted_key` — encrypted at rest via the
+  `KeyVault` trait; see the provider management section.
 
 ### Token model
 
@@ -193,6 +198,11 @@ the tenant's database → wrap in `DatabaseManager` → insert.
 Idle TTL number is TBD; rough target 10–30 minutes for v1. Tune from
 production data.
 
+Eviction must not orphan live WebSocket subscribers — `event_tx` lives in
+the entry, and a quiet-but-connected WS client would otherwise keep
+listening on a channel nothing publishes to. Skip entries with
+`event_tx.receiver_count() > 0`, or count WS activity as a touch.
+
 ### Db extractor change
 
 Today's `Db` extractor (in `atomic-server`) reads from `AppState.manager`.
@@ -204,6 +214,13 @@ The chokepoint check: if `AuthPrincipal.allowed_db_id` is set, the resolved
 `db_id` (from `X-Atomic-Database` header or `last_active_db_id`) must
 match. Single test asserts this. Without it, a database-scoped MCP token
 could read another KB via header override.
+
+A sibling chokepoint test covers the cross-tenant case: a valid session or
+token for account A presented on account B's subdomain must fail with
+401/404. The `.atomic.cloud` cookie crosses subdomains by design, so this
+check — middleware step 4's `WHERE account_id = ?` — is what actually
+enforces browser-level tenant isolation. The middleware provides it; the
+test pins it.
 
 ### "Active database" concept
 
@@ -295,11 +312,16 @@ provisions per process. Happy path ~2–5 seconds. Steps:
 6. Seed `databases` row inside the tenant DB: `(id='default', name='Default',
    is_default=true)`.
 7. Seed per-DB default settings (wiki prompt template, etc.). Do **not** seed
-   provider config — that's in control plane via BYOK.
+   provider config — that lives in the control plane (see provider
+   management).
 8. Seed the default Report (per the reports plan).
-9. Insert `account_databases (account_id, cluster_id, db_name, status='active')`.
-10. Flip `accounts.status='active'`.
-11. Create session, set cookie, redirect to `<slug>.atomic.cloud/`.
+9. Provision the managed OpenRouter key: create a runtime key via the
+   provisioning API with the plan's monthly credit allowance and monthly
+   reset, encrypt via `KeyVault`, insert `provider_credentials`
+   (`origin='managed'`).
+10. Insert `account_databases (account_id, cluster_id, db_name, status='active')`.
+11. Flip `accounts.status='active'`.
+12. Create session, set cookie, redirect to `<slug>.atomic.cloud/`.
 
 **Idempotency** — each step is independently idempotent so a crashed signup
 can be retried or reaped:
@@ -307,13 +329,18 @@ can be retried or reaped:
 - `SELECT FROM pg_database WHERE datname = ?` before CREATE.
 - Migrations are idempotent via `schema_version` + advisory lock.
 - Seed inserts use `ON CONFLICT DO NOTHING`.
+- Managed-key provisioning checks for an existing `provider_credentials`
+  row first (OpenRouter key creation itself is not idempotent); rollback
+  deletes any key that was created before the crash, using
+  `external_key_id`.
 
 **No starter atoms** — render an empty-state UI explaining how to capture a
 first atom rather than seeding fake content.
 
 **Safety-net reaper** picks up rows stuck in `status='provisioning'` for >5
 minutes and either retries or rolls back (DROP DATABASE WITH FORCE if the
-database exists, mark `accounts.status='failed'`, free the subdomain).
+database exists, delete any provisioned OpenRouter key, mark
+`accounts.status='failed'`, free the subdomain).
 
 ### Account deletion
 
@@ -322,15 +349,20 @@ gone.
 
 1. Revoke all `cloud_tokens` (set `revoked_at`).
 2. Invalidate all `sessions`.
-3. Evict `AccountCache` entry, drain pool.
-4. Terminate stragglers: `SELECT pg_terminate_backend(pid) FROM
+3. Delete the managed OpenRouter key via the provisioning API
+   (`origin='managed'` rows).
+4. Take a final logical dump to the backup bucket (`backups/final/`,
+   30-day retention) — the operator's only undo for a fat-fingered
+   confirmation or a deletion-path bug. See Backups & DR.
+5. Evict `AccountCache` entry, drain pool.
+6. Terminate stragglers: `SELECT pg_terminate_backend(pid) FROM
    pg_stat_activity WHERE datname = ?` (or rely on `DROP DATABASE WITH FORCE`).
-5. `DROP DATABASE ... WITH (FORCE)`.
-6. Delete `account_databases` row.
-7. Hard-delete `accounts` row.
-8. Reserve the subdomain in `subdomains_reserved (subdomain, expires_at =
-   now() + 90 days)` to prevent confusion if external clients (RSS readers,
-   MCP configs) still point at the old name.
+7. `DROP DATABASE ... WITH (FORCE)`.
+8. Delete `account_databases` row.
+9. Hard-delete `accounts` row.
+10. Reserve the subdomain in `subdomains_reserved (subdomain, expires_at =
+    now() + 90 days)` to prevent confusion if external clients (RSS readers,
+    MCP configs) still point at the old name.
 
 ### Schema migration on deploy
 
@@ -380,6 +412,11 @@ back the binary to version M while some tenants are on schema M+1 means old
 code reads extra columns it doesn't know about (ignored). The forward-roll
 later is a no-op for already-migrated tenants and a retry for the rest.
 
+**Multi-pod boot**: every pod boots in migrating mode and races over the
+fleet. Per-tenant advisory locks make this safe, merely wasteful. If deploy
+times start to hurt, have one pod claim the migration run via a
+control-plane lock — deferred until it hurts.
+
 ### Failure recovery & the reaper
 
 One periodic job, runs every ~60s, takes a control-plane advisory lock keyed
@@ -423,6 +460,10 @@ Provider calls + tenant DB writes
 
 Initial cap numbers are guesses calibrated to ~50 active tenants per pod. Real
 numbers come from load testing; ship conservative, raise from metrics.
+
+Caps are **per-pod**: a noisy tenant's effective fleet-wide concurrency is
+`per-tenant cap × pod count`. Fine at small pod counts; remember this when
+scaling out, because adding pods loosens fairness without any config change.
 
 ### Selection algorithm
 
@@ -474,8 +515,9 @@ Two layers:
    re-dispatch.
 2. **Per-tenant circuit breaker** — 3 consecutive 429s in 60s pauses that
    tenant's dispatch for a cool-down (60s, doubling). State lives in
-   `accounts.provider_paused_until`. Also handles "BYOK key expired" — the
-   breaker stays open until the user fixes it.
+   `accounts.provider_paused_until`. Also handles "BYOK key expired" and
+   managed-key credit exhaustion (OpenRouter 402) — the breaker stays open
+   until the key is fixed, the allowance resets, or the user upgrades.
 
 ### How each work-type lands
 
@@ -516,11 +558,59 @@ Sequencing-wise: unification can land first, before atomic-cloud exists, and
 ride to production in self-hosted. By the time atomic-cloud's dispatcher is
 built, all background work is already going through one ledger.
 
-## Provider key custody **[drafted]**
+## Provider management **[drafted]**
 
-BYOK only for v1 (decided earlier). Each tenant provides their own OpenRouter
-or OpenAI-compatible key. Platform-proxy with metering is a future paid-tier.
-Ollama is **not supported in cloud** — local-only by definition.
+**Managed by default, BYOK as the escape hatch.** Every account gets a
+platform-provisioned OpenRouter key at signup, created via OpenRouter's
+provisioning API with a hard per-key credit limit and native monthly reset
+(midnight UTC). Users who want to exceed platform allowances — or just
+prefer their own billing — can switch to a BYOK OpenRouter or
+OpenAI-compatible key in settings. Platform-proxy with per-call metering
+stays v2. Ollama is **not supported in cloud** — local-only by definition.
+
+This supersedes the earlier "BYOK only for v1" decision. Rationale: BYOK at
+the front door puts "go create an OpenRouter account and paste a key"
+before the product's first magic moment — embedding, tagging, and chat are
+all dead until then, which is exactly backwards for a growth-first launch.
+And the provisioning API removes the original margin-risk argument: each
+tenant key carries a credit limit that *OpenRouter* enforces, with
+automatic monthly resets, so worst-case spend per account is the allowance
+we set, regardless of bugs in our own metering. Signup becomes "magic link
+→ it works."
+
+### Managed key lifecycle
+
+| Event | Action |
+|---|---|
+| Signup | Create runtime key (`POST /api/v1/keys`) with the plan's monthly credit allowance + monthly reset; encrypt, store with `origin='managed'` |
+| Plan change | PATCH the key's credit limit |
+| Allowance exhausted | OpenRouter 402 → jobs sit in ledger as `blocked_on_credits`; chat/wiki/reports return a structured "out of AI credits" error with reset date + upgrade link |
+| Switch to BYOK | New `origin='user'` row, flip `accounts.active_provider`; managed key kept (switching back is a column flip) |
+| Account deletion | DELETE the key via provisioning API |
+
+Two pieces of shared infrastructure come with this:
+
+- The **master OpenRouter account** funds every managed tenant. Its prepaid
+  balance needs monitoring and auto-top-up, and it is a single point of
+  failure — an empty balance is an all-tenants outage.
+- The **provisioning key** can mint runtime keys against our balance.
+  Crown-jewel custody, same as the KeyVault master key: sealed-secret at
+  deploy, never stored in the control plane.
+
+### Model curation (managed mode)
+
+We pay for managed inference, so we pick the models:
+
+- **The embedding model is pinned fleet-wide.** Not user-changeable:
+  switching embedding models invalidates every stored vector and triggers a
+  full re-embed billed to the platform.
+- Tagging, wiki, and chat run on a curated list of 2–3 cost-effective
+  models; users pick within the list.
+- Frontier-model access is a paid-tier feature flag (`plans.feature_flags`),
+  not a free-tier option.
+
+BYOK accounts choose models freely — their key, their bill. (An
+embedding-model switch still forces a full re-embed; warn loudly.)
 
 ### Storage schema
 
@@ -528,6 +618,8 @@ Ollama is **not supported in cloud** — local-only by definition.
 provider_credentials (
     account_id              TEXT NOT NULL,
     provider                TEXT NOT NULL,   -- 'openrouter' | 'openai_compat'
+    origin                  TEXT NOT NULL,   -- 'managed' | 'user'
+    external_key_id         TEXT,            -- OpenRouter key id; managed rows only
     encrypted_key           BYTEA NOT NULL,
     nonce                   BYTEA NOT NULL,  -- 96-bit, fresh per encryption
     encryption_version      INT  NOT NULL,   -- master-key generation
@@ -537,14 +629,15 @@ provider_credentials (
     last_used_at            TIMESTAMPTZ,
     last_validated_at       TIMESTAMPTZ,
     last_validation_error   TEXT,
-    PRIMARY KEY (account_id, provider)
+    PRIMARY KEY (account_id, provider, origin)
 )
 ```
 
-`accounts.active_provider` selects which row is the active config. Composite
-PK on `(account_id, provider)` allows a user to keep multiple providers
-configured (e.g., OpenRouter for general use + a self-hosted OpenAI-compatible
-endpoint) and switch.
+`origin` distinguishes platform-provisioned from user-provided keys;
+`external_key_id` is the OpenRouter identifier needed to PATCH/DELETE
+managed keys. `accounts.active_provider` selects which row is the active
+config. The composite PK lets managed and BYOK rows coexist, so switching
+between them is a column flip, not a re-provision.
 
 Model selection (`model_config`) lives **with the key** in control plane, not
 in per-DB settings. Rationale: provider config is account-level — different
@@ -578,11 +671,13 @@ next access. Master key custody: sealed-secret at deploy, backed up
 out-of-band. **Loss of master key = unrecoverable keys.** Document
 explicitly in operator runbook.
 
-### Key entry & validation
+### BYOK entry & validation
 
-- Signup flow has an optional "Add provider key" step. Skippable.
-- Settings page at `<slug>.atomic.cloud/settings/provider` for post-signup
-  entry/rotation.
+Signup never asks for a key — the managed key covers onboarding. BYOK is a
+settings-page feature:
+
+- Settings page at `<slug>.atomic.cloud/settings/provider` for key
+  entry/rotation and switching between managed and BYOK.
 - **Existing key is never displayed.** Status only ("configured ✓, last
   validated 3h ago"). Rotation = replace.
 - **Validation on save** — test call against the provider before storing:
@@ -590,14 +685,19 @@ explicitly in operator runbook.
   Failure surfaces provider's error verbatim, rejects the save.
 - **Periodic re-validation** — deferred. See Open questions.
 
-### Empty-state (no key configured)
+### Blocked states
 
-- Atoms create/update fine.
-- Embedding pipeline jobs sit in the ledger with `state='blocked_on_provider'`;
-  not dispatched until a key is configured.
-- Wiki regen, reports, semantic search, chat return a structured
-  "configure your AI provider" error.
-- Frontend banner directs to the settings page.
+With managed keys there is no "no provider configured" state for new
+accounts. Two blocked states remain, both reusing the same ledger-hold
+pattern as `account_upgrading`:
+
+- **`blocked_on_credits`** (managed) — monthly allowance exhausted.
+  Background jobs sit in the ledger until the allowance resets or the user
+  upgrades; interactive features return the structured "out of AI credits"
+  error. Atoms still create/update fine.
+- **`blocked_on_provider`** (BYOK) — key expired, revoked, or out of the
+  user's own credits. Jobs sit until the user fixes the key; frontend
+  banner directs to the settings page.
 
 ### Plumbing — control plane → AtomicCore
 
@@ -615,6 +715,9 @@ through atomic-core's settings-table fallback). If no row exists, pass a
 "missing key" state that reject calls with a structured error.
 
 ### Live rotation
+
+Same path for both origins; for managed keys, "new key" means provisioning
+a replacement via the API and deleting the old one after the swap.
 
 1. Validate new key.
 2. UPSERT `provider_credentials` (bump `rotated_at`).
@@ -636,16 +739,20 @@ through atomic-core's settings-table fallback). If no row exists, pass a
 
 ### Audit / visibility in settings UI
 
-- Provider, configured ✓ (no value).
+- Provider, managed vs BYOK, configured ✓ (no key value, ever).
+- Managed: allowance usage ("62% of monthly AI credits used, resets June 1")
+  — from the OpenRouter key-usage endpoint, cached, with the local advisory
+  counter as fallback.
 - Last validated, last used.
-- Current status (Healthy / Paused / Failing).
+- Current status (Healthy / Paused / Out of credits / Failing).
 - Recent errors (timestamp + redacted message).
 
 ### Trust-building docs (launch task)
 
 Customer-facing "where does my key go?" page explaining encryption,
-in-process decryption, no-logging discipline. B2B norm. Not architectural,
-but write it for launch.
+in-process decryption, no-logging discipline (managed keys get the same
+treatment as BYOK keys). B2B norm. Not architectural, but write it for
+launch.
 
 ## Observability, quotas, billing **[drafted]**
 
@@ -718,7 +825,7 @@ plans (
     name TEXT NOT NULL,
     monthly_price_cents INT,
     atom_limit INT,                       -- NULL = unlimited
-    llm_calls_monthly_limit INT,
+    ai_credits_monthly_cents INT,         -- managed-key allowance; OpenRouter enforces
     kb_limit INT,
     storage_bytes_limit BIGINT,
     feature_flags JSONB
@@ -744,31 +851,43 @@ references it.
 | CloudAuth middleware | Rate limit | 429 with `Retry-After` |
 | Atom create | `atoms_count < limit` | 402 with quota error |
 | KB create | `kb_count < limit` | 402 with quota error |
-| Provider call site | `llm_calls < limit` | 402; background jobs **block** (not fail) |
+| Provider call (managed) | OpenRouter per-key credit limit (hard stop) | 402 → jobs **block** as `blocked_on_credits` |
 | Periodic reaper | Storage bytes recompute | Week 1 warn; week 2 restrict writes; **no auto-delete** |
+
+AI spend is the one quota we do **not** enforce ourselves: the managed
+key's credit limit is the hard stop, enforced by OpenRouter with native
+monthly reset. The internal `quota_usage` AI counter is advisory UX ("80%
+of allowance used") — a bug in it can mislead a progress bar but can't run
+up a bill. BYOK accounts have no platform AI limit at all.
 
 Quota-exceeded response shape:
 
 ```json
 { "error": "quota_exceeded",
-  "metric": "llm_calls",
-  "current": 5000,
-  "limit": 5000,
-  "resets_at": "2026-06-01T00:00:00Z",
+  "metric": "ai_credits",
+  "current": 50,
+  "limit": 50,
+  "resets_at": "2026-07-01T00:00:00Z",
   "upgrade_url": "https://app.atomic.cloud/billing" }
 ```
 
-Background jobs that hit LLM limits **sit in the ledger** (not fail) until
-quota resets or user upgrades. Same hold-message pattern as account-upgrading.
+Background jobs that exhaust the AI allowance **sit in the ledger** (not
+fail) until it resets or the user upgrades. Same hold-message pattern as
+account-upgrading.
 
-Period rollover: 1-hour-cadence job inserts new `period_start` rows when due.
-Old rows kept for billing/audit.
+Period rollover: AI allowances reset natively at OpenRouter (monthly,
+midnight UTC) — no rollover code needed for them. A 1-hour-cadence job
+inserts new `period_start` rows for the remaining metrics. Old rows kept
+for billing/audit.
 
 ### Billing
 
-**v1 model:** BYOK + subscription. User pays for platform (hosting, features).
-AI costs go to OpenRouter directly via their BYOK key. No AI-call billing,
-no margin risk. Platform-proxy with per-call metering is v2.
+**v1 model:** subscription with included AI credits. Each plan's monthly
+price includes a managed-key allowance (`ai_credits_monthly_cents`) that
+OpenRouter enforces per key — no per-call metering, no usage-based
+invoicing, and the margin math is just "allowance < price." BYOK accounts
+take the AI cost off our books entirely. Platform-proxy with metered
+passthrough is v2.
 
 ```sql
 stripe_customers (
@@ -812,38 +931,80 @@ stripe_subscriptions (
 **Never auto-delete data for payment failure.** Hard-delete only on explicit
 user action. Right ethically and commercially (re-conversion is real revenue).
 
-**Free tier (defaults, product-tunable):** 100 atoms, 50 LLM calls/mo, 1 KB,
-100 MB storage. All features available — no feature-gated free tier.
+**Free tier (defaults, product-tunable):** 100 atoms, $0.50/mo AI credits
+(managed key, cheap curated models — embedding and tagging a normal user's
+notes costs pennies), 1 KB, 100 MB storage. All features available — no
+feature-gated free tier. Chat gets a per-message output-token cap on free;
+arbitrary generation is the free-inference abuse vector, embeddings are not.
 
 **Trials:** 14 days of paid tier on signup, **no card required**. Auto-
 downgrade to free after. Accepts signup-spam risk for friction-free
 onboarding; magic-link + rate-limited signup bounds the abuse vector.
 
+## Backups & disaster recovery **[drafted]**
+
+Database-per-tenant makes per-tenant backup natural; hard-delete v1 makes it
+mandatory. Without this section, a reaper bug, a bad migration, or a
+fat-fingered delete confirmation is unrecoverable customer data loss.
+
+### v1: nightly logical dumps
+
+- Nightly `pg_dump -Fc` per tenant database **plus the control plane**,
+  streamed to object storage (`backups/<date>/acct_<uuid>.dump`). Driven by
+  the same reaper/job-runner machinery, with a concurrency cap.
+- Retention: 14 daily + 8 weekly. Bucket lifecycle rules, not custom code.
+- **Final dump on account deletion** — written to `backups/final/` with
+  30-day retention before `DROP DATABASE` (step 4 of the deletion
+  sequence). Hard delete stays the product behavior; this is the operator's
+  undo, not a user feature.
+- **Restore runbook** — write and *rehearse* before launch: restore dump
+  into a fresh database → repoint `account_databases.db_name` → evict the
+  AccountCache entry. Per-tenant restore never touches other tenants —
+  that's the payoff of database-per-tenant.
+- **Monitoring** — alert when any tenant's last successful backup is >36h
+  old. An unmonitored backup job is a placebo.
+
+### Deferred
+
+- **PITR via WAL archiving** (wal-g / pgBackRest) — cluster-wide
+  point-in-time recovery. Restore lands on a side cluster (all tenants at
+  once), then per-tenant dump/restore from there. Add when nightly
+  granularity stops being acceptable.
+- Cross-region replicas, per-tenant continuous streaming — not v1.
+
 ## Open questions (carried across sections)
 
-- **Account signup mechanism.** Email/password vs magic-link vs OAuth IdP
-  (GitHub etc.). Magic-link likely simplest to operate; email deliverability
-  becomes critical-path.
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
-  rate-limited token issuance. Invite-only or paid-from-day-one is much
-  simpler.
+  rate-limited token issuance — and with managed keys, free signups are
+  platform-funded inference, so per-account allowances cap the blast radius
+  but mass signup is the residual vector. Invite-only beta sidesteps all of
+  this *and* defers the entire billing build; strongly consider it as the
+  launch shape.
+- **Email deliverability.** Magic-link-only auth makes it critical-path
+  (decided 2026-05-25). Mailgun client exists in the prototype crate;
+  domain warmup, SPF/DKIM, and a bounce strategy still need an owner.
 - **MCP token default scope.** Account-wide vs per-KB. Affects the MCP setup
   UX in Claude Desktop's config.
 - **AccountCache idle-TTL and hard-cap numbers.** Tune from real load; initial
   guess 10–30 min TTL, cap at 1000 entries.
-- **Provider key custody model** (the whole [stub] above).
-- **Periodic provider-key re-validation.** Reaper-driven daily check
+- **Periodic BYOK re-validation.** Reaper-driven daily check
   (capped, skipped for active keys) catches quietly-expired keys before
   users hit them through failed work. Costs one test call per active key per
   day against the user's quota; adds reaper complexity. Decide once we see
-  how often keys quietly expire in practice.
+  how often keys quietly expire in practice. (Managed keys don't quietly
+  expire — their failure mode is allowance exhaustion, already handled.)
+- **Master OpenRouter account ops.** Auto-top-up threshold, balance
+  alerting, and what happens to tenants in the minutes after the balance
+  hits zero (presumably 402s → circuit breakers → recovery on top-up; verify).
+- **Included-credit sizing per tier.** Free placeholder is $0.50/mo; paid
+  tiers need allowance numbers that keep "allowance < price" with margin.
 - **Per-tenant metric cardinality strategy.** Top-N high-cardinality buckets
   + aggregate vs buy a high-cardinality TSDB (Mimir, VictoriaMetrics).
   Deferable until we have noisy tenants.
 - **Plan tier structure beyond free.** Number of paid tiers, what features
   differ, pricing. Product/business call.
-- **Free-tier limits (numbers).** Placeholder is 100 atoms / 50 LLM calls /
-  1 KB / 100 MB.
+- **Free-tier limits (numbers).** Placeholder is 100 atoms / $0.50 AI
+  credits / 1 KB / 100 MB.
 - **Storage quota unit — bytes vs atoms.** Bytes is more accurate for cost,
   atoms is easier to communicate. Likely bytes for enforcement, atoms for
   marketing copy.
@@ -853,6 +1014,8 @@ onboarding; magic-link + rate-limited signup bounds the abuse vector.
 - **account_events retention policy.** 90 days default? Per-event-type
   retention?
 - **Tracing sample rate.** 1–5% baseline; tail sampling for errors.
+- **Backup numbers.** 14 daily + 8 weekly is a placeholder; revisit
+  alongside the PITR decision once tenant count and database sizes are real.
 
 ## Decisions log
 
@@ -896,8 +1059,8 @@ and link the discussion if it lives in a memory file.
 - **2026-05-25** — Seed defaults: default KB (`db_id='default'`), per-DB
   default settings, default Report (per reports plan). No starter atoms;
   empty-state UI instead.
-- **2026-05-25** — BYOK for provider keys in v1. Platform-proxy is a future
-  paid-tier addition.
+- **2026-05-25** — ~~BYOK for provider keys in v1.~~ **Superseded
+  2026-06-09**: managed keys by default, BYOK as opt-in (see below).
 - **2026-05-25** — Authentication is **magic-link only**. No password
   infrastructure. Email verification falls out of signup naturally — clicking
   the link proves email ownership.
@@ -962,3 +1125,34 @@ and link the discussion if it lives in a memory file.
   only on explicit user action.
 - **2026-05-25** — Trials: 14 days of paid tier on signup, no card required.
   Auto-downgrade to free after.
+- **2026-06-09** — Provider keys are **managed by default**: per-tenant
+  OpenRouter keys created via the provisioning API with a hard credit limit
+  and native monthly reset. BYOK (OpenRouter or OpenAI-compatible) remains
+  as an opt-in escape hatch. Supersedes "BYOK only for v1" — BYOK at the
+  front door blocked the first magic moment, and per-key credit limits
+  remove the margin-risk argument.
+- **2026-06-09** — AI-spend enforcement is delegated to OpenRouter per-key
+  credit limits; internal `quota_usage` AI counters are advisory UX only.
+  AI allowances are denominated in credits (free placeholder $0.50/mo), not
+  call counts.
+- **2026-06-09** — Managed mode pins the embedding model fleet-wide and
+  curates the tagging/wiki/chat model list; frontier models are a paid-tier
+  feature flag. BYOK accounts choose freely (with a loud re-embed warning
+  on embedding-model switches).
+- **2026-06-09** — Billing v1 is subscription with included AI credits
+  (managed-key allowance enforced by OpenRouter). No per-call metering.
+  Replaces "BYOK + subscription" as the v1 billing model.
+- **2026-06-09** — Backups: nightly per-tenant logical dumps to object
+  storage (14 daily + 8 weekly), final dump to `backups/final/` (30-day
+  retention) before account deletion, restore runbook rehearsed before
+  launch, backup-staleness alerting. PITR via WAL archiving deferred.
+- **2026-06-09** — Second auth chokepoint test: credentials for account A
+  presented on account B's subdomain must fail. The `.atomic.cloud` cookie
+  crosses subdomains by design, so this test is what pins browser-level
+  tenant isolation.
+- **2026-06-09** — AccountCache eviction skips entries with live WebSocket
+  subscribers (`event_tx.receiver_count() > 0`), or WS activity counts as
+  a touch.
+- **2026-06-09** — The old `crates/atomic-cloud` prototype (Fly
+  machine-per-customer; never shipped) is a parts bin: salvage magic-link,
+  Mailgun, Stripe clients and signup frontend; the Fly provisioning dies.
