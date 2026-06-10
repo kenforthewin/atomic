@@ -101,6 +101,12 @@ impl FromRequest for Db {
     fn from_request(req: &HttpRequest, _payload: &mut actix_web::dev::Payload) -> Self::Future {
         let req = req.clone();
         Box::pin(async move {
+            // AppState is required even when a RequestDatabaseManager
+            // extension is present (unlike EventChannel, which only touches
+            // AppState on its fallback path): request_manager takes the
+            // state for its fallback unconditionally, and every viable
+            // composition registers AppState anyway since the auth
+            // middleware and most handlers need it.
             let state = req.app_data::<web::Data<AppState>>().ok_or_else(|| {
                 actix_web::error::ErrorInternalServerError("AppState not configured")
             })?;

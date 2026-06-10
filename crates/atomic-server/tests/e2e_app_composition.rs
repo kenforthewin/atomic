@@ -441,8 +441,9 @@ async fn granular_composition_postgres() {
 /// way `configure_app` does, and asserts the result behaves like the
 /// all-in-one: public `/health` answers, `/api` admits a valid token and
 /// rejects a missing one, `/mcp` 401s with OAuth discovery. If a route
-/// migrates between pieces (or a piece starts baking auth in), this fails
-/// before any embedder-side composition does.
+/// migrates between pieces, this fails before any embedder-side
+/// composition does. (It cannot detect a piece baking in auth of the same
+/// scheme — both probes would still pass under a redundant double-wrap.)
 async fn run_granular_composition(backend: Backend) {
     let Some(ctx) = TestCtx::new(backend).await else {
         return;
