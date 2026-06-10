@@ -52,6 +52,20 @@ sha2 = "0.10"           # SHA-256 token/session hashing
 url = "2"               # tenant-database URL construction
 uuid = { version = "1", features = ["v4"] }
 
+# Scratch directory backing the inert fallback `AppState` (see
+# `server::FallbackAppState`) — process-lifetime, removed on drop.
+tempfile = "3"
+
 [dev-dependencies]
-# (none beyond the regular dependencies — `futures` above also powers the
-# test-database cleanup guard's `FutureExt::catch_unwind`.)
+# (`futures` above also powers the test-database cleanup guard's
+# `FutureExt::catch_unwind`.)
+# Shared mock OpenAI-compat server, so tenant pipelines in the e2e suite
+# never hit real providers.
+atomic-test-support = { path = "../atomic-test-support" }
+# HTTP client for the e2e suite — drives the composed cloud server over a
+# real port with explicit Host headers. Version matches the workspace.
+reqwest = { version = "0.12", features = ["json"] }
+# WebSocket client for the tenant-isolation and eviction-pinning e2e tests.
+# Versions match atomic-server's e2e suite.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

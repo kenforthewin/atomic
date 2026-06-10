@@ -32,6 +32,15 @@ pub enum CloudError {
         source: atomic_core::AtomicCoreError,
     },
 
+    /// A filesystem operation failed (e.g. creating the fallback scratch
+    /// directory). `context` says what was being attempted.
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The requested subdomain doesn't match the signup slug rule
     /// (`[a-z0-9-]{3,32}`).
     #[error("invalid subdomain {0:?}: must be 3-32 chars of [a-z0-9-]")]

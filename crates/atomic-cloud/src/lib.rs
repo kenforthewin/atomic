@@ -29,6 +29,7 @@ pub mod control_plane;
 pub mod error;
 pub mod provision;
 pub mod reserved_subdomains;
+pub mod server;
 pub mod tokens;
 
 pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
@@ -39,6 +40,7 @@ pub use provision::{
     delete_account, provision_account, tenant_db_name, ClusterConfig, NewAccount,
     ProvisionedAccount,
 };
+pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState};
 pub use tokens::{
     create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,
     TokenScope,

@@ -84,6 +84,21 @@ impl ControlPlane {
         &self.pool
     }
 
+    /// Resolve a subdomain to its `accounts.id`, regardless of account
+    /// status. Operator tooling (the CLI addresses accounts by subdomain);
+    /// the request path uses its own status-aware lookup in the auth
+    /// middleware.
+    pub async fn account_id_by_subdomain(
+        &self,
+        subdomain: &str,
+    ) -> Result<Option<String>, CloudError> {
+        sqlx::query_scalar("SELECT id FROM accounts WHERE subdomain = $1")
+            .bind(subdomain)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CloudError::db("looking up account by subdomain"))
+    }
+
     /// Run pending control-plane migrations; returns how many were applied
     /// (zero when the schema is already current).
     ///
