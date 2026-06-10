@@ -3,6 +3,7 @@
 //! The binary entry point is in `main.rs`. This module re-exports the pieces
 //! needed to spin up a test server.
 
+pub mod app;
 pub mod auth;
 mod db_extractor;
 pub mod error;

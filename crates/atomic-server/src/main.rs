@@ -6,29 +6,21 @@
 mod config;
 
 use actix_cors::Cors;
-use actix_web::{http::header, middleware, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{http::header, middleware, web, App, HttpServer};
 use atomic_server::{
-    auth, event_bridge,
+    app::configure_app,
+    event_bridge,
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
-    mcp, mcp_auth, routes,
+    mcp,
     state::{AppState, ServerEvent, SetupClaimLimiter, SetupToken},
-    ws, Scalar, Servable,
 };
 use clap::Parser;
 use config::{Cli, Command, TokenAction};
 use std::sync::Arc;
 use std::time::Duration;
-use utoipa::OpenApi;
 
 const SETUP_CLAIMED_AT_KEY: &str = "setup.claimed_at";
-
-async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
-}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -673,74 +665,13 @@ async fn run_server(
     HttpServer::new(move || {
         let cors = build_cors(cors_public_url.as_deref());
 
+        // CORS + compression are deployment concerns and stay here; the
+        // route table itself lives in `atomic_server::app::configure_app`
+        // so tests and other embedders compose the identical wiring.
         App::new()
             .wrap(cors)
             .wrap(middleware::Compress::default())
-            .app_data(app_state.clone())
-            // Public routes (no auth)
-            .route("/health", web::get().to(health))
-            .route(
-                "/api/docs/openapi.json",
-                web::get().to(atomic_server::openapi_spec),
-            )
-            .service(Scalar::with_url(
-                "/api/docs",
-                atomic_server::ApiDoc::openapi(),
-            ))
-            .route("/ws", web::get().to(ws::ws_handler))
-            // OAuth discovery (public, no auth)
-            .route(
-                "/.well-known/oauth-authorization-server",
-                web::get().to(routes::oauth::metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource",
-                web::get().to(routes::oauth::resource_metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/mcp",
-                web::get().to(routes::oauth::resource_metadata),
-            )
-            // Instance setup (public, no auth — guarded by zero-token check)
-            .route(
-                "/api/setup/status",
-                web::get().to(routes::setup::setup_status),
-            )
-            .route(
-                "/api/setup/claim",
-                web::post().to(routes::setup::claim_instance),
-            )
-            // OAuth flow (public, no auth)
-            .route("/oauth/register", web::post().to(routes::oauth::register))
-            .route(
-                "/oauth/authorize",
-                web::get().to(routes::oauth::authorize_page),
-            )
-            .route(
-                "/oauth/authorize",
-                web::post().to(routes::oauth::authorize_approve),
-            )
-            .route("/oauth/token", web::post().to(routes::oauth::token))
-            .route(
-                "/api/exports/{id}/download",
-                web::get().to(routes::exports::download_export),
-            )
-            // MCP endpoint with MCP-aware auth
-            .service(
-                web::scope("/mcp")
-                    .wrap(mcp_auth::McpAuth {
-                        state: app_state.clone(),
-                    })
-                    .service(mcp_transport.clone().scope()),
-            )
-            // Authenticated API routes
-            .service(
-                web::scope("/api")
-                    .wrap(auth::BearerAuth {
-                        state: app_state.clone(),
-                    })
-                    .configure(routes::configure_routes),
-            )
+            .configure(configure_app(app_state.clone(), mcp_transport.clone()))
     })
     .workers(4)
     .bind((bind_owned.as_str(), port))?
@@ -826,6 +757,7 @@ fn is_local_origin(origin: &str) -> bool {
 mod tests {
     use super::*;
     use actix_web::test as actix_test;
+    use atomic_server::app::health;
 
     #[actix_web::test]
     async fn cors_allows_mcp_session_headers_from_local_origins() {

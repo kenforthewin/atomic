@@ -4,9 +4,13 @@
 //! suite against SQLite (always) and Postgres (when `ATOMIC_TEST_DATABASE_URL`
 //! is set). Each `TestCtx` owns an `AppState` backed by the chosen store
 //! plus a freshly minted API token; `test_app(&ctx)` produces an actix-web
-//! `App` that mirrors the real server's `/api` scope (auth wrapper + full
-//! route registration). `spawn_live_server(&ctx)` binds a real port for
-//! tests that need WebSocket upgrades or concurrent HTTP load.
+//! `App` composed via `atomic_server::app::configure_app` — the exact route
+//! table the production binary serves (public routes, `/mcp` behind McpAuth,
+//! `/api` behind BearerAuth). `spawn_live_server(&ctx)` binds the same
+//! composition to a real port for tests that need WebSocket upgrades or
+//! concurrent HTTP load. The only difference from production is what the
+//! caller wraps around it: `main.rs` adds CORS + compression, tests add
+//! nothing.
 //!
 //! The wiremock-backed `MockAiServer` and the Postgres truncate helper live
 //! in the workspace's `atomic-test-support` crate so atomic-core and
@@ -16,6 +20,7 @@
 #![allow(dead_code)] // Helpers are per-test; not every test uses every helper.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::{web, App};
 use atomic_core::DatabaseManager;
@@ -23,12 +28,10 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
-use atomic_server::auth::BearerAuth;
+use atomic_server::app::configure_app;
 use atomic_server::export_jobs::ExportJobManager;
 use atomic_server::log_buffer::LogBuffer;
 use atomic_server::mcp::AtomicMcpTransport;
-use atomic_server::mcp_auth::McpAuth;
-use atomic_server::routes;
 use atomic_server::state::{AppState, SetupClaimLimiter};
 
 // Re-export the shared mock + truncate helper so test files can keep using
@@ -196,11 +199,23 @@ impl TestCtx {
     }
 }
 
-/// Build an actix-web `App` that mirrors the real server's `/api` scope:
-/// `BearerAuth` middleware around the full set of authenticated routes.
-/// Public routes (`/health`, OAuth discovery, setup) are intentionally
-/// omitted — they have their own coverage in `api_atoms.rs` and don't
-/// participate in the per-backend e2e contract.
+/// Construct the MCP transport for a test context. Mirrors `main.rs`: built
+/// once per server (outside any worker factory) so all workers share one
+/// session manager.
+fn mcp_transport_for(ctx: &TestCtx) -> AtomicMcpTransport {
+    AtomicMcpTransport::new(
+        Arc::clone(&ctx.state.manager),
+        ctx.state.event_tx.clone(),
+        Duration::from_secs(30),
+    )
+}
+
+/// Build an in-process actix-web `App` composed from
+/// `atomic_server::app::configure_app` — the same function `main.rs` uses,
+/// so the test app serves the production route table verbatim (public
+/// routes, `/mcp` behind McpAuth, `/api` behind BearerAuth). Only the
+/// deployment middleware (CORS, compression) is absent, because that's
+/// layered by the caller in production and tests layer nothing.
 pub fn test_app(
     ctx: &TestCtx,
 ) -> App<
@@ -212,92 +227,7 @@ pub fn test_app(
         InitError = (),
     >,
 > {
-    App::new().app_data(ctx.state.clone()).service(
-        web::scope("/api")
-            .wrap(BearerAuth {
-                state: ctx.state.clone(),
-            })
-            .configure(routes::configure_routes),
-    )
-}
-
-/// Like [`spawn_live_server`] but also mounts the public (no-auth) routes
-/// the OAuth + setup flow needs: `/oauth/register`, `/oauth/authorize`
-/// (GET + POST), `/oauth/token`, and `/api/setup/*`. The MCP and WS
-/// endpoints are still attached so callers can mix-and-match.
-pub async fn spawn_live_server_with_public_routes(ctx: &TestCtx) -> LiveServer {
-    use actix_web::{web, App, HttpServer};
-    use std::time::Duration;
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    let base_url = format!("http://{}", addr);
-
-    let mcp_transport = AtomicMcpTransport::new(
-        std::sync::Arc::clone(&ctx.state.manager),
-        ctx.state.event_tx.clone(),
-        Duration::from_secs(30),
-    );
-
-    let state_for_factory = ctx.state.clone();
-    let server = HttpServer::new(move || {
-        let state = state_for_factory.clone();
-        App::new()
-            .app_data(state.clone())
-            .route("/ws", web::get().to(atomic_server::ws::ws_handler))
-            // OAuth public flow — these endpoints check `state.public_url`
-            // themselves and 404 when it's unset, which is why
-            // `TestCtxOptions::public_url` must be populated.
-            .route(
-                "/oauth/register",
-                web::post().to(atomic_server::routes::oauth::register),
-            )
-            .route(
-                "/oauth/authorize",
-                web::get().to(atomic_server::routes::oauth::authorize_page),
-            )
-            .route(
-                "/oauth/authorize",
-                web::post().to(atomic_server::routes::oauth::authorize_approve),
-            )
-            .route(
-                "/oauth/token",
-                web::post().to(atomic_server::routes::oauth::token),
-            )
-            // Setup endpoints — public, gated by the token state of the
-            // active DB rather than bearer auth.
-            .route(
-                "/api/setup/status",
-                web::get().to(atomic_server::routes::setup::setup_status),
-            )
-            .route(
-                "/api/setup/claim",
-                web::post().to(atomic_server::routes::setup::claim_instance),
-            )
-            .service(
-                web::scope("/mcp")
-                    .wrap(McpAuth {
-                        state: state.clone(),
-                    })
-                    .service(mcp_transport.clone().scope()),
-            )
-            .service(
-                web::scope("/api")
-                    .wrap(BearerAuth {
-                        state: state.clone(),
-                    })
-                    .configure(routes::configure_routes),
-            )
-    })
-    .workers(1)
-    .listen(listener)
-    .expect("attach listener")
-    .run();
-
-    let handle = server.handle();
-    actix_web::rt::spawn(server);
-
-    LiveServer { base_url, handle }
+    App::new().configure(configure_app(ctx.state.clone(), mcp_transport_for(ctx)))
 }
 
 // ==================== Real-port test server ====================
@@ -315,19 +245,18 @@ impl LiveServer {
     }
 }
 
-/// Start a real `HttpServer` on `127.0.0.1:0` mirroring the production route
-/// table (`/api` scope behind `BearerAuth`, plus the public `/ws` endpoint
-/// and the `/mcp` scope behind `McpAuth`). The returned `base_url` points
-/// at the bound port; the server runs on its own tokio task until the
-/// handle is stopped.
+/// Start a real `HttpServer` on `127.0.0.1:0` serving the production route
+/// table via `atomic_server::app::configure_app` — exactly as `main.rs`
+/// composes it, minus the CORS/compression middleware the binary layers on
+/// top. The returned `base_url` points at the bound port; the server runs
+/// on its own tokio task until the handle is stopped.
 ///
-/// Used by the WebSocket, MCP, and concurrent-storm suites that need a
-/// real TCP listener — `actix_web::test::init_service` is in-process only
-/// and can't satisfy `actix-ws`'s upgrade response or model real concurrent
-/// HTTP load.
+/// Used by the WebSocket, MCP, OAuth/setup, and concurrent-storm suites
+/// that need a real TCP listener — `actix_web::test::init_service` is
+/// in-process only and can't satisfy `actix-ws`'s upgrade response or
+/// model real concurrent HTTP load.
 pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
-    use actix_web::{web, App, HttpServer};
-    use std::time::Duration;
+    use actix_web::{App, HttpServer};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
@@ -335,40 +264,14 @@ pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
 
     // MCP transport must be constructed once and cloned into each worker so
     // the LocalSessionManager is shared. Mirrors the wiring in main.rs.
-    let mcp_transport = AtomicMcpTransport::new(
-        std::sync::Arc::clone(&ctx.state.manager),
-        ctx.state.event_tx.clone(),
-        Duration::from_secs(30),
-    );
+    let mcp_transport = mcp_transport_for(ctx);
 
     let state_for_factory = ctx.state.clone();
     let server = HttpServer::new(move || {
-        let state = state_for_factory.clone();
-        App::new()
-            .app_data(state.clone())
-            .route("/ws", web::get().to(atomic_server::ws::ws_handler))
-            // Export download is intentionally public (one-time token in
-            // the query string) and lives outside the bearer scope in
-            // `main.rs`. The e2e harness mirrors that layout so the
-            // export tests can follow `download_path` without auth.
-            .route(
-                "/api/exports/{id}/download",
-                web::get().to(atomic_server::routes::exports::download_export),
-            )
-            .service(
-                web::scope("/mcp")
-                    .wrap(McpAuth {
-                        state: state.clone(),
-                    })
-                    .service(mcp_transport.clone().scope()),
-            )
-            .service(
-                web::scope("/api")
-                    .wrap(BearerAuth {
-                        state: state.clone(),
-                    })
-                    .configure(routes::configure_routes),
-            )
+        App::new().configure(configure_app(
+            state_for_factory.clone(),
+            mcp_transport.clone(),
+        ))
     })
     .workers(1)
     .listen(listener)

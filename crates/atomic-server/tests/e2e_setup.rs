@@ -18,7 +18,7 @@ mod support;
 
 use serde_json::{json, Value};
 use std::time::Duration;
-use support::{spawn_live_server_with_public_routes, Backend, TestCtx, TestCtxOptions};
+use support::{spawn_live_server, Backend, TestCtx, TestCtxOptions};
 
 async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
     let opts = TestCtxOptions {
@@ -27,7 +27,7 @@ async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
         ..Default::default()
     };
     let ctx = TestCtx::new_with(backend, opts).await?;
-    let server = spawn_live_server_with_public_routes(&ctx).await;
+    let server = spawn_live_server(&ctx).await;
     Some((ctx, server))
 }
 
