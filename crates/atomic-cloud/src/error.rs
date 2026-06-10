@@ -1,61 +1,34 @@
-//! API error handling — maps CloudError to HTTP responses
+//! Error type shared across atomic-cloud.
 
-use actix_web::HttpResponse;
-use serde::Serialize;
-
-#[derive(Debug, Serialize)]
-pub struct ApiErrorResponse {
-    pub error: String,
-}
-
+/// Errors produced by the cloud composition layer.
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
-    #[error("Not found: {0}")]
-    NotFound(String),
+    /// The configured control-plane connection URL failed to parse.
+    #[error("invalid control-plane database URL: {0}")]
+    InvalidUrl(String),
 
-    #[error("Bad request: {0}")]
-    BadRequest(String),
+    /// A Postgres database name contained characters outside
+    /// `[A-Za-z0-9_-]`. Database names are interpolated into DDL as quoted
+    /// identifiers (they cannot be bound as parameters), so anything more
+    /// exotic is rejected outright.
+    #[error("invalid database name {0:?}: only [A-Za-z0-9_-] is permitted")]
+    InvalidDatabaseName(String),
 
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
-
-    #[error("Conflict: {0}")]
-    Conflict(String),
-
-    #[error("Stripe error: {0}")]
-    Stripe(String),
-
-    #[error("Fly.io error: {0}")]
-    Fly(String),
-
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
+    /// A control-plane database operation failed. `context` says what was
+    /// being attempted; `source` is the underlying sqlx error.
+    #[error("{context}: {source}")]
+    Database {
+        context: String,
+        #[source]
+        source: sqlx::Error,
+    },
 }
 
 impl CloudError {
-    pub fn to_response(&self) -> HttpResponse {
-        let status = match self {
-            CloudError::NotFound(_) => actix_web::http::StatusCode::NOT_FOUND,
-            CloudError::BadRequest(_) => actix_web::http::StatusCode::BAD_REQUEST,
-            CloudError::Unauthorized(_) => actix_web::http::StatusCode::UNAUTHORIZED,
-            CloudError::Conflict(_) => actix_web::http::StatusCode::CONFLICT,
-            CloudError::Stripe(_) | CloudError::Fly(_) | CloudError::Internal(_) => {
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
-            }
-            CloudError::Database(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-        };
-
-        HttpResponse::build(status).json(ApiErrorResponse {
-            error: self.to_string(),
-        })
-    }
-}
-
-impl From<CloudError> for HttpResponse {
-    fn from(e: CloudError) -> Self {
-        e.to_response()
+    /// Build a closure that wraps an [`sqlx::Error`] with `context` —
+    /// keeps `map_err` call sites to one line.
+    pub(crate) fn db(context: impl Into<String>) -> impl FnOnce(sqlx::Error) -> CloudError {
+        let context = context.into();
+        move |source| CloudError::Database { context, source }
     }
 }
