@@ -315,11 +315,16 @@ impl AtomicCore {
 
         let storage = storage::StorageBackend::Postgres(pg_storage);
 
-        // Seed default category tags if tags table is empty
+        // Seed default category tags if tags table is empty. The emptiness
+        // check keeps deliberately deleted categories deleted; the upsert
+        // (rather than a plain insert) keeps concurrent opens of the same
+        // logical database from racing each other into a duplicate-key error.
         let all_tags = storage.get_all_tags_impl().await?;
         if all_tags.is_empty() {
             for category in &["Topics", "People", "Locations", "Organizations", "Events"] {
-                storage.create_tag_impl(category, None).await?;
+                storage
+                    .get_or_create_tag_with_parent_id(category, None)
+                    .await?;
             }
             tracing::info!("Seeded default category tags in Postgres");
         }

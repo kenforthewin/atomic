@@ -89,11 +89,14 @@ pub async fn run_task(
 
     match task.run(core, ctx).await {
         Ok(()) => {
-            // Advance the definition fast-path *only* on terminal success —
-            // `is_due` keys off it, so a failure leaves the task due and the
-            // ledger row's `next_attempt_at` alone decides when to retry.
-            state::set_last_run(core, task.id(), Utc::now()).await?;
+            // Settle the ledger row first, then advance the definition
+            // fast-path — and *only* on terminal success: `is_due` keys off
+            // `last_run`, so a failure leaves the task due and the ledger
+            // row's `next_attempt_at` alone decides when to retry. In this
+            // order a `set_last_run` error can't strand a succeeded run in
+            // `running` until its lease expires and gets re-executed.
             let _ = handle.complete(None).await?;
+            state::set_last_run(core, task.id(), Utc::now()).await?;
             (ctx.event_cb)(TaskEvent::Completed {
                 task_id: task.id().to_string(),
                 db_id: db_id.to_string(),
