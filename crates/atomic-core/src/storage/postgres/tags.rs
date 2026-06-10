@@ -980,6 +980,100 @@ impl TagStore for PostgresStorage {
         Ok(())
     }
 
+    async fn get_or_create_tag_with_parent_id(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> StorageResult<(String, bool)> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+            return Err(AtomicCoreError::Validation(format!(
+                "Invalid tag name: '{}'",
+                name
+            )));
+        }
+
+        // Look up by (name, parent_id, db_id) — matches the unique index
+        // `idx_tags_name_parent` (LOWER(name), COALESCE(parent_id, ''), db_id).
+        let existing: Option<String> = if let Some(pid) = parent_id {
+            sqlx::query_scalar(
+                "SELECT id FROM tags WHERE LOWER(name) = LOWER($1) AND parent_id = $2 AND db_id = $3 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(pid)
+            .bind(&self.db_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+        } else {
+            sqlx::query_scalar(
+                "SELECT id FROM tags WHERE LOWER(name) = LOWER($1) AND parent_id IS NULL AND db_id = $2 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(&self.db_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?
+        };
+
+        if let Some(id) = existing {
+            return Ok((id, false));
+        }
+
+        // Insert, racing with concurrent callers via ON CONFLICT on the
+        // unique index. RETURNING id gives us back either the row we
+        // inserted or the row that won the race.
+        let new_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let (actual_id, inserted_at): (String, String) = sqlx::query_as(
+            "INSERT INTO tags (id, name, parent_id, created_at, db_id) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (LOWER(name), COALESCE(parent_id, ''), db_id)
+             DO UPDATE SET name = tags.name
+             RETURNING id, created_at",
+        )
+        .bind(&new_id)
+        .bind(trimmed)
+        .bind(parent_id)
+        .bind(&now)
+        .bind(&self.db_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!(
+                "Failed to upsert tag '{}': {}",
+                trimmed, e
+            ))
+        })?;
+
+        // We "created" the tag iff the returned created_at matches the
+        // value we attempted to insert — otherwise we lost the race and
+        // got back somebody else's row.
+        Ok((actual_id, inserted_at == now))
+    }
+
+    async fn link_tags_to_atom_with_source(
+        &self,
+        atom_id: &str,
+        tag_ids: &[String],
+        source: &str,
+    ) -> StorageResult<()> {
+        for tag_id in tag_ids {
+            sqlx::query(
+                "INSERT INTO atom_tags (atom_id, tag_id, db_id, source) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(atom_id)
+            .bind(tag_id)
+            .bind(&self.db_id)
+            .bind(source)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(
+                format!("Failed to link tag to atom: {}", e),
+            ))?;
+        }
+        Ok(())
+    }
+
     async fn get_tag_tree_for_llm(&self) -> StorageResult<String> {
         // Step 1: Get top-level category tags flagged as auto-tag targets.
         let top_level_tags: Vec<(String, String, String)> = sqlx::query_as(

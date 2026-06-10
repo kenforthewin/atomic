@@ -133,6 +133,25 @@ jobs:
             --locked \
             -- --test-threads=1
 
+      # End-to-end HTTP suites exercise the full atomic-server stack
+      # (BearerAuth middleware, X-Atomic-Database routing, route handlers,
+      # background pipeline) against Postgres. The suite is parameterized
+      # over the same Backend enum used in atomic-core's pipeline tests, so
+      # the SQLite arms also run here as a sanity check — duplicated with
+      # the rust-test job but cheap, and surfaces backend skew faster.
+      - name: Run atomic-server e2e tests against Postgres
+        run: |
+          cargo test \
+            -p atomic-server \
+            --test e2e_auth \
+            --test e2e_atom_pipeline \
+            --test e2e_multi_db \
+            --test e2e_websocket \
+            --test e2e_concurrent \
+            --test e2e_mcp \
+            --locked \
+            -- --test-threads=1
+
   frontend-test:
     name: Frontend tests
     runs-on: ubuntu-22.04

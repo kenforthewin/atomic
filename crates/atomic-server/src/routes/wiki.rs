@@ -11,9 +11,12 @@ pub async fn get_all_wiki_articles(db: Db) -> HttpResponse {
     ok_or_error(db.0.get_all_wiki_articles().await)
 }
 
-#[utoipa::path(get, path = "/api/wiki/{tag_id}", params(("tag_id" = String, Path, description = "Tag ID")), responses((status = 200, description = "Wiki article with citations", body = atomic_core::WikiArticleWithCitations), (status = 404, description = "No article for tag", body = ApiErrorResponse)), tag = "wiki")]
+#[utoipa::path(get, path = "/api/wiki/{tag_id}", params(("tag_id" = String, Path, description = "Tag ID")), responses((status = 200, description = "Wiki article with citations (or `null` if no article exists for this tag)", body = atomic_core::WikiArticleWithCitations)), tag = "wiki")]
 pub async fn get_wiki(db: Db, path: web::Path<String>) -> HttpResponse {
     let tag_id = path.into_inner();
+    // Returns `200 null` (not 404) when no article exists. The frontend
+    // store relies on this — an error response would set an error state
+    // instead of treating "no wiki" as a normal empty result.
     ok_or_error(db.0.get_wiki(&tag_id).await)
 }
 

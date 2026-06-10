@@ -17,6 +17,11 @@ pub struct SearchRequest {
     pub limit: Option<i32>,
     /// Minimum similarity threshold
     pub threshold: Option<f32>,
+    /// Restrict results to atoms tagged with any of these tag IDs
+    #[serde(default)]
+    pub scope_tag_ids: Vec<String>,
+    /// Restrict to atoms created/updated within the last N days
+    pub since_days: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
@@ -53,6 +58,12 @@ pub async fn search(db: Db, body: web::Json<SearchRequest>) -> HttpResponse {
     let mut options = SearchOptions::new(req.query, mode, req.limit.unwrap_or(20));
     if let Some(threshold) = req.threshold {
         options = options.with_threshold(threshold);
+    }
+    if !req.scope_tag_ids.is_empty() {
+        options = options.with_scope(req.scope_tag_ids);
+    }
+    if let Some(days) = req.since_days {
+        options = options.with_since_days(Some(days));
     }
 
     let result = db.0.search(options).await;

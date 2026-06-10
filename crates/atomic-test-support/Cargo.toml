@@ -1,0 +1,34 @@
+[package]
+name = "atomic-test-support"
+version = "0.1.0"
+edition = "2021"
+description = "Shared test fixtures for the Atomic workspace (mock AI provider, Postgres helpers). Only useful as a dev-dep."
+license = "MIT"
+publish = false
+
+[lib]
+name = "atomic_test_support"
+path = "src/lib.rs"
+
+[dependencies]
+# wiremock is the reason this crate exists — it serves the OpenAI-compat
+# endpoints the test pipeline hits. Plain dep (not optional) so consumers
+# don't have to enable a feature to get the mock server.
+wiremock = "0.6"
+
+# JSON helpers for building deterministic mock responses.
+serde_json = "1"
+
+# Provider-side SSE streaming for the chat mock. Kept lightweight; pulled
+# in unconditionally because slice 3 wants it and the framing helpers are
+# tiny.
+futures-util = "0.3"
+
+# Postgres truncation helper, gated behind the `postgres` feature so the
+# default build of this crate stays sqlx-free for fast SQLite-only test
+# runs.
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"], optional = true }
+
+[features]
+default = []
+postgres = ["sqlx"]

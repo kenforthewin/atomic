@@ -12,10 +12,9 @@ mod support;
 
 use atomic_core::{AtomicCore, CreateAtomRequest, EmbeddingEvent, UpdateAtomRequest};
 use support::{
-    await_pipeline, event_collector, setup_core, Backend, EventRx, MockAiServer,
-    EDGE_SIMILARITY_THRESHOLD,
+    await_pipeline, chunk_ids_for_atom, event_collector, open_bare, pending_pipeline_job_count,
+    setup_core, Backend, EventRx, MockAiServer, EDGE_SIMILARITY_THRESHOLD,
 };
-use tempfile::TempDir;
 
 #[tokio::test]
 async fn full_pipeline_sqlite() {
@@ -193,9 +192,25 @@ async fn await_queue_completed(rx: &mut EventRx) -> Vec<EmbeddingEvent> {
 
 #[tokio::test]
 async fn queued_embedding_missing_provider_marks_failed_sqlite() {
-    let dir = TempDir::new().expect("create tempdir");
-    let core =
-        AtomicCore::open_or_create(dir.path().join("pipeline.db")).expect("open sqlite test db");
+    run_queued_embedding_missing_provider_marks_failed(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn queued_embedding_missing_provider_marks_failed_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "queued_embedding_missing_provider_marks_failed_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_queued_embedding_missing_provider_marks_failed(Backend::Postgres).await;
+}
+
+async fn run_queued_embedding_missing_provider_marks_failed(backend: Backend) {
+    let handle = open_bare(backend).await.expect("open bare core");
+    let core = &handle.core;
 
     let (cb, mut rx) = event_collector();
     let created = core
@@ -243,19 +258,34 @@ async fn queued_embedding_missing_provider_marks_failed_sqlite() {
         "failed embedding status should persist an error"
     );
 
-    let conn = rusqlite::Connection::open(core.db_path()).expect("open sqlite db");
-    let queued: i64 = conn
-        .query_row("SELECT COUNT(*) FROM atom_pipeline_jobs", [], |row| {
-            row.get(0)
-        })
-        .expect("count pipeline jobs");
-    assert_eq!(queued, 0, "terminal failed job should be cleared");
+    assert_eq!(
+        pending_pipeline_job_count(core).await,
+        0,
+        "terminal failed job should be cleared from atom_pipeline_jobs"
+    );
 }
 
 #[tokio::test]
 async fn queue_progress_reports_tagging_only_after_embedding_sqlite() {
+    run_queue_progress_reports_tagging_only_after_embedding(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn queue_progress_reports_tagging_only_after_embedding_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "queue_progress_reports_tagging_only_after_embedding_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_queue_progress_reports_tagging_only_after_embedding(Backend::Postgres).await;
+}
+
+async fn run_queue_progress_reports_tagging_only_after_embedding(backend: Backend) {
     let mock = MockAiServer::start().await;
-    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+    let handle = setup_core(backend, &mock.base_url())
         .await
         .expect("test harness setup");
     let core = &handle.core;
@@ -358,8 +388,24 @@ async fn queue_progress_reports_tagging_only_after_embedding_sqlite() {
 
 #[tokio::test]
 async fn reembed_all_is_embedding_only_sqlite() {
+    run_reembed_all_is_embedding_only(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn reembed_all_is_embedding_only_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "reembed_all_is_embedding_only_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_reembed_all_is_embedding_only(Backend::Postgres).await;
+}
+
+async fn run_reembed_all_is_embedding_only(backend: Backend) {
     let mock = MockAiServer::start().await;
-    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+    let handle = setup_core(backend, &mock.base_url())
         .await
         .expect("test harness setup");
     let core = &handle.core;
@@ -370,7 +416,7 @@ async fn reembed_all_is_embedding_only_sqlite() {
         "initial auto-tagging should apply Physics: {:?}",
         before.tags
     );
-    let chunk_ids_before = sqlite_chunk_ids(core, &atom_id);
+    let chunk_ids_before = chunk_ids_for_atom(core, &atom_id).await;
 
     mock.reset_counts();
     let (cb, mut rx) = event_collector();
@@ -412,7 +458,7 @@ async fn reembed_all_is_embedding_only_sqlite() {
         after.tags
     );
     assert_eq!(
-        sqlite_chunk_ids(core, &atom_id),
+        chunk_ids_for_atom(core, &atom_id).await,
         chunk_ids_before,
         "embed-only re-embedding should preserve existing chunk rows"
     );
@@ -420,13 +466,30 @@ async fn reembed_all_is_embedding_only_sqlite() {
 
 #[tokio::test]
 async fn embedding_model_change_reembeds_existing_chunks_sqlite() {
+    run_embedding_model_change_reembeds_existing_chunks(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn embedding_model_change_reembeds_existing_chunks_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "embedding_model_change_reembeds_existing_chunks_postgres: skipping \
+             (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_embedding_model_change_reembeds_existing_chunks(Backend::Postgres).await;
+}
+
+async fn run_embedding_model_change_reembeds_existing_chunks(backend: Backend) {
     let mock = MockAiServer::start().await;
-    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+    let handle = setup_core(backend, &mock.base_url())
         .await
         .expect("test harness setup");
     let core = &handle.core;
     let atom_id = create_and_await(core, "quantum mechanics particles waves").await;
-    let chunk_ids_before = sqlite_chunk_ids(core, &atom_id);
+    let chunk_ids_before = chunk_ids_for_atom(core, &atom_id).await;
 
     mock.reset_counts();
     let (cb, mut rx) = event_collector();
@@ -461,27 +524,32 @@ async fn embedding_model_change_reembeds_existing_chunks_sqlite() {
         events
     );
     assert_eq!(
-        sqlite_chunk_ids(core, &atom_id),
+        chunk_ids_for_atom(core, &atom_id).await,
         chunk_ids_before,
         "embedding model changes should preserve existing chunk rows"
     );
 }
 
-fn sqlite_chunk_ids(core: &AtomicCore, atom_id: &str) -> Vec<String> {
-    let conn = rusqlite::Connection::open(core.db_path()).expect("open sqlite db");
-    let mut stmt = conn
-        .prepare("SELECT id FROM atom_chunks WHERE atom_id = ?1 ORDER BY chunk_index")
-        .expect("prepare chunk query");
-    stmt.query_map([atom_id], |row| row.get::<_, String>(0))
-        .expect("query chunk ids")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect chunk ids")
-}
-
 #[tokio::test]
 async fn retry_tagging_is_tagging_only_sqlite() {
+    run_retry_tagging_is_tagging_only(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn retry_tagging_is_tagging_only_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "retry_tagging_is_tagging_only_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_retry_tagging_is_tagging_only(Backend::Postgres).await;
+}
+
+async fn run_retry_tagging_is_tagging_only(backend: Backend) {
     let mock = MockAiServer::start().await;
-    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+    let handle = setup_core(backend, &mock.base_url())
         .await
         .expect("test harness setup");
     let core = &handle.core;
@@ -783,4 +851,91 @@ async fn run_delete_cascade(backend: Backend) {
 fn involves(edge: &atomic_core::SemanticEdge, a: &str, b: &str) -> bool {
     (edge.source_atom_id == a && edge.target_atom_id == b)
         || (edge.source_atom_id == b && edge.target_atom_id == a)
+}
+
+// ==================== Cross-backend search threshold parity ====================
+
+#[tokio::test]
+async fn search_threshold_parity_sqlite() {
+    run_search_threshold_parity(Backend::Sqlite).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn search_threshold_parity_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!("search_threshold_parity_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        return;
+    }
+    run_search_threshold_parity(Backend::Postgres).await;
+}
+
+/// Both backends measure cosine similarity, but their underlying distance
+/// operators differ: sqlite-vec returns Euclidean distance on normalized
+/// vectors (similarity = 1 − d²/2), pgvector's `<=>` returns cosine distance
+/// directly (similarity = 1 − d). For normalized embeddings the two converge
+/// on the same number, so the same threshold must admit the same atom set on
+/// either backend. The bag-of-words mock embedder normalizes by construction,
+/// making the input shape match production usage.
+///
+/// This test pins that contract: three atoms (two physics-vocab, one biology),
+/// a physics-vocab query, threshold 0.5. The two physics atoms must clear the
+/// threshold, the biology atom must not, and the top score must be inside a
+/// generous-but-bounded interval so a metric regression on either side trips
+/// the assertion.
+async fn run_search_threshold_parity(backend: Backend) {
+    use atomic_core::{SearchMode, SearchOptions};
+
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(backend, &mock.base_url())
+        .await
+        .expect("test harness setup");
+    let core = &handle.core;
+
+    let physics_a =
+        create_and_await(core, "quantum particles atomic waves momentum spin").await;
+    let physics_b = create_and_await(
+        core,
+        "atomic particles quantum waves spin momentum scattering",
+    )
+    .await;
+    let _biology =
+        create_and_await(core, "biology cells dna evolution organisms genetics").await;
+
+    let options = SearchOptions {
+        query: "quantum particles atomic waves".to_string(),
+        mode: SearchMode::Semantic,
+        limit: 10,
+        threshold: 0.5,
+        ..Default::default()
+    };
+    let results = core.search(options).await.expect("semantic search");
+
+    let returned: std::collections::HashSet<String> =
+        results.iter().map(|r| r.atom.atom.id.clone()).collect();
+    let expected: std::collections::HashSet<String> =
+        [physics_a.clone(), physics_b.clone()].into_iter().collect();
+
+    assert_eq!(
+        returned, expected,
+        "threshold=0.5 should admit exactly the two physics atoms on both backends; \
+         got scores={:?}",
+        results
+            .iter()
+            .map(|r| (r.atom.atom.id.clone(), r.similarity_score))
+            .collect::<Vec<_>>()
+    );
+
+    // Sanity-check the score range. Self-similarity of a normalized unit vector
+    // is 1.0; near-duplicates land in [0.5, 1.0]. A score outside that range
+    // means the distance→similarity transform is wrong on this backend.
+    let top_score = results
+        .iter()
+        .map(|r| r.similarity_score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        (0.5..=1.0).contains(&top_score),
+        "top similarity {} should land in [0.5, 1.0] for a normalized cosine metric",
+        top_score
+    );
 }

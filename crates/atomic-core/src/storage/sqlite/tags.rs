@@ -503,6 +503,91 @@ impl SqliteStorage {
             .map_err(|e| AtomicCoreError::Validation(e))
     }
 
+    pub(crate) fn get_or_create_tag_with_parent_id_impl(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> StorageResult<(String, bool)> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+
+        // SQLite's tags table enforces UNIQUE(name COLLATE NOCASE) globally
+        // — names collide regardless of parent. We still query with the
+        // parent_id so that callers walking a folder hierarchy see the same
+        // row they previously inserted under the same parent, but a name
+        // collision under a different parent will surface as an INSERT
+        // error (and the caller will fall through to the cache on the next
+        // iteration). The query mirrors the lookup PG does, just without
+        // the db_id scope.
+        let existing: Option<String> = if let Some(pid) = parent_id {
+            conn.query_row(
+                "SELECT id FROM tags WHERE LOWER(name) = LOWER(?1) AND parent_id = ?2 LIMIT 1",
+                rusqlite::params![name, pid],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            conn.query_row(
+                "SELECT id FROM tags WHERE LOWER(name) = LOWER(?1) AND parent_id IS NULL LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
+        if let Some(id) = existing {
+            return Ok((id, false));
+        }
+
+        // Fall back to a name-only lookup before inserting. SQLite's global
+        // UNIQUE(name COLLATE NOCASE) means the same name under a different
+        // parent already collides — return that existing row rather than
+        // failing the import.
+        let by_name: Option<String> = conn
+            .query_row(
+                "SELECT id FROM tags WHERE LOWER(name) = LOWER(?1) LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = by_name {
+            return Ok((id, false));
+        }
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&new_id, name, parent_id, &now],
+        )
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok((new_id, true))
+    }
+
+    pub(crate) fn link_tags_to_atom_with_source_impl(
+        &self,
+        atom_id: &str,
+        tag_ids: &[String],
+        source: &str,
+    ) -> StorageResult<()> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        for tag_id in tag_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source) VALUES (?1, ?2, ?3)",
+                rusqlite::params![atom_id, tag_id, source],
+            )
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_tag_tree_for_llm_impl(&self) -> StorageResult<String> {
         let conn = self.db.read_conn()?;
         crate::extraction::get_tag_tree_for_llm(&conn).map_err(|e| AtomicCoreError::Validation(e))
@@ -641,6 +726,23 @@ impl TagStore for SqliteStorage {
 
     async fn link_tags_to_atom(&self, atom_id: &str, tag_ids: &[String]) -> StorageResult<()> {
         self.link_tags_to_atom_impl(atom_id, tag_ids)
+    }
+
+    async fn get_or_create_tag_with_parent_id(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> StorageResult<(String, bool)> {
+        self.get_or_create_tag_with_parent_id_impl(name, parent_id)
+    }
+
+    async fn link_tags_to_atom_with_source(
+        &self,
+        atom_id: &str,
+        tag_ids: &[String],
+        source: &str,
+    ) -> StorageResult<()> {
+        self.link_tags_to_atom_with_source_impl(atom_id, tag_ids, source)
     }
 
     async fn get_tag_tree_for_llm(&self) -> StorageResult<String> {

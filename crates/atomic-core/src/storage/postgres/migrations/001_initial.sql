@@ -46,8 +46,11 @@ CREATE TABLE IF NOT EXISTS atom_chunks (
 
 CREATE TABLE IF NOT EXISTS atom_positions (
     atom_id TEXT PRIMARY KEY REFERENCES atoms(id) ON DELETE CASCADE,
-    x REAL NOT NULL,
-    y REAL NOT NULL,
+    -- DOUBLE PRECISION (not REAL): the Rust model is `f64`, and sqlx's strict
+    -- decoding rejects REAL → f64. Fresh installs land at the post-020
+    -- column type; existing databases migrate via 020.
+    x DOUBLE PRECISION NOT NULL,
+    y DOUBLE PRECISION NOT NULL,
     updated_at TEXT NOT NULL
 );
 

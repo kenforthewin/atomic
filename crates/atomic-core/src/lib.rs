@@ -311,6 +311,8 @@ impl AtomicCore {
         let pg_storage = PostgresStorage::connect(database_url, db_id).await?;
         pg_storage.initialize().await?;
 
+        Self::reconcile_pg_vector_index(&pg_storage).await?;
+
         let storage = storage::StorageBackend::Postgres(pg_storage);
 
         // Seed default category tags if tags table is empty
@@ -342,6 +344,69 @@ impl AtomicCore {
         };
         core.register_canvas_rebuilder();
         Ok(core)
+    }
+
+    /// Pin atom_chunks.embedding to the configured provider's dimension and
+    /// ensure the HNSW index exists. Idempotent — safe to call on every
+    /// `open_postgres`, including the second bootstrap call from
+    /// `DatabaseManager::new_postgres`. Schema is cluster-wide (not per-db_id),
+    /// so this only does real work the first time it sees a dimensionless
+    /// column or a missing index.
+    #[cfg(feature = "postgres")]
+    async fn reconcile_pg_vector_index(
+        pg: &storage::PostgresStorage,
+    ) -> Result<(), AtomicCoreError> {
+        use crate::storage::traits::{ChunkStore, SettingsStore};
+
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atom_chunks")
+            .fetch_one(pg.pool())
+            .await
+            .unwrap_or(0);
+        let current_dim = pg.get_embedding_dimension().await?;
+
+        let settings = pg.get_all_settings().await?;
+        let expected_dim = ProviderConfig::from_settings(&settings).embedding_dimension();
+
+        match current_dim {
+            Some(d) if d == expected_dim => {
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS atom_chunks_embedding_hnsw_idx
+                     ON atom_chunks USING hnsw (embedding vector_cosine_ops)",
+                )
+                .execute(pg.pool())
+                .await
+                .map_err(|e| {
+                    AtomicCoreError::DatabaseOperation(format!(
+                        "Failed to ensure HNSW index: {}",
+                        e
+                    ))
+                })?;
+            }
+            None if chunk_count == 0 => {
+                tracing::info!(
+                    expected_dim,
+                    "Pinning Postgres atom_chunks vector dimension and building HNSW index"
+                );
+                pg.recreate_vector_index(expected_dim).await?;
+            }
+            Some(d) => {
+                tracing::warn!(
+                    current_dim = d,
+                    expected_dim,
+                    "Postgres atom_chunks.embedding dimension does not match configured \
+                     provider; change the embedding provider setting to trigger a re-embed"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    chunk_count,
+                    "Postgres atom_chunks.embedding is dimensionless with existing rows; \
+                     unable to safely reconcile dimension at startup"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Create an AtomicCore from an existing PostgresStorage (for multi-db in Postgres mode).
@@ -3346,58 +3411,92 @@ impl AtomicCore {
                 }
             }
 
-            // Process hierarchical folder tags using the raw conn helper
-            // (get_or_create_tag uses parent_id, which the trait method doesn't support directly)
-            let sqlite = self.storage.as_sqlite().ok_or_else(|| {
-                AtomicCoreError::Configuration(
-                    "Obsidian import is not yet supported with Postgres backend".to_string(),
-                )
-            })?;
-            let conn = sqlite
-                .db
-                .conn
-                .lock()
-                .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+            // Hierarchical folder tags. Each level resolves against the
+            // running `folder_tag_ids` chain, so a path `Vault/Notes/Foo`
+            // produces three tags whose parent_ids point up the chain. The
+            // storage primitive handles dedupe-by-(name, parent, db) on both
+            // backends; we still maintain `tag_cache` to short-circuit
+            // repeated lookups in the same import run.
             let mut folder_tag_ids: Vec<String> = Vec::new();
             for htag in &note.folder_tags {
-                let parent_id = if htag.parent_path.is_empty() {
+                let parent_id: Option<String> = if htag.parent_path.is_empty() {
                     None
                 } else {
-                    let parent_index = htag.parent_path.len() - 1;
-                    folder_tag_ids.get(parent_index).map(|s| s.as_str())
+                    folder_tag_ids
+                        .get(htag.parent_path.len() - 1)
+                        .cloned()
                 };
 
-                if let Some(tag_id) =
-                    get_or_create_tag(&conn, &mut tag_cache, &htag.name, parent_id, &mut stats)
-                {
-                    folder_tag_ids.push(tag_id.clone());
-                    if let Err(e) = conn.execute(
-                        "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source) VALUES (?1, ?2, 'manual')",
-                        rusqlite::params![&atom_id, &tag_id],
-                    ) {
-                        tracing::error!(tag_name = %htag.name, error = %e, "Error linking folder tag to atom");
-                        continue;
+                let cache_key = (htag.name.to_lowercase(), parent_id.clone());
+                let tag_id = if let Some(cached) = tag_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    match self
+                        .storage
+                        .get_or_create_tag_with_parent_id(&htag.name, parent_id.as_deref())
+                        .await
+                    {
+                        Ok((id, created)) => {
+                            if created {
+                                stats.tags_created += 1;
+                            }
+                            tag_cache.insert(cache_key, id.clone());
+                            id
+                        }
+                        Err(e) => {
+                            tracing::error!(tag_name = %htag.name, error = %e, "Error creating folder tag");
+                            continue;
+                        }
                     }
-                    stats.tags_linked += 1;
+                };
+
+                folder_tag_ids.push(tag_id.clone());
+                if let Err(e) = self
+                    .storage
+                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .await
+                {
+                    tracing::error!(tag_name = %htag.name, error = %e, "Error linking folder tag to atom");
+                    continue;
                 }
+                stats.tags_linked += 1;
             }
 
-            // Process flat frontmatter tags
+            // Flat frontmatter tags (root-level).
             for tag_name in &note.frontmatter_tags {
-                if let Some(tag_id) =
-                    get_or_create_tag(&conn, &mut tag_cache, tag_name, None, &mut stats)
-                {
-                    if let Err(e) = conn.execute(
-                        "INSERT OR IGNORE INTO atom_tags (atom_id, tag_id, source) VALUES (?1, ?2, 'manual')",
-                        rusqlite::params![&atom_id, &tag_id],
-                    ) {
-                        tracing::error!(tag_name = %tag_name, error = %e, "Error linking tag to atom");
-                        continue;
+                let cache_key = (tag_name.to_lowercase(), None);
+                let tag_id = if let Some(cached) = tag_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    match self
+                        .storage
+                        .get_or_create_tag_with_parent_id(tag_name, None)
+                        .await
+                    {
+                        Ok((id, created)) => {
+                            if created {
+                                stats.tags_created += 1;
+                            }
+                            tag_cache.insert(cache_key, id.clone());
+                            id
+                        }
+                        Err(e) => {
+                            tracing::error!(tag_name = %tag_name, error = %e, "Error creating frontmatter tag");
+                            continue;
+                        }
                     }
-                    stats.tags_linked += 1;
+                };
+
+                if let Err(e) = self
+                    .storage
+                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .await
+                {
+                    tracing::error!(tag_name = %tag_name, error = %e, "Error linking frontmatter tag to atom");
+                    continue;
                 }
+                stats.tags_linked += 1;
             }
-            drop(conn);
 
             stats.imported += 1;
             on_progress(ImportProgress {
@@ -3843,57 +3942,6 @@ fn oauth_unavailable() -> AtomicCoreError {
     AtomicCoreError::Configuration(
         "OAuth is unavailable: no SQLite registry is attached and the storage backend does not support OAuth".to_string(),
     )
-}
-
-/// Helper to get or create a tag, using a cache to avoid duplicate lookups.
-fn get_or_create_tag(
-    conn: &rusqlite::Connection,
-    tag_cache: &mut HashMap<(String, Option<String>), String>,
-    name: &str,
-    parent_id: Option<&str>,
-    stats: &mut ImportResult,
-) -> Option<String> {
-    let cache_key = (name.to_lowercase(), parent_id.map(|s| s.to_string()));
-
-    if let Some(cached_id) = tag_cache.get(&cache_key) {
-        return Some(cached_id.clone());
-    }
-
-    let existing: Option<String> = if let Some(pid) = parent_id {
-        conn.query_row(
-            "SELECT id FROM tags WHERE LOWER(name) = LOWER(?1) AND parent_id = ?2 LIMIT 1",
-            rusqlite::params![name, pid],
-            |row| row.get(0),
-        )
-        .ok()
-    } else {
-        conn.query_row(
-            "SELECT id FROM tags WHERE LOWER(name) = LOWER(?1) AND parent_id IS NULL LIMIT 1",
-            [name],
-            |row| row.get(0),
-        )
-        .ok()
-    };
-
-    let id = match existing {
-        Some(id) => id,
-        None => {
-            let new_id = Uuid::new_v4().to_string();
-            let now = Utc::now().to_rfc3339();
-            if let Err(e) = conn.execute(
-                "INSERT INTO tags (id, name, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![&new_id, name, parent_id, &now],
-            ) {
-                tracing::error!(tag_name = %name, error = %e, "Error creating tag");
-                return None;
-            }
-            stats.tags_created += 1;
-            new_id
-        }
-    };
-
-    tag_cache.insert(cache_key, id.clone());
-    Some(id)
 }
 
 // ==================== Helper Functions ====================

@@ -20,6 +20,8 @@ mod oauth;
 #[cfg(feature = "postgres")]
 mod reports;
 #[cfg(feature = "postgres")]
+mod retry;
+#[cfg(feature = "postgres")]
 mod search;
 #[cfg(feature = "postgres")]
 mod settings;
@@ -38,6 +40,73 @@ use crate::storage::traits::*;
 use async_trait::async_trait;
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
+#[cfg(feature = "postgres")]
+use std::time::Duration;
+
+/// Tunables for the Postgres connection pool.
+///
+/// Defaults match the historical hard-coded values (50 connections, 10s
+/// acquire timeout, no idle/lifetime caps) so existing deployments keep their
+/// behavior. Override via the `ATOMIC_PG_*` environment variables or by
+/// constructing this struct directly and calling
+/// [`PostgresStorage::connect_with_config`].
+///
+/// Environment variables (all optional):
+///   - `ATOMIC_PG_MAX_CONNECTIONS` — pool max size
+///   - `ATOMIC_PG_ACQUIRE_TIMEOUT_SECS` — wait time before acquire fails
+///   - `ATOMIC_PG_IDLE_TIMEOUT_SECS` — close idle connections after N seconds
+///   - `ATOMIC_PG_MAX_LIFETIME_SECS` — recycle connections after N seconds
+///   - `ATOMIC_PG_SLOW_QUERY_MS` — log queries slower than this at WARN
+///     (set to 0 to disable; default 1000ms)
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone)]
+pub struct PgPoolConfig {
+    pub max_connections: u32,
+    pub acquire_timeout: Duration,
+    pub idle_timeout: Option<Duration>,
+    pub max_lifetime: Option<Duration>,
+    /// When set, sqlx logs any statement slower than this threshold at WARN
+    /// via `tracing` (target = `sqlx::query`). Setting this to `None` (env
+    /// value `0`) disables slow-query logging entirely.
+    pub slow_query_threshold: Option<Duration>,
+}
+
+#[cfg(feature = "postgres")]
+impl PgPoolConfig {
+    /// Build a config from `ATOMIC_PG_*` environment variables, falling back
+    /// to library defaults for anything unset.
+    pub fn from_env() -> Self {
+        fn parse_secs(name: &str) -> Option<Duration> {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+        }
+        let slow_query_threshold = std::env::var("ATOMIC_PG_SLOW_QUERY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|ms| if ms == 0 { None } else { Some(Duration::from_millis(ms)) })
+            .unwrap_or(Some(Duration::from_millis(1000)));
+        Self {
+            max_connections: std::env::var("ATOMIC_PG_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+            acquire_timeout: parse_secs("ATOMIC_PG_ACQUIRE_TIMEOUT_SECS")
+                .unwrap_or_else(|| Duration::from_secs(10)),
+            idle_timeout: parse_secs("ATOMIC_PG_IDLE_TIMEOUT_SECS"),
+            max_lifetime: parse_secs("ATOMIC_PG_MAX_LIFETIME_SECS"),
+            slow_query_threshold,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Default for PgPoolConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
 
 /// Postgres-backed storage implementation using sqlx + pgvector.
 ///
@@ -54,20 +123,56 @@ pub struct PostgresStorage {
 
 #[cfg(feature = "postgres")]
 impl PostgresStorage {
-    /// Connect to a Postgres database with a specific logical database ID.
-    ///
-    /// Creates a connection pool on the caller's tokio runtime.
+    /// Connect to a Postgres database with a specific logical database ID,
+    /// using pool tunables drawn from `ATOMIC_PG_*` environment variables.
     pub async fn connect(database_url: &str, db_id: &str) -> Result<Self, AtomicCoreError> {
-        use sqlx::postgres::PgPoolOptions;
+        Self::connect_with_config(database_url, db_id, PgPoolConfig::from_env()).await
+    }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(50)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(database_url)
-            .await
+    /// Connect with an explicit pool configuration. Bypasses the
+    /// environment-variable fallback chain in `connect`.
+    pub async fn connect_with_config(
+        database_url: &str,
+        db_id: &str,
+        config: PgPoolConfig,
+    ) -> Result<Self, AtomicCoreError> {
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx::ConnectOptions;
+        use std::str::FromStr;
+
+        let mut connect_opts = sqlx::postgres::PgConnectOptions::from_str(database_url)
             .map_err(|e| {
-                AtomicCoreError::DatabaseOperation(format!("Postgres connection failed: {}", e))
+                AtomicCoreError::DatabaseOperation(format!(
+                    "Invalid Postgres connection URL: {}",
+                    e
+                ))
             })?;
+
+        // Quiet by default. Atomic emits its own structured logs at the call
+        // sites that matter; sqlx's `Executed query` line is noisy and only
+        // useful in debug. Slow-query logging stays on (configurable below).
+        connect_opts = connect_opts.log_statements(log::LevelFilter::Off);
+        if let Some(threshold) = config.slow_query_threshold {
+            connect_opts =
+                connect_opts.log_slow_statements(log::LevelFilter::Warn, threshold);
+        } else {
+            connect_opts =
+                connect_opts.log_slow_statements(log::LevelFilter::Off, Duration::default());
+        }
+
+        let mut opts = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .acquire_timeout(config.acquire_timeout);
+        if let Some(idle) = config.idle_timeout {
+            opts = opts.idle_timeout(idle);
+        }
+        if let Some(lifetime) = config.max_lifetime {
+            opts = opts.max_lifetime(lifetime);
+        }
+
+        let pool = opts.connect_with(connect_opts).await.map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Postgres connection failed: {}", e))
+        })?;
         Ok(Self {
             pool,
             db_id: db_id.to_string(),
@@ -120,6 +225,14 @@ impl PostgresStorage {
                 include_str!("migrations/017_task_runs_active_unique.sql"),
             ),
             (18, include_str!("migrations/018_briefings_teardown.sql")),
+            (
+                19,
+                include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
+            ),
+            (
+                20,
+                include_str!("migrations/020_atom_positions_double.sql"),
+            ),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations

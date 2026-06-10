@@ -284,8 +284,31 @@ pub trait TagStore: Send + Sync {
         parent_name: Option<&str>,
     ) -> StorageResult<String>;
 
+    /// Get or create a tag by name under a specific parent ID (None = root).
+    /// Used by importers that walk hierarchies by ID (e.g., Obsidian folder
+    /// paths build a chain `Vault > Folder > Subfolder` where each level's
+    /// parent_id is known from the previous lookup). Returns `(tag_id,
+    /// created)` so callers can keep accurate `tags_created` statistics.
+    async fn get_or_create_tag_with_parent_id(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> StorageResult<(String, bool)>;
+
     /// Link tags to an atom (ignores duplicates).
     async fn link_tags_to_atom(&self, atom_id: &str, tag_ids: &[String]) -> StorageResult<()>;
+
+    /// Link tags to an atom with an explicit `source` label (`'auto'` /
+    /// `'manual'`). Existing assignments are preserved — INSERT ... ON
+    /// CONFLICT DO NOTHING — so a previous 'manual' won't get demoted to
+    /// 'auto' by a re-tag pass. Used by the Obsidian importer to mark
+    /// folder/frontmatter tags as deliberately user-assigned.
+    async fn link_tags_to_atom_with_source(
+        &self,
+        atom_id: &str,
+        tag_ids: &[String],
+        source: &str,
+    ) -> StorageResult<()>;
 
     /// Get the tag tree formatted as JSON for LLM tag extraction.
     async fn get_tag_tree_for_llm(&self) -> StorageResult<String>;

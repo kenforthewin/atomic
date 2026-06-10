@@ -12,7 +12,7 @@ pub use sqlite::SqliteStorage;
 pub use traits::*;
 
 #[cfg(feature = "postgres")]
-pub use postgres::PostgresStorage;
+pub use postgres::{PgPoolConfig, PostgresStorage};
 
 use crate::error::AtomicCoreError;
 
@@ -429,6 +429,10 @@ dispatch! {
         => sqlite: get_or_create_tag_impl, pg_trait: TagStore, pg_method: get_or_create_tag;
     fn link_tags_to_atom_impl(&self, atom_id: &str, tag_ids: &[String]) -> Result<(), AtomicCoreError>
         => sqlite: link_tags_to_atom_impl, pg_trait: TagStore, pg_method: link_tags_to_atom;
+    fn get_or_create_tag_with_parent_id(&self, name: &str, parent_id: Option<&str>) -> Result<(String, bool), AtomicCoreError>
+        => sqlite: get_or_create_tag_with_parent_id_impl, pg_trait: TagStore, pg_method: get_or_create_tag_with_parent_id;
+    fn link_tags_to_atom_with_source(&self, atom_id: &str, tag_ids: &[String], source: &str) -> Result<(), AtomicCoreError>
+        => sqlite: link_tags_to_atom_with_source_impl, pg_trait: TagStore, pg_method: link_tags_to_atom_with_source;
     fn get_tag_tree_for_llm_impl(&self) -> Result<String, AtomicCoreError>
         => sqlite: get_tag_tree_for_llm_impl, pg_trait: TagStore, pg_method: get_tag_tree_for_llm;
     fn compute_tag_centroids_batch_impl(&self, tag_ids: &[String]) -> Result<(), AtomicCoreError>

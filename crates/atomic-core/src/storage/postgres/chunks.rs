@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::retry::with_retry;
 use super::PostgresStorage;
 use crate::error::AtomicCoreError;
 use crate::models::*;
@@ -887,15 +888,18 @@ impl ChunkStore for PostgresStorage {
     }
 
     async fn claim_pending_embeddings(&self, limit: i32) -> StorageResult<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "UPDATE atoms SET embedding_status = 'processing'
-             WHERE id IN (SELECT id FROM atoms WHERE embedding_status = 'pending' AND db_id = $2 LIMIT $1)
-             AND db_id = $2
-             RETURNING id, content",
-        )
-        .bind(limit)
-        .bind(&self.db_id)
-        .fetch_all(&self.pool)
+        let rows: Vec<(String, String)> = with_retry(|| async {
+            sqlx::query_as(
+                "UPDATE atoms SET embedding_status = 'processing'
+                 WHERE id IN (SELECT id FROM atoms WHERE embedding_status = 'pending' AND db_id = $2 LIMIT $1)
+                 AND db_id = $2
+                 RETURNING id, content",
+            )
+            .bind(limit)
+            .bind(&self.db_id)
+            .fetch_all(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| {
             AtomicCoreError::DatabaseOperation(format!(
@@ -911,22 +915,25 @@ impl ChunkStore for PostgresStorage {
         limit: i32,
         max_updated_at: &str,
     ) -> StorageResult<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "UPDATE atoms SET embedding_status = 'processing'
-             WHERE id IN (
-                 SELECT id FROM atoms
-                 WHERE embedding_status = 'pending'
-                   AND updated_at <= $3
-                   AND db_id = $2
-                 LIMIT $1
-             )
-             AND db_id = $2
-             RETURNING id, content",
-        )
-        .bind(limit)
-        .bind(&self.db_id)
-        .bind(max_updated_at)
-        .fetch_all(&self.pool)
+        let rows: Vec<(String, String)> = with_retry(|| async {
+            sqlx::query_as(
+                "UPDATE atoms SET embedding_status = 'processing'
+                 WHERE id IN (
+                     SELECT id FROM atoms
+                     WHERE embedding_status = 'pending'
+                       AND updated_at <= $3
+                       AND db_id = $2
+                     LIMIT $1
+                 )
+                 AND db_id = $2
+                 RETURNING id, content",
+            )
+            .bind(limit)
+            .bind(&self.db_id)
+            .bind(max_updated_at)
+            .fetch_all(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(rows)
@@ -975,32 +982,38 @@ impl ChunkStore for PostgresStorage {
     }
 
     async fn claim_pending_tagging(&self) -> StorageResult<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "UPDATE atoms SET tagging_status = 'processing'
-             WHERE embedding_status = 'complete'
-             AND tagging_status = 'pending'
-             AND db_id = $1
-             RETURNING id",
-        )
-        .bind(&self.db_id)
-        .fetch_all(&self.pool)
+        let rows: Vec<(String,)> = with_retry(|| async {
+            sqlx::query_as(
+                "UPDATE atoms SET tagging_status = 'processing'
+                 WHERE embedding_status = 'complete'
+                 AND tagging_status = 'pending'
+                 AND db_id = $1
+                 RETURNING id",
+            )
+            .bind(&self.db_id)
+            .fetch_all(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     async fn claim_pending_tagging_due(&self, max_updated_at: &str) -> StorageResult<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "UPDATE atoms SET tagging_status = 'processing'
-             WHERE embedding_status = 'complete'
-               AND tagging_status = 'pending'
-               AND updated_at <= $2
-               AND db_id = $1
-             RETURNING id",
-        )
-        .bind(&self.db_id)
-        .bind(max_updated_at)
-        .fetch_all(&self.pool)
+        let rows: Vec<(String,)> = with_retry(|| async {
+            sqlx::query_as(
+                "UPDATE atoms SET tagging_status = 'processing'
+                 WHERE embedding_status = 'complete'
+                   AND tagging_status = 'pending'
+                   AND updated_at <= $2
+                   AND db_id = $1
+                 RETURNING id",
+            )
+            .bind(&self.db_id)
+            .bind(max_updated_at)
+            .fetch_all(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -1029,6 +1042,14 @@ impl ChunkStore for PostgresStorage {
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
+        // ALTER COLUMN TYPE on a vector column invalidates HNSW indexes built
+        // against the prior dimension. Drop explicitly so the ALTER doesn't
+        // trip over a dependent object, then rebuild after.
+        sqlx::query("DROP INDEX IF EXISTS atom_chunks_embedding_hnsw_idx")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+
         sqlx::query(&format!(
             "ALTER TABLE atom_chunks ALTER COLUMN embedding TYPE vector({}) USING NULL",
             dimension
@@ -1037,6 +1058,16 @@ impl ChunkStore for PostgresStorage {
         .await
         .map_err(|e| {
             AtomicCoreError::DatabaseOperation(format!("Failed to alter vector dimension: {}", e))
+        })?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS atom_chunks_embedding_hnsw_idx
+             ON atom_chunks USING hnsw (embedding vector_cosine_ops)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Failed to create HNSW index: {}", e))
         })?;
 
         // Reset all atoms across all databases for embed-only re-embedding.
@@ -1328,39 +1359,42 @@ impl ChunkStore for PostgresStorage {
         lease_until: &str,
         now: &str,
     ) -> StorageResult<Vec<AtomPipelineJob>> {
-        let rows: Vec<(String, bool, bool, String, i32)> = sqlx::query_as(
-            "WITH claimed AS (
-                SELECT j.atom_id, j.db_id
-                FROM atom_pipeline_jobs j
-                INNER JOIN atoms a ON a.id = j.atom_id AND a.db_id = j.db_id
-                WHERE j.db_id = $1
-                  AND (
-                    j.state = 'pending'
-                    OR (j.state = 'processing' AND j.lease_until IS NOT NULL AND j.lease_until <= $3)
-                  )
-                  AND j.not_before <= $3
-                  AND (
-                    j.embed_requested
-                    OR (j.tag_requested AND a.embedding_status = 'complete')
-                  )
-                ORDER BY j.updated_at ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-             )
-             UPDATE atom_pipeline_jobs j
-             SET state = 'processing',
-                 lease_until = $4,
-                 attempts = attempts + 1,
-                 updated_at = $3
-             FROM claimed c
-             WHERE j.atom_id = c.atom_id AND j.db_id = c.db_id
-             RETURNING j.atom_id, j.embed_requested, j.tag_requested, j.atom_updated_at, j.attempts",
-        )
-        .bind(&self.db_id)
-        .bind(limit as i64)
-        .bind(now)
-        .bind(lease_until)
-        .fetch_all(&self.pool)
+        let rows: Vec<(String, bool, bool, String, i32)> = with_retry(|| async {
+            sqlx::query_as(
+                "WITH claimed AS (
+                    SELECT j.atom_id, j.db_id
+                    FROM atom_pipeline_jobs j
+                    INNER JOIN atoms a ON a.id = j.atom_id AND a.db_id = j.db_id
+                    WHERE j.db_id = $1
+                      AND (
+                        j.state = 'pending'
+                        OR (j.state = 'processing' AND j.lease_until IS NOT NULL AND j.lease_until <= $3)
+                      )
+                      AND j.not_before <= $3
+                      AND (
+                        j.embed_requested
+                        OR (j.tag_requested AND a.embedding_status = 'complete')
+                      )
+                    ORDER BY j.updated_at ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE atom_pipeline_jobs j
+                 SET state = 'processing',
+                     lease_until = $4,
+                     attempts = attempts + 1,
+                     updated_at = $3
+                 FROM claimed c
+                 WHERE j.atom_id = c.atom_id AND j.db_id = c.db_id
+                 RETURNING j.atom_id, j.embed_requested, j.tag_requested, j.atom_updated_at, j.attempts",
+            )
+            .bind(&self.db_id)
+            .bind(limit as i64)
+            .bind(now)
+            .bind(lease_until)
+            .fetch_all(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| {
             AtomicCoreError::DatabaseOperation(format!("Failed to claim pipeline jobs: {}", e))

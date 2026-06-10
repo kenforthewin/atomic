@@ -6,6 +6,7 @@
 //! predicate `RETURNING id` pattern is the Postgres equivalent of SQLite's
 //! `changes() == 1` check.
 
+use super::retry::with_retry;
 use super::PostgresStorage;
 use crate::error::AtomicCoreError;
 use crate::models::{TaskRun, TaskRunState, TaskRunTrigger};
@@ -248,21 +249,24 @@ impl TaskRunStore for PostgresStorage {
         now: &str,
         lease_until: &str,
     ) -> StorageResult<bool> {
-        let row = sqlx::query(
-            "UPDATE task_runs
-                SET state       = 'running',
-                    started_at  = $2,
-                    lease_until = $3,
-                    attempts    = attempts + 1,
-                    updated_at  = $2
-              WHERE id = $1 AND state = 'pending' AND db_id = $4
-              RETURNING id",
-        )
-        .bind(id)
-        .bind(now)
-        .bind(lease_until)
-        .bind(&self.db_id)
-        .fetch_optional(&self.pool)
+        let row = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET state       = 'running',
+                        started_at  = $2,
+                        lease_until = $3,
+                        attempts    = attempts + 1,
+                        updated_at  = $2
+                  WHERE id = $1 AND state = 'pending' AND db_id = $4
+                  RETURNING id",
+            )
+            .bind(id)
+            .bind(now)
+            .bind(lease_until)
+            .bind(&self.db_id)
+            .fetch_optional(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(row.is_some())
@@ -274,23 +278,26 @@ impl TaskRunStore for PostgresStorage {
         now: &str,
         lease_until: &str,
     ) -> StorageResult<bool> {
-        let row = sqlx::query(
-            "UPDATE task_runs
-                SET started_at  = $2,
-                    lease_until = $3,
-                    updated_at  = $2
-              WHERE id = $1
-                AND state = 'running'
-                AND lease_until IS NOT NULL
-                AND lease_until < $2
-                AND db_id = $4
-              RETURNING id",
-        )
-        .bind(id)
-        .bind(now)
-        .bind(lease_until)
-        .bind(&self.db_id)
-        .fetch_optional(&self.pool)
+        let row = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET started_at  = $2,
+                        lease_until = $3,
+                        updated_at  = $2
+                  WHERE id = $1
+                    AND state = 'running'
+                    AND lease_until IS NOT NULL
+                    AND lease_until < $2
+                    AND db_id = $4
+                  RETURNING id",
+            )
+            .bind(id)
+            .bind(now)
+            .bind(lease_until)
+            .bind(&self.db_id)
+            .fetch_optional(&self.pool)
+            .await
+        })
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(row.is_some())
