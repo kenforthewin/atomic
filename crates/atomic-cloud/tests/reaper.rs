@@ -10,10 +10,14 @@
 
 mod support;
 
+use std::time::Duration;
+
 use atomic_cloud::reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
-use atomic_cloud::{provision_account, tenant_db_name, ClusterConfig, ControlPlane, NewAccount};
+use atomic_cloud::{
+    provision_account, tenant_db_name, ClusterConfig, ControlPlane, NewAccount, ProvisionedAccount,
+};
 use sqlx::{Connection, PgConnection};
-use support::{create_database, with_control_db, with_db_guard};
+use support::{create_database, drop_database, with_control_db, with_db_guard};
 use uuid::Uuid;
 
 /// Migrated control plane + a cluster config pointing at the test cluster.
@@ -314,6 +318,204 @@ async fn in_flight_healthy_provision_is_left_alone() {
         },
     )
     .await;
+}
+
+/// A stuck provision whose accounts row is yanked while the reaper's resume
+/// is mid-flight (the tail end of a racing `delete_account`) must NOT be
+/// reported resumed: the resume aborts typed
+/// (`AccountNoLongerProvisioning`), the rollback's status-guarded DELETE
+/// finds the row already gone, and the outcome is "already settled" —
+/// neither `stuck_resumed` nor `stuck_rolled_back` — with the tenant
+/// database the resume created dropped rather than orphaned.
+#[tokio::test]
+async fn resume_racing_deletion_is_not_reported_resumed() {
+    with_control_db(
+        "resume_racing_deletion_is_not_reported_resumed",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let account_id = Uuid::new_v4();
+            seed_provisioning_row(&control, account_id, "r@example.com", "yanked", 10).await;
+            let db_name = tenant_db_name(account_id);
+
+            with_db_guard(&cluster.cluster_url, &db_name, || async {
+                let policy = ReaperPolicy::default();
+                let pass = run_reaper_pass(&control, &cluster, &policy);
+                let saboteur = async {
+                    // Wait for the resume's CREATE DATABASE to land
+                    // (migrations still have hundreds of milliseconds to
+                    // run), then yank the accounts row, as the tail end of
+                    // a concurrent delete_account would.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !database_exists(&cluster.cluster_url, &db_name).await {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "tenant database never appeared; resume stalled"
+                        );
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    sqlx::query("DELETE FROM accounts WHERE id = $1")
+                        .bind(account_id.to_string())
+                        .execute(control.pool())
+                        .await
+                        .expect("delete accounts row mid-resume");
+                };
+                let (summary, ()) = tokio::join!(pass, saboteur);
+
+                assert_no_errors(&summary);
+                assert!(
+                    summary.stuck_resumed.is_empty(),
+                    "a dead account must not be reported resumed: {summary:?}"
+                );
+                assert!(
+                    summary.stuck_rolled_back.is_empty(),
+                    "nothing was left to roll back: {summary:?}"
+                );
+                assert_eq!(
+                    account_status(&control, &account_id.to_string()).await,
+                    None,
+                    "the deletion's outcome stands"
+                );
+                assert!(
+                    !database_exists(&cluster.cluster_url, &db_name).await,
+                    "the aborted resume must drop the database it created"
+                );
+            })
+            .await;
+        },
+    )
+    .await;
+}
+
+/// The interrupted-deletion arm. Three active accounts:
+///
+/// - one half-deleted past the grace (the REAL deletion steps 1–5 run —
+///   tokens revoked, sessions gone, database dropped, mapping row removed —
+///   with the accounts row left `'active'`, exactly what a killed
+///   `DELETE /api/account` pod leaves) → completed: row gone, subdomain
+///   parked;
+/// - one healthy, equally old → untouched, pinning the no-false-positive
+///   invariant (a healthy active account always has its mapping row);
+/// - one half-deleted but inside the grace → deferred this pass.
+#[tokio::test]
+async fn interrupted_deletion_is_completed_and_healthy_account_untouched() {
+    with_control_db(
+        "interrupted_deletion_is_completed_and_healthy_account_untouched",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            let healthy = provision_account(
+                &control,
+                &cluster,
+                new_account("keep@example.com", "keeper"),
+            )
+            .await
+            .expect("provision healthy");
+            let doomed =
+                provision_account(&control, &cluster, new_account("gone@example.com", "goner"))
+                    .await
+                    .expect("provision doomed");
+            let fresh = provision_account(
+                &control,
+                &cluster,
+                new_account("young@example.com", "youngling"),
+            )
+            .await
+            .expect("provision fresh");
+
+            // Age healthy and doomed past the 5-minute grace; fresh stays
+            // at NOW().
+            for id in [&healthy.account_id, &doomed.account_id] {
+                sqlx::query(
+                    "UPDATE accounts SET created_at = NOW() - INTERVAL '10 minutes' \
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .execute(control.pool())
+                .await
+                .expect("backdate account");
+            }
+
+            run_deletion_steps_through_mapping_removal(&control, &cluster, &doomed).await;
+            run_deletion_steps_through_mapping_removal(&control, &cluster, &fresh).await;
+
+            let summary = run_reaper_pass(&control, &cluster, &ReaperPolicy::default()).await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.deletions_completed,
+                vec![doomed.account_id.clone()],
+                "exactly the aged half-deletion is completed: {summary:?}"
+            );
+            assert!(summary.deletions_skipped_locked.is_empty());
+
+            // Doomed: deletion completed — row gone, subdomain parked.
+            assert_eq!(account_status(&control, &doomed.account_id).await, None);
+            let parked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM subdomains_reserved \
+                 WHERE subdomain = 'goner' AND expires_at > NOW())",
+            )
+            .fetch_one(control.pool())
+            .await
+            .expect("query reservation");
+            assert!(parked, "the completed deletion must park the subdomain");
+
+            // Healthy: untouched in every respect.
+            assert_eq!(
+                account_status(&control, &healthy.account_id)
+                    .await
+                    .as_deref(),
+                Some("active")
+            );
+            assert!(database_exists(&cluster.cluster_url, &healthy.db_name).await);
+            assert_eq!(
+                count(
+                    &control,
+                    "SELECT COUNT(*) FROM account_databases WHERE account_id = $1",
+                    &healthy.account_id,
+                )
+                .await,
+                1
+            );
+
+            // Fresh: inside the grace, deferred to a later pass.
+            assert_eq!(
+                account_status(&control, &fresh.account_id).await.as_deref(),
+                Some("active"),
+                "a half-deletion inside the grace must be left alone this pass"
+            );
+        },
+    )
+    .await;
+}
+
+/// The real `delete_account` steps 1–5 — everything before the accounts-row
+/// delete — by direct SQL + DROP, manufacturing the exact state a deletion
+/// interrupted after the mapping removal leaves behind.
+async fn run_deletion_steps_through_mapping_removal(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    acct: &ProvisionedAccount,
+) {
+    // Step 1 — revoke tokens (idempotent over none).
+    sqlx::query("UPDATE cloud_tokens SET revoked_at = NOW() WHERE account_id = $1")
+        .bind(&acct.account_id)
+        .execute(control.pool())
+        .await
+        .expect("revoke tokens");
+    // Step 2 — delete sessions.
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(&acct.account_id)
+        .execute(control.pool())
+        .await
+        .expect("delete sessions");
+    // Step 4 — drop the tenant database.
+    drop_database(&cluster.cluster_url, &acct.db_name).await;
+    // Step 5 — remove the mapping rows. The crash point: the accounts row
+    // is never touched.
+    sqlx::query("DELETE FROM account_databases WHERE account_id = $1")
+        .bind(&acct.account_id)
+        .execute(control.pool())
+        .await
+        .expect("delete mapping rows");
 }
 
 /// Self-reservation cleanup: a reservation parked on an ACTIVE account's
@@ -670,6 +872,69 @@ async fn resume_cap_defers_surplus_rows_across_passes() {
                 .await,
                 0,
                 "both stuck rows handled across the two passes"
+            );
+        },
+    )
+    .await;
+}
+
+/// Rows found already settled under their lock must NOT consume the resume
+/// cap. Three stale rows, cap 2: while the oldest row's (real, slow) resume
+/// runs, a saboteur settles the middle row by activating it — the pass must
+/// spend its remaining budget on the youngest row, not defer it because a
+/// settled row was charged.
+#[tokio::test]
+async fn settled_rows_do_not_consume_the_resume_cap() {
+    with_control_db(
+        "settled_rows_do_not_consume_the_resume_cap",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            // Processing order is created_at ascending: oldest first.
+            let oldest = Uuid::new_v4();
+            seed_provisioning_row(&control, oldest, "first@example.com", "cap-first", 30).await;
+            let middle = Uuid::new_v4();
+            seed_provisioning_row(&control, middle, "settled@example.com", "cap-settled", 20).await;
+            let youngest = Uuid::new_v4();
+            seed_provisioning_row(&control, youngest, "last@example.com", "cap-last", 10).await;
+
+            let policy = ReaperPolicy {
+                max_resumes_per_pass: 2,
+                // The saboteur leaves `middle` active with no mapping row —
+                // keep the interrupted-deletion arm away from it.
+                deletion_recovery_grace: Duration::from_secs(3600),
+                ..ReaperPolicy::default()
+            };
+            let oldest_db = tenant_db_name(oldest);
+            let pass = run_reaper_pass(&control, &cluster, &policy);
+            let saboteur = async {
+                // The oldest row's resume signals progress by creating its
+                // tenant database; migrations leave a wide window in which
+                // to settle the middle row before the pass reaches it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !database_exists(&cluster.cluster_url, &oldest_db).await {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "oldest row's tenant database never appeared"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
+                    .bind(middle.to_string())
+                    .execute(control.pool())
+                    .await
+                    .expect("settle the middle row");
+            };
+            let (summary, ()) = tokio::join!(pass, saboteur);
+
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.stuck_resumed,
+                vec![oldest.to_string(), youngest.to_string()],
+                "both real rows resumed in one pass: {summary:?}"
+            );
+            assert!(
+                summary.stuck_deferred.is_empty(),
+                "a settled row must not crowd real work out of the cap: {summary:?}"
             );
         },
     )

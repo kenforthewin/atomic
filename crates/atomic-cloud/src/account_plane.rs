@@ -35,10 +35,24 @@
 //!   already leak); everything after validation — including email-send
 //!   failure — answers the same neutral 200, because differential responses
 //!   on the email axis are exactly the enumeration oracle the login route
-//!   must not have, and the two routes should behave identically.
+//!   must not have, and the two routes should behave identically. One
+//!   deliberate carve-out in the availability check: a subdomain whose only
+//!   claim is a `'provisioning'` account for the *same* (lowercased) email
+//!   is **not** "taken" — that claim is the requester's own crashed signup,
+//!   and a fresh link is exactly how they resume it (`provision_account` is
+//!   idempotent for the same email + subdomain).
 //! - `POST /login/request-link` `{email}` — if an active account matches,
 //!   email a login link. The response is byte-identical whether or not the
-//!   account exists (no email enumeration; e2e-pinned).
+//!   account exists (no email enumeration; e2e-pinned) — **and arrives in
+//!   uniform time**: both branches return right after the same synchronous
+//!   work (the rate-limit charges plus one indexed account lookup). The
+//!   issue+send on the exists branch is `tokio::spawn`ed fire-and-forget,
+//!   because awaiting it (a DB insert plus an outbound Mailgun POST,
+//!   hundreds of ms) would make response latency the very enumeration
+//!   oracle the identical bodies exist to close. Spawn-side failures are
+//!   logged, never reflected in the response — which is already the policy
+//!   for send failures on both routes. The residual signal is the lookup
+//!   itself: one indexed SELECT on both branches, far below network jitter.
 //! - `GET /signup/complete?token=…` — consume the signup link and provision
 //!   the account synchronously (plan: "Signup" steps 3–12, minus the
 //!   deferred 7–9), then establish a session and 302 to the new tenant. See
@@ -50,14 +64,25 @@
 //! # Completion semantics
 //!
 //! The completion routes handle a **single-use credential**, so the order
-//! of refusals is load-bearing:
+//! of refusals is load-bearing. Signup completion admits in four steps —
+//! shape, peek, permit, consume — each refusing as early (and as cheaply)
+//! as the refusal can be made sound:
 //!
+//! - **Syntactic shape first** ([`magic_link_token_shape_ok`]): a token
+//!   that can't possibly be real is refused before any database work.
+//! - **Then a read-only eligibility peek** ([`peek_magic_link`]): a dead
+//!   token (unknown, expired, spent, wrong purpose) is refused before the
+//!   provision permit is touched. Together these keep junk requests from
+//!   starving the semaphore — only plausibly-live tokens ever contend for a
+//!   permit. The handler never awaits anything unbounded while
+//!   unauthenticated; the peek is one indexed SELECT.
 //! - **Capacity is checked before the token is consumed.** Synchronous
 //!   provisioning is capped by a process-wide semaphore
 //!   ([`AccountPlaneConfig::max_concurrent_provisions`]; plan: 4–8). A
 //!   saturated process answers a structured 503 + `Retry-After` *without*
 //!   touching the link — consume-then-refuse would burn the user's only
-//!   credential on a condition that retrying cures.
+//!   credential on a condition that retrying cures. `try_acquire`, never
+//!   wait.
 //! - **Consumption is atomic and purpose-pinned** (one UPDATE; see
 //!   [`crate::magic_links::consume_magic_link`]). Expired, reused,
 //!   wrong-purpose, and unknown tokens are all the same honest
@@ -71,9 +96,10 @@
 //!   spent, ask again".
 //! - **A provision failure after consumption** leaves the accounts row in
 //!   `status='provisioning'`; the response is a structured 500 advising
-//!   retry-later. The safety-net reaper (plan: "Failure recovery & the
-//!   reaper"; arrives later in this slice) is what retries or rolls back
-//!   such rows.
+//!   retry-later. The safety-net reaper ([`crate::reaper`]) is what retries
+//!   or rolls back such rows — and the request-link route's
+//!   same-email carve-out (above) is what lets the user resume sooner by
+//!   simply asking for a fresh link.
 //!
 //! On success the route creates a web session ([`crate::tokens`]) and sets
 //! the [`SESSION_COOKIE`](crate::auth::SESSION_COOKIE) with
@@ -89,15 +115,30 @@
 //!
 //! # Anti-abuse limits (plan: "Quotas" table)
 //!
-//! - Signup request-link: 5 per client IP per hour.
+//! - Request-link routes (signup + login combined): 5 per client IP per
+//!   hour. The plan's table lists only "signup attempts per IP"; covering
+//!   login with the same shared bucket is this implementation's choice —
+//!   login request-link is the same probe surface (an enumerating client
+//!   doesn't care which route answers), so it gets the same per-IP cost,
+//!   and a shared bucket means switching routes doesn't mint fresh
+//!   allowance. See [`crate::rate_limit`].
 //! - Magic-link requests (signup + login combined): 3 per email per hour.
 //!
 //! Per-pod in-memory sliding windows ([`crate::rate_limit`]); refusals are
-//! 429 with `Retry-After`. The IP limit runs *before* validation — a
-//! validation-failing request is still a signup attempt — and the email
-//! limit runs after it, keyed on the (lowercased) validated email, and is
-//! always charged before the account lookup so the limiter's behavior
-//! cannot become an enumeration side channel either.
+//! 429 with `Retry-After`. On both routes the IP limit is charged *before
+//! everything else* — before validation (a validation-failing request is
+//! still an attempt) and before any lookup. The email limit runs after
+//! validation, keyed on the (lowercased) email, and is always charged
+//! before the account lookup so the limiter's behavior cannot become an
+//! enumeration side channel either.
+//!
+//! # Response headers
+//!
+//! Every account-plane response carries `Referrer-Policy: no-referrer`
+//! (a `DefaultHeaders` wrap on both scopes). Completion URLs carry live
+//! single-use credentials in their query string; without the policy, the
+//! post-completion redirect (and any error page a browser renders) could
+//! leak the token to the next origin via the `Referer` header.
 //!
 //! # Client IP derivation
 //!
@@ -117,6 +158,7 @@ use std::sync::Arc;
 use actix_web::cookie::{Cookie, SameSite};
 use actix_web::guard::{Guard, GuardContext};
 use actix_web::http::header;
+use actix_web::middleware::DefaultHeaders;
 use actix_web::{guard, web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
@@ -125,7 +167,10 @@ use crate::auth::SESSION_COOKIE;
 use crate::control_plane::ControlPlane;
 use crate::email::EmailSender;
 use crate::error::CloudError;
-use crate::magic_links::{consume_magic_link, issue_magic_link, MagicLinkPurpose, MAGIC_LINK_TTL};
+use crate::magic_links::{
+    consume_magic_link, issue_magic_link, magic_link_token_shape_ok, peek_magic_link,
+    MagicLinkPurpose, MAGIC_LINK_TTL,
+};
 use crate::provision::{
     email_format_ok, provision_account, subdomain_format_ok, ClusterConfig, NewAccount,
 };
@@ -153,9 +198,11 @@ const PROVISION_BUSY_RETRY_AFTER_SECS: u64 = 10;
 /// real hours. Production callers use `Default`.
 #[derive(Debug, Clone)]
 pub struct RateLimits {
-    /// Signup request-link admissions per client IP per window.
-    pub signup_links_per_ip: u32,
-    pub signup_ip_window: std::time::Duration,
+    /// Request-link admissions (signup + login combined, one shared bucket)
+    /// per client IP per window. See the module docs for why login shares
+    /// the plan's signup number.
+    pub links_per_ip: u32,
+    pub ip_window: std::time::Duration,
     /// Magic-link admissions (signup + login combined) per email per window.
     pub links_per_email: u32,
     pub email_window: std::time::Duration,
@@ -164,8 +211,8 @@ pub struct RateLimits {
 impl Default for RateLimits {
     fn default() -> Self {
         Self {
-            signup_links_per_ip: 5,
-            signup_ip_window: std::time::Duration::from_secs(3600),
+            links_per_ip: 5,
+            ip_window: std::time::Duration::from_secs(3600),
             links_per_email: 3,
             email_window: std::time::Duration::from_secs(3600),
         }
@@ -231,7 +278,9 @@ struct PlaneState {
     tenant_scheme: String,
     tenant_port: Option<u16>,
     trust_proxy_header: bool,
-    signup_ip_limiter: SlidingWindow,
+    /// One shared per-IP bucket for both request-link routes (module docs:
+    /// "Anti-abuse limits").
+    ip_limiter: SlidingWindow,
     email_limiter: SlidingWindow,
     /// The synchronous-signup concurrency cap (module docs: "Completion
     /// semantics"). Checked with `try_acquire` *before* the token is
@@ -285,10 +334,7 @@ impl AccountPlane {
                 tenant_scheme,
                 tenant_port,
                 trust_proxy_header: config.trust_proxy_header,
-                signup_ip_limiter: SlidingWindow::new(
-                    limits.signup_links_per_ip,
-                    limits.signup_ip_window,
-                ),
+                ip_limiter: SlidingWindow::new(limits.links_per_ip, limits.ip_window),
                 email_limiter: SlidingWindow::new(limits.links_per_email, limits.email_window),
                 provision_permits: Arc::new(Semaphore::new(
                     config.max_concurrent_provisions.max(1),
@@ -309,12 +355,17 @@ impl AccountPlane {
     /// Register the account-plane routes on `cfg`, each guarded to the app
     /// host. Called by `configure_cloud_app`; the guard is what makes these
     /// routes not exist on tenant subdomains (fail-closed direction one in
-    /// the module docs).
+    /// the module docs). Every response carries
+    /// `Referrer-Policy: no-referrer` (module docs: "Response headers") —
+    /// completion URLs hold live single-use tokens that must never leak via
+    /// `Referer`.
     pub(crate) fn configure(&self, cfg: &mut web::ServiceConfig) {
+        let no_referrer = || DefaultHeaders::new().add((header::REFERRER_POLICY, "no-referrer"));
         cfg.service(
             web::scope("/signup")
                 .guard(app_host_guard(self.state.base_domain.clone()))
                 .app_data(self.state.clone())
+                .wrap(no_referrer())
                 .route("/request-link", web::post().to(signup_request_link))
                 .route("/complete", web::get().to(signup_complete)),
         );
@@ -322,6 +373,7 @@ impl AccountPlane {
             web::scope("/login")
                 .guard(app_host_guard(self.state.base_domain.clone()))
                 .app_data(self.state.clone())
+                .wrap(no_referrer())
                 .route("/request-link", web::post().to(login_request_link))
                 .route("/complete", web::get().to(login_complete)),
         );
@@ -404,10 +456,7 @@ async fn signup_request_link(
     // Rate-limit by IP before anything else — a validation-failing request
     // is still a signup attempt (the plan's "signup attempts per IP").
     let ip = client_ip(&req, state.trust_proxy_header);
-    if let Err(retry_after) = state
-        .signup_ip_limiter
-        .check(ip.as_deref().unwrap_or("unknown"))
-    {
+    if let Err(retry_after) = state.ip_limiter.check(ip.as_deref().unwrap_or("unknown")) {
         return rate_limited(retry_after);
     }
 
@@ -445,11 +494,21 @@ async fn signup_request_link(
             return internal_error();
         }
     }
-    let taken: Result<bool, sqlx::Error> =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE subdomain = $1)")
-            .bind(&subdomain)
-            .fetch_one(state.control.pool())
-            .await;
+    // "Taken" exempts the requester's own stuck claim: a `'provisioning'`
+    // row for the same (lowercased) email is a crashed earlier signup, and
+    // re-requesting a link is the documented way to resume it — the
+    // eventual completion re-runs `provision_account`, which resumes that
+    // exact claim idempotently. Any other claim (active, or another email's
+    // in-flight provision) is honestly taken.
+    let taken: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM accounts \
+         WHERE subdomain = $1 \
+           AND NOT (status = 'provisioning' AND LOWER(email) = LOWER($2)))",
+    )
+    .bind(&subdomain)
+    .bind(&email)
+    .fetch_one(state.control.pool())
+    .await;
     match taken {
         Ok(true) => {
             return validation_error("subdomain_taken", "That subdomain is already taken.");
@@ -484,12 +543,23 @@ async fn signup_request_link(
 
 /// `POST /login/request-link` (app host only). Sends a login link when an
 /// active account matches the email; the response is byte-identical either
-/// way (no email enumeration — e2e-pinned).
+/// way (no email enumeration — e2e-pinned) **and returns without awaiting
+/// the issue+send** (module docs: uniform time — awaiting only on the
+/// exists branch would be a timing oracle over account existence).
 async fn login_request_link(
     state: web::Data<PlaneState>,
     req: HttpRequest,
     body: web::Json<LoginRequest>,
 ) -> HttpResponse {
+    // Same shared per-IP bucket as signup, charged before everything else —
+    // a probing request is an attempt whether or not it validates, and the
+    // limit is what keeps the (already timing-uniform) route from being
+    // freely probed across many distinct emails.
+    let ip = client_ip(&req, state.trust_proxy_header);
+    if let Err(retry_after) = state.ip_limiter.check(ip.as_deref().unwrap_or("unknown")) {
+        return rate_limited(retry_after);
+    }
+
     let LoginRequest { email } = body.into_inner();
     if !email_format_ok(&email) {
         return validation_error("invalid_email", "That email address doesn't look valid.");
@@ -511,8 +581,15 @@ async fn login_request_link(
     .await;
     match exists {
         Ok(true) => {
-            let ip = client_ip(&req, state.trust_proxy_header);
-            issue_and_send(&state, &email, MagicLinkPurpose::Login, None, ip.as_deref()).await;
+            // Fire-and-forget: both branches return immediately after the
+            // same synchronous work above. The spawned task's failures are
+            // logged inside issue_and_send, never surfaced — exactly the
+            // existing policy for send failures, now also keeping the
+            // response timing identical to the not-exists branch.
+            let state = state.clone();
+            tokio::spawn(async move {
+                issue_and_send(&state, &email, MagicLinkPurpose::Login, None, ip.as_deref()).await;
+            });
         }
         Ok(false) => {
             // No account: do nothing, answer exactly like the happy path.
@@ -587,14 +664,34 @@ async fn signup_complete(
         return invalid_link();
     };
 
-    // Capacity BEFORE consumption (module docs): a saturated process must
-    // refuse without spending the single-use token, so the same link
-    // succeeds on retry. `try_acquire` — never wait — because each waiter
-    // would pin an HTTP connection behind multi-second provisions.
+    // Admission order (module docs: "Completion semantics"): shape, peek,
+    // permit, consume. The two read-only checks refuse dead tokens before
+    // the permit is touched, so junk requests can never starve the
+    // semaphore; the permit still precedes consumption, so saturation
+    // never burns a live token.
+    if !magic_link_token_shape_ok(&token) {
+        return invalid_link();
+    }
+    match peek_magic_link(&state.control, &token, MagicLinkPurpose::Signup).await {
+        Ok(true) => {}
+        Ok(false) => return invalid_link(),
+        Err(e) => {
+            tracing::error!(error = %e, "peeking signup link failed");
+            return internal_error();
+        }
+    }
+
+    // Capacity BEFORE consumption: a saturated process must refuse without
+    // spending the single-use token, so the same link succeeds on retry.
+    // `try_acquire` — never wait — because each waiter would pin an HTTP
+    // connection behind multi-second provisions.
     let Ok(_permit) = Arc::clone(&state.provision_permits).try_acquire_owned() else {
         return provisioning_busy();
     };
 
+    // The atomic consume remains the only authority: a token that died
+    // between peek and consume (a double click racing this request) is
+    // refused here exactly as before.
     let record = match consume_magic_link(&state.control, &token, MagicLinkPurpose::Signup).await {
         Ok(Some(record)) => record,
         Ok(None) => return invalid_link(),
@@ -665,6 +762,12 @@ async fn login_complete(
     let Some(token) = query.into_inner().token else {
         return invalid_link();
     };
+    // Same syntactic gate as signup completion (there's no permit to
+    // protect here, but garbage shouldn't cost a database round-trip
+    // either, and the refusal is byte-identical).
+    if !magic_link_token_shape_ok(&token) {
+        return invalid_link();
+    }
     let record = match consume_magic_link(&state.control, &token, MagicLinkPurpose::Login).await {
         Ok(Some(record)) => record,
         Ok(None) => return invalid_link(),

@@ -41,9 +41,12 @@ use crate::tokens::{generate_secret, sha256_hex};
 /// prefixes so a leaked value is immediately classifiable.
 pub const MAGIC_LINK_PREFIX: &str = "aml_";
 
-/// Default link lifetime (plan: the emailed copy promises "expires in 15
-/// minutes"). Issuance takes an explicit TTL so tests can shrink it, but
-/// every production caller passes this.
+/// Default link lifetime. The 15 minutes are this implementation's choice
+/// (the plan doesn't fix a number): long enough for a slow mailbox, short
+/// enough that a leaked link goes stale fast. The emailed copy promises
+/// "expires in 15 minutes" ([`crate::email`]) — keep the two in sync.
+/// Issuance takes an explicit TTL so tests can shrink it, but every
+/// production caller passes this.
 pub const MAGIC_LINK_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// What consuming a link does. Serialized to text in `magic_links.purpose`.
@@ -133,6 +136,51 @@ impl TryFrom<MagicLinkRow> for MagicLinkRecord {
     }
 }
 
+/// Whether `token` has exactly the shape [`issue_magic_link`] generates:
+/// [`MAGIC_LINK_PREFIX`] + 52 chars of lowercase RFC 4648 base32 (32 bytes,
+/// no padding — see `tokens::generate_secret`).
+///
+/// A pure syntactic gate for the completion routes: anything else can never
+/// match a stored hash, so it is refused before any database work — junk
+/// requests must not be able to spend queries (or contend for the signup
+/// provision permit) on tokens that cannot possibly be real.
+pub fn magic_link_token_shape_ok(token: &str) -> bool {
+    token.strip_prefix(MAGIC_LINK_PREFIX).is_some_and(|suffix| {
+        suffix.len() == 52 && suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+    })
+}
+
+/// Read-only eligibility peek: whether `plaintext` currently matches a
+/// live, unconsumed link for `purpose` — the same WHERE clause as
+/// [`consume_magic_link`], **without** consuming.
+///
+/// Exists for the signup completion's admission ordering: the route must
+/// not hand a provisioning permit to a dead token (permit starvation), but
+/// also must not consume a live token before holding a permit (a saturated
+/// process would burn the user's only credential). The peek is the
+/// in-between: it proves the token is plausibly live *before* `try_acquire`,
+/// and the atomic consume afterwards remains the only authority — a token
+/// that dies between peek and consume is still refused, exactly like a
+/// double click.
+pub async fn peek_magic_link(
+    control: &ControlPlane,
+    plaintext: &str,
+    purpose: MagicLinkPurpose,
+) -> Result<bool, CloudError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM magic_links \
+         WHERE token_hash = $1 \
+           AND purpose = $2 \
+           AND consumed_at IS NULL \
+           AND expires_at > NOW())",
+    )
+    .bind(sha256_hex(plaintext))
+    .bind(purpose.as_str())
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db("peeking magic link"))
+}
+
 /// Issue a magic link for `email` and return its plaintext — the value the
 /// emailed URL carries, never persisted anywhere.
 ///
@@ -209,6 +257,27 @@ pub async fn consume_magic_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_shape_gate_accepts_generated_and_rejects_garbage() {
+        let (plaintext, _) = crate::tokens::generate_secret(MAGIC_LINK_PREFIX);
+        assert!(
+            magic_link_token_shape_ok(&plaintext),
+            "generated tokens pass the gate: {plaintext}"
+        );
+        for bad in [
+            "",
+            "aml_",
+            "aml_short",
+            "atm_thewrongprefixaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            // Right length, wrong charset (base32 has no 0/1/8/9, no uppercase).
+            &format!("aml_{}", "0".repeat(52)),
+            &format!("aml_{}", "A".repeat(52)),
+            &format!("aml_{}x", "a".repeat(52)),
+        ] {
+            assert!(!magic_link_token_shape_ok(bad), "{bad:?} must be rejected");
+        }
+    }
 
     #[test]
     fn purpose_roundtrips_through_text() {

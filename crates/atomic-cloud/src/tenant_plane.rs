@@ -32,6 +32,24 @@
 //! after success never reaches the handler: the accounts row is gone, so
 //! CloudAuth answers 404 at step 2.
 //!
+//! # Cancellation-proofing: the work runs in a spawned task
+//!
+//! actix drops a handler's future the moment the client disconnects. The
+//! deletion sequence destroys the account's credentials *first* (token
+//! revocation, session deletion — deliberately, to close the
+//! still-authenticated crash window) and then does multi-second work
+//! (terminating backends, dropping the tenant database). A future dropped
+//! between those would strand a zombie: `status = 'active'`, credentials
+//! revoked, tenant database possibly gone — an account its owner can no
+//! longer drive to completion with the credential they just used. So the
+//! handler spawns the delete + evict sequence as a detached task
+//! (`actix_web::rt::spawn` onto the worker's LocalSet) and awaits its
+//! `JoinHandle`: a disconnect cancels only the *await*, while the spawned
+//! task runs to completion regardless. Only a process death can interrupt
+//! the sequence now — and that residue is exactly what the reaper's
+//! interrupted-deletion arm detects (an active account with no
+//! `account_databases` row) and completes.
+//!
 //! # Ordering: delete first, evict second
 //!
 //! The plan's deletion sequence lists cache eviction (step 5) before the
@@ -169,11 +187,40 @@ async fn delete_account_route(
         return confirmation_required(&tenant.subdomain);
     }
 
-    // delete_account is idempotent under retry, so a failure partway
-    // through is answered with "try again" rather than compensated here.
-    if let Err(e) =
-        delete_account(&state.control, &state.cluster, &tenant.principal.account_id).await
-    {
+    // Spawn the destructive sequence and await the handle (module docs:
+    // "Cancellation-proofing"): a client disconnect drops this handler
+    // future, but the spawned task — which has already revoked the
+    // account's credentials by its first step — keeps running to
+    // completion. Evict happens inside the same task, after the delete
+    // (module docs): the account rows are gone by then, so nothing can
+    // rebuild the entry behind it; dropping the entry drops its event
+    // channel's Sender, which is what severs the account's live WebSocket
+    // sessions once the request-scoped clones unwind.
+    // `actix_web::rt::spawn` (a `spawn_local` onto this worker's LocalSet)
+    // rather than `tokio::spawn`: the detachment semantics are identical —
+    // dropping this handler's future does not cancel the spawned task — and
+    // it sidesteps rustc's overly-conservative `Send` analysis of sqlx
+    // futures (the same limitation noted in tests/provisioning.rs).
+    let task_state = state.clone();
+    let account_id = tenant.principal.account_id.clone();
+    let outcome = actix_web::rt::spawn(async move {
+        delete_account(&task_state.control, &task_state.cluster, &account_id).await?;
+        task_state.cache.evict(&account_id).await;
+        Ok::<(), crate::error::CloudError>(())
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(join_error) => {
+            tracing::error!(
+                account_id = tenant.principal.account_id,
+                error = %join_error,
+                "account deletion task panicked"
+            );
+            return deletion_failed();
+        }
+    };
+    if let Err(e) = outcome {
         tracing::error!(
             account_id = tenant.principal.account_id,
             subdomain = tenant.subdomain,
@@ -182,12 +229,6 @@ async fn delete_account_route(
         );
         return deletion_failed();
     }
-
-    // Evict after the delete (module docs): the account rows are gone, so
-    // nothing can rebuild the entry behind this. Dropping the entry drops
-    // its event channel's Sender, which is what severs the account's live
-    // WebSocket sessions once the request-scoped clones unwind.
-    state.cache.evict(&tenant.principal.account_id).await;
 
     tracing::info!(
         account_id = tenant.principal.account_id,
@@ -227,13 +268,19 @@ fn confirmation_required(subdomain: &str) -> HttpResponse {
     }))
 }
 
-/// `delete_account` failed partway. Every step is idempotent, so the honest
-/// answer is "retry"; anything left half-deleted is also reaper territory
-/// (plan: "Failure recovery & the reaper").
+/// `delete_account` failed partway. The credential that authenticated this
+/// request is likely already revoked (revocation is deletion's first step),
+/// so the body must NOT advise retrying with it. The honest message:
+/// recovery is automatic — anything left half-deleted is reaper territory
+/// (the interrupted-deletion arm; see [`crate::reaper`]) — and if the
+/// account is still reachable, a fresh login link mints a fresh credential
+/// to retry with.
 fn deletion_failed() -> HttpResponse {
     HttpResponse::InternalServerError().json(serde_json::json!({
         "error": "deletion_failed",
-        "message": "Something went wrong deleting the account. \
-                    It is safe to try again.",
+        "message": "Something went wrong deleting the account. Cleanup \
+                    completes automatically in the background; if the \
+                    account is still reachable, request a fresh login link \
+                    to sign in and try again.",
     }))
 }

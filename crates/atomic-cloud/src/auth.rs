@@ -236,8 +236,10 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
     match status.as_str() {
         "active" => {}
         "provisioning" => return Err(account_provisioning()),
-        // 'failed' and anything unrecognized: not servable, and not worth
-        // distinguishing from "no such account" to the outside.
+        // Anything unrecognized: not servable, and not worth distinguishing
+        // from "no such account" to the outside. (No status beyond
+        // 'provisioning'/'active' exists today — failed provisions are
+        // hard-deleted by the reaper, never tombstoned.)
         _ => return Err(not_found()),
     }
 

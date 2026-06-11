@@ -30,7 +30,7 @@ use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{control_db_contains, with_control_db, CapturingSender, SentEmail};
+use support::{control_db_contains, with_control_db, CapturingSender, DelayedSender, SentEmail};
 
 /// Base domain the composition is configured with. The app host is this
 /// name itself and `app.<BASE_DOMAIN>`.
@@ -67,6 +67,20 @@ struct PlaneHarness {
 
 impl PlaneHarness {
     async fn spawn(control_url: &str, config: AccountPlaneConfig) -> Self {
+        let sender = CapturingSender::default();
+        let email: Arc<dyn atomic_cloud::EmailSender> = Arc::new(sender.clone());
+        Self::spawn_with_sender(control_url, config, email, sender).await
+    }
+
+    /// [`Self::spawn`] with an explicit [`EmailSender`] (e.g. a
+    /// [`DelayedSender`] for timing assertions). `sender` must be the
+    /// capture the custom sender ultimately records into.
+    async fn spawn_with_sender(
+        control_url: &str,
+        config: AccountPlaneConfig,
+        email: Arc<dyn atomic_cloud::EmailSender>,
+        sender: CapturingSender,
+    ) -> Self {
         let control = ControlPlane::connect(control_url)
             .await
             .expect("connect control plane");
@@ -82,14 +96,8 @@ impl PlaneHarness {
             AccountCacheConfig::default(),
         ));
         let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
-        let sender = CapturingSender::default();
-        let account_plane = AccountPlane::new(
-            control.clone(),
-            cluster.clone(),
-            Arc::new(sender.clone()),
-            config,
-        )
-        .expect("build account plane");
+        let account_plane = AccountPlane::new(control.clone(), cluster.clone(), email, config)
+            .expect("build account plane");
         let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
         let fallback = FallbackAppState::build().expect("build fallback state");
 
@@ -193,15 +201,28 @@ impl PlaneHarness {
         token_from_link(&last.link).to_string()
     }
 
-    /// Request a login link and return the captured token.
+    /// Request a login link and return the captured token. The login route
+    /// spawns its issue+send fire-and-forget (the timing-uniformity fix),
+    /// so the capture is polled briefly rather than read synchronously.
     async fn login_token(&self, email: &str) -> String {
+        let already_sent = self.sender.sent().len();
         let resp = self.request_login_link(email).await;
         assert_eq!(resp.status(), StatusCode::OK, "request login link");
-        let sent = self.sender.sent();
-        let last = sent.last().expect("a login email was captured");
-        assert_eq!(last.to, email);
-        assert_eq!(last.purpose, MagicLinkPurpose::Login);
-        token_from_link(&last.link).to_string()
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let sent = self.sender.sent();
+            if sent.len() > already_sent {
+                let last = sent.last().expect("len > already_sent");
+                assert_eq!(last.to, email);
+                assert_eq!(last.purpose, MagicLinkPurpose::Login);
+                return token_from_link(&last.link).to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a login email was never captured"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Whether the magic-link row for `token` has been consumed.
@@ -490,7 +511,7 @@ async fn signup_validation_errors_are_honest_400s() {
             let h = PlaneHarness::spawn(
                 &url,
                 plane_config(RateLimits {
-                    signup_links_per_ip: 100,
+                    links_per_ip: 100,
                     links_per_email: 100,
                     ..RateLimits::default()
                 }),
@@ -595,7 +616,13 @@ async fn login_request_link_is_indistinguishable() {
             );
 
             // Side effects: exactly one login email, for the real account,
-            // pointing at the login completion route.
+            // pointing at the login completion route. The send is spawned
+            // fire-and-forget (the timing-uniformity fix), so wait briefly
+            // for it to land before asserting.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while h.sender.sent().is_empty() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let sent = h.sender.sent();
             assert_eq!(sent.len(), 1, "only the real account gets an email");
             assert_eq!(sent[0].to, "alpha@example.com");
@@ -624,23 +651,102 @@ async fn login_request_link_is_indistinguishable() {
     .await;
 }
 
+/// Timing-oracle regression: the login route must NOT await the issue+send
+/// on the exists branch (an outbound email send takes hundreds of ms in
+/// production; awaiting it only when the account exists hands out the very
+/// signal the byte-identical bodies hide). With a sender that takes 3 s to
+/// "deliver", the response for a real account still arrives in a fraction
+/// of that, and the link lands in the capture afterwards — and works. The
+/// bounds are deliberately loose (1.5 s response vs. 3 s sender, 15 s
+/// capture deadline) to avoid flake.
+#[actix_web::test]
+async fn login_request_link_returns_before_the_send() {
+    with_control_db(
+        "login_request_link_returns_before_the_send",
+        |url| async move {
+            let capture = CapturingSender::default();
+            let delay = Duration::from_secs(3);
+            let h = PlaneHarness::spawn_with_sender(
+                &url,
+                plane_config(RateLimits::default()),
+                Arc::new(DelayedSender {
+                    inner: capture.clone(),
+                    delay,
+                }),
+                capture.clone(),
+            )
+            .await;
+            provision_account(
+                &h.control,
+                &h.cluster,
+                NewAccount {
+                    email: "alpha@example.com".to_string(),
+                    subdomain: "alpha".to_string(),
+                },
+            )
+            .await
+            .expect("provision alpha");
+
+            let started = std::time::Instant::now();
+            let resp = h.request_login_link("alpha@example.com").await;
+            let elapsed = started.elapsed();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "the exists branch must return without awaiting the send; took {elapsed:?}"
+            );
+            assert!(
+                capture.sent().is_empty(),
+                "the slow send must still be in flight when the response lands"
+            );
+
+            // The spawned send completes on its own, and its link is a
+            // working credential.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while capture.sent().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the spawned send never completed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let sent = capture.sent();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].to, "alpha@example.com");
+            assert_eq!(sent[0].purpose, MagicLinkPurpose::Login);
+            let token = token_from_link(&sent[0].link).to_string();
+            let resp = h.complete("login", &token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "the fire-and-forget link must complete a login"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
 // ==================== Rate limits ====================
 
-/// The per-IP signup limit admits exactly `limit` requests, refuses the
-/// next with 429 + Retry-After, and admits again once the window passes.
-/// Validation-failing requests count as attempts (they're charged before
-/// validation), pinned by spending one slot on a bad slug.
+/// The per-IP request-link limit admits exactly `limit` requests, refuses
+/// the next with 429 + Retry-After, and admits again once the window
+/// passes. Validation-failing requests count as attempts (they're charged
+/// before validation), pinned by spending one slot on a bad slug — and the
+/// bucket is SHARED across the signup and login routes, pinned by the
+/// refusal landing on whichever route is hit next.
 #[actix_web::test]
-async fn signup_ip_rate_limit_enforces_and_resets() {
+async fn ip_rate_limit_spans_routes_enforces_and_resets() {
     with_control_db(
-        "signup_ip_rate_limit_enforces_and_resets",
+        "ip_rate_limit_spans_routes_enforces_and_resets",
         |url| async move {
             let window = Duration::from_millis(1500);
             let h = PlaneHarness::spawn(
                 &url,
                 plane_config(RateLimits {
-                    signup_links_per_ip: 3,
-                    signup_ip_window: window,
+                    links_per_ip: 3,
+                    ip_window: window,
                     // Distinct emails below keep the email limit out of play.
                     ..RateLimits::default()
                 }),
@@ -653,13 +759,17 @@ async fn signup_ip_rate_limit_enforces_and_resets() {
                 .request_signup_link(&app_host, "a@example.com", "ab")
                 .await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-            // Admissions 2 and 3.
-            for (email, slug) in [("b@example.com", "slug-b"), ("c@example.com", "slug-c")] {
-                let resp = h.request_signup_link(&app_host, email, slug).await;
-                assert_eq!(resp.status(), StatusCode::OK);
-            }
+            // Admission 2 — a login request draws from the same bucket.
+            let resp = h.request_login_link("b@example.com").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Admission 3.
+            let resp = h
+                .request_signup_link(&app_host, "c@example.com", "slug-c")
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
-            // Over the limit: 429 with Retry-After.
+            // Over the limit: 429 with Retry-After — on BOTH routes, since
+            // the bucket is shared (switching routes mints no allowance).
             let resp = h
                 .request_signup_link(&app_host, "d@example.com", "slug-d")
                 .await;
@@ -676,9 +786,21 @@ async fn signup_ip_rate_limit_enforces_and_resets() {
             let body: Value = resp.json().await.expect("denial json");
             assert_eq!(body["error"], "rate_limited");
             assert_eq!(body["retry_after_seconds"], retry_after);
-            assert_eq!(h.sender.sent().len(), 2, "the refused request sent nothing");
+            let resp = h.request_login_link("e@example.com").await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the login route must refuse from the same exhausted bucket"
+            );
+            assert!(resp.headers().get(RETRY_AFTER).is_some());
+            assert_eq!(
+                h.sender.sent().len(),
+                1,
+                "exactly one email: the admitted signup (the admitted login \
+                 was a ghost email; the refused requests sent nothing)"
+            );
 
-            // After the window the limiter resets.
+            // After the window the limiter resets, for both routes.
             tokio::time::sleep(window + Duration::from_millis(200)).await;
             let resp = h
                 .request_signup_link(&app_host, "d@example.com", "slug-d")
@@ -688,6 +810,8 @@ async fn signup_ip_rate_limit_enforces_and_resets() {
                 StatusCode::OK,
                 "limit must reset once the window passes"
             );
+            let resp = h.request_login_link("f@example.com").await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
             h.stop().await;
         },
@@ -708,6 +832,9 @@ async fn email_rate_limit_enforces_and_resets() {
             plane_config(RateLimits {
                 links_per_email: 2,
                 email_window: window,
+                // Every request below shares one loopback IP; keep the
+                // (now route-spanning) IP bucket out of play.
+                links_per_ip: 100,
                 ..RateLimits::default()
             }),
         )
@@ -1071,6 +1198,24 @@ async fn saturated_provisioning_refuses_without_consuming() {
             );
             assert_eq!(h.account_count("kenny@example.com").await, 0);
 
+            // Dead tokens are refused by the pre-permit checks even while
+            // saturated — 400 invalid_link, never 503 — pinning that the
+            // syntactic gate (malformed) and the read-only peek
+            // (well-shaped but unknown) both run before the permit.
+            for junk in [
+                "definitely-not-a-token".to_string(),
+                format!("aml_{}", "a".repeat(52)),
+            ] {
+                let resp = h.complete("signup", &junk).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{junk:?} must be refused as invalid even under saturation"
+                );
+                let body: Value = resp.json().await.expect("denial json");
+                assert_eq!(body["error"], "invalid_link");
+            }
+
             // Capacity frees up; the SAME link completes.
             drop(held);
             let resp = h.complete("signup", &token).await;
@@ -1079,6 +1224,186 @@ async fn saturated_provisioning_refuses_without_consuming() {
                 StatusCode::FOUND,
                 "the token must remain usable after a saturation refusal"
             );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// Permit-starvation regression: garbage completions must never hold a
+/// provision permit. With the cap at 1, a legitimate signup completes
+/// successfully on its first try WHILE a hammer of well-shaped-but-unknown
+/// tokens runs — if junk acquired the only permit even briefly, the legit
+/// request would race into 503s; and every hammered request must itself be
+/// a 400, never a 503.
+#[actix_web::test]
+async fn garbage_completions_never_hold_permits() {
+    with_control_db("garbage_completions_never_hold_permits", |url| async move {
+        let h = PlaneHarness::spawn(
+            &url,
+            AccountPlaneConfig {
+                max_concurrent_provisions: 1,
+                ..AccountPlaneConfig::new(BASE_DOMAIN)
+            },
+        )
+        .await;
+        let token = h.signup_token("kenny@example.com", "kenny").await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = {
+            let stop = Arc::clone(&stop);
+            let client = h.client.clone();
+            let url = format!(
+                "{}/signup/complete?token=aml_{}",
+                h.base_url,
+                "a".repeat(52)
+            );
+            actix_web::rt::spawn(async move {
+                let mut refused = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let resp = client
+                        .get(&url)
+                        .header(HOST, format!("app.{BASE_DOMAIN}"))
+                        .send()
+                        .await
+                        .expect("send garbage complete");
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST,
+                        "garbage must always be 400 — a 503 would mean it \
+                         reached the permit"
+                    );
+                    refused += 1;
+                }
+                refused
+            })
+        };
+
+        // The legit completion (a real multi-second provision) wins its
+        // permit on the first try, mid-hammer.
+        let resp = h.complete("signup", &token).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "the legit completion must succeed while garbage hammers"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let refused = hammer.await.expect("hammer task");
+        assert!(refused > 0, "the hammer must actually have run");
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Self-resume regression: a subdomain claimed by the requester's OWN stuck
+/// `'provisioning'` account is not "taken" — re-requesting a link (in any
+/// email casing) gets a 200 whose completion resumes the stuck provision to
+/// active. A different email is still refused honestly.
+#[actix_web::test]
+async fn stuck_provision_resumes_via_fresh_request_link() {
+    with_control_db(
+        "stuck_provision_resumes_via_fresh_request_link",
+        |url| async move {
+            let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+            let app_host = format!("app.{BASE_DOMAIN}");
+
+            // A crashed signup: the claim sits in 'provisioning' (nothing
+            // else was done — the earliest possible crash point).
+            let account_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ($1, 'stuck', 'kenny@example.com', 'provisioning', 'free')",
+            )
+            .bind(account_id.to_string())
+            .execute(h.control.pool())
+            .await
+            .expect("seed stuck provision");
+
+            // A different email is still honestly refused.
+            let resp = h
+                .request_signup_link(&app_host, "rival@example.com", "stuck")
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body: Value = resp.json().await.expect("error json");
+            assert_eq!(body["error"], "subdomain_taken");
+
+            // The same email — in different casing, since every email
+            // comparison is lowercased — gets a fresh link...
+            let token = h.signup_token("Kenny@Example.com", "stuck").await;
+
+            // ...whose completion RESUMES the stuck account (same id, now
+            // active), rather than failing subdomain_taken.
+            let resp = h.complete("signup", &token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "completion must resume the user's own stuck claim"
+            );
+            let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = $1")
+                .bind(account_id.to_string())
+                .fetch_one(h.control.pool())
+                .await
+                .expect("stuck account row still exists");
+            assert_eq!(status, "active", "the original claim was resumed");
+            let owners: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE subdomain = 'stuck'")
+                    .fetch_one(h.control.pool())
+                    .await
+                    .expect("count owners");
+            assert_eq!(owners, 1, "resume, not a duplicate claim");
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// Every account-plane response carries `Referrer-Policy: no-referrer`:
+/// completion URLs hold live single-use tokens, and neither the redirect
+/// nor any error page may leak them onward via `Referer`.
+#[actix_web::test]
+async fn account_plane_responses_set_no_referrer() {
+    with_control_db(
+        "account_plane_responses_set_no_referrer",
+        |url| async move {
+            let h = PlaneHarness::spawn(&url, plane_config(RateLimits::default())).await;
+            let app_host = format!("app.{BASE_DOMAIN}");
+
+            fn assert_no_referrer(resp: &reqwest::Response, what: &str) {
+                assert_eq!(
+                    resp.headers()
+                        .get("referrer-policy")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-referrer"),
+                    "{what} must carry Referrer-Policy: no-referrer"
+                );
+            }
+
+            // Request-link successes and validation failures, both routes.
+            let resp = h
+                .request_signup_link(&app_host, "kenny@example.com", "kenny")
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_no_referrer(&resp, "signup request-link 200");
+            let resp = h.request_signup_link(&app_host, "garbage", "kenny").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_no_referrer(&resp, "signup request-link 400");
+            let resp = h.request_login_link("kenny@example.com").await;
+            assert_no_referrer(&resp, "login request-link 200");
+
+            // Completion: the redirect (the URL that carried the token) and the
+            // dead-token refusal.
+            let sent = h.sender.sent();
+            let token = token_from_link(&sent[0].link).to_string();
+            let resp = h.complete("signup", &token).await;
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            assert_no_referrer(&resp, "signup completion redirect");
+            let resp = h.complete("signup", &token).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_no_referrer(&resp, "spent-token refusal");
 
             h.stop().await;
         },

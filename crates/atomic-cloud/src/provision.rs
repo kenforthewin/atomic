@@ -26,8 +26,8 @@
 //!
 //! # Provision/deletion races
 //!
-//! Provisioning and deletion can interleave on a live system; two guards in
-//! [`provision_account`] keep that safe:
+//! Provisioning and deletion can interleave on a live system; three guards
+//! in [`provision_account`] keep that safe:
 //!
 //! - [`ensure_claim_not_reserved`] re-checks `subdomains_reserved` *after*
 //!   the claim INSERT, rolling the claim back if a concurrent deletion
@@ -37,6 +37,10 @@
 //!   foreign-key violation (the accounts row vanished mid-provision) as
 //!   "deletion won": the just-created database is dropped rather than
 //!   orphaned.
+//! - [`activate_account`] (step 11) checks `rows_affected`: an UPDATE that
+//!   matches zero rows means the accounts row vanished *after* the mapping
+//!   insert, and the provision fails typed instead of reporting success for
+//!   a dead account.
 
 use std::str::FromStr;
 
@@ -229,9 +233,10 @@ pub async fn provision_account(
     // Step 3 — claim the subdomain atomically. The UNIQUE constraint on
     // accounts.subdomain is what makes "taken" race-free: losers of a
     // concurrent claim see SQLSTATE 23505. A conflicting row that is still
-    // 'provisioning' for the same email is a crashed earlier attempt —
-    // resume it. Anything else (active account, different email, a 'failed'
-    // row awaiting the reaper) reports taken.
+    // 'provisioning' for the same email (compared case-insensitively, like
+    // every other email comparison in the crate) is a crashed earlier
+    // attempt — resume it. Anything else (an active account, or another
+    // email's in-flight claim) reports taken.
     let account_id = Uuid::new_v4();
     let claim = sqlx::query(
         "INSERT INTO accounts (id, subdomain, email, status, plan) \
@@ -260,7 +265,10 @@ pub async fn provision_account(
                     .await
                     .map_err(CloudError::db("looking up conflicting subdomain claim"))?;
             match existing {
-                Some((id, row_email, status)) if status == "provisioning" && row_email == email => {
+                Some((id, row_email, status))
+                    if status == "provisioning"
+                        && row_email.to_lowercase() == email.to_lowercase() =>
+                {
                     Uuid::parse_str(&id).map_err(|_| {
                         CloudError::Invariant(format!("accounts.id {id:?} is not a UUID"))
                     })?
@@ -365,11 +373,7 @@ pub async fn provision_account(
     }
 
     // Step 11 — activate.
-    sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
-        .bind(account_id.to_string())
-        .execute(control.pool())
-        .await
-        .map_err(CloudError::db("activating account"))?;
+    activate_account(control, account_id).await?;
 
     tracing::info!(
         account_id = %account_id,
@@ -383,6 +387,39 @@ pub async fn provision_account(
         subdomain,
         db_name,
     })
+}
+
+/// Step 11 — flip a claimed account from `'provisioning'` to `'active'`,
+/// **verifying the row still exists**.
+///
+/// `rows_affected == 0` means the accounts row vanished between the
+/// `account_databases` insert and here: a concurrent [`delete_account`] (or
+/// a reaper rollback) won the race and the CASCADE already swept the mapping
+/// row this provision just wrote. Returning `Ok` would report success for a
+/// dead account — the caller would mint a session against a missing FK, the
+/// reaper would log a resume that didn't happen, the CLI would print
+/// success — so the zero-row case is the same typed
+/// [`CloudError::AccountNoLongerProvisioning`] the earlier guards use.
+/// Re-activating an already-`'active'` row matches one row and stays `Ok`,
+/// keeping resumed provisions idempotent.
+///
+/// Public as a test seam (like [`ensure_claim_not_reserved`]): the window
+/// between steps 10 and 11 is too narrow to drive end-to-end, so the
+/// regression test exercises this function against a deleted row directly;
+/// production code reaches it only through [`provision_account`].
+pub async fn activate_account(control: &ControlPlane, account_id: Uuid) -> Result<(), CloudError> {
+    let updated = sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
+        .bind(account_id.to_string())
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("activating account"))?
+        .rows_affected();
+    if updated == 0 {
+        return Err(CloudError::AccountNoLongerProvisioning(
+            account_id.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Post-claim reservation guard, closing the TOCTOU between

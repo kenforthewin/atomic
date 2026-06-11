@@ -241,6 +241,28 @@ impl EmailSender for CapturingSender {
     }
 }
 
+/// A deliberately slow [`EmailSender`] for timing assertions: sleeps for
+/// `delay`, then records into the wrapped [`CapturingSender`]. Lets a test
+/// prove a route returned *without* awaiting the send (the response arrives
+/// in far less than `delay`; the captured email lands afterwards).
+pub struct DelayedSender {
+    pub inner: CapturingSender,
+    pub delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmailSender for DelayedSender {
+    async fn send_magic_link(
+        &self,
+        to: &str,
+        link: &str,
+        purpose: MagicLinkPurpose,
+    ) -> Result<(), CloudError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.send_magic_link(to, link, purpose).await
+    }
+}
+
 /// Whether `needle` appears in ANY text/varchar column of ANY public-schema
 /// table in the control database. The exhaustive form of "the plaintext is
 /// never persisted": scanning every column means a future table or column

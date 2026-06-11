@@ -4,7 +4,7 @@
 //! One periodic job. Every serve process runs [`run_reaper_pass`] on an
 //! interval (`main.rs` wires the loop with a jittered start; the pass itself
 //! is a plain async function so tests and operators can call it directly).
-//! A pass has four arms, in order:
+//! A pass has five arms, in order:
 //!
 //! 1. **Stuck provisions** — `accounts` rows parked in
 //!    `status = 'provisioning'` longer than
@@ -35,7 +35,30 @@
 //!    the drop, under the advisory lock derived from the database name's
 //!    embedded account id ([`tenant_db_account_id`]).
 //!
-//! 3. **Self-reservations** — `subdomains_reserved` rows whose subdomain
+//! 3. **Interrupted deletions** — `accounts` rows in `status = 'active'`,
+//!    older than [`ReaperPolicy::deletion_recovery_grace`], with **no**
+//!    `account_databases` row. A healthy active account ALWAYS has a
+//!    mapping row — provisioning inserts it (step 10) strictly *before*
+//!    activation (step 11), and only `delete_account` (its step 5) or the
+//!    accounts-row CASCADE ever removes one — so the predicate cannot
+//!    false-positive; active-without-mapping is precisely a
+//!    `delete_account` that died between removing the mapping and deleting
+//!    the accounts row. (The tempting cheaper signal "all tokens revoked
+//!    and no sessions" is *unsound* on its own: a dormant account that
+//!    never minted a token and whose sessions expired looks identical.)
+//!    Recovery is completing the deletion via [`delete_account`] — it is
+//!    idempotent, re-parks the subdomain, and removes the row. This arm
+//!    deliberately does **not** depend on the deletion's `subdomains_
+//!    reserved` self-reservation marker, so its ordering relative to arm 4
+//!    (which clears such markers) is not load-bearing — but it still runs
+//!    *before* arm 4 so a half-deleted account's marker is consumed by the
+//!    completed deletion rather than transiently cleared and re-parked.
+//!    Note the grace is keyed on `created_at` (accounts carry no deletion
+//!    timestamp), so on old accounts this arm can race a deletion's
+//!    milliseconds-wide step-5→6 window; that is safe — `delete_account`
+//!    is idempotent and writes its reservation before the row delete.
+//!
+//! 4. **Self-reservations** — `subdomains_reserved` rows whose subdomain
 //!    belongs to an *active* account: the residue of a deletion that crashed
 //!    between reserving the subdomain and deleting the accounts row (the
 //!    slice-1 follow-up). Cleared only once the reservation is older than
@@ -43,9 +66,11 @@
 //!    is a deletion in flight right now, mid-way between its reserve and
 //!    row-delete steps, and clearing it would lose the 90-day park
 //!    (`delete_account` re-ups `created_at` on its upsert precisely so
-//!    retried deletions regain this shield).
+//!    retried deletions regain this shield). An account arm 3 just finished
+//!    deleting is invisible here (the join needs an *active* accounts row),
+//!    which is why the two arms cannot fight.
 //!
-//! 4. **Hygiene** — purge `magic_links` expired more than
+//! 5. **Hygiene** — purge `magic_links` expired more than
 //!    [`ReaperPolicy::magic_link_retention_after_expiry`] ago (the recently
 //!    expired keep their forensic value a little longer), expired
 //!    `sessions`, and lapsed `subdomains_reserved` rows. All three are
@@ -58,7 +83,7 @@
 //! deletions (none of which take reaper locks). Three mechanisms make that
 //! safe; each arm documents which it leans on:
 //!
-//! - **Per-account advisory locks.** Row processing in arms 1 and 2 happens
+//! - **Per-account advisory locks.** Row processing in arms 1–3 happens
 //!   under `pg_try_advisory_lock` on the control plane, keyed by
 //!   [`reaper_lock_key`] over the account id. Contention means another pass
 //!   owns the row — skip it (recorded in the summary), never wait. The lock
@@ -71,8 +96,9 @@
 //! - **Under-lock re-checks.** The work lists are read unlocked, so every
 //!   row is re-verified after its lock is acquired: arm 1 re-reads the
 //!   accounts row (a concurrent pass — or the user's own retried signup —
-//!   may have resumed, rolled back, or activated it), and arm 2 re-proves
-//!   the absence of both control-plane rows.
+//!   may have resumed, rolled back, or activated it), arm 2 re-proves the
+//!   absence of both control-plane rows, and arm 3 re-proves
+//!   active-without-mapping.
 //!
 //! - **Existing idempotency guarantees.** The resume *is*
 //!   [`provision_account`]; the rollback's claim is a status-guarded
@@ -81,7 +107,7 @@
 //!   double-processing (the interleavings are walked through on
 //!   [`roll_back_stuck_provision`]).
 //!
-//! Arms 3 and 4 are single atomic SQL statements — concurrent passes
+//! Arms 4 and 5 are single atomic SQL statements — concurrent passes
 //! running them twice is harmless (the second deletes nothing), so they
 //! take no locks.
 
@@ -113,18 +139,29 @@ pub struct ReaperPolicy {
     /// migrations for seconds; the cap keeps a backlog of stuck rows from
     /// turning a 60-second job into a minutes-long one. Surplus rows are
     /// deferred to the next pass, recorded in
-    /// [`ReaperSummary::stuck_deferred`].
+    /// [`ReaperSummary::stuck_deferred`]. Rows found already settled under
+    /// their lock cost one indexed read and do **not** count against the
+    /// cap — settled rows must not crowd out real work.
     pub max_resumes_per_pass: usize,
 
-    /// Minimum age of a self-reservation before arm 3 clears it. Younger
+    /// Minimum account age before arm 3 treats an active-without-mapping
+    /// account as an interrupted deletion. The predicate itself is sound at
+    /// any age (see the module docs); the grace is defensive depth — it
+    /// keeps the arm out of brand-new accounts entirely and bounds how soon
+    /// the reaper competes with a deletion that is still being retried by
+    /// its own caller.
+    pub deletion_recovery_grace: Duration,
+
+    /// Minimum age of a self-reservation before arm 4 clears it. Younger
     /// rows are presumed to be a `delete_account` in flight between its
     /// reserve and row-delete steps.
     pub self_reservation_grace: Duration,
 
     /// How long expired magic links are retained before the hygiene arm
-    /// purges them (plan follow-up: "expired > 24h ago"). They are inert
-    /// the moment they expire; the retention only preserves the forensic
-    /// breadcrumbs (`request_ip`, timing) for a debugging window.
+    /// purges them. The 24 hours are this implementation's choice (the plan
+    /// doesn't fix a retention). Links are inert the moment they expire;
+    /// the retention only preserves the forensic breadcrumbs
+    /// (`request_ip`, timing) for a debugging window.
     pub magic_link_retention_after_expiry: Duration,
 }
 
@@ -134,6 +171,7 @@ impl Default for ReaperPolicy {
             stuck_provision_age: Duration::from_secs(5 * 60),
             // One pass is at most as provision-heavy as the signup plane.
             max_resumes_per_pass: crate::account_plane::DEFAULT_MAX_CONCURRENT_PROVISIONS,
+            deletion_recovery_grace: Duration::from_secs(5 * 60),
             self_reservation_grace: Duration::from_secs(5 * 60),
             magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
         }
@@ -161,6 +199,12 @@ pub struct ReaperSummary {
     /// Orphan candidates skipped because another pass holds the lock for
     /// their embedded account id.
     pub orphan_dbs_skipped_locked: Vec<String>,
+    /// Interrupted deletions completed (account ids; rows gone, subdomains
+    /// re-parked).
+    pub deletions_completed: Vec<String>,
+    /// Interrupted-deletion candidates skipped because another pass holds
+    /// their lock.
+    pub deletions_skipped_locked: Vec<String>,
     /// Reservations cleared because their subdomain belongs to an active
     /// account (subdomains).
     pub self_reservations_cleared: Vec<String>,
@@ -186,6 +230,8 @@ impl ReaperSummary {
             && self.stuck_deferred.is_empty()
             && self.orphan_dbs_dropped.is_empty()
             && self.orphan_dbs_skipped_locked.is_empty()
+            && self.deletions_completed.is_empty()
+            && self.deletions_skipped_locked.is_empty()
             && self.self_reservations_cleared.is_empty()
             && self.expired_magic_links_purged == 0
             && self.expired_sessions_purged == 0
@@ -221,6 +267,9 @@ pub async fn run_reaper_pass(
     }
     if let Err(e) = reap_orphaned_tenant_databases(control, cluster, &mut summary).await {
         record_error(&mut summary, "orphaned-database arm", &e);
+    }
+    if let Err(e) = complete_interrupted_deletions(control, cluster, policy, &mut summary).await {
+        record_error(&mut summary, "interrupted-deletion arm", &e);
     }
     if let Err(e) = clear_self_reservations(control, policy, &mut summary).await {
         record_error(&mut summary, "self-reservation arm", &e);
@@ -337,11 +386,18 @@ async fn reap_stuck_provisions(
                 continue;
             }
         };
-        resumes_used += 1;
         // Process under the lock, then ALWAYS release — outcomes (including
         // errors) are values here precisely so no path skips the release.
         let outcome = process_stuck_provision(control, cluster, &account_id, stale_before).await;
         lock.release().await;
+        // Only attempts that actually did resume work count against the
+        // cap. AlreadySettled cost one indexed re-read — charging it would
+        // let rows settled by concurrent actors crowd real work out of the
+        // pass. Errors count: a failed resume may well have burned the
+        // multi-second budget the cap exists to bound.
+        if !matches!(outcome, Ok(StuckOutcome::AlreadySettled)) {
+            resumes_used += 1;
+        }
         match outcome {
             Ok(StuckOutcome::Resumed) => summary.stuck_resumed.push(account_id),
             Ok(StuckOutcome::RolledBack) => summary.stuck_rolled_back.push(account_id),
@@ -633,7 +689,99 @@ async fn is_referenced(
     .map_err(CloudError::db("checking orphan candidate references"))
 }
 
-/// Arm 3 — self-reservations: one atomic DELETE, age-guarded (see module
+/// Arm 3 — interrupted deletions: active accounts with no
+/// `account_databases` row, older than the grace. See the module docs for
+/// the soundness proof (a healthy active account always has a mapping row —
+/// provision step 10 precedes step 11; only `delete_account` or the
+/// accounts-row CASCADE removes mappings). Recovery is the idempotent
+/// [`delete_account`] under the same per-account advisory lock arms 1 and 2
+/// use; no per-pass cap — completion is a handful of queries plus an
+/// `IF EXISTS` drop of an already-dropped database, and half-deleted
+/// accounts are rare by construction (the HTTP route is cancellation-proof;
+/// this arm exists for pod crashes).
+async fn complete_interrupted_deletions(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    policy: &ReaperPolicy,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let abandoned_before = cutoff(policy.deletion_recovery_grace);
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT a.id FROM accounts a \
+         WHERE a.status = 'active' \
+           AND a.created_at < $1 \
+           AND NOT EXISTS (SELECT 1 FROM account_databases ad \
+                           WHERE ad.account_id = a.id) \
+         ORDER BY a.created_at",
+    )
+    .bind(abandoned_before)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing interrupted deletions"))?;
+
+    for account_id in candidates {
+        let lock = match AccountLock::try_acquire(control, &account_id).await {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                summary.deletions_skipped_locked.push(account_id);
+                continue;
+            }
+            Err(e) => {
+                record_error(
+                    summary,
+                    &format!("locking interrupted deletion {account_id}"),
+                    &e,
+                );
+                continue;
+            }
+        };
+        let outcome: Result<bool, CloudError> = async {
+            // Under-lock re-check: the unlocked listing may have raced a
+            // provision activating... no — activation requires the mapping
+            // row to exist first; what it can race is another pass (or the
+            // user's own deletion retry) finishing the job, leaving the row
+            // gone or re-provisioned. Re-prove active-without-mapping.
+            let still_interrupted: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM accounts a \
+                 WHERE a.id = $1 AND a.status = 'active' \
+                   AND NOT EXISTS (SELECT 1 FROM account_databases ad \
+                                   WHERE ad.account_id = a.id))",
+            )
+            .bind(&account_id)
+            .fetch_one(control.pool())
+            .await
+            .map_err(CloudError::db(
+                "re-checking interrupted deletion under lock",
+            ))?;
+            if !still_interrupted {
+                return Ok(false);
+            }
+            crate::provision::delete_account(control, cluster, &account_id).await?;
+            Ok(true)
+        }
+        .await;
+        lock.release().await;
+        match outcome {
+            Ok(true) => {
+                tracing::warn!(
+                    account_id,
+                    "reaper completed an interrupted account deletion \
+                     (active account with no tenant-database mapping)"
+                );
+                summary.deletions_completed.push(account_id);
+            }
+            Ok(false) => {}
+            Err(e) => record_error(
+                summary,
+                &format!("completing interrupted deletion {account_id}"),
+                &e,
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Arm 4 — self-reservations: one atomic DELETE, age-guarded (see module
 /// docs for why the grace shields in-flight deletions).
 async fn clear_self_reservations(
     control: &ControlPlane,
@@ -663,7 +811,7 @@ async fn clear_self_reservations(
     Ok(())
 }
 
-/// Arm 4 — hygiene purges. Each target is already inert before deletion
+/// Arm 5 — hygiene purges. Each target is already inert before deletion
 /// (every reader filters on expiry/consumption), so these are independent
 /// single statements with no locking.
 async fn purge_expired_rows(
@@ -709,9 +857,12 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_matches_plan_numbers() {
+    fn default_policy_numbers() {
         let policy = ReaperPolicy::default();
+        // The plan's number ("created_at < now() - interval '5 minutes'").
         assert_eq!(policy.stuck_provision_age, Duration::from_secs(300));
+        // Our choices (the plan fixes neither).
+        assert_eq!(policy.deletion_recovery_grace, Duration::from_secs(300));
         assert_eq!(
             policy.magic_link_retention_after_expiry,
             Duration::from_secs(24 * 60 * 60)

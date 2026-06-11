@@ -511,6 +511,64 @@ async fn racing_deletion_does_not_orphan_tenant_database() {
     .await;
 }
 
+/// Issue: step 11 (activation) must verify its UPDATE matched a row — a
+/// concurrent deletion/rollback can remove the accounts row between the
+/// mapping insert and activation, and returning `Ok` there would report
+/// success for a dead account (session insert hits the FK, the reaper logs
+/// a resume that didn't happen, the CLI prints success). That window is two
+/// pool round-trips wide, so this drives the activation seam directly (the
+/// `ensure_claim_not_reserved` test pattern): a live claim activates and
+/// re-activates idempotently; a vanished row is the typed error, never Ok.
+#[tokio::test]
+async fn activation_of_vanished_account_is_typed_error() {
+    with_control_db(
+        "activation_of_vanished_account_is_typed_error",
+        |url| async move {
+            let (control, _cluster) = setup(&url).await;
+
+            let account_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ($1, 'activatable', 'k@example.com', 'provisioning', 'free')",
+            )
+            .bind(account_id.to_string())
+            .execute(control.pool())
+            .await
+            .expect("seed claim row");
+
+            // A live claim activates...
+            atomic_cloud::provision::activate_account(&control, account_id)
+                .await
+                .expect("live claim activates");
+            assert_eq!(
+                account_status(&control, &account_id.to_string()).await,
+                "active"
+            );
+            // ...idempotently (resumed provisions re-run step 11).
+            atomic_cloud::provision::activate_account(&control, account_id)
+                .await
+                .expect("re-activation is idempotent");
+
+            // The row vanishes (a concurrent delete_account or reaper
+            // rollback won): activation must fail typed, never Ok.
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(account_id.to_string())
+                .execute(control.pool())
+                .await
+                .expect("yank accounts row");
+            let err = atomic_cloud::provision::activate_account(&control, account_id)
+                .await
+                .expect_err("activating a vanished account must fail");
+            assert!(
+                matches!(err, CloudError::AccountNoLongerProvisioning(ref id)
+                    if *id == account_id.to_string()),
+                "expected AccountNoLongerProvisioning, got {err:?}"
+            );
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn delete_account_removes_everything_and_parks_subdomain() {
     with_control_db(
