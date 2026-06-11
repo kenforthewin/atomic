@@ -606,6 +606,7 @@ name = "atomic-cloud"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "async-trait",
  "atomic-core",
  "atomic-server",
  "atomic-test-support",
@@ -616,6 +617,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.5",
  "reqwest 0.12.26",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

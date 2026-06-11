@@ -138,8 +138,10 @@ fn checked_tenant_db_name(name: &str) -> Result<&str, CloudError> {
     Ok(name)
 }
 
-/// Signup slug rule from the plan: 3-32 chars of `[a-z0-9-]`.
-fn subdomain_format_ok(subdomain: &str) -> bool {
+/// Signup slug rule from the plan: 3-32 chars of `[a-z0-9-]`. Shared with
+/// the account plane's request-link validation, so the early UX check and
+/// the authoritative provision-time check can never disagree.
+pub(crate) fn subdomain_format_ok(subdomain: &str) -> bool {
     (3..=32).contains(&subdomain.len())
         && subdomain
             .chars()
@@ -147,10 +149,11 @@ fn subdomain_format_ok(subdomain: &str) -> bool {
 }
 
 /// Minimal email shape check: non-empty local and domain parts, the domain
-/// containing a dot, no whitespace. Real verification is the magic link
-/// (signup slice) — clicking it proves ownership; this only rejects obvious
-/// garbage before we burn an account row on it.
-fn email_format_ok(email: &str) -> bool {
+/// containing a dot, no whitespace. Real verification is the magic link —
+/// clicking it proves ownership; this only rejects obvious garbage before
+/// we burn an account row (or an email send) on it. Shared with the account
+/// plane's request-link validation.
+pub(crate) fn email_format_ok(email: &str) -> bool {
     if email.chars().any(char::is_whitespace) {
         return false;
     }

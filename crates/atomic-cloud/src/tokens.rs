@@ -141,8 +141,9 @@ pub struct SessionRecord {
 
 /// Generate an opaque secret: `prefix` + 32 bytes from the OS RNG, base32
 /// (RFC 4648, no padding, lowercased). Returns `(plaintext, sha256_hex)` —
-/// only the hash is ever persisted.
-fn generate_secret(prefix: &str) -> (String, String) {
+/// only the hash is ever persisted. Shared with [`crate::magic_links`],
+/// which follows the same discipline under its own prefix.
+pub(crate) fn generate_secret(prefix: &str) -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let plaintext = format!(
@@ -156,7 +157,7 @@ fn generate_secret(prefix: &str) -> (String, String) {
 }
 
 /// SHA-256 of the full plaintext (prefix included), lowercase hex.
-fn sha256_hex(plaintext: &str) -> String {
+pub(crate) fn sha256_hex(plaintext: &str) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(plaintext.as_bytes()))
 }
 

@@ -37,7 +37,10 @@ pub const DEFAULT_CONTROL_DB_NAME: &str = "atomic_cloud_control";
 /// Embedded migration registry: `(version, sql)`. Each migration's SQL is
 /// responsible for inserting its own `schema_version` row, matching the
 /// tenant-migration convention in atomic-core.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/001_control_plane.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/001_control_plane.sql")),
+    (2, include_str!("../migrations/002_magic_links.sql")),
+];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks
 /// are scoped to the database a session is connected to, so this cannot

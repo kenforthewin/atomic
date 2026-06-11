@@ -18,10 +18,10 @@ use std::sync::Arc;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
-    AccountCacheConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, NewAccount,
-    TokenScope,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
+    EmailSender, FallbackAppState, LogSender, MailgunSender, NewAccount, RateLimits, TokenScope,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "atomic-cloud", about = "Atomic Cloud multi-tenant server")]
@@ -104,6 +104,24 @@ enum Command {
         /// seconds. Defaults to a quarter of the cache idle TTL.
         #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
         cache_sweep_interval_secs: Option<u64>,
+
+        #[command(flatten)]
+        email: EmailArgs,
+
+        /// Derive the client IP for rate limiting from `X-Forwarded-For`
+        /// (rightmost entry — the one appended by your proxy) instead of
+        /// the connection peer address. Enable when, and ONLY when, a
+        /// trusted reverse proxy fronts this process: without one, clients
+        /// can spoof the header and sidestep per-IP limits; with one but
+        /// this flag off, every client shares the proxy's bucket.
+        #[arg(long, env = "ATOMIC_CLOUD_TRUST_PROXY_HEADER")]
+        trust_proxy_header: bool,
+
+        /// Public origin used when building emailed magic links, e.g.
+        /// `https://app.atomic.cloud`. Defaults to `https://app.<base-domain>`;
+        /// override for local/dev deployments with ports or plain http.
+        #[arg(long, env = "ATOMIC_CLOUD_APP_PUBLIC_URL")]
+        app_public_url: Option<String>,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -121,6 +139,68 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+}
+
+/// How magic-link emails leave the process.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EmailMode {
+    /// Write the link to the server log at info level instead of sending
+    /// anything (dev mode — the log is the delivery channel).
+    Log,
+    /// Send real email via the Mailgun REST API; links are never logged.
+    Mailgun,
+}
+
+/// Email delivery selection for `serve`. Mailgun mode requires all three
+/// credentials; the API key is env-only by convention (it's a secret).
+#[derive(Args)]
+struct EmailArgs {
+    /// Email delivery mode for magic links.
+    #[arg(long, env = "ATOMIC_CLOUD_EMAIL_MODE", default_value = "log")]
+    email_mode: EmailMode,
+
+    /// Mailgun API key (required with --email-mode mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_API_KEY", hide_env_values = true)]
+    mailgun_api_key: Option<String>,
+
+    /// Mailgun sending domain, e.g. `mg.atomic.cloud` (required with
+    /// --email-mode mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_DOMAIN")]
+    mailgun_domain: Option<String>,
+
+    /// From address for magic-link email, e.g.
+    /// `Atomic <no-reply@mg.atomic.cloud>` (required with --email-mode
+    /// mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_FROM")]
+    mailgun_from: Option<String>,
+}
+
+impl EmailArgs {
+    /// Build the configured sender, erroring when mailgun mode is missing
+    /// credentials — fail at boot, not on the first signup.
+    fn into_sender(self) -> Result<Arc<dyn EmailSender>, Box<dyn std::error::Error>> {
+        match self.email_mode {
+            EmailMode::Log => {
+                tracing::warn!(
+                    "email mode is 'log': magic links are written to this log, not emailed"
+                );
+                Ok(Arc::new(LogSender))
+            }
+            EmailMode::Mailgun => {
+                let missing = |flag: &str| {
+                    format!("--email-mode mailgun requires {flag} (or its environment variable)")
+                };
+                let api_key = self
+                    .mailgun_api_key
+                    .ok_or_else(|| missing("--mailgun-api-key"))?;
+                let domain = self
+                    .mailgun_domain
+                    .ok_or_else(|| missing("--mailgun-domain"))?;
+                let from = self.mailgun_from.ok_or_else(|| missing("--mailgun-from"))?;
+                Ok(Arc::new(MailgunSender::new(api_key, domain, from)))
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -221,6 +301,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tenant_pool_max_connections,
             tenant_pool_idle_timeout_secs,
             cache_sweep_interval_secs,
+            email,
+            trust_proxy_header,
+            app_public_url,
         } => {
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
@@ -228,6 +311,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     tenant_pool_idle_timeout_secs,
                 ),
                 ..AccountCacheConfig::default()
+            };
+            let plane_config = AccountPlaneConfig {
+                app_public_url,
+                trust_proxy_header,
+                rate_limits: RateLimits::default(),
+                ..AccountPlaneConfig::new(base_domain.clone())
             };
             serve(
                 control,
@@ -237,6 +326,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 cache_config,
                 cache_sweep_interval_secs.map(std::time::Duration::from_secs),
+                email.into_sender()?,
+                plane_config,
             )
             .await
         }
@@ -315,6 +406,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// `sweep_interval` controls the periodic account-cache sweep; `None` means
 /// a quarter of the cache's idle TTL.
+#[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
 async fn serve(
     control: ControlPlane,
     cluster: ClusterConfig,
@@ -323,12 +415,15 @@ async fn serve(
     port: u16,
     cache_config: AccountCacheConfig,
     sweep_interval: Option<std::time::Duration>,
+    email: Arc<dyn EmailSender>,
+    plane_config: AccountPlaneConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
         .max(std::time::Duration::from_secs(1));
     let cache = Arc::new(AccountCache::new(control.clone(), cluster, cache_config));
-    let auth = CloudAuth::new(control, Arc::clone(&cache), &base_domain);
+    let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
+    let account_plane = AccountPlane::new(control, email, plane_config);
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
     // a new entry, but a stable working set produces no inserts — without
@@ -356,14 +451,24 @@ async fn serve(
 
     tracing::info!("Atomic Cloud starting...");
     tracing::info!(base_domain, "accounts served under *.{base_domain}");
+    tracing::info!(
+        base_domain,
+        "account plane (signup/login) on {base_domain} and app.{base_domain}"
+    );
     tracing::info!(bind, port, "listening on http://{bind}:{port}");
     tracing::info!(bind, port, "health: http://{bind}:{port}/health");
 
-    HttpServer::new(move || App::new().configure(configure_cloud_app(state.clone(), auth.clone())))
-        .workers(4)
-        .bind((bind.as_str(), port))?
-        .run()
-        .await?;
+    HttpServer::new(move || {
+        App::new().configure(configure_cloud_app(
+            state.clone(),
+            auth.clone(),
+            account_plane.clone(),
+        ))
+    })
+    .workers(4)
+    .bind((bind.as_str(), port))?
+    .run()
+    .await?;
 
     Ok(())
 }

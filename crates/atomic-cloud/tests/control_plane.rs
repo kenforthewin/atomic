@@ -9,12 +9,14 @@ use atomic_cloud::reserved_subdomains::is_reserved;
 use atomic_cloud::ControlPlane;
 use support::with_control_db;
 
-const SLICE_1_TABLES: &[&str] = &[
+/// Every table the control-plane migrations create (001 + 002).
+const CONTROL_TABLES: &[&str] = &[
     "accounts",
     "account_databases",
     "cloud_tokens",
     "sessions",
     "subdomains_reserved",
+    "magic_links",
 ];
 
 async fn table_exists(control: &ControlPlane, table: &str) -> bool {
@@ -51,10 +53,10 @@ async fn fresh_initialize_applies_all_migrations() {
                 applied as i64,
                 "each applied migration records exactly one schema_version row"
             );
-            for table in SLICE_1_TABLES {
+            for table in CONTROL_TABLES {
                 assert!(
                     table_exists(&control, table).await,
-                    "slice-1 table {table:?} should exist after initialize"
+                    "table {table:?} should exist after initialize"
                 );
             }
 
@@ -127,7 +129,7 @@ async fn concurrent_initialize_is_serialized_by_advisory_lock() {
                 total_rows,
                 "between them the two racers apply each migration exactly once"
             );
-            for table in SLICE_1_TABLES {
+            for table in CONTROL_TABLES {
                 assert!(table_exists(&a, table).await, "{table:?} should exist");
             }
         },

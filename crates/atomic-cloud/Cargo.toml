@@ -42,7 +42,14 @@ thiserror = "1"
 # Middleware plumbing — `LocalBoxFuture` for the actix Service impls and
 # JSON denial bodies; versions match atomic-server's usage of both.
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Email delivery (account plane) — `async-trait` for the object-safe
+# EmailSender trait, `reqwest` for the Mailgun REST client; versions match
+# the rest of the workspace.
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
 
 # Control-plane primitives — versions match the rest of the workspace.
 chrono = "0.4"
@@ -59,6 +66,11 @@ tempfile = "3"
 [dev-dependencies]
 # (`futures` above also powers the test-database cleanup guard's
 # `FutureExt::catch_unwind`.)
+# The capturing EmailSender in tests/support implements the async trait and
+# the magic-link tests recompute stored hashes from captured plaintexts.
+async-trait = "0.1"
+data-encoding = "2"
+sha2 = "0.10"
 # Shared mock OpenAI-compat server, so tenant pipelines in the e2e suite
 # never hit real providers.
 atomic-test-support = { path = "../atomic-test-support" }

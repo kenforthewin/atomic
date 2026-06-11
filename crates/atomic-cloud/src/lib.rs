@@ -24,18 +24,27 @@
 //! are salvageable from git history.
 
 pub mod account_cache;
+pub mod account_plane;
 pub mod auth;
 pub mod control_plane;
+pub mod email;
 pub mod error;
+pub mod magic_links;
 pub mod provision;
+pub mod rate_limit;
 pub mod reserved_subdomains;
 pub mod server;
 pub mod tokens;
 
 pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
+pub use account_plane::{AccountPlane, AccountPlaneConfig, RateLimits};
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use control_plane::ControlPlane;
+pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
+pub use magic_links::{
+    consume_magic_link, issue_magic_link, MagicLinkPurpose, MagicLinkRecord, MAGIC_LINK_TTL,
+};
 pub use provision::{
     delete_account, provision_account, tenant_db_name, ClusterConfig, NewAccount,
     ProvisionedAccount,

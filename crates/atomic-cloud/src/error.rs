@@ -83,6 +83,20 @@ pub enum CloudError {
     #[error("unknown token scope {0:?}")]
     InvalidTokenScope(String),
 
+    /// A `magic_links.purpose` value didn't parse as a
+    /// [`MagicLinkPurpose`] (`signup` | `login`).
+    ///
+    /// [`MagicLinkPurpose`]: crate::magic_links::MagicLinkPurpose
+    #[error("unknown magic-link purpose {0:?}")]
+    InvalidMagicLinkPurpose(String),
+
+    /// Delivering a magic-link email failed (transport error or a
+    /// non-success provider response). The message carries provider
+    /// status/body text and **never** the link — the link is the
+    /// credential (see [`crate::email`]).
+    #[error("email send failed: {0}")]
+    EmailSend(String),
+
     /// A control-plane invariant the code relies on was violated (e.g. an
     /// `accounts.id` that isn't a UUID). Indicates corruption or a bug, not
     /// a user error.

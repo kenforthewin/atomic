@@ -23,9 +23,10 @@
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex};
 
 use atomic_cloud::provision::is_tenant_db_name;
-use atomic_cloud::tenant_db_name;
+use atomic_cloud::{tenant_db_name, CloudError, EmailSender, MagicLinkPurpose};
 use futures::FutureExt;
 use sqlx::{Connection, PgConnection};
 
@@ -196,4 +197,87 @@ where
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// A magic-link email captured by [`CapturingSender`] — nothing was sent.
+#[derive(Debug, Clone)]
+pub struct SentEmail {
+    pub to: String,
+    /// The exact link the message carries; tests extract the `aml_` token
+    /// from it.
+    pub link: String,
+    pub purpose: MagicLinkPurpose,
+}
+
+/// Test-side [`EmailSender`]: records every message for assertion, never
+/// sends anything. NO REAL EMAIL, EVER — every server harness in this suite
+/// uses this (or the lib's `LogSender`).
+#[derive(Clone, Default)]
+pub struct CapturingSender {
+    sent: Arc<Mutex<Vec<SentEmail>>>,
+}
+
+impl CapturingSender {
+    /// Snapshot of everything "sent" so far.
+    pub fn sent(&self) -> Vec<SentEmail> {
+        self.sent.lock().expect("capture lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmailSender for CapturingSender {
+    async fn send_magic_link(
+        &self,
+        to: &str,
+        link: &str,
+        purpose: MagicLinkPurpose,
+    ) -> Result<(), CloudError> {
+        self.sent.lock().expect("capture lock").push(SentEmail {
+            to: to.to_string(),
+            link: link.to_string(),
+            purpose,
+        });
+        Ok(())
+    }
+}
+
+/// Whether `needle` appears in ANY text/varchar column of ANY public-schema
+/// table in the control database. The exhaustive form of "the plaintext is
+/// never persisted": scanning every column means a future table or column
+/// can't quietly start storing secrets without tripping the assertion.
+pub async fn control_db_contains(control_url: &str, needle: &str) -> bool {
+    let mut conn = PgConnection::connect(control_url)
+        .await
+        .expect("connect for control-db scan");
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name, column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND data_type IN ('text', 'character varying')",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("list text columns");
+    assert!(
+        !columns.is_empty(),
+        "control database should have text columns to scan"
+    );
+
+    let mut found = false;
+    for (table, column) in columns {
+        // Identifiers come from information_schema, not user input;
+        // position() avoids LIKE-escaping the needle.
+        let hit: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM \"{table}\" WHERE position($1 in \"{column}\") > 0)"
+        ))
+        .bind(needle)
+        .fetch_one(&mut conn)
+        .await
+        .expect("scan column");
+        if hit {
+            eprintln!("needle {needle:?} found in {table}.{column}");
+            found = true;
+        }
+    }
+    let _ = conn.close().await;
+    found
 }

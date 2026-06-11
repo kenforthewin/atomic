@@ -5,7 +5,16 @@
 //! binary listens on. The composition is deliberately narrower than the
 //! self-hosted server's [`configure_app`](atomic_server::app::configure_app):
 //!
-//! - `GET /health` — public, no auth. The only unauthenticated route.
+//! - `GET /health` — public, no auth on any host.
+//! - **The account plane** ([`crate::account_plane`]) — `POST
+//!   /signup/request-link` and `POST /login/request-link`, served only on
+//!   the **app host** (the bare base domain or `app.<base>`). No CloudAuth,
+//!   no tenant state: these routes exist for people without accounts. The
+//!   host split fails closed in both directions — the routes carry an
+//!   app-host guard (404 on tenant subdomains), and tenant routes 404 on
+//!   the app host because `CloudAuth` extracts no subdomain from the bare
+//!   base and `app` is blocklisted from ever resolving to an account. See
+//!   the account_plane module docs; the e2e suite pins both directions.
 //! - `GET /ws` — a **cloud-owned** WebSocket route under [`CloudAuth`].
 //!   Self-hosted's public `/ws` route authenticates a `?token=` query
 //!   parameter against the tenant's own `api_tokens` table — exactly the
@@ -88,6 +97,7 @@ use atomic_server::state::{AppState, SetupClaimLimiter};
 use atomic_server::ws;
 use tokio::sync::broadcast;
 
+use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
 use crate::error::CloudError;
 
@@ -235,26 +245,30 @@ async fn cloud_ws(
 ///   the owning [`FallbackAppState`] must outlive the server.
 /// - `auth` — the [`CloudAuth`] middleware, carrying the control plane and
 ///   the account cache. Cheap to clone per worker.
+/// - `account_plane` — the app-host plane ([`AccountPlane`]): signup/login
+///   request-link routes, each guarded to the app host so they don't exist
+///   on tenant subdomains.
 ///
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
-/// clones `state` and `auth` into each worker's call.
+/// clones the arguments into each worker's call.
 pub fn configure_cloud_app(
     state: web::Data<AppState>,
     auth: CloudAuth,
+    account_plane: AccountPlane,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     move |cfg: &mut web::ServiceConfig| {
-        cfg.app_data(state)
-            .route("/health", web::get().to(health))
-            .service(
-                web::resource("/ws")
-                    .route(web::get().to(cloud_ws))
-                    // Later-registered wrap runs first: auth resolves the
-                    // tenant, then the guard verifies the extensions exist.
-                    .wrap(from_fn(cloud_plane_guard))
-                    .wrap(auth.clone()),
-            )
-            .service(api_scope().wrap(from_fn(cloud_plane_guard)).wrap(auth));
+        cfg.app_data(state).route("/health", web::get().to(health));
+        account_plane.configure(cfg);
+        cfg.service(
+            web::resource("/ws")
+                .route(web::get().to(cloud_ws))
+                // Later-registered wrap runs first: auth resolves the
+                // tenant, then the guard verifies the extensions exist.
+                .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth.clone()),
+        )
+        .service(api_scope().wrap(from_fn(cloud_plane_guard)).wrap(auth));
     }
 }
 

@@ -21,8 +21,9 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
-    provision_account, AccountCache, AccountCacheConfig, CloudAuth, ClusterConfig, ControlPlane,
-    FallbackAppState, NewAccount, TokenScope, SESSION_COOKIE,
+    provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
+    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, NewAccount, TokenScope,
+    SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -92,13 +93,25 @@ impl CloudHarness {
             cache_config,
         ));
         let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
+        // This suite never drives the account plane (tests/account_plane.rs
+        // owns that); a capturing sender keeps any accidental traffic from
+        // sending mail.
+        let account_plane = AccountPlane::new(
+            control.clone(),
+            Arc::new(support::CapturingSender::default()),
+            AccountPlaneConfig::new(BASE_DOMAIN),
+        );
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
         let server = HttpServer::new(move || {
-            App::new().configure(configure_cloud_app(state.clone(), auth.clone()))
+            App::new().configure(configure_cloud_app(
+                state.clone(),
+                auth.clone(),
+                account_plane.clone(),
+            ))
         })
         .workers(1)
         .listen(listener)
