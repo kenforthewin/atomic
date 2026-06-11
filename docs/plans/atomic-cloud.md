@@ -1045,7 +1045,64 @@ reserving the subdomain and deleting the accounts row can be revived by a
 resumed provision, leaving an active account whose own subdomain holds a
 90-day reservation (benign; reaper should clear self-reservations); orphaned
 `acct_*` databases from failed 23503 cleanup are logged loudly for the
-reaper to reclaim.
+reaper to reclaim. *(Both closed by slice 2.)*
+
+### Slice 2 — app-host plane, magic-link signup/login, HTTP deletion, reaper (2026-06-10, branch `cloud-signup`)
+
+Landed: host-based plane split (the bare apex **and** `app.<base>` serve the
+account plane; tenant subdomains and the app plane 404 each other's routes,
+e2e-pinned both directions); `magic_links` (migration 002, hash-only `aml_`
+tokens, 15-min TTL — our choice, not plan-specified); `EmailSender` trait
+with Mailgun (salvaged from the parts bin), log-mode, and a capturing test
+impl; request-link + completion routes for signup and login; synchronous
+provisioning behind a semaphore (default 4, `try_acquire` so saturation
+503s without consuming the token; shape-check → read-only peek → permit →
+atomic consume, so junk can't starve permits); session cookie
+`Domain=.<base>; Secure; HttpOnly; SameSite=Lax`, 302 to the new subdomain;
+`DELETE /api/account` (account-scope credentials only, confirmation body,
+unconditional cache evict + WS severing, cancellation-proof via a detached
+task); a five-arm reaper (stuck-provision resume-or-rollback, interrupted-
+deletion recovery, orphan reclaim, self-reservation cleanup, link/session/
+reservation expiry hygiene) under per-account advisory locks with an
+observable per-pass summary.
+
+**Deviations and choices (review-vetted):**
+
+- Rate limiting is a hand-rolled sliding log, not `governor`: exact window
+  semantics and a directly computable `Retry-After`, no new dependency.
+  Implemented rows: request-link 5/IP/hour (one bucket shared across signup
+  and login, charged before validation) and 3/email/hour (shared across
+  both purposes, lowercased email). The other table rows (API req/min, atom
+  creates, URL ingestion) belong to the quotas slice.
+- Subdomain availability failures are honest 400s (subdomains are public
+  via DNS); only email-axis outcomes get the neutral 200. The login path's
+  issue+send is **fire-and-forget** so the exists/not-exists branches are
+  timing-uniform — byte-identical bodies alone were a timing oracle.
+- Failed-provision rollback **hard-deletes** the accounts row (loudly
+  logged) instead of a `status='failed'` tombstone — consistent with v1
+  hard-delete philosophy and avoids a non-additive UNIQUE-constraint
+  migration.
+- Deletion order remains revoke-credentials-first, delete-then-evict
+  (inverting plan steps 5/7); the response can't claim "retry with the same
+  credential," so recovery is automatic: an active account with no
+  `account_databases` row is *provably* an interrupted deletion (the
+  mapping INSERT precedes activation, and only deletion/CASCADE removes
+  it), and the reaper's recovery arm completes it after a grace period.
+- `provision_account` treats a zero-row activation UPDATE as the typed
+  not-provisioning error (fourth race guard — a concurrent rollback can no
+  longer yield a false-positive success).
+- A stuck `'provisioning'` claim is exempt from `subdomain_taken` for the
+  same (lowercased) email, so user-driven resume via a fresh link works.
+- CSRF posture of the cookie-authenticated DELETE: `SameSite=Lax` blocks
+  cross-site non-navigation requests and the confirmation body is required;
+  no CSRF token in v1. `Referrer-Policy: no-referrer` on the account plane
+  (completion URLs carry live tokens).
+
+**Deferred:** remaining rate-limit rows (quotas slice), failed-migrations
+reaper arm (deploy gating slice), folding the reaper into the shared job
+runner, email plus-addressing canonicalization (accepted residue: variants
+get separate rate-limit buckets), HTTP token CRUD for cloud, signup/login
+frontend pages (parts-bin salvage later — API + redirects only today).
 
 ## Open questions (carried across sections)
 
@@ -1060,6 +1117,10 @@ reaper to reclaim.
   domain warmup, SPF/DKIM, and a bounce strategy still need an owner.
 - **MCP token default scope.** Account-wide vs per-KB. Affects the MCP setup
   UX in Claude Desktop's config.
+- **Email uniqueness.** `accounts.email` is not unique and signup never
+  checks it — one email can own unlimited accounts (each rate-limited, each
+  its own subdomain). Probably fine (it's also the multi-account story),
+  but decide deliberately before billing ties subscriptions to accounts.
 - **Event-stream scope for database-scoped tokens.** The cloud `/ws` route
   streams the whole account's event channel to any authenticated credential;
   the `allowed_db_id` chokepoint governs only the data plane, so a KB-pinned
@@ -1254,3 +1315,14 @@ and link the discussion if it lives in a memory file.
   subdomain + credential against the control plane, keeping revocation and
   deletion immediate. AccountCache caches only manager/event-channel
   resolution. Revisit under real load.
+- **2026-06-10** — Slice 2 landed (see Implementation log). Magic-link-only
+  auth implemented end to end; hash-only link storage; timing-uniform
+  enumeration defense on login; provisioning semaphore that never consumes
+  tokens on saturation.
+- **2026-06-10** — Failed provisions are hard-deleted, never tombstoned;
+  the reaper recovers interrupted deletions via the active-account-without-
+  mapping-row predicate. Reaper rollback/resume runs under per-account
+  advisory locks; multiple pods may reap concurrently.
+- **2026-06-10** — Anti-abuse limits ship as per-pod hand-rolled sliding
+  logs (request-link: 5/IP/hour shared across signup+login, 3/email/hour);
+  the rest of the quota table waits for the quotas slice.
