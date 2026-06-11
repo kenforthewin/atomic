@@ -34,6 +34,7 @@ pub mod provision;
 pub mod rate_limit;
 pub mod reserved_subdomains;
 pub mod server;
+pub mod tenant_plane;
 pub mod tokens;
 
 pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
@@ -52,6 +53,7 @@ pub use provision::{
     ProvisionedAccount,
 };
 pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState};
+pub use tenant_plane::TenantPlane;
 pub use tokens::{
     create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,
     TokenScope,

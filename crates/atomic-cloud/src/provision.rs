@@ -481,7 +481,14 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
 ///   backups slice (plan: "Backups & disaster recovery"); until it lands,
 ///   deletion is genuinely unrecoverable.
 /// - AccountCache eviction (step 5) — the serving composition layer owns
-///   the cache and must evict before calling this.
+///   the cache. Its HTTP deletion route ([`crate::tenant_plane`]) evicts
+///   *after* this returns: once the account rows are gone nothing can
+///   rebuild the entry behind the eviction, and the pooled connections an
+///   un-evicted entry holds during the drop are handled below
+///   (`pg_terminate_backend` + `WITH (FORCE)`). A process-separate caller
+///   (the CLI) has no cache to evict; a serve process's stale entry
+///   self-heals — CloudAuth 404s the deleted account, and the idle TTL
+///   reclaims the entry.
 ///
 /// Idempotent under retry: an already-dropped database, already-deleted
 /// rows, and an already-reserved subdomain are all no-ops, so calling this

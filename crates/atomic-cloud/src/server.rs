@@ -17,6 +17,11 @@
 //!   the app host because `CloudAuth` extracts no subdomain from the bare
 //!   base and `app` is blocklisted from ever resolving to an account. See
 //!   the account_plane module docs; the e2e suite pins both directions.
+//! - **The tenant plane's cloud-owned routes** ([`crate::tenant_plane`]) —
+//!   currently `DELETE /api/account`, the authenticated account-deletion
+//!   route. Registered *before* atomic-server's `api_scope()` so the
+//!   exact-path resource wins the route match; behind [`CloudAuth`] like
+//!   everything else on a tenant subdomain.
 //! - `GET /ws` — a **cloud-owned** WebSocket route under [`CloudAuth`].
 //!   Self-hosted's public `/ws` route authenticates a `?token=` query
 //!   parameter against the tenant's own `api_tokens` table — exactly the
@@ -102,6 +107,7 @@ use tokio::sync::broadcast;
 use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
 use crate::error::CloudError;
+use crate::tenant_plane::TenantPlane;
 
 /// The inert [`AppState`] registered as app data in the cloud composition.
 ///
@@ -250,6 +256,8 @@ async fn cloud_ws(
 /// - `account_plane` — the app-host plane ([`AccountPlane`]): signup/login
 ///   request-link routes, each guarded to the app host so they don't exist
 ///   on tenant subdomains.
+/// - `tenant_plane` — the cloud-owned tenant routes ([`TenantPlane`]):
+///   account deletion, behind the same `auth`.
 ///
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
@@ -258,10 +266,14 @@ pub fn configure_cloud_app(
     state: web::Data<AppState>,
     auth: CloudAuth,
     account_plane: AccountPlane,
+    tenant_plane: TenantPlane,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(state).route("/health", web::get().to(health));
         account_plane.configure(cfg);
+        // Before api_scope: its exact-path /api/account resource must win
+        // the route match over the /api scope.
+        tenant_plane.configure(cfg, auth.clone());
         cfg.service(
             web::resource("/ws")
                 .route(web::get().to(cloud_ws))

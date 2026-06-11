@@ -19,7 +19,8 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
-    EmailSender, FallbackAppState, LogSender, MailgunSender, NewAccount, RateLimits, TokenScope,
+    EmailSender, FallbackAppState, LogSender, MailgunSender, NewAccount, RateLimits, TenantPlane,
+    TokenScope,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -234,6 +235,15 @@ enum AccountAction {
 
     /// Hard-delete an account: revoke its credentials, drop its tenant
     /// database, and reserve the freed subdomain for 90 days.
+    ///
+    /// The preferred path is the authenticated HTTP route (`DELETE
+    /// /api/account` on the account's subdomain), which also evicts the
+    /// serve process's AccountCache entry and severs the account's live
+    /// WebSocket sessions. This CLI command runs process-separate, so it
+    /// can't reach that cache; a running serve process's stale entry is
+    /// harmless and self-heals (requests 404 at auth, the idle TTL reclaims
+    /// the entry). Use the CLI for operator cleanup, the route for
+    /// everything else.
     Delete {
         #[command(flatten)]
         cluster: ClusterArgs,
@@ -441,6 +451,7 @@ async fn serve(
         cache_config,
     ));
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
+    let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
     let account_plane = AccountPlane::new(control, cluster, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
@@ -481,6 +492,7 @@ async fn serve(
             state.clone(),
             auth.clone(),
             account_plane.clone(),
+            tenant_plane.clone(),
         ))
     })
     .workers(4)

@@ -24,7 +24,7 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState,
-    MagicLinkPurpose, NewAccount, RateLimits, TokenScope, SESSION_COOKIE,
+    MagicLinkPurpose, NewAccount, RateLimits, TenantPlane, TokenScope, SESSION_COOKIE,
 };
 use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
@@ -90,6 +90,7 @@ impl PlaneHarness {
             config,
         )
         .expect("build account plane");
+        let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -101,6 +102,7 @@ impl PlaneHarness {
                 state.clone(),
                 auth.clone(),
                 account_plane.clone(),
+                tenant_plane.clone(),
             ))
         })
         .workers(1)

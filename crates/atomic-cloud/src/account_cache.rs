@@ -234,10 +234,12 @@ impl AccountCache {
 
     /// Drop `account_id`'s entry immediately, returning whether one existed.
     ///
-    /// The account-deletion path calls this before dropping the tenant
-    /// database so no pooled connection holds the database open; eviction
-    /// rules (live receivers, TTL) deliberately don't apply — deletion
-    /// outranks an open WebSocket.
+    /// This is the account-deletion path's eviction (the HTTP deletion
+    /// route calls it right after `delete_account` returns — see
+    /// [`crate::tenant_plane`] for why delete-then-evict is the safe order
+    /// in-process). Eviction rules (live receivers, TTL) deliberately don't
+    /// apply — deletion outranks an open WebSocket, and dropping the
+    /// entry's `Sender` is exactly what severs those sessions.
     pub async fn evict(&self, account_id: &str) -> bool {
         self.inner.lock().await.entries.remove(account_id).is_some()
     }

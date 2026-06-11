@@ -22,7 +22,7 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
     provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, NewAccount, TokenScope,
+    CloudAuth, ClusterConfig, ControlPlane, FallbackAppState, NewAccount, TenantPlane, TokenScope,
     SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
@@ -103,6 +103,7 @@ impl CloudHarness {
             AccountPlaneConfig::new(BASE_DOMAIN),
         )
         .expect("build account plane");
+        let tenant_plane = TenantPlane::new(control.clone(), cluster.clone(), Arc::clone(&cache));
         let fallback = FallbackAppState::build().expect("build fallback state");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -113,6 +114,7 @@ impl CloudHarness {
                 state.clone(),
                 auth.clone(),
                 account_plane.clone(),
+                tenant_plane.clone(),
             ))
         })
         .workers(1)
@@ -318,6 +320,42 @@ where
             _ => continue,
         }
     }
+}
+
+/// Wait for the server to terminate the WebSocket, draining any straggler
+/// frames. Accepts every shape a severed actix-ws connection produces at
+/// the client: a Close frame, a clean stream end, or a reset without a
+/// closing handshake (the forwarding task dropping its `Session` ends the
+/// response body at the TCP level). Panics when `deadline` elapses first.
+async fn await_ws_close(ws: &mut WsStream, deadline: Duration) {
+    let stop_at = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = stop_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("ws not closed within {deadline:?}");
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Err(_elapsed) => panic!("ws not closed within {deadline:?}"),
+            Ok(None) => return,
+            Ok(Some(Err(_))) => return,
+            Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
+}
+
+/// Whether `db_name` exists on the test cluster.
+async fn database_exists(db_name: &str) -> bool {
+    let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").expect("env");
+    let mut conn = PgConnection::connect(&base_url).await.expect("connect");
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(db_name)
+            .fetch_one(&mut conn)
+            .await
+            .expect("query pg_database");
+    let _ = conn.close().await;
+    exists
 }
 
 fn atom_ids(listing: &Value) -> Vec<&str> {
@@ -730,26 +768,133 @@ async fn live_ws_pins_cache_entry_against_eviction() {
     .await;
 }
 
-/// Deletion: after deleting alpha, requests to its subdomain 404, its
-/// tenant database is gone from `pg_database`, and bravo is unaffected.
+/// The CLI deletion shape: a process-separate `delete_account` call that
+/// never touches the serve process's cache. The serve process self-heals —
+/// the deleted account's requests 404 at auth even while its stale cache
+/// entry lingers (harmless; the idle TTL reclaims it), the tenant database
+/// is gone, and other tenants are untouched. The HTTP route
+/// (`http_account_deletion_end_to_end`) is the preferred path because it
+/// *does* evict and sever; this pins the self-healing the CLI doc promises.
 #[actix_web::test]
-async fn account_deletion_end_to_end() {
-    with_control_db("account_deletion_end_to_end", |url| async move {
+async fn cli_style_deletion_self_heals_without_eviction() {
+    with_control_db(
+        "cli_style_deletion_self_heals_without_eviction",
+        |url| async move {
+            let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+            let alpha = h.provision("alpha").await;
+            let bravo = h.provision("bravo").await;
+
+            let bravo_atom = h.create_atom(&bravo, "Bravo survives.").await;
+            let bravo_id = bravo_atom["id"].as_str().expect("atom id").to_string();
+            let alpha_atom = h.create_atom(&alpha, "Alpha is about to go.").await;
+            let alpha_id = alpha_atom["id"].as_str().expect("atom id").to_string();
+            h.poll_pipeline_done(&alpha, &alpha_id).await;
+
+            // Library-level deletion, exactly as the CLI runs it: no cache
+            // eviction. Alpha's entry is still cached afterwards.
+            delete_account(&h.control, &h.cluster, &alpha.account_id)
+                .await
+                .expect("delete account");
+            assert!(
+                h.cache.contains(&alpha.account_id).await,
+                "the CLI path leaves the serve cache entry in place"
+            );
+
+            // Alpha's subdomain no longer routes, stale cache entry or not.
+            let resp = h
+                .api(Method::GET, &alpha.subdomain, "/api/atoms")
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            // The tenant database is gone from the cluster.
+            assert!(
+                !database_exists(&alpha.db_name).await,
+                "tenant database must be dropped"
+            );
+
+            // Bravo is untouched.
+            let listing = h.list_atoms(&bravo).await;
+            assert!(
+                atom_ids(&listing).contains(&bravo_id.as_str()),
+                "bravo must be unaffected by alpha's deletion"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The authenticated deletion route, end to end (plan: "Provisioning
+/// lifecycle" → "Account deletion"): a session-cookie DELETE with the
+/// correct confirmation destroys the account — the tenant database is gone,
+/// the subdomain 404s (including a repeat DELETE), the cache entry is
+/// evicted *despite* a live WebSocket receiver (deletion bypasses the
+/// eviction pinning of decision 2026-06-09), the severed socket closes
+/// within a bounded wait, and bravo — mid-flight, with its own open socket —
+/// is untouched.
+#[actix_web::test]
+async fn http_account_deletion_end_to_end() {
+    with_control_db("http_account_deletion_end_to_end", |url| async move {
         let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
         let alpha = h.provision("alpha").await;
         let bravo = h.provision("bravo").await;
 
+        // Bravo mid-flight: existing content and an open WebSocket, both of
+        // which must ride through alpha's deletion untouched.
         let bravo_atom = h.create_atom(&bravo, "Bravo survives.").await;
         let bravo_id = bravo_atom["id"].as_str().expect("atom id").to_string();
-        h.create_atom(&alpha, "Alpha is about to go.").await;
+        h.poll_pipeline_done(&bravo, &bravo_id).await;
+        let mut bravo_ws = h.ws_connect(&bravo).await;
 
-        // The deletion sequence: evict the serving resources, then delete.
-        h.cache.evict(&alpha.account_id).await;
-        delete_account(&h.control, &h.cluster, &alpha.account_id)
+        // Alpha: content with a *finished* pipeline (so no background task
+        // still holds a Sender clone and the post-deletion socket close is
+        // deterministic) and a connected WebSocket — whose live receiver
+        // pins alpha's cache entry against ordinary eviction, exactly the
+        // rule deletion must cut through.
+        let alpha_atom = h.create_atom(&alpha, "Alpha is about to go.").await;
+        let alpha_id = alpha_atom["id"].as_str().expect("atom id").to_string();
+        h.poll_pipeline_done(&alpha, &alpha_id).await;
+        let mut alpha_ws = h.ws_connect(&alpha).await;
+        assert!(h.cache.contains(&alpha.account_id).await);
+
+        // Happy path: session cookie + correct confirmation.
+        let session = create_session(
+            &h.control,
+            &alpha.account_id,
+            Duration::from_secs(3600),
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .json(&json!({ "confirm": alpha.subdomain }))
+            .send()
             .await
-            .expect("delete account");
+            .expect("send delete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.expect("json");
+        assert_eq!(body["status"], "deleted");
+        assert_eq!(body["subdomain"], alpha.subdomain);
 
-        // Alpha's subdomain no longer routes.
+        // Evicted despite the live receiver: deletion is not idle-TTL
+        // eviction, the pinning rule must not apply.
+        assert!(
+            !h.cache.contains(&alpha.account_id).await,
+            "deletion must evict the cache entry even with a live WebSocket"
+        );
+
+        // The severed socket closes once the last Sender clone unwinds.
+        await_ws_close(&mut alpha_ws, EVENT_DEADLINE).await;
+
+        // The subdomain no longer routes — the account is gone, so
+        // CloudAuth 404s everything, including a repeat DELETE.
         let resp = h
             .api(Method::GET, &alpha.subdomain, "/api/atoms")
             .bearer_auth(&alpha.token)
@@ -757,25 +902,167 @@ async fn account_deletion_end_to_end() {
             .await
             .expect("send");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .json(&json!({ "confirm": alpha.subdomain }))
+            .send()
+            .await
+            .expect("send repeat delete");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "repeat DELETE after deletion must 404 at auth"
+        );
 
         // The tenant database is gone from the cluster.
-        let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").expect("env");
-        let mut conn = PgConnection::connect(&base_url).await.expect("connect");
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
-                .bind(&alpha.db_name)
-                .fetch_one(&mut conn)
-                .await
-                .expect("query pg_database");
-        let _ = conn.close().await;
-        assert!(!exists, "tenant database must be dropped");
+        assert!(
+            !database_exists(&alpha.db_name).await,
+            "tenant database must be dropped"
+        );
 
-        // Bravo is untouched.
+        // Bravo, mid-flight: listing intact, and its open socket still
+        // streams a fresh atom's pipeline events — its channel was never
+        // touched by alpha's eviction.
         let listing = h.list_atoms(&bravo).await;
         assert!(
             atom_ids(&listing).contains(&bravo_id.as_str()),
             "bravo must be unaffected by alpha's deletion"
         );
+        let atom = h
+            .create_atom(&bravo, "Created after alpha's deletion.")
+            .await;
+        let atom_id = atom["id"].as_str().expect("atom id").to_string();
+        collect_until(&mut bravo_ws, EVENT_DEADLINE, |e| {
+            e["type"] == "EmbeddingComplete" && e["atom_id"] == atom_id.as_str()
+        })
+        .await;
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Every refusal on the deletion route, each leaving the account fully
+/// intact: database- and MCP-scoped tokens 403 (a KB-pinned integration
+/// must not destroy the account), cross-tenant credentials 401, wrong or
+/// missing confirmation 400, and the route doesn't exist on the app host.
+/// Then the bearer-token happy path (the end-to-end test covers the session
+/// path) proves the same account deletes cleanly once asked correctly.
+#[actix_web::test]
+async fn account_deletion_refusals() {
+    with_control_db("account_deletion_refusals", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+        let bravo = h.provision("bravo").await;
+
+        // Database- and MCP-scoped tokens: correct confirmation, still 403.
+        for (scope, name) in [
+            (TokenScope::Database, "kb-pinned"),
+            (TokenScope::Mcp, "mcp"),
+        ] {
+            let scoped = issue_token(&h.control, &alpha.account_id, scope, Some("default"), name)
+                .await
+                .expect("issue scoped token");
+            let resp = h
+                .api(Method::DELETE, &alpha.subdomain, "/api/account")
+                .bearer_auth(&scoped)
+                .json(&json!({ "confirm": alpha.subdomain }))
+                .send()
+                .await
+                .expect("send scoped delete");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{name} token must not delete the account"
+            );
+            let body: Value = resp.json().await.expect("denial json");
+            assert_eq!(body["error"], "account_scope_required");
+        }
+
+        // Bravo's account-scope token on alpha's subdomain: the cross-tenant
+        // chokepoint refuses before the handler exists.
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .bearer_auth(&bravo.token)
+            .json(&json!({ "confirm": alpha.subdomain }))
+            .send()
+            .await
+            .expect("send cross-tenant delete");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong confirmation → 400.
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .bearer_auth(&alpha.token)
+            .json(&json!({ "confirm": "alpha-typo" }))
+            .send()
+            .await
+            .expect("send mismatched delete");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json().await.expect("denial json");
+        assert_eq!(body["error"], "confirmation_mismatch");
+
+        // Missing body → the same structured 400; a stray DELETE can't fire.
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("send bodyless delete");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json().await.expect("denial json");
+        assert_eq!(body["error"], "confirmation_mismatch");
+
+        // The route doesn't exist on the app plane: no subdomain label on
+        // either app-host name → CloudAuth 404s before any handler.
+        for host in [BASE_DOMAIN.to_string(), format!("app.{BASE_DOMAIN}")] {
+            let resp = h
+                .client
+                .request(Method::DELETE, format!("{}/api/account", h.base_url))
+                .header(HOST, host.clone())
+                .bearer_auth(&alpha.token)
+                .json(&json!({ "confirm": alpha.subdomain }))
+                .send()
+                .await
+                .expect("send app-host delete");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "DELETE /api/account must not exist on {host}"
+            );
+        }
+
+        // Nothing above touched the account.
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), StatusCode::OK, "account must be intact");
+        assert!(
+            database_exists(&alpha.db_name).await,
+            "tenant database must still exist after refused deletions"
+        );
+
+        // Asked correctly — account-scope bearer token + matching
+        // confirmation — the same account deletes.
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, "/api/account")
+            .bearer_auth(&alpha.token)
+            .json(&json!({ "confirm": alpha.subdomain }))
+            .send()
+            .await
+            .expect("send delete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         h.stop().await;
     })
