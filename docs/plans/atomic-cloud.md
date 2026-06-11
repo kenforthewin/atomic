@@ -1104,6 +1104,75 @@ runner, email plus-addressing canonicalization (accepted residue: variants
 get separate rate-limit buckets), HTTP token CRUD for cloud, signup/login
 frontend pages (parts-bin salvage later — API + redirects only today).
 
+### Slice 3 — provider management (2026-06-11, branch `cloud-provider`)
+
+Landed: the sanctioned atomic-core plumbing (explicit `Option<ProviderConfig>`
+injection with byte-identical `None` fallback, live `update_provider_config`,
+redacting `Debug`, `openrouter_base_url` override — implemented as a
+settings-map overlay at one chokepoint, `settings_for_ai`, since providers
+are rebuilt per-operation rather than cached); migration 004
+(`provider_credentials` + the active-provider pointer) and 005
+(`accounts.provider_generation`); `KeyVault` with AES-256-GCM
+`EnvMasterKeyVault` (length-prefixed AAD over account/provider/**origin** —
+stronger than the plan's plain concatenation); the OpenRouter provisioning
+client behind a trait (API shape verified against openrouter.ai docs);
+managed-key minting at signup step 9 with race-safe conditional insert and
+external-key cleanup on every rollback/deletion path; BYOK save with
+validate-before-store, per-account write locks, model curation
+(pinned embedding model + curated LLM list), and live rotation.
+
+**Deviations and choices (review-vetted):**
+
+- **Explicit mode pins per-task models**: `apply_to_settings` pins
+  `wiki_model`/`chat_model` to the config's `llm_model`, and the re-embed
+  machinery sources both settings maps from `settings_for_ai` — so tenant
+  settings writes are inert for model routing AND for embedding-space
+  changes (no platform-billed frontier inference, no destructive vector
+  index recreation). Consequence: one LLM selection governs all tasks; BYOK
+  per-task models deferred until someone asks.
+- **BYOK dimension changes are rejected**, not warned (plan said "warn
+  loudly"): the warning was unfulfillable — the tenant vector column is
+  pinned at `PINNED_EMBEDDING_DIMENSION` (1536) and no cloud mechanism can
+  recreate it. Structured `embedding_dimension_unsupported` 400. Revisit
+  with a dimension-migration story.
+- **Rotation convergence via `provider_generation`**: every provider
+  mutation bumps it; CloudAuth's existing per-request account lookup
+  observes it and lagging cache entries refresh in place — bounded
+  staleness across rebuild races and pods (the no-auth-caching decision
+  paying off). In-place swap remains the fast path.
+- `accounts.active_provider` became two columns `(active_provider,
+  active_origin)` with a paired-NULL CHECK; flip is still one UPDATE.
+- Deletion step 3 and all rollback paths delete external keys best-effort
+  with loud logging — deletion never wedges on a provider outage; the
+  master-account key listing is the ops fallback. The create-key→row-insert
+  orphan window is accepted and documented.
+- Reaper stuck-provision rollback is outage-classified: provisioning-API
+  failures defer rollback (summary-visible) up to a 60-min ceiling.
+- Managed `model_config` writes merge over platform-owned keys (base-URL
+  overrides survive); BYOK writes are vocabulary-checked (a misplaced
+  `api_key` inside `model_config` is rejected, never stored plaintext).
+- BYOK validation errors are bounded (500 chars) and key-scrubbed before
+  truncation on both provider arms.
+- `last_used_at` stamps at cache-entry build, not per provider call.
+- CLI stays keyless (never holds master/provisioning keys): `account
+  create` provisions without a managed key; HTTP routes are the real path.
+  Provisioning mode `disabled` is the dev default.
+
+**Deferred:** plan-change → PATCH credit limit (billing slice);
+`blocked_on_credits`/`blocked_on_provider` ledger holds + circuit breaker +
+rotation step 6 (dispatcher slice); managed-key re-provisioning/rotation
+route; synthesized health status + recent-errors list (needs breaker +
+`account_events`); advisory usage counter fallback (needs `quota_usage`);
+frontier-model feature flags (needs `plans`); master-key lazy re-encrypt
+(nothing to rotate to at generation 1); periodic BYOK re-validation (open
+question, unchanged); signup steps 7-8 (still deferred from slice 2).
+
+**Accepted residue (verifier-noted):** the cross-pod rotation test asserts
+the refreshed config rather than driving a second-pod embed (the in-process
+twin does drive one); a rotation landing inside `set_setting_with_reembed`'s
+two config reads can queue one spurious same-dimension re-embed (cost
+noise, not correctness; dimension mismatch impossible under the pin).
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -1326,3 +1395,19 @@ and link the discussion if it lives in a memory file.
 - **2026-06-10** — Anti-abuse limits ship as per-pod hand-rolled sliding
   logs (request-link: 5/IP/hour shared across signup+login, 3/email/hour);
   the rest of the quota table waits for the quotas slice.
+- **2026-06-11** — Slice 3 landed (see Implementation log). Explicit
+  provider mode is authoritative end to end: tenant settings writes are
+  inert for provider keys, model routing, and embedding-space changes.
+  One LLM selection governs tagging/wiki/chat/reports in explicit mode.
+- **2026-06-11** — BYOK embedding-dimension changes are rejected
+  (`embedding_dimension_unsupported`), superseding the plan's "warn
+  loudly" — the warning was unfulfillable without a dimension-migration
+  mechanism. The embedding model/dimension pin is enforced fleet-wide at
+  `PINNED_EMBEDDING_DIMENSION`.
+- **2026-06-11** — Provider-config staleness is bounded by
+  `accounts.provider_generation`, observed on CloudAuth's existing
+  per-request lookup: rotations converge across pods and cache-rebuild
+  races within one request, with no cross-pod invalidation infrastructure.
+- **2026-06-11** — KeyVault AAD binds (account_id, provider, origin) with
+  length-prefixed encoding; managed/BYOK ciphertexts are not swappable
+  even with direct DB write access.
