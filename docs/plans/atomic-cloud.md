@@ -7,6 +7,11 @@ been worked through; sections marked **[stub]** are placeholders for future
 deep dives. Decisions made so far are recorded in the "Decisions log" at the
 bottom — when you change one, update the log so future-us knows what shifted.
 
+Implementation began 2026-06-10. Slice 1 (control plane, provisioning core,
+CloudAuth/AccountCache, composed cloud server + multi-tenant e2e suite) is on
+branch `cloud-control-plane`; see the **Implementation log** section for what
+landed, where it deviates from this plan, and what each slice deferred.
+
 ## Context
 
 The earlier exploration of "Atomic Cloud on SQLite + per-customer mounted
@@ -975,6 +980,73 @@ fat-fingered delete confirmation is unrecoverable customer data loss.
   granularity stops being acceptable.
 - Cross-region replicas, per-tenant continuous streaming — not v1.
 
+## Implementation log
+
+### Slice 1 — control plane, provisioning, CloudAuth, composed server (2026-06-10, branch `cloud-control-plane`)
+
+The Fly-era prototype at `crates/atomic-cloud` was removed (its last commit,
+`4b44c51`, is the parts bin for the magic-link/Mailgun/Stripe salvage).
+Landed: control-plane database (`atomic_cloud_control`, hardened migration
+runner mirroring atomic-core's advisory-lock pattern; migration 001 with the
+slice-1 tables only), `provision_account`/`delete_account` as idempotent
+library functions, token/session issuance (`atm_`/`ats_` prefixes, SHA-256
+hashes), `AccountCache` (idle TTL + hard cap, WS-receiver eviction pinning,
+coalesced loads, periodic sweep at `idle_ttl/4`), `CloudAuth` middleware with
+both auth chokepoints enforced and e2e-pinned, and a composed `serve` binary
+(atomic-server's `api_scope()` under CloudAuth) plus operator CLI
+(`migrate`, `account create/delete`, `token create`).
+
+**Deviations from this plan (deliberate, review-vetted):**
+
+- `account_databases` got `PRIMARY KEY (account_id, db_name)` +
+  `UNIQUE (cluster_id, db_name)`; account-owned tables carry
+  `ON DELETE CASCADE` FKs as a safety net under hard-delete (the deletion
+  sequence still deletes explicitly).
+- Deletion **reserves the subdomain before deleting the accounts row**; this
+  ordering is load-bearing — provisioning re-checks `subdomains_reserved`
+  after its claim and rolls back if a reservation landed in the window.
+- Stragglers/non-active accounts return a 503 variant `account_provisioning`
+  (sibling of the planned `account_upgrading`, which arrives with deploy
+  gating).
+- `ResolvedTenant` carries the principal only; manager/event channel travel
+  via atomic-server's `RequestDatabaseManager`/`RequestEventChannel`
+  extensions (better than the plan's combined struct — one injection
+  mechanism, not two).
+- The Db extractor's AppState requirement is satisfied by an **inert
+  `FallbackAppState`** plus a `cloud_plane_guard` that fails closed: requests
+  lacking the tenant extension 404 before any handler runs (e2e-pinned).
+- Per-tenant pools: 5 connections + 5-minute idle timeout by default
+  (configurable), via a cloud-unaware `new_postgres_with_pool` generality
+  constructor in atomic-core. `new_postgres` behavior is unchanged.
+- Reserved-subdomain blocklist is ~80 names (plan said ~60; over-reserving
+  is the safe direction).
+- **No auth caching in v1, by choice**: subdomain→account and credential
+  verification hit the control plane every request (plus a `last_used_at`
+  write). This is what makes deletion/revocation immediate. Revisit with
+  real load data; the plan's "looked up … and cached" applies only to the
+  manager/event-channel resolution (AccountCache).
+
+**Unrouted planes (fail-closed 404 under cloud, pending a per-tenant
+story):** `/api/auth/*` (token CRUD is control-plane business),
+`/api/exports/*` + `/api/databases/{id}/exports/*` (atomic-server's export
+jobs bind process-global state — would be a cross-tenant job/artifact
+namespace), `/api/logs` (process-global log buffer), OAuth/MCP (own slice).
+
+**Deferred to later slices:** signup HTTP flow + magic links + email,
+managed OpenRouter keys / `provider_credentials`, OAuth + MCP for cloud,
+billing, quotas, dispatcher/worker pools, backups (including
+final-dump-before-delete), deploy gating / fleet migration, the reaper,
+`accounts.last_active_db_id` wiring, an HTTP deletion route (CLI deletion
+today cannot evict the serve process's AccountCache — the stale entry is
+harmless but lingers; the deletion route evicts in-process).
+
+**Follow-ups for the reaper/signup slices:** a deletion that crashes between
+reserving the subdomain and deleting the accounts row can be revived by a
+resumed provision, leaving an active account whose own subdomain holds a
+90-day reservation (benign; reaper should clear self-reservations); orphaned
+`acct_*` databases from failed 23503 cleanup are logged loudly for the
+reaper to reclaim.
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -988,6 +1060,12 @@ fat-fingered delete confirmation is unrecoverable customer data loss.
   domain warmup, SPF/DKIM, and a bounce strategy still need an owner.
 - **MCP token default scope.** Account-wide vs per-KB. Affects the MCP setup
   UX in Claude Desktop's config.
+- **Event-stream scope for database-scoped tokens.** The cloud `/ws` route
+  streams the whole account's event channel to any authenticated credential;
+  the `allowed_db_id` chokepoint governs only the data plane, so a KB-pinned
+  token sees other KBs' pipeline events (atom ids, etc.). Within-account
+  exposure only, so fine while one account = one user — but decide before
+  the MCP/OAuth slice mints db-scoped tokens for third-party clients.
 - **AccountCache idle-TTL and hard-cap numbers.** Tune from real load; initial
   guess 10–30 min TTL, cap at 1000 entries.
 - **Periodic BYOK re-validation.** Reaper-driven daily check
@@ -1159,3 +1237,20 @@ and link the discussion if it lives in a memory file.
 - **2026-06-09** — The old `crates/atomic-cloud` prototype (Fly
   machine-per-customer; never shipped) is a parts bin: salvage magic-link,
   Mailgun, Stripe clients and signup frontend; the Fly provisioning dies.
+- **2026-06-10** — Slice 1 landed (see Implementation log). Deviations
+  ratified there: reserve-before-delete ordering + post-claim re-check,
+  `account_provisioning` 503 variant, ResolvedTenant carries principal only,
+  inert FallbackAppState + fail-closed cloud_plane_guard, CASCADE FKs as
+  safety net.
+- **2026-06-10** — Export jobs, `/api/logs`, and `/api/auth/*` are unrouted
+  (404) in the cloud composition until each gets a per-tenant story — they
+  bind process-global state in atomic-server and would otherwise be a
+  cross-tenant namespace.
+- **2026-06-10** — Per-tenant pools are bounded at the composition layer
+  (default 5 connections, 5-min idle timeout) via a cloud-unaware
+  pool-config constructor added to atomic-core. The plan's pgbouncer
+  assumption stands, but the per-pool cap no longer depends on it.
+- **2026-06-10** — No auth caching in v1: every request verifies
+  subdomain + credential against the control plane, keeping revocation and
+  deletion immediate. AccountCache caches only manager/event-channel
+  resolution. Revisit under real load.
