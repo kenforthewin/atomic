@@ -3306,6 +3306,19 @@ impl AtomicCore {
     /// vector space. Existing chunk rows are preserved by the embed-only queue.
     /// Failed atoms are auto-retried for non-space provider config changes
     /// such as API keys or base URLs.
+    ///
+    /// Both the current and the post-write settings maps are resolved through
+    /// [`settings_for_ai`](Self::settings_for_ai) — the invariant documented
+    /// there: every map that feeds `ProviderConfig::from_settings` must carry
+    /// the explicit-config overlay. In explicit provider-config mode the
+    /// overlay pins every provider/embedding key in *both* maps, so an
+    /// embedding-space settings write is **inert**: the value is stored, but
+    /// the resolved vector space cannot change — no index recreation, no
+    /// re-embed queue, no failed-atom retry. Computing the change decision
+    /// from raw `get_settings` instead would recreate the vector index at a
+    /// dimension the active config never produces, destroying every stored
+    /// vector. In settings-resolved mode the overlay arm is a no-op and
+    /// behavior is unchanged.
     pub async fn set_setting_with_reembed<F>(
         &self,
         key: &str,
@@ -3315,8 +3328,16 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let current_settings = self.get_settings().await?;
-        let value_changed = current_settings.get(key).map(|s| s.as_str()) != Some(value);
+        let current_settings = self.settings_for_ai().await?;
+        // The map the write produces, as AI operations will resolve it:
+        // the new value overlaid with the explicit config (if any), exactly
+        // like `settings_for_ai` will report it after the write.
+        let mut new_settings = current_settings.clone();
+        new_settings.insert(key.to_string(), value.to_string());
+        if let Some(config) = self.active_provider_config() {
+            config.apply_to_settings(&mut new_settings);
+        }
+        let value_changed = current_settings.get(key) != new_settings.get(key);
 
         let mut embedding_space_changed = false;
         let mut dimension_changed = false;
@@ -3328,8 +3349,6 @@ impl AtomicCore {
             let current_config = ProviderConfig::from_settings(&current_settings);
             old_dim = current_config.embedding_dimension();
 
-            let mut new_settings = current_settings.clone();
-            new_settings.insert(key.to_string(), value.to_string());
             let new_config = ProviderConfig::from_settings(&new_settings);
             new_dim = new_config.embedding_dimension();
 
@@ -3421,6 +3440,13 @@ impl AtomicCore {
     /// recreate the active DB's vector index before queueing pending atoms;
     /// same-dimension space changes re-embed all atoms so stale vectors are
     /// not left behind.
+    ///
+    /// As with [`set_setting_with_reembed`](Self::set_setting_with_reembed),
+    /// both settings maps come from [`settings_for_ai`](Self::settings_for_ai):
+    /// in explicit provider-config mode the overlay pins the embedding-space
+    /// keys on both sides of the clear, so the override row is removed but the
+    /// resolved vector space never changes — no recreation, no re-embedding.
+    /// Settings-resolved mode is unchanged.
     pub async fn clear_override_with_reembed<F>(
         &self,
         key: &str,
@@ -3429,13 +3455,13 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let current_settings = self.get_settings().await?;
+        let current_settings = self.settings_for_ai().await?;
         let current_config = ProviderConfig::from_settings(&current_settings);
         let current_value = current_settings.get(key).cloned();
 
         self.clear_override(key).await?;
 
-        let new_settings = self.get_settings().await?;
+        let new_settings = self.settings_for_ai().await?;
         let new_config = ProviderConfig::from_settings(&new_settings);
         let new_value = new_settings.get(key).cloned();
         let value_changed = current_value != new_value;
@@ -5261,6 +5287,124 @@ mod tests {
         assert!(!result.dimension_changed);
         assert_eq!(result.old_dim, 1536);
         assert_eq!(result.new_dim, 1536);
+    }
+
+    /// Settings-mode regression: an embedding-model change through
+    /// `set_setting_with_reembed` still marks the space changed (and would
+    /// re-embed) when no explicit provider config is active. The explicit-mode
+    /// tests below depend on this staying true — inertness must come from the
+    /// overlay, not from the change detection going blind.
+    #[tokio::test]
+    async fn test_settings_mode_model_change_marks_space_changed() {
+        let (_registry, cores, _dir) = make_workspace(0);
+
+        let result = cores[0]
+            .set_setting_with_reembed("embedding_model", "custom/other-space", |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            result.embedding_space_changed,
+            "settings mode must still treat a model change as a space change"
+        );
+        assert!(!result.dimension_changed, "same dimension, no recreation");
+    }
+
+    /// Explicit provider-config mode: embedding-space settings writes are
+    /// inert. The values land in the settings tables, but the resolved vector
+    /// space is pinned by the active config — no index recreation, no re-embed
+    /// queue, no failed-atom retry.
+    #[tokio::test]
+    async fn test_explicit_mode_embedding_space_writes_are_inert() {
+        let (_registry, cores, _dir) = make_workspace(0);
+        // Promote to explicit mode with the default config (OpenRouter,
+        // 1536-dim embedding model).
+        cores[0].update_provider_config(ProviderConfig::from_settings(
+            &std::collections::HashMap::new(),
+        ));
+
+        // Writes that, in settings mode, would flip the provider to a
+        // 3072-dim openai_compat space (recreating the vector index) or
+        // change the embedding model (queueing a full re-embed).
+        for (key, value) in [
+            ("openai_compat_embedding_dimension", "3072"),
+            ("provider", "openai_compat"),
+            ("embedding_model", "frontier/other-space"),
+        ] {
+            let result = cores[0]
+                .set_setting_with_reembed(key, value, |_| {})
+                .await
+                .unwrap();
+            assert!(!result.embedding_space_changed, "{key} must be inert");
+            assert!(!result.dimension_changed, "{key} must not recreate");
+            assert_eq!(result.total_atom_count, 0, "{key} must queue nothing");
+            assert_eq!(result.retried_failed_count, 0, "{key} must retry nothing");
+        }
+
+        // The vector index was never touched: still at the 1536 dimension the
+        // explicit config produces, not the 3072 the settings rows now claim.
+        assert_vec_chunks_dimension(&cores[0], 1536);
+
+        // The writes themselves landed — explicit mode stores values, it only
+        // keeps them from steering the embedding space.
+        let stored = cores[0].get_settings().await.unwrap();
+        assert_eq!(
+            stored
+                .get("openai_compat_embedding_dimension")
+                .map(String::as_str),
+            Some("3072")
+        );
+        assert_eq!(
+            stored.get("provider").map(String::as_str),
+            Some("openai_compat")
+        );
+    }
+
+    /// Explicit-mode twin of
+    /// `test_clear_embedding_dimension_override_recreates_vector_index`:
+    /// clearing an embedding-space override under an active explicit config
+    /// removes the override row but recreates nothing — the overlay pins both
+    /// sides of the comparison.
+    #[tokio::test]
+    async fn test_explicit_mode_clear_override_is_inert() {
+        let (registry, cores, _dir) = make_workspace(1);
+        registry.set_setting("provider", "openai_compat").unwrap();
+        registry
+            .set_setting("openai_compat_embedding_dimension", "1536")
+            .unwrap();
+
+        // Settings mode writes a 768-dim override (recreates — existing
+        // behavior, pinned elsewhere).
+        cores[0]
+            .set_setting_with_reembed("openai_compat_embedding_dimension", "768", |_| {})
+            .await
+            .unwrap();
+        assert_vec_chunks_dimension(&cores[0], 768);
+
+        // Explicit mode on: clearing the override flips the settings-resolved
+        // dimension 768 → 1536, but the explicit config owns the space, so
+        // nothing may be recreated or re-embedded.
+        cores[0].update_provider_config(ProviderConfig::from_settings(
+            &std::collections::HashMap::new(),
+        ));
+        let result = cores[0]
+            .clear_override_with_reembed("openai_compat_embedding_dimension", |_| {})
+            .await
+            .unwrap();
+
+        assert!(!result.embedding_space_changed);
+        assert!(!result.dimension_changed);
+        assert_eq!(result.total_atom_count, 0, "no re-embed queued");
+        assert_vec_chunks_dimension(&cores[0], 768);
+
+        // The override row is genuinely gone — the clear itself worked.
+        let s = cores[0].get_settings().await.unwrap();
+        assert_eq!(
+            s.get("openai_compat_embedding_dimension")
+                .map(String::as_str),
+            Some("1536"),
+            "override cleared back to the workspace default"
+        );
     }
 
     #[tokio::test]

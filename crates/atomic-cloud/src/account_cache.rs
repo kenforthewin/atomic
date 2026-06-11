@@ -58,6 +58,24 @@
 //! on a cached entry **in place** — no eviction, so in-flight operations
 //! finish on the config they started with while new operations pick up the
 //! fresh one (plan: "Live rotation", steps 4-5).
+//!
+//! ## Generation-checked convergence
+//!
+//! The in-place swap only reaches the pod that handled the rotation, and it
+//! can race a concurrent entry build (the build reads credentials, the
+//! rotation lands, the swap misses, the build inserts the *old* config).
+//! `accounts.provider_generation` bounds both: every provider mutation
+//! bumps it transactionally ([`crate::provider_credentials`]), each cache
+//! entry records the generation its config was built from — read in the
+//! **same query** as the credentials, so the stamp is never newer than the
+//! config — and CloudAuth's per-request account lookup (already a
+//! per-request read; slice-1's no-auth-caching decision) carries the
+//! current value into [`AccountCache::get_or_load_with_generation`]. A hit
+//! whose entry lags the observed generation re-reads the control plane,
+//! swaps the fresh config in place, and re-stamps the entry — under a
+//! per-account refresh permit (the same keyed-lock idiom as the loading
+//! map) so concurrent requests don't stampede the control plane. Any pod,
+//! and any lost race, converges on the next authenticated request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,7 +89,9 @@ use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 use crate::keyvault::KeyVault;
 use crate::provider_config::{config_for_credentials, keyless_provider_config};
-use crate::provider_credentials::{get_active_credentials, touch_last_used};
+use crate::provider_credentials::{
+    get_active_provider_state, touch_last_used, ActiveProviderState, ProviderCredentials,
+};
 use crate::provision::{is_tenant_db_name, ClusterConfig};
 
 /// Capacity of each per-account event channel. Matches the sizing of
@@ -140,6 +160,11 @@ struct Entry {
     manager: Arc<DatabaseManager>,
     event_tx: broadcast::Sender<ServerEvent>,
     last_touched: Instant,
+    /// `accounts.provider_generation` the entry's provider config was built
+    /// from (module docs: "Generation-checked convergence"). Read in the
+    /// same query as the credentials, so it is never newer than the config
+    /// actually serving; refreshes re-stamp it.
+    provider_generation: i64,
 }
 
 impl Entry {
@@ -157,12 +182,17 @@ impl Entry {
     }
 }
 
-/// Both maps live under one lock: `entries` is the cache proper, `loading`
-/// holds the per-account build permits that coalesce concurrent loads.
+/// All three maps live under one lock: `entries` is the cache proper,
+/// `loading` holds the per-account build permits that coalesce concurrent
+/// loads, and `refreshing` holds the per-account permits that serialize
+/// generation refreshes (module docs: "Generation-checked convergence").
+/// `refreshing` prunes by `Arc::strong_count` on acquire — an entry only
+/// the map holds has no guard out and no waiter queued.
 #[derive(Default)]
 struct Inner {
     entries: HashMap<String, Entry>,
     loading: HashMap<String, Arc<Mutex<()>>>,
+    refreshing: HashMap<String, Arc<Mutex<()>>>,
 }
 
 /// Cache of per-account tenant resources, keyed by account id.
@@ -205,7 +235,36 @@ impl AccountCache {
     /// A hit refreshes the entry's idle clock. Concurrent calls for the same
     /// account coalesce onto a single build (module docs); a failed build is
     /// returned to its caller and retried by any coalesced waiters.
+    ///
+    /// This form performs no provider-generation freshness check — callers
+    /// on the authenticated request path, which have just read the accounts
+    /// row anyway, should use
+    /// [`get_or_load_with_generation`](Self::get_or_load_with_generation).
     pub async fn get_or_load(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
+        self.lookup_or_build(account_id).await
+    }
+
+    /// [`get_or_load`](Self::get_or_load), plus the per-request convergence
+    /// check (module docs: "Generation-checked convergence"):
+    /// `observed_generation` is the `accounts.provider_generation` the
+    /// caller just read alongside authentication. When the cached entry's
+    /// config was built from an older generation, the entry's provider
+    /// config is refreshed from the control plane — in place, no eviction —
+    /// before the handle is returned, so a rotation written by any pod (or
+    /// one that raced this entry's build) is serving by the end of this
+    /// call.
+    pub async fn get_or_load_with_generation(
+        &self,
+        account_id: &str,
+        observed_generation: i64,
+    ) -> Result<TenantHandle, CloudError> {
+        let handle = self.lookup_or_build(account_id).await?;
+        self.refresh_stale_provider_config(account_id, observed_generation)
+            .await?;
+        Ok(handle)
+    }
+
+    async fn lookup_or_build(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
         loop {
             // Fast path: cache hit. Otherwise pick up (or register) the
             // account's build permit while still under the map lock.
@@ -260,6 +319,88 @@ impl AccountCache {
             inner.entries.insert(account_id.to_string(), entry);
             return Ok(handle);
         }
+    }
+
+    /// Bring `account_id`'s cached provider config up to (at least)
+    /// `observed_generation`, re-reading the control plane when the entry
+    /// lags. No-op when the entry is already current — the steady state,
+    /// one map probe — or when no entry exists (a fresh build reads state
+    /// at least as new as any prior observation).
+    ///
+    /// Concurrent stale requests serialize on a per-account refresh permit
+    /// and re-check under it, so one control-plane read serves them all.
+    /// Errors propagate: a request that *knows* the serving config is stale
+    /// must not quietly proceed on credentials the account holder may just
+    /// have revoked.
+    async fn refresh_stale_provider_config(
+        &self,
+        account_id: &str,
+        observed_generation: i64,
+    ) -> Result<(), CloudError> {
+        // Fast path under the map lock: entry current (or gone) → done.
+        let permit = {
+            let mut inner = self.inner.lock().await;
+            match inner.entries.get(account_id) {
+                Some(entry) if entry.provider_generation < observed_generation => {}
+                _ => return Ok(()),
+            }
+            inner.refreshing.retain(|_, p| Arc::strong_count(p) > 1);
+            Arc::clone(inner.refreshing.entry(account_id.to_string()).or_default())
+        };
+        let _guard = permit.lock().await;
+
+        // Re-check under the permit: a coalesced refresh may have caught up
+        // while we waited; the entry may also have been evicted (nothing to
+        // refresh — the next build reads fresh state).
+        let manager = {
+            let inner = self.inner.lock().await;
+            match inner.entries.get(account_id) {
+                Some(entry) if entry.provider_generation < observed_generation => {
+                    Arc::clone(&entry.manager)
+                }
+                _ => return Ok(()),
+            }
+        };
+
+        // One snapshot read: generation + credentials together, so the
+        // stamp below is never newer than the config it travels with.
+        let state =
+            get_active_provider_state(&self.control, self.vault.as_ref(), account_id).await?;
+        let Some(state) = state else {
+            // The accounts row vanished mid-request (concurrent deletion).
+            // The deletion path evicts; nothing to converge here.
+            tracing::debug!(account_id, "provider refresh found no accounts row");
+            return Ok(());
+        };
+        let config = match &state.credentials {
+            Some(credentials) => config_for_credentials(credentials),
+            None => keyless_provider_config(),
+        };
+        let core = manager
+            .active_core()
+            .await
+            .map_err(CloudError::core("resolving core for provider refresh"))?;
+        core.update_provider_config(config);
+        self.stamp_last_used(account_id, state.credentials.as_ref())
+            .await;
+
+        let mut inner = self.inner.lock().await;
+        if let Some(entry) = inner.entries.get_mut(account_id) {
+            // Only stamp the entry whose manager we actually updated — an
+            // eviction + rebuild while we read would have built fresher
+            // state than ours.
+            if Arc::ptr_eq(&entry.manager, &manager)
+                && entry.provider_generation < state.provider_generation
+            {
+                entry.provider_generation = state.provider_generation;
+            }
+        }
+        tracing::info!(
+            account_id,
+            generation = state.provider_generation,
+            "refreshed stale provider config from control plane"
+        );
+        Ok(())
     }
 
     /// Drop `account_id`'s entry immediately, returning whether one existed.
@@ -386,10 +527,24 @@ impl AccountCache {
         // Resolve the account's provider config from the control plane —
         // ALWAYS an explicit Some (module docs: the settings-fallback path
         // is forbidden in cloud). No credentials row → key-less config →
-        // structured missing-key errors downstream.
-        let credentials =
-            get_active_credentials(&self.control, self.vault.as_ref(), account_id).await?;
-        let provider_config = match &credentials {
+        // structured missing-key errors downstream. The provider generation
+        // arrives in the same query as the credentials, so the entry's
+        // stamp below can never be newer than the config it describes —
+        // which is what lets a rotation racing this build heal by
+        // generation mismatch on the next request (module docs).
+        let state =
+            get_active_provider_state(&self.control, self.vault.as_ref(), account_id).await?;
+        let state = state.unwrap_or_else(|| {
+            // The accounts row vanished between the mapping lookup above and
+            // this read (concurrent deletion). Build the key-less shape; the
+            // deletion's eviction (or the idle TTL) reclaims the entry.
+            tracing::warn!(account_id, "account row missing during entry build");
+            ActiveProviderState {
+                provider_generation: 0,
+                credentials: None,
+            }
+        });
+        let provider_config = match &state.credentials {
             Some(credentials) => config_for_credentials(credentials),
             None => keyless_provider_config(),
         };
@@ -416,26 +571,35 @@ impl AccountCache {
 
         // Stamp the credential's last_used_at: handing the key to a serving
         // manager is the moment it goes into use (plan: "Audit /
-        // visibility"). Best-effort — a stamp failure must not fail the
-        // tenant load.
-        if let Some(credentials) = &credentials {
-            if let Err(e) = touch_last_used(
-                &self.control,
-                account_id,
-                credentials.provider,
-                credentials.origin,
-            )
-            .await
-            {
-                tracing::warn!(account_id, error = %e, "failed to stamp credential last_used_at");
-            }
-        }
+        // visibility").
+        self.stamp_last_used(account_id, state.credentials.as_ref())
+            .await;
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Ok(Entry {
             manager: Arc::new(manager),
             event_tx,
             last_touched: Instant::now(),
+            provider_generation: state.provider_generation,
         })
+    }
+
+    /// Best-effort `last_used_at` stamp for the credentials a serving config
+    /// was just built from — a stamp failure must never fail the tenant load
+    /// or a refresh.
+    async fn stamp_last_used(&self, account_id: &str, credentials: Option<&ProviderCredentials>) {
+        let Some(credentials) = credentials else {
+            return;
+        };
+        if let Err(e) = touch_last_used(
+            &self.control,
+            account_id,
+            credentials.provider,
+            credentials.origin,
+        )
+        .await
+        {
+            tracing::warn!(account_id, error = %e, "failed to stamp credential last_used_at");
+        }
     }
 }

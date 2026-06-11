@@ -32,8 +32,25 @@ use serde_json::{Map, Value};
 /// The fleet-wide pinned embedding model for managed keys. Matches
 /// atomic-core's OpenRouter default so settings-mode (self-hosted) and
 /// explicit-mode (cloud) deployments embed identically, and matches the
-/// 1536-dimension column the tenant schema is reconciled to.
+/// [`PINNED_EMBEDDING_DIMENSION`]-wide column the tenant schema is
+/// reconciled to.
 pub const MANAGED_EMBEDDING_MODEL: &str = "openai/text-embedding-3-small";
+
+/// The platform-pinned embedding dimension — the width of every tenant's
+/// vector column, fixed at provision time and **not changeable in cloud**
+/// (v1). [`MANAGED_EMBEDDING_MODEL`] produces vectors of exactly this
+/// width.
+///
+/// This pin governs BYOK as well as managed configs: tenant settings writes
+/// are inert for embedding-space keys in explicit mode (atomic-core), so no
+/// cloud mechanism exists that could recreate a tenant's vector index at a
+/// different width — accepting a config whose effective dimension differs
+/// would wedge the account (every embed fails against the mismatched
+/// column). The provider routes therefore *reject* such configs with a
+/// structured `embedding_dimension_unsupported` error instead of storing
+/// them with an unfulfillable re-embed warning. Revisit alongside a real
+/// dimension-migration story.
+pub const PINNED_EMBEDDING_DIMENSION: usize = 1536;
 
 /// The curated LLM list for managed keys (tagging, wiki, chat): 2-3
 /// cost-effective models, per the plan. The first entry is the default
@@ -148,6 +165,19 @@ mod tests {
         assert_eq!(validate_managed_model_config(&seed), Ok(()));
         assert_eq!(seed["embedding_model"], json!(MANAGED_EMBEDDING_MODEL));
         assert_eq!(seed["llm_model"], json!(MANAGED_LLM_MODELS[0]));
+    }
+
+    #[test]
+    fn pinned_model_produces_the_pinned_dimension() {
+        // The two pins must agree: the seeded managed config's effective
+        // embedding dimension is the width tenant columns are created at.
+        let seed = crate::managed_keys::default_managed_model_config();
+        let config = crate::provider_config::build_provider_config(
+            crate::provider_credentials::Provider::OpenRouter,
+            None,
+            &seed,
+        );
+        assert_eq!(config.embedding_dimension(), PINNED_EMBEDDING_DIMENSION);
     }
 
     #[test]

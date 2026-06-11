@@ -32,11 +32,13 @@
 //! | `openai_compat_base_url` | OpenAI-compatible API base (required for that provider to function) |
 //! | `embedding_dimension` | embedding vector width (OpenAI-compat only; OpenRouter models carry known dimensions) |
 //!
-//! Unknown keys are ignored here — *write-side* policy (which keys a user
-//! may set, per origin) is [`crate::curated_models`]' job, enforced by the
-//! provider routes before anything lands in the column. Everything not
-//! supplied falls back to atomic-core's own defaults, which keeps this
-//! builder a thin overlay rather than a second source of default truth.
+//! Unknown keys are ignored here — *write-side* policy lives with the
+//! routes: managed rows are curation-checked ([`crate::curated_models`]),
+//! and BYOK rows are vocabulary-checked ([`validate_byok_model_config`],
+//! below) so a write can never smuggle keys outside this table into the
+//! column. Everything not supplied falls back to atomic-core's own
+//! defaults, which keeps this builder a thin overlay rather than a second
+//! source of default truth.
 //!
 //! `llm_model` is the account's *entire* LLM selection: in explicit mode
 //! atomic-core pins the per-task `wiki_model`/`chat_model` settings keys to
@@ -113,6 +115,57 @@ pub fn build_provider_config(
         }
     }
     config
+}
+
+/// The full `model_config` vocabulary (module docs) — every key a **BYOK**
+/// write may carry. Wider than the managed allowlist
+/// (`crate::curated_models`): BYOK users own their base URLs and (subject
+/// to the platform dimension pin) their embedding setup.
+pub const BYOK_ALLOWED_KEYS: &[&str] = &[
+    "embedding_model",
+    "llm_model",
+    "openrouter_base_url",
+    "openai_compat_base_url",
+    "embedding_dimension",
+];
+
+/// Validate a user-submitted BYOK `model_config` against the documented
+/// vocabulary. Mirrors `validate_managed_model_config`'s shape (an
+/// `Err(message)` written for the 400 body), with the wider
+/// [`BYOK_ALLOWED_KEYS`] allowlist and no model curation.
+///
+/// This is a **secret-hygiene** gate as much as a schema check: the column
+/// is stored plaintext (only the API key is encrypted) and echoed verbatim
+/// by the status route, so an unknown key — say a client nesting `api_key`
+/// inside `model_config` — would persist a secret unencrypted and display
+/// it forever. Rejecting everything outside the vocabulary closes that by
+/// construction.
+pub fn validate_byok_model_config(model_config: &Value) -> Result<(), String> {
+    let Some(object) = model_config.as_object() else {
+        return Err("model_config must be a JSON object".to_string());
+    };
+
+    for (key, value) in object {
+        if !BYOK_ALLOWED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "model_config key {key:?} is not part of the model-config \
+                 vocabulary; allowed keys: {BYOK_ALLOWED_KEYS:?}. model_config \
+                 is stored and displayed in plain text — API keys belong in \
+                 the api_key field, never here."
+            ));
+        }
+        if key == "embedding_dimension" {
+            if !value.is_u64() {
+                return Err(
+                    "model_config.embedding_dimension must be a positive integer".to_string(),
+                );
+            }
+        } else if !value.is_string() {
+            return Err(format!("model_config.{key} must be a string"));
+        }
+    }
+
+    Ok(())
 }
 
 /// The explicit config for a decrypted credentials row.
@@ -207,6 +260,40 @@ mod tests {
             config.openrouter_base_url,
             core_defaults.openrouter_base_url
         );
+    }
+
+    #[test]
+    fn byok_vocabulary_accepts_documented_keys_only() {
+        // Every documented key, well-typed: fine.
+        assert_eq!(
+            validate_byok_model_config(&json!({
+                "embedding_model": "mock-embed",
+                "llm_model": "any/model",
+                "openrouter_base_url": "http://127.0.0.1:1",
+                "openai_compat_base_url": "http://127.0.0.1:2",
+                "embedding_dimension": 1536,
+            })),
+            Ok(())
+        );
+        assert_eq!(validate_byok_model_config(&json!({})), Ok(()));
+
+        // The secret-hygiene case: a nested api_key must never reach the
+        // plaintext column.
+        let err = validate_byok_model_config(&json!({ "api_key": "sk-leak" })).unwrap_err();
+        assert!(err.contains("api_key"), "{err}");
+        assert!(
+            !err.contains("sk-leak"),
+            "rejection must not echo the value: {err}"
+        );
+
+        // Shape checks mirror the managed validator's.
+        assert!(validate_byok_model_config(&json!("gpt")).is_err());
+        assert!(validate_byok_model_config(&json!({ "llm_model": 42 })).is_err());
+        assert!(
+            validate_byok_model_config(&json!({ "embedding_dimension": "1536" })).is_err(),
+            "dimension must be a number, not a string"
+        );
+        assert!(validate_byok_model_config(&json!({ "embedding_dimension": -5 })).is_err());
     }
 
     #[test]

@@ -27,6 +27,19 @@
 //!    to the next pass, and a row that keeps failing never wedges the loop —
 //!    every row's outcome is independent.
 //!
+//!    Rollback is **classified**, not reflexive: a resume that failed at
+//!    the managed-key provisioning step (the typed
+//!    [`CloudError::ProviderProvisioning`] class) is a *provider outage*,
+//!    not a broken provision — every other step already converged
+//!    idempotently, and one more pass after the API recovers completes the
+//!    signup. Hard-deleting the claim for that would burn a user's
+//!    subdomain over OpenRouter downtime. Such rows are deferred
+//!    ([`ReaperSummary::stuck_deferred_provider_outage`]) and retried next
+//!    pass — up to [`ReaperPolicy::provision_rollback_ceiling`], past which
+//!    the row rolls back regardless so an extended outage can't accumulate
+//!    unbounded zombie claims. Every other failure class still rolls back
+//!    immediately.
+//!
 //! 2. **Orphaned tenant databases** — `acct_*` databases (the exact
 //!    [`is_tenant_db_name`] shape) with **no** `accounts` row and **no**
 //!    `account_databases` row. These are the loudly-logged debris of failed
@@ -148,6 +161,13 @@ pub struct ReaperPolicy {
     /// cap — settled rows must not crowd out real work.
     pub max_resumes_per_pass: usize,
 
+    /// Ceiling on how long a stuck provision may keep being deferred when
+    /// its resume fails at the managed-key provisioning step (a provider
+    /// outage; module docs). Rows younger than this are left for the next
+    /// pass — the claim survives the outage; rows older roll back
+    /// regardless, bounding zombie-claim accumulation. Default 60 minutes.
+    pub provision_rollback_ceiling: Duration,
+
     /// Minimum account age before arm 3 treats an active-without-mapping
     /// account as an interrupted deletion. The predicate itself is sound at
     /// any age (see the module docs); the grace is defensive depth — it
@@ -175,6 +195,7 @@ impl Default for ReaperPolicy {
             stuck_provision_age: Duration::from_secs(5 * 60),
             // One pass is at most as provision-heavy as the signup plane.
             max_resumes_per_pass: crate::account_plane::DEFAULT_MAX_CONCURRENT_PROVISIONS,
+            provision_rollback_ceiling: Duration::from_secs(60 * 60),
             deletion_recovery_grace: Duration::from_secs(5 * 60),
             self_reservation_grace: Duration::from_secs(5 * 60),
             magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
@@ -198,6 +219,11 @@ pub struct ReaperSummary {
     /// Stuck provisions past [`ReaperPolicy::max_resumes_per_pass`],
     /// deferred to the next pass untouched.
     pub stuck_deferred: Vec<String>,
+    /// Stuck provisions whose resume failed at the managed-key provisioning
+    /// step (a provider outage) and are still inside
+    /// [`ReaperPolicy::provision_rollback_ceiling`]: rollback skipped, row
+    /// left for the next pass (module docs: classified rollback).
+    pub stuck_deferred_provider_outage: Vec<String>,
     /// Orphaned tenant databases dropped (database names).
     pub orphan_dbs_dropped: Vec<String>,
     /// Orphan candidates skipped because another pass holds the lock for
@@ -232,6 +258,7 @@ impl ReaperSummary {
             && self.stuck_rolled_back.is_empty()
             && self.stuck_skipped_locked.is_empty()
             && self.stuck_deferred.is_empty()
+            && self.stuck_deferred_provider_outage.is_empty()
             && self.orphan_dbs_dropped.is_empty()
             && self.orphan_dbs_skipped_locked.is_empty()
             && self.deletions_completed.is_empty()
@@ -348,6 +375,10 @@ impl AccountLock {
 enum StuckOutcome {
     Resumed,
     RolledBack,
+    /// Resume failed at the managed-key provisioning step (provider
+    /// outage), row inside the rollback ceiling: rollback skipped, row left
+    /// intact for the next pass (module docs: classified rollback).
+    DeferredProviderOutage,
     /// The under-lock re-check found the row already handled (activated,
     /// rolled back, or refreshed) by a concurrent actor — nothing to do.
     AlreadySettled,
@@ -397,19 +428,24 @@ async fn reap_stuck_provisions(
         // Process under the lock, then ALWAYS release — outcomes (including
         // errors) are values here precisely so no path skips the release.
         let outcome =
-            process_stuck_provision(control, cluster, managed, &account_id, stale_before).await;
+            process_stuck_provision(control, cluster, managed, policy, &account_id, stale_before)
+                .await;
         lock.release().await;
         // Only attempts that actually did resume work count against the
         // cap. AlreadySettled cost one indexed re-read — charging it would
         // let rows settled by concurrent actors crowd real work out of the
         // pass. Errors count: a failed resume may well have burned the
-        // multi-second budget the cap exists to bound.
+        // multi-second budget the cap exists to bound — as does a deferred
+        // provider outage, whose resume attempt ran in full before failing.
         if !matches!(outcome, Ok(StuckOutcome::AlreadySettled)) {
             resumes_used += 1;
         }
         match outcome {
             Ok(StuckOutcome::Resumed) => summary.stuck_resumed.push(account_id),
             Ok(StuckOutcome::RolledBack) => summary.stuck_rolled_back.push(account_id),
+            Ok(StuckOutcome::DeferredProviderOutage) => {
+                summary.stuck_deferred_provider_outage.push(account_id)
+            }
             Ok(StuckOutcome::AlreadySettled) => {}
             Err(e) => record_error(
                 summary,
@@ -421,12 +457,13 @@ async fn reap_stuck_provisions(
     Ok(())
 }
 
-/// One stuck row, lock held: re-check, resume, and only if the resume fails,
-/// roll back.
+/// One stuck row, lock held: re-check, resume, and only if the resume fails
+/// — for a reason that isn't a deferrable provider outage — roll back.
 async fn process_stuck_provision(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     managed: &ManagedKeys,
+    policy: &ReaperPolicy,
     account_id: &str,
     stale_before: DateTime<Utc>,
 ) -> Result<StuckOutcome, CloudError> {
@@ -471,6 +508,26 @@ async fn process_stuck_provision(
         }
         Err(e) => e,
     };
+
+    // Classify before rolling back (module docs): a resume that failed at
+    // the managed-key provisioning step is a provider outage — every other
+    // step converged idempotently, and the next pass after the API recovers
+    // finishes the signup. Rolling back would burn the user's claim over
+    // third-party downtime, so defer instead — unless the row has been
+    // deferred past the hard ceiling, at which point the outage is no
+    // longer "transient" and the claim must stop accumulating.
+    if matches!(resume_err, CloudError::ProviderProvisioning { .. })
+        && created_at >= cutoff(policy.provision_rollback_ceiling)
+    {
+        tracing::warn!(
+            account_id,
+            subdomain,
+            resume_error = %resume_err,
+            "stuck provision's resume failed at managed-key provisioning \
+             (provider outage); deferring rollback to the next pass"
+        );
+        return Ok(StuckOutcome::DeferredProviderOutage);
+    }
 
     if roll_back_stuck_provision(
         control,

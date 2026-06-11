@@ -11,9 +11,14 @@
 //! everything it needs.
 //!
 //! Every ciphertext is bound to its row via AEAD associated data derived
-//! from `(account_id, provider)` — see [`binding_aad`] — so a ciphertext
-//! copied onto another account's row (or another provider's) fails
-//! authentication instead of decrypting.
+//! from the row's full primary key, `(account_id, provider, origin)` — see
+//! [`binding_aad`] — so a ciphertext copied onto another account's row,
+//! another provider's, or swapped between an account's managed and BYOK rows
+//! fails authentication instead of decrypting. Origin is part of the binding
+//! because managed and user rows for the same `(account, provider)` coexist
+//! by design: without it, database-level tampering could present the
+//! platform-funded managed key as the user's own (or vice versa) and both
+//! would decrypt.
 //!
 //! # Operator runbook — master key custody
 //!
@@ -59,31 +64,33 @@ const NONCE_LEN: usize = 12;
 const MASTER_KEY_LEN: usize = 32;
 
 /// Encrypts and decrypts provider credentials, binding each ciphertext to
-/// the `(account_id, provider)` row it belongs to.
+/// the `(account_id, provider, origin)` row it belongs to.
 ///
 /// Methods are synchronous on purpose: the work is pure CPU (v1) and a
 /// future KMS-backed implementation can pre-fetch/caches DEKs at account
 /// resolution time rather than per call.
 pub trait KeyVault: Send + Sync {
-    /// Encrypt `plaintext` for the `(account_id, provider)` row. Returns
-    /// `(ciphertext, nonce, encryption_version)` — exactly the triple the
-    /// `provider_credentials` row stores.
+    /// Encrypt `plaintext` for the `(account_id, provider, origin)` row.
+    /// Returns `(ciphertext, nonce, encryption_version)` — exactly the
+    /// triple the `provider_credentials` row stores.
     fn encrypt(
         &self,
         account_id: &str,
         provider: &str,
+        origin: &str,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>, i32), CloudError>;
 
     /// Decrypt a stored triple back to plaintext. Fails typed when
     /// `version` is unknown ([`CloudError::UnknownEncryptionVersion`]) or
     /// when authentication fails — wrong master key, a `(account_id,
-    /// provider)` binding that doesn't match the one encrypted under, or a
-    /// corrupt row ([`CloudError::CredentialDecrypt`]).
+    /// provider, origin)` binding that doesn't match the one encrypted
+    /// under, or a corrupt row ([`CloudError::CredentialDecrypt`]).
     fn decrypt(
         &self,
         account_id: &str,
         provider: &str,
+        origin: &str,
         ciphertext: &[u8],
         nonce: &[u8],
         version: i32,
@@ -195,6 +202,7 @@ impl KeyVault for EnvMasterKeyVault {
         &self,
         account_id: &str,
         provider: &str,
+        origin: &str,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>, i32), CloudError> {
         // Fresh 96-bit nonce per encryption, from the OS RNG. Nonce reuse
@@ -210,7 +218,7 @@ impl KeyVault for EnvMasterKeyVault {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext,
-                    aad: &binding_aad(account_id, provider),
+                    aad: &binding_aad(account_id, provider, origin),
                 },
             )
             .map_err(|_| CloudError::CredentialEncrypt)?;
@@ -221,6 +229,7 @@ impl KeyVault for EnvMasterKeyVault {
         &self,
         account_id: &str,
         provider: &str,
+        origin: &str,
         ciphertext: &[u8],
         nonce: &[u8],
         version: i32,
@@ -239,7 +248,7 @@ impl KeyVault for EnvMasterKeyVault {
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: &binding_aad(account_id, provider),
+                    aad: &binding_aad(account_id, provider, origin),
                 },
             )
             .map_err(|_| {
@@ -247,23 +256,24 @@ impl KeyVault for EnvMasterKeyVault {
                 // add the row context — and nothing secret — ourselves.
                 CloudError::CredentialDecrypt(format!(
                     "AEAD authentication failed for account {account_id} provider \
-                     {provider}: wrong master key, mismatched account/provider \
-                     binding, or corrupt row"
+                     {provider} origin {origin}: wrong master key, mismatched \
+                     row binding, or corrupt row"
                 ))
             })
     }
 }
 
-/// AEAD associated data binding a ciphertext to its row.
+/// AEAD associated data binding a ciphertext to its row's full primary key,
+/// `(account_id, provider, origin)`.
 ///
 /// Each component is length-prefixed (u32 big-endian) before its bytes, so
 /// the encoding is injective: `("a", "bc")` and `("ab", "c")` produce
 /// different AAD even though their concatenations are identical. A naive
-/// `account_id || provider` join would let a ciphertext authenticate under
-/// a shifted split of the same byte string.
-fn binding_aad(account_id: &str, provider: &str) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(8 + account_id.len() + provider.len());
-    for part in [account_id, provider] {
+/// concatenation join would let a ciphertext authenticate under a shifted
+/// split of the same byte string.
+fn binding_aad(account_id: &str, provider: &str, origin: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(12 + account_id.len() + provider.len() + origin.len());
+    for part in [account_id, provider, origin] {
         aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
         aad.extend_from_slice(part.as_bytes());
     }
@@ -283,54 +293,79 @@ mod tests {
     fn encrypt_decrypt_roundtrip() {
         let v = vault();
         let (ct, nonce, version) = v
-            .encrypt("acct-1", "openrouter", b"sk-or-secret")
+            .encrypt("acct-1", "openrouter", "managed", b"sk-or-secret")
             .expect("encrypt");
         assert_eq!(version, ENCRYPTION_VERSION);
         assert_eq!(nonce.len(), 12, "nonce is 96 bits");
         assert_ne!(ct, b"sk-or-secret".to_vec(), "ciphertext != plaintext");
         let plaintext = v
-            .decrypt("acct-1", "openrouter", &ct, &nonce, version)
+            .decrypt("acct-1", "openrouter", "managed", &ct, &nonce, version)
             .expect("decrypt");
         assert_eq!(plaintext, b"sk-or-secret");
     }
 
     #[test]
-    fn decrypt_is_bound_to_account_and_provider() {
+    fn decrypt_is_bound_to_account_provider_and_origin() {
         let v = vault();
-        let (ct, nonce, version) = v.encrypt("acct-1", "openrouter", b"key").unwrap();
+        let (ct, nonce, version) = v
+            .encrypt("acct-1", "openrouter", "managed", b"key")
+            .unwrap();
 
         // Same ciphertext under a different account: authentication fails.
         assert!(matches!(
-            v.decrypt("acct-2", "openrouter", &ct, &nonce, version),
+            v.decrypt("acct-2", "openrouter", "managed", &ct, &nonce, version),
             Err(CloudError::CredentialDecrypt(_))
         ));
         // ... and under a different provider.
         assert!(matches!(
-            v.decrypt("acct-1", "openai_compat", &ct, &nonce, version),
+            v.decrypt("acct-1", "openai_compat", "managed", &ct, &nonce, version),
+            Err(CloudError::CredentialDecrypt(_))
+        ));
+        // ... and under a different origin: a managed ciphertext moved onto
+        // the same account's BYOK row (DB-level tampering) must not decrypt.
+        assert!(matches!(
+            v.decrypt("acct-1", "openrouter", "user", &ct, &nonce, version),
+            Err(CloudError::CredentialDecrypt(_))
+        ));
+        // The swap fails in the other direction too.
+        let (user_ct, user_nonce, user_version) = v
+            .encrypt("acct-1", "openrouter", "user", b"byok-key")
+            .unwrap();
+        assert!(matches!(
+            v.decrypt(
+                "acct-1",
+                "openrouter",
+                "managed",
+                &user_ct,
+                &user_nonce,
+                user_version
+            ),
             Err(CloudError::CredentialDecrypt(_))
         ));
         // The true binding still works (the failures above weren't luck).
         assert!(v
-            .decrypt("acct-1", "openrouter", &ct, &nonce, version)
+            .decrypt("acct-1", "openrouter", "managed", &ct, &nonce, version)
             .is_ok());
     }
 
     #[test]
     fn aad_delimiting_is_unambiguous() {
         // ("a", "bc") and ("ab", "c") concatenate to the same bytes; the
-        // length-prefixed AAD must still distinguish them, both directions.
-        assert_ne!(binding_aad("a", "bc"), binding_aad("ab", "c"));
+        // length-prefixed AAD must still distinguish them — including across
+        // the provider/origin boundary.
+        assert_ne!(binding_aad("a", "bc", "x"), binding_aad("ab", "c", "x"));
+        assert_ne!(binding_aad("a", "b", "cx"), binding_aad("a", "bc", "x"));
 
         let v = vault();
-        let (ct, nonce, version) = v.encrypt("a", "bc", b"key").unwrap();
+        let (ct, nonce, version) = v.encrypt("a", "bc", "x", b"key").unwrap();
         assert!(matches!(
-            v.decrypt("ab", "c", &ct, &nonce, version),
+            v.decrypt("ab", "c", "x", &ct, &nonce, version),
             Err(CloudError::CredentialDecrypt(_))
         ));
 
-        let (ct, nonce, version) = v.encrypt("ab", "c", b"key").unwrap();
+        let (ct, nonce, version) = v.encrypt("a", "b", "cx", b"key").unwrap();
         assert!(matches!(
-            v.decrypt("a", "bc", &ct, &nonce, version),
+            v.decrypt("a", "bc", "x", &ct, &nonce, version),
             Err(CloudError::CredentialDecrypt(_))
         ));
     }
@@ -342,7 +377,7 @@ mod tests {
         let mut ciphertexts = HashSet::new();
         for _ in 0..256 {
             let (ct, nonce, _) = v
-                .encrypt("acct-1", "openrouter", b"same plaintext")
+                .encrypt("acct-1", "openrouter", "managed", b"same plaintext")
                 .unwrap();
             assert!(nonces.insert(nonce), "nonce reused across encryptions");
             assert!(
@@ -355,20 +390,24 @@ mod tests {
     #[test]
     fn tampered_ciphertext_is_rejected() {
         let v = vault();
-        let (mut ct, nonce, version) = v.encrypt("acct-1", "openrouter", b"key").unwrap();
+        let (mut ct, nonce, version) = v
+            .encrypt("acct-1", "openrouter", "managed", b"key")
+            .unwrap();
         ct[0] ^= 0x01;
         assert!(matches!(
-            v.decrypt("acct-1", "openrouter", &ct, &nonce, version),
+            v.decrypt("acct-1", "openrouter", "managed", &ct, &nonce, version),
             Err(CloudError::CredentialDecrypt(_))
         ));
     }
 
     #[test]
     fn wrong_master_key_fails_authentication() {
-        let (ct, nonce, version) = vault().encrypt("acct-1", "openrouter", b"key").unwrap();
+        let (ct, nonce, version) = vault()
+            .encrypt("acct-1", "openrouter", "managed", b"key")
+            .unwrap();
         let other = EnvMasterKeyVault::new([0x17; MASTER_KEY_LEN]);
         assert!(matches!(
-            other.decrypt("acct-1", "openrouter", &ct, &nonce, version),
+            other.decrypt("acct-1", "openrouter", "managed", &ct, &nonce, version),
             Err(CloudError::CredentialDecrypt(_))
         ));
     }
@@ -376,9 +415,11 @@ mod tests {
     #[test]
     fn unknown_encryption_version_is_typed() {
         let v = vault();
-        let (ct, nonce, _) = v.encrypt("acct-1", "openrouter", b"key").unwrap();
+        let (ct, nonce, _) = v
+            .encrypt("acct-1", "openrouter", "managed", b"key")
+            .unwrap();
         for bad_version in [0, 2, -1] {
-            match v.decrypt("acct-1", "openrouter", &ct, &nonce, bad_version) {
+            match v.decrypt("acct-1", "openrouter", "managed", &ct, &nonce, bad_version) {
                 Err(CloudError::UnknownEncryptionVersion(got)) => assert_eq!(got, bad_version),
                 other => panic!("expected UnknownEncryptionVersion, got {other:?}"),
             }

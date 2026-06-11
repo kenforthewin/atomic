@@ -1280,3 +1280,597 @@ async fn provider_route_input_validation() {
     })
     .await;
 }
+
+/// The embedding-space closure of the curation bypass (atomic-core's
+/// explicit mode, embedding-space half): `PUT /api/settings/{key}` is live
+/// on cloud tenant hosts, and `provider` / `openai_compat_embedding_dimension`
+/// are embedding-space keys routed through `set_setting_with_reembed`. In
+/// explicit mode those writes must be INERT — stored, but never recreating
+/// the tenant's vector index at a dimension the managed config doesn't
+/// produce (which would destroy every stored vector) and never queueing a
+/// platform-billed re-embed. Pinned end-to-end: the writes succeed and
+/// report no space change, a later embed still completes at the managed
+/// dimension, and the atom embedded BEFORE the writes still answers
+/// semantic search — its vectors survived.
+#[actix_web::test]
+async fn settings_writes_cannot_change_embedding_space() {
+    with_control_db(
+        "settings_writes_cannot_change_embedding_space",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (_account, token) = h.provision("alpha").await;
+
+            // An atom embedded through the managed config, before any
+            // settings mischief.
+            h.embed_atom("alpha", &token, "Original note about Rust workspaces.")
+                .await;
+
+            // Embedding-space settings writes: accepted (settings stay
+            // writable) but inert — no recreation, no re-embed queue.
+            for (key, value) in [
+                ("provider", "openai_compat"),
+                ("openai_compat_embedding_dimension", "3072"),
+            ] {
+                let resp = h
+                    .api(Method::PUT, "alpha", &format!("/api/settings/{key}"))
+                    .bearer_auth(&token)
+                    .json(&json!({ "value": value }))
+                    .send()
+                    .await
+                    .expect("send settings put");
+                let (status, body) = h.read(resp).await;
+                assert_eq!(status, StatusCode::OK, "{key}: {body}");
+                assert_eq!(
+                    body["embedding_space_changed"], false,
+                    "{key} must be inert: {body}"
+                );
+                assert_eq!(
+                    body["dimension_changed"], false,
+                    "{key} must not recreate the index: {body}"
+                );
+                assert_eq!(
+                    body["total_atom_count"], 0,
+                    "{key} must queue no re-embeds: {body}"
+                );
+            }
+
+            // Embedding still works, at the managed dimension, through the
+            // managed mock.
+            let before = h.managed_mock.embedding_request_count();
+            h.embed_atom("alpha", &token, "Second note, embedded after the writes.")
+                .await;
+            assert!(
+                h.managed_mock.embedding_request_count() > before,
+                "post-write embeds still flow through the managed config"
+            );
+
+            // And the pre-write atom's vectors survived: semantic search
+            // still returns it.
+            let resp = h
+                .api(Method::POST, "alpha", "/api/search")
+                .bearer_auth(&token)
+                .json(&json!({ "query": "Rust workspaces", "mode": "semantic" }))
+                .send()
+                .await
+                .expect("send search");
+            let (status, results) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "{results}");
+            let hits: Vec<&str> = results
+                .as_array()
+                .expect("array body")
+                .iter()
+                .filter_map(|r| r["content"].as_str())
+                .collect();
+            assert!(
+                hits.iter().any(|c| c.contains("Original note")),
+                "the pre-write atom's vectors must survive: {hits:?}"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The dimension pin (v1): the tenant vector column is fixed at the
+/// platform dimension and NO cloud mechanism can recreate it at another
+/// width, so a BYOK save or models write whose effective embedding
+/// dimension differs is a structured 400 — never stored with an
+/// unfulfillable re-embed warning. Same-dimension model changes keep the
+/// warning (covered here and by the rotation test).
+#[actix_web::test]
+async fn byok_dimension_change_is_rejected_structured() {
+    with_control_db(
+        "byok_dimension_change_is_rejected_structured",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (account, token) = h.provision("alpha").await;
+            let account_id = &account.account_id;
+
+            // OpenAI-compat save asking for 3072: rejected before any
+            // validation traffic, nothing stored, active pointer untouched.
+            let byok_mock = MockAiServer::start().await;
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openai_compat",
+                    "api_key": "sk-byok-3072",
+                    "model_config": {
+                        "embedding_model": "mock-embed",
+                        "openai_compat_base_url": byok_mock.base_url(),
+                        "embedding_dimension": 3072,
+                    },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "embedding_dimension_unsupported");
+            assert_eq!(body["required_dimension"], 1536, "{body}");
+            assert_eq!(body["requested_dimension"], 3072, "{body}");
+            assert_eq!(
+                byok_mock.embedding_request_count(),
+                0,
+                "the rejection must precede provider validation"
+            );
+            assert_eq!(rows_with_origin(&h.control, account_id, "user").await, 0);
+            assert_eq!(
+                active_pointer(&h.control, account_id).await,
+                Some(("openrouter".to_string(), "managed".to_string()))
+            );
+
+            // OpenRouter save with a 3072-dimension model: same rejection
+            // (the dimension is implied by the model, not a config key).
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openrouter",
+                    "api_key": "sk-or-large",
+                    "model_config": { "embedding_model": "openai/text-embedding-3-large" },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "embedding_dimension_unsupported");
+            assert_eq!(rows_with_origin(&h.control, account_id, "user").await, 0);
+
+            // A pinned-dimension save with a *different model* is accepted,
+            // with the loud re-embed warning.
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openai_compat",
+                    "api_key": "sk-byok-1536",
+                    "model_config": {
+                        "embedding_model": "mock-embed",
+                        "llm_model": "mock-llm",
+                        "openai_compat_base_url": byok_mock.base_url(),
+                        "embedding_dimension": 1536,
+                    },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                body["reembed_warning"]
+                    .as_str()
+                    .is_some_and(|w| w.contains("re-embed")),
+                "same-dimension model change keeps the warning: {body}"
+            );
+
+            // The models route enforces the same pin, BEFORE storing.
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider/models")
+                .bearer_auth(&token)
+                .json(&json!({ "model_config": {
+                    "embedding_model": "mock-embed",
+                    "openai_compat_base_url": byok_mock.base_url(),
+                    "embedding_dimension": 3072,
+                }}))
+                .send()
+                .await
+                .expect("send models put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "embedding_dimension_unsupported");
+            let stored: Value = sqlx::query_scalar(
+                "SELECT model_config FROM provider_credentials \
+                 WHERE account_id = $1 AND origin = 'user'",
+            )
+            .bind(account_id)
+            .fetch_one(h.control.pool())
+            .await
+            .expect("read stored model config");
+            assert_eq!(
+                stored["embedding_dimension"], 1536,
+                "the rejected models write must store nothing: {stored}"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The plaintext-column rule: `model_config` is stored unencrypted and
+/// echoed by the status route, so BYOK writes are checked against the
+/// documented vocabulary — a client nesting `api_key` inside `model_config`
+/// is a structured 400 and the secret never touches storage.
+#[actix_web::test]
+async fn byok_model_config_rejects_unknown_keys() {
+    with_control_db("byok_model_config_rejects_unknown_keys", |url| async move {
+        let h = ProviderHarness::spawn_managed(&url).await;
+        let (account, token) = h.provision("alpha").await;
+        let account_id = &account.account_id;
+
+        const NESTED_SECRET: &str = "sk-nested-leak-77ab2e";
+        let resp = h
+            .api(Method::PUT, "alpha", "/api/account/provider")
+            .bearer_auth(&token)
+            .json(&json!({
+                "provider": "openrouter",
+                "api_key": "sk-or-outer",
+                "model_config": { "api_key": NESTED_SECRET },
+            }))
+            .send()
+            .await
+            .expect("send byok put");
+        let (status, body) = h.read(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_model_config");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("api_key")),
+            "the message names the offending key: {body}"
+        );
+
+        // Nothing stored — neither the row nor the nested secret.
+        assert_eq!(rows_with_origin(&h.control, account_id, "user").await, 0);
+        assert!(!control_db_contains(&url, NESTED_SECRET).await);
+        h.assert_bodies_free_of(NESTED_SECRET, "nested model_config secret");
+
+        // The models route applies the same vocabulary to BYOK rows. Save a
+        // valid config first, then attempt the smuggle.
+        let byok_mock = MockAiServer::start().await;
+        let resp = h
+            .api(Method::PUT, "alpha", "/api/account/provider")
+            .bearer_auth(&token)
+            .json(&json!({
+                "provider": "openai_compat",
+                "api_key": "sk-byok-ok",
+                "model_config": {
+                    "embedding_model": "mock-embed",
+                    "openai_compat_base_url": byok_mock.base_url(),
+                },
+            }))
+            .send()
+            .await
+            .expect("send byok put");
+        let (status, body) = h.read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let resp = h
+            .api(Method::PUT, "alpha", "/api/account/provider/models")
+            .bearer_auth(&token)
+            .json(&json!({ "model_config": {
+                "embedding_model": "mock-embed",
+                "openai_compat_base_url": byok_mock.base_url(),
+                "api_key": NESTED_SECRET,
+            }}))
+            .send()
+            .await
+            .expect("send models put");
+        let (status, body) = h.read(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_model_config");
+        assert!(!control_db_contains(&url, NESTED_SECRET).await);
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// The scrub-before-truncate ordering, both provider arms: a hostile
+/// endpoint that echoes the submitted key right at the truncation boundary
+/// must still produce a fully scrubbed message. Scrubbing after truncation
+/// would cut the echoed key mid-way and leave the surviving fragment
+/// unmatched by the verbatim replace.
+#[actix_web::test]
+async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
+    with_control_db(
+        "echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (_account, token) = h.provision("alpha").await;
+
+            // 44-char keys positioned so the 500-char truncation lands
+            // INSIDE the echoed key — scrub-after-truncate would leave the
+            // leading fragment — while the scrub marker itself stays inside
+            // the bound, keeping both properties observable. Each arm's
+            // filler accounts for its fixed prefixes (the JSON wrapper; the
+            // compat arm's "API error (401): ").
+            const OR_KEY: &str = "sk-or-boundary-echo-victim-0123456789abcdef0";
+            const COMPAT_KEY: &str = "sk-cm-boundary-echo-victim-0123456789abcdef0";
+
+            // OpenRouter arm: GET {base}/v1/auth/key answers 401 echoing the
+            // key straddling the boundary (truncation applies to the body;
+            // its JSON wrapper is ~21 chars, so the key spans ~481..525).
+            let hostile_or = openrouter_auth_endpoint(
+                OR_KEY,
+                401,
+                json!({ "error": { "message": format!("{}{OR_KEY} rejected", "x".repeat(460)) } }),
+            )
+            .await;
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openrouter",
+                    "api_key": OR_KEY,
+                    "model_config": { "openrouter_base_url": hostile_or.uri() },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let message = body["message"].as_str().expect("message");
+            assert!(
+                message.contains("[redacted]"),
+                "the echo is scrubbed to the marker: {message}"
+            );
+            for fragment in [OR_KEY, &OR_KEY[..12], &OR_KEY[OR_KEY.len() - 12..]] {
+                assert!(
+                    !message.contains(fragment),
+                    "no fragment of the key may survive the boundary: {message}"
+                );
+            }
+
+            // OpenAI-compat arm: the validation embedding call hits
+            // POST {base}/v1/embeddings; answer 401 echoing the key at the
+            // boundary. This arm's error body was previously unbounded as
+            // well — pin the bound alongside the scrub.
+            let hostile_compat = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                    // Truncation applies to the whole "API error (401): "-
+                    // prefixed message (~38 fixed chars before the filler),
+                    // so the key spans ~478..522.
+                    "error": { "message": format!("{}{COMPAT_KEY} rejected", "x".repeat(440)) }
+                })))
+                .mount(&hostile_compat)
+                .await;
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openai_compat",
+                    "api_key": COMPAT_KEY,
+                    "model_config": {
+                        "embedding_model": "mock-embed",
+                        "openai_compat_base_url": hostile_compat.uri(),
+                    },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let message = body["message"].as_str().expect("message");
+            assert!(
+                message.contains("[redacted]"),
+                "compat echo is scrubbed: {message}"
+            );
+            for fragment in [
+                COMPAT_KEY,
+                &COMPAT_KEY[..12],
+                &COMPAT_KEY[COMPAT_KEY.len() - 12..],
+            ] {
+                assert!(
+                    !message.contains(fragment),
+                    "no fragment of the key may survive on the compat arm: {message}"
+                );
+            }
+            assert!(
+                message.chars().count() <= 600,
+                "the compat arm's provider error must be length-bounded, got {} chars",
+                message.chars().count()
+            );
+
+            // Belt and braces: neither key in any body, nothing stored.
+            h.assert_bodies_free_of(OR_KEY, "openrouter boundary key");
+            h.assert_bodies_free_of(COMPAT_KEY, "compat boundary key");
+            assert!(!control_db_contains(&url, OR_KEY).await);
+            assert!(!control_db_contains(&url, COMPAT_KEY).await);
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// Rotation convergence, same pod (the rebuild-race shape): credentials are
+/// rotated through the control-plane store directly — bumping the provider
+/// generation but never touching this pod's cache, exactly the divergence a
+/// build/rotate race leaves behind. One authenticated request later the
+/// entry has refreshed in place (no rebuild), and the next embed uses the
+/// NEW provider.
+#[actix_web::test]
+async fn out_of_band_rotation_heals_on_next_request() {
+    with_control_db(
+        "out_of_band_rotation_heals_on_next_request",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (account, token) = h.provision("alpha").await;
+            let account_id = &account.account_id;
+
+            // Warm this pod's cache through the managed config.
+            h.embed_atom("alpha", &token, "Pre-rotation note via managed.")
+                .await;
+            let handle_before = h.cache.get_or_load(account_id).await.expect("cached entry");
+
+            // Out-of-band rotation: store writes only (these bump the
+            // generation transactionally); the pod's cached config is now stale.
+            let byok_mock = MockAiServer::start().await;
+            let vault = support::test_vault();
+            atomic_cloud::upsert_credentials(
+                &h.control,
+                vault.as_ref(),
+                account_id,
+                atomic_cloud::NewCredentials {
+                    provider: atomic_cloud::Provider::OpenAiCompat,
+                    origin: atomic_cloud::CredentialOrigin::User,
+                    api_key: atomic_cloud::SecretKey::new("sk-byok-out-of-band".to_string()),
+                    external_key_id: None,
+                    model_config: json!({
+                        "embedding_model": "mock-embed",
+                        "llm_model": "mock-llm",
+                        "openai_compat_base_url": byok_mock.base_url(),
+                        "embedding_dimension": 1536,
+                    }),
+                },
+            )
+            .await
+            .expect("rotate credentials out of band");
+            atomic_cloud::set_active_provider(
+                &h.control,
+                account_id,
+                Some((
+                    atomic_cloud::Provider::OpenAiCompat,
+                    atomic_cloud::CredentialOrigin::User,
+                )),
+            )
+            .await
+            .expect("flip active pointer out of band");
+
+            // One authenticated request — any request — heals the divergence.
+            let resp = h
+                .api(Method::GET, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("send status");
+            let (status, _body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK);
+
+            // The next embed uses the NEW provider; the managed endpoint sees
+            // nothing further.
+            let managed_before = h.managed_mock.embedding_request_count();
+            h.embed_atom("alpha", &token, "Post-rotation note via BYOK.")
+                .await;
+            assert!(
+                byok_mock.embedding_request_count() >= 1,
+                "post-heal embeds must hit the rotated provider"
+            );
+            assert_eq!(
+                h.managed_mock.embedding_request_count(),
+                managed_before,
+                "the stale managed config must not serve after the heal"
+            );
+
+            // The heal was an in-place refresh, not an eviction.
+            let handle_after = h.cache.get_or_load(account_id).await.expect("cached entry");
+            assert!(
+                Arc::ptr_eq(&handle_before.manager, &handle_after.manager),
+                "generation refresh must swap the config in place"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// Rotation convergence, cross-pod: a second AccountCache over the same
+/// control plane (a second serve process) holds the pre-rotation config; a
+/// BYOK save through the FIRST pod's HTTP route rotates storage and bumps
+/// the generation. The second pod's next generation-checked resolution —
+/// what its CloudAuth performs on every request — picks up the new config
+/// without any cross-pod signalling.
+#[actix_web::test]
+async fn second_pod_sees_rotation_after_one_request() {
+    with_control_db(
+        "second_pod_sees_rotation_after_one_request",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (account, token) = h.provision("alpha").await;
+            let account_id = &account.account_id;
+
+            // Pod 2, warmed before the rotation: serves the managed config.
+            let pod2 = AccountCache::new(
+                h.control.clone(),
+                h.cluster.clone(),
+                support::test_vault(),
+                AccountCacheConfig::default(),
+            );
+            let handle2 = pod2.get_or_load(account_id).await.expect("pod-2 entry");
+            let core2 = handle2.manager.active_core().await.expect("pod-2 core");
+            let before = core2
+                .active_provider_config()
+                .expect("cloud cores always run explicit configs");
+            assert_eq!(before.provider_type, atomic_core::ProviderType::OpenRouter);
+
+            // Rotation through pod 1's HTTP route (validated against the BYOK
+            // mock, stored, generation bumped, pod 1 live-swapped).
+            let byok_mock = MockAiServer::start().await;
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openai_compat",
+                    "api_key": "sk-byok-cross-pod",
+                    "model_config": {
+                        "embedding_model": "mock-embed",
+                        "llm_model": "mock-llm",
+                        "openai_compat_base_url": byok_mock.base_url(),
+                        "embedding_dimension": 1536,
+                    },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            // Pod 2's next request: its auth layer reads the bumped generation
+            // and resolves through the generation-checked path — the stale
+            // entry refreshes in place.
+            let generation: i64 =
+                sqlx::query_scalar("SELECT provider_generation FROM accounts WHERE id = $1")
+                    .bind(account_id)
+                    .fetch_one(h.control.pool())
+                    .await
+                    .expect("read generation");
+            let handle2_after = pod2
+                .get_or_load_with_generation(account_id, generation)
+                .await
+                .expect("pod-2 generation-checked resolve");
+            assert!(
+                Arc::ptr_eq(&handle2.manager, &handle2_after.manager),
+                "pod 2 refreshes in place, no rebuild"
+            );
+            let after = core2
+                .active_provider_config()
+                .expect("explicit config still active");
+            assert_eq!(
+                after.provider_type,
+                atomic_core::ProviderType::OpenAICompat,
+                "pod 2 must serve the rotated provider after one request"
+            );
+            assert_eq!(after.openai_compat_base_url, byok_mock.base_url());
+
+            h.stop().await;
+        },
+    )
+    .await;
+}

@@ -682,3 +682,133 @@ async fn lost_race_after_key_creation_deletes_the_key() {
     )
     .await;
 }
+
+/// The double-mint race inside step 9: two concurrent resumes can both pass
+/// the existence check and both mint a key. The row insert is conditional
+/// (`ON CONFLICT DO NOTHING`), so the loser must detect the conflict,
+/// delete the key *it* just minted (instead of silently overwriting the
+/// winner's `external_key_id`, which would orphan a billed key with no
+/// trace), and proceed on the winner's row. Deterministic via the storage
+/// seam: the recording API's `create_key` plants the winner's row between
+/// the loser's create and its insert.
+#[tokio::test]
+async fn double_mint_race_loser_deletes_its_own_key_and_uses_the_winner() {
+    with_control_db(
+        "double_mint_race_loser_deletes_its_own_key_and_uses_the_winner",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            /// Plants the concurrent winner's credentials row inside
+            /// `create_key`, after the inner mint succeeds — exactly the
+            /// interleaving where both resumes passed the existence check.
+            struct RacingApi {
+                inner: RecordingProvisioning,
+                control: ControlPlane,
+            }
+            #[async_trait::async_trait]
+            impl atomic_cloud::ProvisioningApi for RacingApi {
+                async fn create_key(
+                    &self,
+                    name: &str,
+                    credit_limit_cents: u32,
+                    monthly_reset: bool,
+                ) -> Result<atomic_cloud::CreatedRuntimeKey, CloudError> {
+                    let created = self
+                        .inner
+                        .create_key(name, credit_limit_cents, monthly_reset)
+                        .await?;
+                    let account_id = name
+                        .strip_prefix("atomic-cloud/")
+                        .expect("managed key names are account-keyed");
+                    // The "winner" resume's insert lands here.
+                    let landed = atomic_cloud::insert_credentials_if_absent(
+                        &self.control,
+                        &test_vault(),
+                        account_id,
+                        NewCredentials {
+                            provider: Provider::OpenRouter,
+                            origin: CredentialOrigin::Managed,
+                            api_key: SecretKey::new("sk-or-v1-winner".to_string()),
+                            external_key_id: Some("orkey-winner".to_string()),
+                            model_config: serde_json::json!({}),
+                        },
+                    )
+                    .await
+                    .expect("plant winner row");
+                    assert!(landed, "the planted winner row must be first");
+                    Ok(created)
+                }
+                async fn update_key_limit(
+                    &self,
+                    external_key_id: &str,
+                    credit_limit_cents: u32,
+                ) -> Result<(), CloudError> {
+                    self.inner
+                        .update_key_limit(external_key_id, credit_limit_cents)
+                        .await
+                }
+                async fn delete_key(&self, external_key_id: &str) -> Result<(), CloudError> {
+                    self.inner.delete_key(external_key_id).await
+                }
+                async fn get_key_usage(
+                    &self,
+                    external_key_id: &str,
+                ) -> Result<atomic_cloud::RuntimeKeyUsage, CloudError> {
+                    self.inner.get_key_usage(external_key_id).await
+                }
+            }
+
+            let api = Arc::new(RacingApi {
+                inner: RecordingProvisioning::default(),
+                control: control.clone(),
+            });
+            let managed = ManagedKeys::Enabled {
+                api: Arc::clone(&api) as Arc<dyn atomic_cloud::ProvisioningApi>,
+                vault: Arc::new(test_vault()),
+                config: atomic_cloud::ManagedKeyConfig::default(),
+            };
+
+            // The losing resume completes the provision anyway — on the
+            // winner's key.
+            let account = provision_account(
+                &control,
+                &cluster,
+                &managed,
+                new_account("k@example.com", "raced"),
+            )
+            .await
+            .expect("the losing resume must still complete");
+            assert_eq!(
+                account_status(&control, &account.account_id)
+                    .await
+                    .as_deref(),
+                Some("active")
+            );
+
+            // The loser deleted exactly the key IT minted — never the
+            // winner's.
+            let (_, loser_key_id) = RecordingProvisioning::nth_key(0);
+            assert_eq!(api.inner.deleted_key_ids(), vec![loser_key_id]);
+
+            // The stored row is the winner's, untouched, and active.
+            let creds = get_credentials(
+                &control,
+                &test_vault(),
+                &account.account_id,
+                Provider::OpenRouter,
+                CredentialOrigin::Managed,
+            )
+            .await
+            .expect("fetch")
+            .expect("winner row survives");
+            assert_eq!(creds.external_key_id.as_deref(), Some("orkey-winner"));
+            assert_eq!(creds.api_key.expose(), "sk-or-v1-winner");
+            assert_eq!(credentials_count(&control, &account.account_id).await, 1);
+            assert_eq!(
+                active_provider(&control, &account.account_id).await,
+                Some(("openrouter".to_string(), "managed".to_string()))
+            );
+        },
+    )
+    .await;
+}

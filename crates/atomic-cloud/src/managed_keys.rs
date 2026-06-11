@@ -24,7 +24,11 @@
 //! lists every runtime key it has minted (see the custody runbook in
 //! [`crate::provisioning_api`]). An insert *failure* (as opposed to a
 //! crash) closes its own window: the just-created key is deleted
-//! best-effort before the error propagates.
+//! best-effort before the error propagates. And the insert is
+//! **conditional, never an upsert** — two concurrent resumes that both
+//! mint a key race to one row; the loser detects the conflict, deletes its
+//! own freshly minted key (loudly), and proceeds on the winner's row
+//! instead of silently overwriting the winner's `external_key_id`.
 //!
 //! # Best-effort deletion, everywhere
 //!
@@ -45,8 +49,8 @@ use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 use crate::keyvault::KeyVault;
 use crate::provider_credentials::{
-    get_credentials, set_active_provider, upsert_credentials, CredentialOrigin, NewCredentials,
-    Provider,
+    get_credentials, insert_credentials_if_absent, set_active_provider, CredentialOrigin,
+    NewCredentials, Provider,
 };
 use crate::provisioning_api::ProvisioningApi;
 
@@ -195,8 +199,15 @@ impl ManagedKeys {
 
         // Insert IMMEDIATELY — the row is what every later step finds the
         // key by; the gap between the create above and this insert is the
-        // crash-orphan window documented in the module docs.
-        let inserted = upsert_credentials(
+        // crash-orphan window documented in the module docs. The insert is
+        // conditional (`ON CONFLICT DO NOTHING`), never an upsert: two
+        // concurrent resumes can both pass the existence check above and
+        // both mint a key, and an upsert would silently overwrite the
+        // winner's `external_key_id` with the loser's — orphaning the
+        // winner's billed key with zero trace. The loser detects the lost
+        // race instead, deletes the key *it* just minted (loudly), and
+        // proceeds on the winner's row.
+        let inserted = insert_credentials_if_absent(
             control,
             vault.as_ref(),
             account_id,
@@ -209,16 +220,59 @@ impl ManagedKeys {
             },
         )
         .await;
-        if let Err(e) = inserted {
-            // The insert failed (concurrent deletion cascaded the accounts
-            // row away, control plane hiccup): without a row, the key just
-            // minted would be unreferenced forever. Delete it best-effort
-            // before surfacing the error — the provision is failing either
-            // way, and the account (if it still exists) stays
-            // `'provisioning'` for the reaper.
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                // The insert failed (concurrent deletion cascaded the
+                // accounts row away, control plane hiccup): without a row,
+                // the key just minted would be unreferenced forever. Delete
+                // it best-effort before surfacing the error — the provision
+                // is failing either way, and the account (if it still
+                // exists) stays `'provisioning'` for the reaper.
+                self.delete_external_key_best_effort(account_id, &external_key_id)
+                    .await;
+                return Err(e);
+            }
+        };
+        if !inserted {
+            // Lost the double-mint race: a concurrent resume's row landed
+            // between our existence check and our insert. Dispose of the
+            // key this call minted — loudly, it was billed — and serve the
+            // winner's.
+            tracing::warn!(
+                account_id,
+                external_key_id,
+                "concurrent managed-key provisioning detected; deleting the \
+                 runtime key this call minted and using the winner's row"
+            );
             self.delete_external_key_best_effort(account_id, &external_key_id)
                 .await;
-            return Err(e);
+            let winner: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT external_key_id FROM provider_credentials \
+                 WHERE account_id = $1 AND provider = $2 AND origin = $3",
+            )
+            .bind(account_id)
+            .bind(Provider::OpenRouter.as_str())
+            .bind(CredentialOrigin::Managed.as_str())
+            .fetch_optional(control.pool())
+            .await
+            .map_err(CloudError::db("reading winning managed-key row"))?;
+            let Some(winner_key_id) = winner else {
+                // The winner's row vanished again (concurrent deletion).
+                // Same shape as the insert-error path: the account, if it
+                // still exists, stays 'provisioning' for the reaper.
+                return Err(CloudError::Invariant(format!(
+                    "managed credentials row for account {account_id} \
+                     disappeared after losing the provisioning race"
+                )));
+            };
+            set_active_provider(
+                control,
+                account_id,
+                Some((Provider::OpenRouter, CredentialOrigin::Managed)),
+            )
+            .await?;
+            return Ok(winner_key_id);
         }
 
         // Make the fresh key the account's active provider config. A crash

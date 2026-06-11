@@ -502,3 +502,190 @@ async fn schema_rejects_unknown_vocabulary_and_half_set_pointers() {
     )
     .await;
 }
+
+/// Every provider mutation bumps `accounts.provider_generation` in the same
+/// statement/transaction (the rotation-convergence signal the AccountCache
+/// keys its per-request staleness check on). Pinned per mutation so a new
+/// write path can't quietly skip the bump and reopen unbounded divergence.
+#[tokio::test]
+async fn every_provider_mutation_bumps_the_generation() {
+    with_control_db(
+        "every_provider_mutation_bumps_the_generation",
+        |url| async move {
+            let control = connect(&url).await;
+            let vault = vault();
+            insert_account(&control, "acct-1", "kenny").await;
+
+            async fn generation(control: &ControlPlane) -> i64 {
+                sqlx::query_scalar("SELECT provider_generation FROM accounts WHERE id = 'acct-1'")
+                    .fetch_one(control.pool())
+                    .await
+                    .expect("read provider generation")
+            }
+            assert_eq!(generation(&control).await, 0, "fresh accounts start at 0");
+
+            // Upsert (the BYOK save / managed mint): +1.
+            upsert_credentials(&control, &vault, "acct-1", managed_openrouter(MANAGED_KEY))
+                .await
+                .expect("upsert");
+            assert_eq!(generation(&control).await, 1, "upsert bumps");
+
+            // Rotation through the same upsert: +1 again.
+            upsert_credentials(
+                &control,
+                &vault,
+                "acct-1",
+                managed_openrouter("sk-or-v1-rotated"),
+            )
+            .await
+            .expect("rotate");
+            assert_eq!(generation(&control).await, 2, "rotation bumps");
+
+            // Conditional insert (the managed-key mint guard): +1 when it
+            // lands, +0 when it loses the conflict.
+            let inserted = atomic_cloud::insert_credentials_if_absent(
+                &control,
+                &vault,
+                "acct-1",
+                NewCredentials {
+                    provider: Provider::OpenRouter,
+                    origin: CredentialOrigin::User,
+                    api_key: SecretKey::new("sk-or-byok".to_string()),
+                    external_key_id: None,
+                    model_config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("conditional insert");
+            assert!(inserted);
+            assert_eq!(generation(&control).await, 3, "conditional insert bumps");
+            let lost = atomic_cloud::insert_credentials_if_absent(
+                &control,
+                &vault,
+                "acct-1",
+                NewCredentials {
+                    provider: Provider::OpenRouter,
+                    origin: CredentialOrigin::User,
+                    api_key: SecretKey::new("sk-or-loser".to_string()),
+                    external_key_id: None,
+                    model_config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("losing conditional insert");
+            assert!(!lost, "second conditional insert must not land");
+            assert_eq!(
+                generation(&control).await,
+                3,
+                "a lost insert changes nothing"
+            );
+
+            // Activation flip (managed-key ensure on resume re-asserts the
+            // pointer through this same call): +1.
+            set_active_provider(
+                &control,
+                "acct-1",
+                Some((Provider::OpenRouter, CredentialOrigin::Managed)),
+            )
+            .await
+            .expect("activate");
+            assert_eq!(generation(&control).await, 4, "pointer flip bumps");
+
+            // Models write: +1.
+            let updated = atomic_cloud::update_model_config(
+                &control,
+                "acct-1",
+                Provider::OpenRouter,
+                CredentialOrigin::Managed,
+                &serde_json::json!({ "llm_model": "openai/gpt-4o-mini" }),
+            )
+            .await
+            .expect("models write");
+            assert!(updated);
+            assert_eq!(generation(&control).await, 5, "models write bumps");
+
+            // Pointer clear: +1.
+            set_active_provider(&control, "acct-1", None)
+                .await
+                .expect("clear pointer");
+            assert_eq!(generation(&control).await, 6, "pointer clear bumps");
+
+            // Credential delete: +1.
+            let deleted = delete_credentials(
+                &control,
+                "acct-1",
+                Provider::OpenRouter,
+                CredentialOrigin::Managed,
+            )
+            .await
+            .expect("delete");
+            assert!(deleted);
+            assert_eq!(generation(&control).await, 7, "credential delete bumps");
+
+            // A repeated delete matches no row and must NOT bump — only
+            // real mutations move the counter.
+            let deleted_again = delete_credentials(
+                &control,
+                "acct-1",
+                Provider::OpenRouter,
+                CredentialOrigin::Managed,
+            )
+            .await
+            .expect("repeat delete");
+            assert!(!deleted_again);
+            assert_eq!(generation(&control).await, 7, "no-op delete is silent");
+        },
+    )
+    .await;
+}
+
+/// `get_active_provider_state` returns the generation and credentials from
+/// one snapshot, for every pointer shape.
+#[tokio::test]
+async fn provider_state_snapshot_reads_generation_and_credentials() {
+    with_control_db(
+        "provider_state_snapshot_reads_generation_and_credentials",
+        |url| async move {
+            let control = connect(&url).await;
+            let vault = vault();
+            insert_account(&control, "acct-1", "kenny").await;
+
+            // No credentials: generation present, credentials None.
+            let state = atomic_cloud::get_active_provider_state(&control, &vault, "acct-1")
+                .await
+                .expect("read state")
+                .expect("account exists");
+            assert_eq!(state.provider_generation, 0);
+            assert!(state.credentials.is_none());
+
+            // Active credentials: both halves of the snapshot populated.
+            upsert_credentials(&control, &vault, "acct-1", managed_openrouter(MANAGED_KEY))
+                .await
+                .expect("upsert");
+            set_active_provider(
+                &control,
+                "acct-1",
+                Some((Provider::OpenRouter, CredentialOrigin::Managed)),
+            )
+            .await
+            .expect("activate");
+            let state = atomic_cloud::get_active_provider_state(&control, &vault, "acct-1")
+                .await
+                .expect("read state")
+                .expect("account exists");
+            assert_eq!(state.provider_generation, 2, "upsert + flip");
+            let credentials = state.credentials.expect("active credentials decrypt");
+            assert_eq!(credentials.api_key.expose(), MANAGED_KEY);
+            assert_eq!(credentials.provider, Provider::OpenRouter);
+
+            // Unknown account: None, not an error.
+            assert!(
+                atomic_cloud::get_active_provider_state(&control, &vault, "nope")
+                    .await
+                    .expect("read state")
+                    .is_none()
+            );
+        },
+    )
+    .await;
+}

@@ -222,9 +222,11 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         .and_then(|host| subdomain_from_host(host, &ctx.base_domain))
         .ok_or_else(not_found)?;
 
-    // 2 — subdomain → account.
-    let account: Option<(String, String)> =
-        sqlx::query_as("SELECT id, status FROM accounts WHERE subdomain = $1")
+    // 2 — subdomain → account. The provider generation rides along on the
+    // lookup this middleware already makes per request (no auth caching),
+    // making the cache's rotation-convergence check in step 7 free.
+    let account: Option<(String, String, i64)> =
+        sqlx::query_as("SELECT id, status, provider_generation FROM accounts WHERE subdomain = $1")
             .bind(&subdomain)
             .fetch_optional(ctx.control.pool())
             .await
@@ -232,7 +234,7 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
                 tracing::error!(error = %e, "account lookup failed");
                 internal_error()
             })?;
-    let (account_id, status) = account.ok_or_else(not_found)?;
+    let (account_id, status, provider_generation) = account.ok_or_else(not_found)?;
     match status.as_str() {
         "active" => {}
         "provisioning" => return Err(account_provisioning()),
@@ -284,10 +286,12 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         enforce_allowed_db(req, &allowed)?;
     }
 
-    // 7 — tenant resources + request extensions.
+    // 7 — tenant resources + request extensions. The generation observed in
+    // step 2 lets the cache detect (and heal) a provider config that lags a
+    // rotation written by another pod or a racing entry build.
     let handle = ctx
         .cache
-        .get_or_load(&principal.account_id)
+        .get_or_load_with_generation(&principal.account_id, provider_generation)
         .await
         .map_err(|e| {
             tracing::error!(

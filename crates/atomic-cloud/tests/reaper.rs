@@ -1023,3 +1023,116 @@ async fn settled_rows_do_not_consume_the_resume_cap() {
     )
     .await;
 }
+
+/// Classified rollback (arm 1): a resume that fails at the managed-key
+/// provisioning step is a provider outage — every idempotent step before it
+/// converged — so the pass DEFERS instead of hard-deleting the claim. When
+/// the API recovers, the next pass resumes the account to active. Rolling
+/// back on the first failed pass would have burned the subdomain over
+/// third-party downtime.
+#[tokio::test]
+async fn provider_outage_defers_rollback_until_recovery() {
+    with_control_db(
+        "provider_outage_defers_rollback_until_recovery",
+        |url| async move {
+            use std::sync::atomic::Ordering;
+
+            let (control, cluster) = setup(&url).await;
+            let account_id = Uuid::new_v4();
+            seed_provisioning_row(&control, account_id, "k@example.com", "outage-bound", 10).await;
+
+            let api = std::sync::Arc::new(support::RecordingProvisioning::default());
+            api.fail_create.store(true, Ordering::SeqCst);
+            let managed = support::managed_keys_with(std::sync::Arc::clone(&api));
+
+            // Pass 1, provider down: the resume runs (and fails at step 9),
+            // the row is deferred — intact, still 'provisioning', subdomain
+            // unburned.
+            let summary =
+                run_reaper_pass(&control, &cluster, &managed, &ReaperPolicy::default()).await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.stuck_deferred_provider_outage,
+                vec![account_id.to_string()],
+                "provider-outage failures defer: {summary:?}"
+            );
+            assert!(summary.stuck_rolled_back.is_empty(), "{summary:?}");
+            assert!(summary.stuck_resumed.is_empty());
+            assert_eq!(
+                account_status(&control, &account_id.to_string())
+                    .await
+                    .as_deref(),
+                Some("provisioning"),
+                "the claim must survive the outage pass"
+            );
+
+            // The API recovers: the next pass completes the signup.
+            api.fail_create.store(false, Ordering::SeqCst);
+            let summary =
+                run_reaper_pass(&control, &cluster, &managed, &ReaperPolicy::default()).await;
+            assert_no_errors(&summary);
+            assert_eq!(summary.stuck_resumed, vec![account_id.to_string()]);
+            assert!(summary.stuck_deferred_provider_outage.is_empty());
+            assert_eq!(
+                account_status(&control, &account_id.to_string())
+                    .await
+                    .as_deref(),
+                Some("active")
+            );
+            assert_eq!(
+                count(
+                    &control,
+                    "SELECT COUNT(*) FROM provider_credentials WHERE account_id = $1",
+                    &account_id.to_string(),
+                )
+                .await,
+                1,
+                "recovery minted exactly one managed key"
+            );
+        },
+    )
+    .await;
+}
+
+/// The deferral has a hard ceiling: a row older than
+/// [`ReaperPolicy::provision_rollback_ceiling`] rolls back even when the
+/// failure is still the provider class — an extended outage must not
+/// accumulate zombie claims forever.
+#[tokio::test]
+async fn provider_outage_past_the_ceiling_rolls_back() {
+    with_control_db(
+        "provider_outage_past_the_ceiling_rolls_back",
+        |url| async move {
+            use std::sync::atomic::Ordering;
+
+            let (control, cluster) = setup(&url).await;
+            let account_id = Uuid::new_v4();
+            // Older than the default 60-minute ceiling.
+            seed_provisioning_row(&control, account_id, "k@example.com", "outage-stale", 90).await;
+
+            let api = std::sync::Arc::new(support::RecordingProvisioning::default());
+            api.fail_create.store(true, Ordering::SeqCst);
+            let managed = support::managed_keys_with(std::sync::Arc::clone(&api));
+
+            let summary =
+                run_reaper_pass(&control, &cluster, &managed, &ReaperPolicy::default()).await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.stuck_rolled_back,
+                vec![account_id.to_string()],
+                "past the ceiling the outage row must roll back: {summary:?}"
+            );
+            assert!(summary.stuck_deferred_provider_outage.is_empty());
+            assert_eq!(
+                account_status(&control, &account_id.to_string()).await,
+                None,
+                "the claim is hard-deleted"
+            );
+            assert!(
+                !database_exists(&cluster.cluster_url, &tenant_db_name(account_id)).await,
+                "the resume attempt's tenant database is dropped by the rollback"
+            );
+        },
+    )
+    .await;
+}

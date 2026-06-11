@@ -23,14 +23,24 @@
 //!   managed keys) best-effort allowance usage from the provisioning API.
 //!   **No key material, ever** — not even a prefix; the stored key is never
 //!   displayed and rotation means replacing it.
-//! - **`PUT /api/account/provider`** — BYOK save. The submitted key is
-//!   **validated against the provider before anything is stored**
-//!   (OpenRouter: `GET {base}/auth/key`; OpenAI-compatible: a minimal
-//!   embedding call through the same provider machinery the pipeline uses).
-//!   Validation failure → 400 carrying the provider's error verbatim
-//!   (scrubbed of the submitted key, should a hostile endpoint echo it) and
-//!   nothing stored. Success → encrypt + UPSERT the `origin='user'` row,
-//!   flip the active pointer, live-rotate.
+//! - **`PUT /api/account/provider`** — BYOK save. The submitted
+//!   `model_config` is vocabulary-checked
+//!   ([`validate_byok_model_config`]) — the column is plaintext and echoed
+//!   by status, so unknown keys (an `api_key` nested where it doesn't
+//!   belong) are rejected, never stored. The candidate config's effective
+//!   embedding dimension must equal the platform pin
+//!   ([`PINNED_EMBEDDING_DIMENSION`]) — no cloud mechanism can recreate a
+//!   tenant's vector index at another width, so a differing dimension is a
+//!   structured 400 (`embedding_dimension_unsupported`), not a warning.
+//!   Then the key is **validated against the provider before anything is
+//!   stored** (OpenRouter: `GET {base}/auth/key`; OpenAI-compatible: a
+//!   minimal embedding call through the same provider machinery the
+//!   pipeline uses). Validation failure → 400 carrying the provider's
+//!   error verbatim (scrubbed of the submitted key, should a hostile
+//!   endpoint echo it — scrubbed *before* truncation, so a key cut by the
+//!   length bound can't survive as a fragment) and nothing stored. Success
+//!   → encrypt + UPSERT the `origin='user'` row, flip the active pointer,
+//!   live-rotate.
 //! - **`POST /api/account/provider/activate`** — the column flip between
 //!   stored rows (managed ↔ BYOK, both directions). 404s when the target
 //!   row doesn't exist; a missing managed row is **not** re-provisioned
@@ -38,9 +48,11 @@
 //! - **`PUT /api/account/provider/models`** — model selection on the active
 //!   row. Managed rows are curation-checked ([`crate::curated_models`]) and
 //!   merged over the stored config so platform-seeded keys survive; BYOK
-//!   rows choose freely and replace wholesale. An embedding-model change
-//!   returns a loud `reembed_warning` — every stored vector is invalidated
-//!   by it.
+//!   rows choose freely within the vocabulary and replace wholesale. The
+//!   same dimension pin applies — a write whose effective embedding
+//!   dimension differs from the platform's is rejected before anything is
+//!   stored. A same-dimension embedding-model change returns a loud
+//!   `reembed_warning` — every stored vector is invalidated by it.
 //!
 //! **Live rotation** (plan steps 1-5): after any successful write the fresh
 //! [`ProviderConfig`] is applied to the account's cached entry via
@@ -145,11 +157,15 @@ use serde_json::{json, Value};
 use crate::account_cache::AccountCache;
 use crate::auth::{CloudAuth, ResolvedTenant};
 use crate::control_plane::ControlPlane;
-use crate::curated_models::{merge_managed_model_config, validate_managed_model_config};
+use crate::curated_models::{
+    merge_managed_model_config, validate_managed_model_config, PINNED_EMBEDDING_DIMENSION,
+};
 use crate::error::CloudError;
 use crate::keyvault::{KeyVault, SecretKey};
 use crate::managed_keys::ManagedKeys;
-use crate::provider_config::{build_provider_config, config_for_credentials};
+use crate::provider_config::{
+    build_provider_config, config_for_credentials, validate_byok_model_config,
+};
 use crate::provider_credentials::{
     get_active_credentials, get_credentials, record_validation, set_active_provider,
     update_model_config, upsert_credentials, CredentialOrigin, NewCredentials, Provider,
@@ -491,11 +507,11 @@ async fn save_byok_provider_route(
     }
     let api_key = SecretKey::new(api_key.to_string());
     let model_config = body.model_config.unwrap_or_else(|| json!({}));
-    if !model_config.is_object() {
-        return bad_request(
-            "invalid_model_config",
-            "model_config must be a JSON object.",
-        );
+    // Vocabulary check (module docs): the column is plaintext and echoed by
+    // the status route, so anything outside the documented keys — most
+    // dangerously a nested api_key — is rejected before it can be stored.
+    if let Err(violation) = validate_byok_model_config(&model_config) {
+        return bad_request("invalid_model_config", &violation);
     }
 
     // One provider write per account at a time, from here through the live
@@ -505,9 +521,18 @@ async fn save_byok_provider_route(
     // and live configs convergent.
     let _write_guard = state.provider_locks.acquire(account_id).await;
 
-    // Build the candidate config and validate it against the provider
-    // BEFORE storing anything (plan: validation on save).
+    // Build the candidate config; refuse any config whose effective
+    // embedding dimension differs from the platform pin BEFORE the network
+    // round-trip — the tenant's vector column cannot be recreated at
+    // another width (module docs), so storing such a config would wedge
+    // every future embed.
     let candidate = build_provider_config(provider, Some(&api_key), &model_config);
+    if candidate.embedding_dimension() != PINNED_EMBEDDING_DIMENSION {
+        return embedding_dimension_unsupported(candidate.embedding_dimension());
+    }
+
+    // Validate the key against the provider BEFORE storing anything (plan:
+    // validation on save).
     if let Err(provider_error) = validate_provider_key(&candidate).await {
         // Scrub the submitted key out of the message before it goes
         // anywhere — a hostile or misconfigured endpoint could echo it.
@@ -703,8 +728,10 @@ struct UpdateModelsRequest {
 /// curation-checked — pinned embedding model, curated LLM list, no base-URL
 /// overrides — and the write merges over the stored config so
 /// platform-owned keys survive ([`merge_managed_model_config`]); BYOK rows
-/// choose freely and replace wholesale, with a loud `reembed_warning` when
-/// the embedding model changes.
+/// choose freely within the documented vocabulary and replace wholesale.
+/// Every write must keep the effective embedding dimension at the platform
+/// pin (rejected otherwise, before storing — module docs); a same-dimension
+/// embedding-model change carries the loud `reembed_warning`.
 async fn update_models_route(
     req: HttpRequest,
     state: web::Data<PlaneState>,
@@ -750,7 +777,8 @@ async fn update_models_route(
     // platform-owned keys seeded at provision (notably a base-URL override
     // routing managed traffic through a proxy). BYOK rows keep the
     // documented read-modify-write contract — the user owns every key,
-    // having seeded them all at save time.
+    // having seeded them all at save time — but are still vocabulary-checked
+    // (the plaintext-column rule; see the save route) before anything lands.
     let model_config = if active.origin == CredentialOrigin::Managed {
         if let Err(violation) = validate_managed_model_config(&submitted) {
             return HttpResponse::BadRequest().json(json!({
@@ -760,8 +788,19 @@ async fn update_models_route(
         }
         merge_managed_model_config(&active.model_config, &submitted)
     } else {
+        if let Err(violation) = validate_byok_model_config(&submitted) {
+            return bad_request("invalid_model_config", &violation);
+        }
         submitted
     };
+
+    // The dimension pin applies to model selection too — and must reject
+    // BEFORE the write lands, or a stored-but-unservable config would wedge
+    // the account (module docs).
+    let new_config = build_provider_config(active.provider, Some(&active.api_key), &model_config);
+    if new_config.embedding_dimension() != PINNED_EMBEDDING_DIMENSION {
+        return embedding_dimension_unsupported(new_config.embedding_dimension());
+    }
 
     let old_config = config_for_credentials(&active);
     let updated = match update_model_config(
@@ -782,7 +821,6 @@ async fn update_models_route(
         return credentials_not_found(active.provider, active.origin);
     }
 
-    let new_config = build_provider_config(active.provider, Some(&active.api_key), &model_config);
     let warning = reembed_warning(Some(&old_config), &new_config);
 
     if let Err(denial) = apply_live_config(&state, account_id, new_config).await {
@@ -855,6 +893,10 @@ async fn validate_openrouter_key(config: &ProviderConfig) -> Result<(), String> 
         return Ok(());
     }
     let body = response.text().await.unwrap_or_default();
+    // Scrub the key out BEFORE truncating: the verbatim replace can only
+    // match the whole key, so truncating first could cut an echoed key in
+    // half and leave the surviving fragment unscrubbed.
+    let body = scrub_secret(&body, provider.api_key());
     Err(format!(
         "HTTP {status}: {}",
         truncate_chars(&body, PROVIDER_ERROR_MAX_CHARS)
@@ -873,7 +915,27 @@ async fn validate_openai_compat_key(config: &ProviderConfig) -> Result<(), Strin
         )
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            // Provider API errors carry the response body verbatim and
+            // unbounded; same discipline as the OpenRouter arm — scrub any
+            // key echo first, then bound the length.
+            let mut message = e.to_string();
+            if let Some(api_key) = &config.openai_compat_api_key {
+                message = scrub_secret(&message, api_key);
+            }
+            truncate_chars(&message, PROVIDER_ERROR_MAX_CHARS).to_string()
+        })
+}
+
+/// Replace every occurrence of `secret` in `message` with `[redacted]`.
+/// Must run on the **untruncated** text (see the validation arms). An empty
+/// secret is a no-op — `str::replace("")` would interleave the marker
+/// between every character.
+fn scrub_secret(message: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return message.to_string();
+    }
+    message.replace(secret, "[redacted]")
 }
 
 /// Char-safe truncation for provider error bodies.
@@ -1005,6 +1067,26 @@ fn bad_request(error: &str, message: &str) -> HttpResponse {
     HttpResponse::BadRequest().json(json!({
         "error": error,
         "message": message,
+    }))
+}
+
+/// Structured 400 for a provider config whose effective embedding dimension
+/// differs from the platform pin (module docs; the plan's "warn loudly" is
+/// deliberately hardened to a rejection here — the warning promised a
+/// re-embed no cloud mechanism can deliver at a different width).
+fn embedding_dimension_unsupported(requested: usize) -> HttpResponse {
+    HttpResponse::BadRequest().json(json!({
+        "error": "embedding_dimension_unsupported",
+        "message": format!(
+            "This deployment's vector index is fixed at \
+             {PINNED_EMBEDDING_DIMENSION} dimensions; the submitted \
+             configuration produces {requested}-dimensional embeddings. \
+             Changing the embedding dimension is not supported in cloud — \
+             choose an embedding model (or embedding_dimension) that \
+             produces {PINNED_EMBEDDING_DIMENSION}-dimensional vectors."
+        ),
+        "required_dimension": PINNED_EMBEDDING_DIMENSION,
+        "requested_dimension": requested,
     }))
 }
 

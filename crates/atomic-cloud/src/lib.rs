@@ -52,7 +52,7 @@ pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSI
 pub use control_plane::ControlPlane;
 pub use curated_models::{
     merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
-    MANAGED_LLM_MODELS,
+    MANAGED_LLM_MODELS, PINNED_EMBEDDING_DIMENSION,
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
@@ -63,11 +63,15 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
-pub use provider_config::{build_provider_config, config_for_credentials, keyless_provider_config};
+pub use provider_config::{
+    build_provider_config, config_for_credentials, keyless_provider_config,
+    validate_byok_model_config, BYOK_ALLOWED_KEYS,
+};
 pub use provider_credentials::{
-    delete_credentials, get_active_credentials, get_credentials, record_validation,
-    set_active_provider, touch_last_used, update_model_config, upsert_credentials,
-    CredentialOrigin, NewCredentials, Provider, ProviderCredentials,
+    delete_credentials, get_active_credentials, get_active_provider_state, get_credentials,
+    insert_credentials_if_absent, record_validation, set_active_provider, touch_last_used,
+    update_model_config, upsert_credentials, ActiveProviderState, CredentialOrigin, NewCredentials,
+    Provider, ProviderCredentials,
 };
 pub use provision::{
     delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,

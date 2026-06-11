@@ -250,7 +250,7 @@ async fn explicit_config_pins_per_task_models_sqlite() {
     let mock = MockAiServer::start().await;
     core.update_provider_config(mock_openrouter_config(&mock));
 
-    // A tenant-writable settings write points the per-task keys elsewhere.
+    // An out-of-band settings write points the per-task keys elsewhere.
     for key in ["chat_model", "wiki_model"] {
         core.set_setting(key, "frontier/expensive")
             .await
@@ -284,6 +284,90 @@ async fn explicit_config_pins_per_task_models_sqlite() {
              never the settings-written one: {models:?}"
         );
     }
+}
+
+/// In explicit mode, embedding-space settings writes through
+/// `set_setting_with_reembed` are inert end to end: with an atom already
+/// embedded through the explicit config, writing `provider`,
+/// `openai_compat_embedding_dimension`, and `embedding_model` stores the
+/// values but recreates no vector index and queues no re-embedding — the
+/// atom keeps its `complete` status and its vectors keep answering semantic
+/// search, and the next embed still flows through the explicit config.
+#[tokio::test]
+async fn explicit_mode_embedding_space_settings_writes_are_inert_sqlite() {
+    let dir = tempfile::TempDir::new().expect("create tempdir");
+    let core =
+        AtomicCore::open_or_create(dir.path().join("inert.db")).expect("open sqlite test db");
+    seed_dead_provider_settings(&core).await;
+    core.configure_autotag_targets(&["Topics".to_string()], &[])
+        .await
+        .expect("configure autotag targets");
+
+    let mock = MockAiServer::start().await;
+    core.update_provider_config(mock_openrouter_config(&mock));
+
+    let atom_id = create_and_await(&core, "an explicit-mode note about vector spaces").await;
+    let embeds_after_create = mock.embedding_request_count();
+
+    // Each write would, in settings mode, either recreate the index at a
+    // foreign dimension (3072) or queue a full re-embed (model change).
+    for (key, value) in [
+        ("provider", "openai_compat"),
+        ("openai_compat_embedding_dimension", "3072"),
+        ("embedding_model", "frontier/other-space"),
+    ] {
+        let result = core
+            .set_setting_with_reembed(key, value, |_| {})
+            .await
+            .expect("settings write succeeds");
+        assert!(!result.embedding_space_changed, "{key} must be inert");
+        assert!(
+            !result.dimension_changed,
+            "{key} must not recreate the index"
+        );
+        assert_eq!(result.total_atom_count, 0, "{key} must queue no re-embeds");
+        assert_eq!(result.retried_failed_count, 0, "{key} must retry nothing");
+    }
+
+    // No re-embedding was scheduled: the atom's status survived untouched
+    // (an index recreation would have reset it to 'pending').
+    let atom = core
+        .get_atom(&atom_id)
+        .await
+        .expect("get atom")
+        .expect("atom exists");
+    assert_eq!(
+        atom.atom.embedding_status, "complete",
+        "the embedded atom must keep its vectors"
+    );
+    assert_eq!(
+        mock.embedding_request_count(),
+        embeds_after_create,
+        "no re-embed traffic may follow the inert writes"
+    );
+
+    // The stored vectors still answer semantic search (the query embedding
+    // accounts for the +1 below).
+    let results = core
+        .search(atomic_core::search::SearchOptions::new(
+            "vector spaces",
+            atomic_core::search::SearchMode::Semantic,
+            5,
+        ))
+        .await
+        .expect("semantic search after inert writes");
+    assert!(
+        results.iter().any(|r| r.atom.atom.id == atom_id),
+        "existing vectors must survive the settings writes"
+    );
+    assert_eq!(mock.embedding_request_count(), embeds_after_create + 1);
+
+    // And new embeds still run at the explicit config's space.
+    create_and_await(&core, "a second note embedded after the inert writes").await;
+    assert!(
+        mock.embedding_request_count() > embeds_after_create + 1,
+        "post-write embeds still flow through the explicit config"
+    );
 }
 
 // ==================== Manager-wide sharing ====================

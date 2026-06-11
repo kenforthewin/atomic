@@ -14,8 +14,9 @@
 //! decrypted on the way out into a [`SecretKey`] (Debug/Display-redacted,
 //! never `Serialize`). Plaintext keys exist only inside `SecretKey`
 //! wrappers; nothing in this module logs, serializes, or errors with key
-//! material. The vault binds each ciphertext to its `(account_id,
-//! provider)` row, so a row copied across accounts fails authentication
+//! material. The vault binds each ciphertext to its full `(account_id,
+//! provider, origin)` row key, so a row copied across accounts — or swapped
+//! between an account's managed and BYOK rows — fails authentication
 //! instead of decrypting (see [`crate::keyvault`]).
 //!
 //! # Active-provider pointer
@@ -31,6 +32,19 @@
 //! - A NULL pointer means "no provider configured": callers translate that
 //!   into a key-less `ProviderConfig`, and provider calls fail with a
 //!   structured error (plan: "Plumbing — control plane → AtomicCore").
+//!
+//! # Provider generation
+//!
+//! `accounts.provider_generation` (migration 005) counts provider-state
+//! mutations. **Every** write in this module — upsert, conditional insert,
+//! pointer flip, model-config update, delete — bumps it in the same
+//! statement or transaction as the mutation, so the counter and the state it
+//! versions can never be observed out of step. [`get_active_provider_state`]
+//! reads the generation and the active credentials in one query for the same
+//! reason: a config built from that snapshot is stamped with a generation
+//! that is *never newer* than the credentials it was built from, which is
+//! the invariant the serving cache's staleness check leans on (see
+//! [`crate::account_cache`]).
 
 use std::str::FromStr;
 
@@ -193,16 +207,18 @@ fn column_list(prefix: &str) -> String {
 }
 
 /// Parse + decrypt a fetched row. The vault binds the ciphertext to the
-/// row's own `(account_id, provider)`, so a row that was tampered with —
-/// or copied onto another account — fails here, typed.
+/// row's own `(account_id, provider, origin)`, so a row that was tampered
+/// with — or copied onto another account or origin — fails here, typed.
 fn decrypt_row(
     vault: &dyn KeyVault,
     row: CredentialRow,
 ) -> Result<ProviderCredentials, CloudError> {
     let provider: Provider = row.provider.parse()?;
+    let origin: CredentialOrigin = row.origin.parse()?;
     let plaintext = vault.decrypt(
         &row.account_id,
         provider.as_str(),
+        origin.as_str(),
         &row.encrypted_key,
         &row.nonce,
         row.encryption_version,
@@ -215,7 +231,7 @@ fn decrypt_row(
     })?);
     Ok(ProviderCredentials {
         provider,
-        origin: row.origin.parse()?,
+        origin,
         account_id: row.account_id,
         external_key_id: row.external_key_id,
         api_key,
@@ -240,7 +256,8 @@ pub struct NewCredentials {
     pub model_config: serde_json::Value,
 }
 
-/// Insert or replace the `(account, provider, origin)` credentials row.
+/// Insert or replace the `(account, provider, origin)` credentials row,
+/// bumping the account's provider generation in the same transaction.
 ///
 /// The key is encrypted via `vault` before it reaches the query. Replacing
 /// an existing row is a rotation: `rotated_at` is stamped and the
@@ -257,8 +274,14 @@ pub async fn upsert_credentials(
     let (ciphertext, nonce, version) = vault.encrypt(
         account_id,
         new.provider.as_str(),
+        new.origin.as_str(),
         new.api_key.expose().as_bytes(),
     )?;
+    let mut tx = control
+        .pool()
+        .begin()
+        .await
+        .map_err(CloudError::db("starting credential-upsert transaction"))?;
     sqlx::query(
         "INSERT INTO provider_credentials \
              (account_id, provider, origin, external_key_id, encrypted_key, \
@@ -282,9 +305,87 @@ pub async fn upsert_credentials(
     .bind(&nonce)
     .bind(version)
     .bind(&new.model_config)
-    .execute(control.pool())
+    .execute(&mut *tx)
     .await
     .map_err(CloudError::db("upserting provider credentials"))?;
+    bump_provider_generation(&mut tx, account_id).await?;
+    tx.commit()
+        .await
+        .map_err(CloudError::db("committing credential upsert"))?;
+    Ok(())
+}
+
+/// Insert the `(account, provider, origin)` credentials row **only if it
+/// doesn't exist yet**, returning whether this call inserted it. The
+/// concurrent-mint guard for managed-key provisioning: two racing
+/// `ensure_managed_key` calls both mint a key, but only one row can land —
+/// the loser sees `false` and must dispose of the key it just created
+/// instead of silently overwriting the winner's `external_key_id` (which
+/// would orphan a billed key with no trace). BYOK saves keep using
+/// [`upsert_credentials`] — replacement *is* their rotation contract.
+///
+/// Bumps the provider generation in the same transaction when (and only
+/// when) the insert lands.
+pub async fn insert_credentials_if_absent(
+    control: &ControlPlane,
+    vault: &dyn KeyVault,
+    account_id: &str,
+    new: NewCredentials,
+) -> Result<bool, CloudError> {
+    let (ciphertext, nonce, version) = vault.encrypt(
+        account_id,
+        new.provider.as_str(),
+        new.origin.as_str(),
+        new.api_key.expose().as_bytes(),
+    )?;
+    let mut tx = control
+        .pool()
+        .begin()
+        .await
+        .map_err(CloudError::db("starting credential-insert transaction"))?;
+    let inserted = sqlx::query(
+        "INSERT INTO provider_credentials \
+             (account_id, provider, origin, external_key_id, encrypted_key, \
+              nonce, encryption_version, model_config) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (account_id, provider, origin) DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(new.provider.as_str())
+    .bind(new.origin.as_str())
+    .bind(new.external_key_id.as_deref())
+    .bind(&ciphertext)
+    .bind(&nonce)
+    .bind(version)
+    .bind(&new.model_config)
+    .execute(&mut *tx)
+    .await
+    .map_err(CloudError::db("inserting provider credentials"))?
+    .rows_affected()
+        > 0;
+    if inserted {
+        bump_provider_generation(&mut tx, account_id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(CloudError::db("committing credential insert"))?;
+    Ok(inserted)
+}
+
+/// Bump `accounts.provider_generation` inside the caller's transaction —
+/// the convergence signal every provider mutation must emit (module docs:
+/// "Provider generation"). Zero matched rows is tolerated: a mutation can
+/// legitimately race the accounts-row CASCADE of a concurrent deletion, and
+/// a deleted account has nothing left to converge.
+async fn bump_provider_generation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    sqlx::query("UPDATE accounts SET provider_generation = provider_generation + 1 WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(CloudError::db("bumping provider generation"))?;
     Ok(())
 }
 
@@ -334,9 +435,79 @@ pub async fn get_active_credentials(
     row.map(|r| decrypt_row(vault, r)).transpose()
 }
 
+/// One consistent snapshot of an account's provider state: the generation
+/// counter plus the active (decrypted) credentials it versions. See
+/// [`get_active_provider_state`].
+#[derive(Debug)]
+pub struct ActiveProviderState {
+    /// `accounts.provider_generation` at the moment the credentials were
+    /// read — never newer than `credentials`, by construction.
+    pub provider_generation: i64,
+    /// The active credentials row, decrypted; `None` when the active
+    /// pointer is NULL (no provider configured).
+    pub credentials: Option<ProviderCredentials>,
+}
+
+/// Fetch the account's provider generation **and** its active credentials
+/// in a single query, or `None` when the account doesn't exist.
+///
+/// The single-statement read is load-bearing: the serving cache stamps each
+/// entry with the generation its config was built from, and the staleness
+/// check (`entry generation < generation observed on the accounts row`)
+/// only heals divergence if a stamped generation is never *newer* than the
+/// credentials it travels with. Two separate reads could interleave with a
+/// rotation in exactly the wrong order; one snapshot cannot.
+pub async fn get_active_provider_state(
+    control: &ControlPlane,
+    vault: &dyn KeyVault,
+    account_id: &str,
+) -> Result<Option<ActiveProviderState>, CloudError> {
+    use sqlx::Row;
+
+    let row = sqlx::query(&format!(
+        "SELECT a.provider_generation, {} FROM accounts a \
+         LEFT JOIN provider_credentials pc \
+           ON pc.account_id = a.id \
+          AND pc.provider = a.active_provider \
+          AND pc.origin = a.active_origin \
+         WHERE a.id = $1",
+        column_list("pc.")
+    ))
+    .bind(account_id)
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("fetching provider state"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let provider_generation: i64 = row
+        .try_get("provider_generation")
+        .map_err(CloudError::db("decoding provider generation"))?;
+    // With no active row the LEFT JOIN nulls every pc column; `provider` is
+    // NOT NULL on real rows, so its nullness is the presence signal.
+    let has_credentials = row
+        .try_get::<Option<String>, _>("provider")
+        .map_err(CloudError::db("decoding provider column"))?
+        .is_some();
+    let credentials = if has_credentials {
+        use sqlx::FromRow;
+        let credential_row = CredentialRow::from_row(&row)
+            .map_err(CloudError::db("decoding provider credentials row"))?;
+        Some(decrypt_row(vault, credential_row)?)
+    } else {
+        None
+    };
+    Ok(Some(ActiveProviderState {
+        provider_generation,
+        credentials,
+    }))
+}
+
 /// Point the account at a `(provider, origin)` credentials row — the
 /// "column flip" that switches between managed and BYOK (plan: "Managed
-/// key lifecycle") — or clear the pointer with `None`.
+/// key lifecycle") — or clear the pointer with `None`. Either form bumps
+/// the provider generation in the same UPDATE.
 ///
 /// Flipping to a row that doesn't exist is refused with
 /// [`CloudError::MissingProviderCredentials`] (a dangling pointer would
@@ -351,7 +522,8 @@ pub async fn set_active_provider(
     match active {
         Some((provider, origin)) => {
             let result = sqlx::query(
-                "UPDATE accounts SET active_provider = $2, active_origin = $3 \
+                "UPDATE accounts SET active_provider = $2, active_origin = $3, \
+                     provider_generation = provider_generation + 1 \
                  WHERE id = $1 AND EXISTS ( \
                      SELECT 1 FROM provider_credentials \
                      WHERE account_id = $1 AND provider = $2 AND origin = $3)",
@@ -374,7 +546,9 @@ pub async fn set_active_provider(
         }
         None => {
             let result = sqlx::query(
-                "UPDATE accounts SET active_provider = NULL, active_origin = NULL WHERE id = $1",
+                "UPDATE accounts SET active_provider = NULL, active_origin = NULL, \
+                     provider_generation = provider_generation + 1 \
+                 WHERE id = $1",
             )
             .bind(account_id)
             .execute(control.pool())
@@ -395,7 +569,8 @@ pub async fn set_active_provider(
 /// pointer is cleared in the same transaction — the pointer must never
 /// dangle (callers deleting a *managed* row also delete the external
 /// OpenRouter key via the provisioning API; that lifecycle lives with the
-/// caller, not here).
+/// caller, not here). A real deletion bumps the provider generation in the
+/// same transaction.
 pub async fn delete_credentials(
     control: &ControlPlane,
     account_id: &str,
@@ -432,6 +607,7 @@ pub async fn delete_credentials(
         .execute(&mut *tx)
         .await
         .map_err(CloudError::db("clearing active provider after delete"))?;
+        bump_provider_generation(&mut tx, account_id).await?;
     }
 
     tx.commit()
@@ -444,7 +620,8 @@ pub async fn delete_credentials(
 /// returning whether the row existed. Model selection lives with the key
 /// (plan: "Storage schema"), but changing it is not a rotation: the key
 /// bytes and the validation state are untouched, so `rotated_at` /
-/// `last_validated_at` keep describing the stored key.
+/// `last_validated_at` keep describing the stored key. It *is* a provider
+/// mutation, though — the generation is bumped in the same transaction.
 ///
 /// Write-side policy — which keys a user may set, per origin (see
 /// [`crate::curated_models`]) — is the caller's job; this function is the
@@ -456,7 +633,12 @@ pub async fn update_model_config(
     origin: CredentialOrigin,
     model_config: &serde_json::Value,
 ) -> Result<bool, CloudError> {
-    let result = sqlx::query(
+    let mut tx = control
+        .pool()
+        .begin()
+        .await
+        .map_err(CloudError::db("starting model-config transaction"))?;
+    let updated = sqlx::query(
         "UPDATE provider_credentials SET model_config = $4 \
          WHERE account_id = $1 AND provider = $2 AND origin = $3",
     )
@@ -464,10 +646,18 @@ pub async fn update_model_config(
     .bind(provider.as_str())
     .bind(origin.as_str())
     .bind(model_config)
-    .execute(control.pool())
+    .execute(&mut *tx)
     .await
-    .map_err(CloudError::db("updating provider model config"))?;
-    Ok(result.rows_affected() > 0)
+    .map_err(CloudError::db("updating provider model config"))?
+    .rows_affected()
+        > 0;
+    if updated {
+        bump_provider_generation(&mut tx, account_id).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(CloudError::db("committing model-config update"))?;
+    Ok(updated)
 }
 
 /// Stamp `last_used_at` on a credentials row. Best-effort by design: a row
