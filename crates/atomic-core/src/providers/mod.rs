@@ -46,12 +46,25 @@ impl ProviderType {
     }
 }
 
+/// Default OpenRouter API endpoint. `ProviderConfig::openrouter_base_url`
+/// resolves to this unless explicitly overridden (proxies, gateways, or test
+/// servers that speak the same API).
+pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 /// Provider configuration extracted from settings
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually to redact API keys — configs get logged
+/// via `tracing` in pipeline diagnostics and must never leak key material.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub provider_type: ProviderType,
     // OpenRouter settings
     pub openrouter_api_key: Option<String>,
+    /// Base URL for the OpenRouter API. Defaults to
+    /// [`OPENROUTER_DEFAULT_BASE_URL`]; overridable (settings key
+    /// `openrouter_base_url`) for proxies or composing processes that front
+    /// the OpenRouter API.
+    pub openrouter_base_url: String,
     pub openrouter_embedding_model: String,
     pub openrouter_llm_model: String,
     /// User-specified context length override. None = use model default from API cache.
@@ -72,6 +85,55 @@ pub struct ProviderConfig {
     pub openai_compat_timeout_secs: u64,
 }
 
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact key material: `Some("[redacted]")` preserves the
+        // present/absent signal without the value. Every other field is
+        // safe to print verbatim.
+        fn redacted(key: &Option<String>) -> Option<&'static str> {
+            key.as_ref().map(|_| "[redacted]")
+        }
+        f.debug_struct("ProviderConfig")
+            .field("provider_type", &self.provider_type)
+            .field("openrouter_api_key", &redacted(&self.openrouter_api_key))
+            .field("openrouter_base_url", &self.openrouter_base_url)
+            .field(
+                "openrouter_embedding_model",
+                &self.openrouter_embedding_model,
+            )
+            .field("openrouter_llm_model", &self.openrouter_llm_model)
+            .field("openrouter_context_length", &self.openrouter_context_length)
+            .field("ollama_host", &self.ollama_host)
+            .field("ollama_embedding_model", &self.ollama_embedding_model)
+            .field("ollama_llm_model", &self.ollama_llm_model)
+            .field("ollama_context_length", &self.ollama_context_length)
+            .field("ollama_timeout_secs", &self.ollama_timeout_secs)
+            .field("openai_compat_base_url", &self.openai_compat_base_url)
+            .field(
+                "openai_compat_api_key",
+                &redacted(&self.openai_compat_api_key),
+            )
+            .field(
+                "openai_compat_embedding_model",
+                &self.openai_compat_embedding_model,
+            )
+            .field("openai_compat_llm_model", &self.openai_compat_llm_model)
+            .field(
+                "openai_compat_embedding_dimension",
+                &self.openai_compat_embedding_dimension,
+            )
+            .field(
+                "openai_compat_context_length",
+                &self.openai_compat_context_length,
+            )
+            .field(
+                "openai_compat_timeout_secs",
+                &self.openai_compat_timeout_secs,
+            )
+            .finish()
+    }
+}
+
 impl ProviderConfig {
     pub fn from_settings(settings: &HashMap<String, String>) -> Self {
         let provider_type = ProviderType::from_string(
@@ -84,6 +146,11 @@ impl ProviderConfig {
         ProviderConfig {
             provider_type,
             openrouter_api_key: settings.get("openrouter_api_key").cloned(),
+            openrouter_base_url: settings
+                .get("openrouter_base_url")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| OPENROUTER_DEFAULT_BASE_URL.to_string()),
             openrouter_embedding_model: settings
                 .get("embedding_model")
                 .cloned()
@@ -148,6 +215,94 @@ impl ProviderConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300), // Default 5 minutes
         }
+    }
+
+    /// Overlay this config onto a resolved settings map so that
+    /// [`ProviderConfig::from_settings`] on the result reproduces `self`
+    /// exactly. Every key `from_settings` reads is either written or removed
+    /// (for `None` optionals), so no provider-config residue from the
+    /// underlying map can survive.
+    ///
+    /// This is the bridge used by `AtomicCore`'s explicit provider-config
+    /// mode: AI operations resolve their settings map once per operation, and
+    /// this overlay makes the active config authoritative over whatever the
+    /// settings tables hold, without touching unrelated settings (prompts,
+    /// strategies, non-provider model selection).
+    pub(crate) fn apply_to_settings(&self, settings: &mut HashMap<String, String>) {
+        let provider = match self.provider_type {
+            ProviderType::OpenRouter => "openrouter",
+            ProviderType::Ollama => "ollama",
+            ProviderType::OpenAICompat => "openai_compat",
+        };
+        settings.insert("provider".to_string(), provider.to_string());
+
+        match &self.openrouter_api_key {
+            Some(key) => settings.insert("openrouter_api_key".to_string(), key.clone()),
+            None => settings.remove("openrouter_api_key"),
+        };
+        settings.insert(
+            "openrouter_base_url".to_string(),
+            self.openrouter_base_url.clone(),
+        );
+        settings.insert(
+            "embedding_model".to_string(),
+            self.openrouter_embedding_model.clone(),
+        );
+        settings.insert(
+            "tagging_model".to_string(),
+            self.openrouter_llm_model.clone(),
+        );
+        match self.openrouter_context_length {
+            Some(len) => settings.insert("openrouter_context_length".to_string(), len.to_string()),
+            None => settings.remove("openrouter_context_length"),
+        };
+
+        settings.insert("ollama_host".to_string(), self.ollama_host.clone());
+        settings.insert(
+            "ollama_embedding_model".to_string(),
+            self.ollama_embedding_model.clone(),
+        );
+        settings.insert(
+            "ollama_llm_model".to_string(),
+            self.ollama_llm_model.clone(),
+        );
+        settings.insert(
+            "ollama_context_length".to_string(),
+            self.ollama_context_length.to_string(),
+        );
+        settings.insert(
+            "ollama_timeout_secs".to_string(),
+            self.ollama_timeout_secs.to_string(),
+        );
+
+        settings.insert(
+            "openai_compat_base_url".to_string(),
+            self.openai_compat_base_url.clone(),
+        );
+        match &self.openai_compat_api_key {
+            Some(key) => settings.insert("openai_compat_api_key".to_string(), key.clone()),
+            None => settings.remove("openai_compat_api_key"),
+        };
+        settings.insert(
+            "openai_compat_embedding_model".to_string(),
+            self.openai_compat_embedding_model.clone(),
+        );
+        settings.insert(
+            "openai_compat_llm_model".to_string(),
+            self.openai_compat_llm_model.clone(),
+        );
+        settings.insert(
+            "openai_compat_embedding_dimension".to_string(),
+            self.openai_compat_embedding_dimension.to_string(),
+        );
+        settings.insert(
+            "openai_compat_context_length".to_string(),
+            self.openai_compat_context_length.to_string(),
+        );
+        settings.insert(
+            "openai_compat_timeout_secs".to_string(),
+            self.openai_compat_timeout_secs.to_string(),
+        );
     }
 
     /// Get the embedding model for the current provider
@@ -228,7 +383,10 @@ pub fn create_embedding_provider(
             let api_key = config.openrouter_api_key.clone().ok_or_else(|| {
                 ProviderError::Configuration("OpenRouter API key not configured".to_string())
             })?;
-            Ok(Arc::new(OpenRouterProvider::new(api_key)))
+            Ok(Arc::new(OpenRouterProvider::with_base_url(
+                api_key,
+                config.openrouter_base_url.clone(),
+            )))
         }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
             Some(config.ollama_host.clone()),
@@ -256,7 +414,10 @@ pub fn create_llm_provider(config: &ProviderConfig) -> Result<Arc<dyn LlmProvide
             let api_key = config.openrouter_api_key.clone().ok_or_else(|| {
                 ProviderError::Configuration("OpenRouter API key not configured".to_string())
             })?;
-            Ok(Arc::new(OpenRouterProvider::new(api_key)))
+            Ok(Arc::new(OpenRouterProvider::with_base_url(
+                api_key,
+                config.openrouter_base_url.clone(),
+            )))
         }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
             Some(config.ollama_host.clone()),
@@ -286,7 +447,10 @@ pub fn create_streaming_llm_provider(
             let api_key = config.openrouter_api_key.clone().ok_or_else(|| {
                 ProviderError::Configuration("OpenRouter API key not configured".to_string())
             })?;
-            Ok(Arc::new(OpenRouterProvider::new(api_key)))
+            Ok(Arc::new(OpenRouterProvider::with_base_url(
+                api_key,
+                config.openrouter_base_url.clone(),
+            )))
         }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
             Some(config.ollama_host.clone()),
@@ -508,6 +672,148 @@ mod tests {
         assert_eq!(config.ollama_host, "http://localhost:11434");
         assert_eq!(config.embedding_model(), "nomic-embed-text");
         assert_eq!(config.llm_model(), "llama3.2");
+    }
+
+    #[test]
+    fn test_openrouter_base_url_default_and_override() {
+        let config = ProviderConfig::from_settings(&HashMap::new());
+        assert_eq!(config.openrouter_base_url, OPENROUTER_DEFAULT_BASE_URL);
+
+        // Empty value falls back to the default, same as a missing key.
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("openrouter_base_url".to_string(), "".to_string());
+        let config = ProviderConfig::from_settings(&settings);
+        assert_eq!(config.openrouter_base_url, OPENROUTER_DEFAULT_BASE_URL);
+
+        settings.insert(
+            "openrouter_base_url".to_string(),
+            "http://127.0.0.1:9999".to_string(),
+        );
+        let config = ProviderConfig::from_settings(&settings);
+        assert_eq!(config.openrouter_base_url, "http://127.0.0.1:9999");
+    }
+
+    #[test]
+    fn test_openrouter_provider_base_url_normalization() {
+        // Default endpoint already ends with /v1 — kept verbatim.
+        let provider = OpenRouterProvider::new("k".to_string());
+        assert_eq!(provider.base_url(), OPENROUTER_DEFAULT_BASE_URL);
+
+        // Bare host gets /v1 appended; trailing slashes are trimmed first.
+        let provider = OpenRouterProvider::with_base_url(
+            "k".to_string(),
+            "http://localhost:8080/".to_string(),
+        );
+        assert_eq!(provider.base_url(), "http://localhost:8080/v1");
+
+        // An explicit /v1 suffix is preserved, not doubled.
+        let provider = OpenRouterProvider::with_base_url(
+            "k".to_string(),
+            "http://proxy.internal/api/v1".to_string(),
+        );
+        assert_eq!(provider.base_url(), "http://proxy.internal/api/v1");
+    }
+
+    #[test]
+    fn test_provider_config_debug_redacts_keys() {
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert(
+            "openrouter_api_key".to_string(),
+            "sk-or-super-secret".to_string(),
+        );
+        settings.insert(
+            "openai_compat_api_key".to_string(),
+            "compat-super-secret".to_string(),
+        );
+        settings.insert(
+            "embedding_model".to_string(),
+            "openai/text-embedding-3-small".to_string(),
+        );
+        let config = ProviderConfig::from_settings(&settings);
+
+        let debug = format!("{:?}", config);
+        let debug_alt = format!("{:#?}", config);
+        for rendered in [&debug, &debug_alt] {
+            assert!(
+                !rendered.contains("sk-or-super-secret"),
+                "Debug output leaked the OpenRouter key: {rendered}"
+            );
+            assert!(
+                !rendered.contains("compat-super-secret"),
+                "Debug output leaked the OpenAI-compat key: {rendered}"
+            );
+            assert!(
+                rendered.contains("[redacted]"),
+                "Debug output should mark present keys as redacted: {rendered}"
+            );
+            // Non-secret fields stay visible.
+            assert!(
+                rendered.contains("openai/text-embedding-3-small"),
+                "Debug output should keep non-secret fields: {rendered}"
+            );
+        }
+
+        // Absent keys render as None, preserving the present/absent signal.
+        let bare = ProviderConfig::from_settings(&HashMap::new());
+        let rendered = format!("{:?}", bare);
+        assert!(rendered.contains("openrouter_api_key: None"), "{rendered}");
+    }
+
+    #[test]
+    fn test_apply_to_settings_roundtrip() {
+        // A config with every optional populated and nothing left at its
+        // default, overlaid onto a map full of conflicting provider keys:
+        // from_settings must reproduce the config exactly and unrelated
+        // settings must survive untouched.
+        let mut config = ProviderConfig::from_settings(&HashMap::new());
+        config.provider_type = ProviderType::OpenRouter;
+        config.openrouter_api_key = Some("key-a".to_string());
+        config.openrouter_base_url = "http://proxy.internal/api/v1".to_string();
+        config.openrouter_embedding_model = "mock/embed".to_string();
+        config.openrouter_llm_model = "mock/llm".to_string();
+        config.openrouter_context_length = Some(8192);
+        config.ollama_host = "http://ollama:11434".to_string();
+        config.ollama_embedding_model = "embed-x".to_string();
+        config.ollama_llm_model = "llm-x".to_string();
+        config.ollama_context_length = 1234;
+        config.ollama_timeout_secs = 77;
+        config.openai_compat_base_url = "http://compat:9000".to_string();
+        config.openai_compat_api_key = Some("key-b".to_string());
+        config.openai_compat_embedding_model = "ce".to_string();
+        config.openai_compat_llm_model = "cl".to_string();
+        config.openai_compat_embedding_dimension = 768;
+        config.openai_compat_context_length = 4321;
+        config.openai_compat_timeout_secs = 99;
+
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("provider".to_string(), "ollama".to_string());
+        settings.insert("openrouter_api_key".to_string(), "stale-key".to_string());
+        settings.insert(
+            "openrouter_base_url".to_string(),
+            "http://stale".to_string(),
+        );
+        settings.insert("embedding_model".to_string(), "stale/embed".to_string());
+        settings.insert("wiki_model".to_string(), "keep/this-model".to_string());
+
+        config.apply_to_settings(&mut settings);
+        assert_eq!(ProviderConfig::from_settings(&settings), config);
+        assert_eq!(
+            settings.get("wiki_model").map(|s| s.as_str()),
+            Some("keep/this-model"),
+            "non-provider settings must survive the overlay"
+        );
+
+        // None-valued optionals must clear stale residue, not inherit it.
+        config.openrouter_api_key = None;
+        config.openrouter_context_length = None;
+        config.openai_compat_api_key = None;
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("openrouter_api_key".to_string(), "stale-key".to_string());
+        settings.insert("openrouter_context_length".to_string(), "999".to_string());
+        settings.insert("openai_compat_api_key".to_string(), "stale-b".to_string());
+        config.apply_to_settings(&mut settings);
+        assert_eq!(ProviderConfig::from_settings(&settings), config);
+        assert!(!settings.contains_key("openrouter_api_key"));
     }
 
     #[test]

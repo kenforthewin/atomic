@@ -247,6 +247,20 @@ pub struct AtomicCore {
     /// When present, settings and token operations delegate to the shared registry.
     /// When absent (standalone use, tests), uses per-db tables as before.
     registry: Option<Arc<registry::Registry>>,
+    /// Active explicit provider configuration. `None` (the default for every
+    /// constructor without a `_provider` variant) keeps today's behavior:
+    /// provider config is resolved from the settings tables on every
+    /// operation. `Some` makes the held config authoritative — the settings
+    /// tables are never consulted for provider config, only for non-provider
+    /// AI settings (prompts, strategies, wiki/chat model selection).
+    ///
+    /// Shared (`Arc`) across every core resolved from the same
+    /// `DatabaseManager`, so a live swap via [`AtomicCore::update_provider_config`]
+    /// takes effect for all logical databases at once. `RwLock` rather than a
+    /// per-operation read of settings keeps explicit mode coherent: operations
+    /// snapshot the config once at their start, so in-flight work finishes on
+    /// the config it started with.
+    provider_config: Arc<std::sync::RwLock<Option<ProviderConfig>>>,
     /// Per-tag locks to serialize wiki operations (update, propose, accept,
     /// dismiss) against the same article. Prevents background + manual runs
     /// from racing and ensures supersede semantics are consistent. Entries are
@@ -267,6 +281,7 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry: None,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -332,13 +347,67 @@ impl AtomicCore {
         registry: Option<Arc<registry::Registry>>,
         pool_config: PgPoolConfig,
     ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool_and_provider(database_url, db_id, registry, pool_config, None)
+            .await
+    }
+
+    /// Like [`open_postgres`](Self::open_postgres), but with an explicit
+    /// provider configuration instead of resolving one from the settings
+    /// tables (see
+    /// [`open_postgres_with_pool_and_provider`](Self::open_postgres_with_pool_and_provider)
+    /// for the semantics).
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_provider(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        provider_config: Option<ProviderConfig>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool_and_provider(
+            database_url,
+            db_id,
+            registry,
+            PgPoolConfig::from_env(),
+            provider_config,
+        )
+        .await
+    }
+
+    /// Fully explicit Postgres constructor: pool sizing and provider
+    /// configuration are both injected rather than environment- or
+    /// settings-derived.
+    ///
+    /// `provider_config` semantics:
+    ///
+    /// * `Some(config)` — every AI operation builds its providers from
+    ///   `config`; the settings tables are **never** consulted for provider
+    ///   config (keys, base URLs, provider selection, embedding/tagging
+    ///   models). Non-provider AI settings (prompts, strategies, wiki/chat
+    ///   model selection) still resolve from settings. Composing processes
+    ///   that manage provider credentials outside the settings tables use
+    ///   this; pair with [`update_provider_config`](Self::update_provider_config)
+    ///   for live rotation.
+    /// * `None` — identical to [`open_postgres`](Self::open_postgres):
+    ///   provider config is read from settings on every operation.
+    ///
+    /// The SQLite constructors deliberately have no `_provider` variants —
+    /// no caller needs one today, and explicit mode remains reachable on any
+    /// backend via [`update_provider_config`](Self::update_provider_config).
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_pool_and_provider(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        pool_config: PgPoolConfig,
+        provider_config: Option<ProviderConfig>,
+    ) -> Result<Self, AtomicCoreError> {
         use storage::PostgresStorage;
 
         let pg_storage =
             PostgresStorage::connect_with_config(database_url, db_id, pool_config).await?;
         pg_storage.initialize().await?;
 
-        Self::reconcile_pg_vector_index(&pg_storage).await?;
+        Self::reconcile_pg_vector_index(&pg_storage, provider_config.as_ref()).await?;
 
         let storage = storage::StorageBackend::Postgres(pg_storage);
 
@@ -373,6 +442,7 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry,
+            provider_config: Arc::new(std::sync::RwLock::new(provider_config)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -386,9 +456,13 @@ impl AtomicCore {
     /// `DatabaseManager::new_postgres`. Schema is cluster-wide (not per-db_id),
     /// so this only does real work the first time it sees a dimensionless
     /// column or a missing index.
+    /// `provider_config` carries the explicit config when the caller opened
+    /// with one — the dimension must reflect the config the pipeline will
+    /// actually embed with, not whatever the settings tables hold.
     #[cfg(feature = "postgres")]
     async fn reconcile_pg_vector_index(
         pg: &storage::PostgresStorage,
+        provider_config: Option<&ProviderConfig>,
     ) -> Result<(), AtomicCoreError> {
         use crate::storage::traits::{ChunkStore, SettingsStore};
 
@@ -398,8 +472,13 @@ impl AtomicCore {
             .unwrap_or(0);
         let current_dim = pg.get_embedding_dimension().await?;
 
-        let settings = pg.get_global_settings().await?;
-        let expected_dim = ProviderConfig::from_settings(&settings).embedding_dimension();
+        let expected_dim = match provider_config {
+            Some(config) => config.embedding_dimension(),
+            None => {
+                let settings = pg.get_global_settings().await?;
+                ProviderConfig::from_settings(&settings).embedding_dimension()
+            }
+        };
 
         match current_dim {
             Some(d) if d == expected_dim => {
@@ -449,6 +528,27 @@ impl AtomicCore {
         let core = Self {
             storage: storage::StorageBackend::Postgres(pg),
             registry: None,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
+            wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            canvas_cache: CanvasCache::new(),
+        };
+        core.register_canvas_rebuilder();
+        core
+    }
+
+    /// Create a core for another logical database that shares this core's
+    /// connection pool **and** active provider configuration. Used by
+    /// `DatabaseManager` when lazily resolving additional `db_id`s, so a
+    /// live [`update_provider_config`](Self::update_provider_config) on any
+    /// core takes effect across every logical database of the same manager.
+    /// Wiki locks and the canvas cache stay per-core — they're keyed by
+    /// per-database identifiers.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn sibling_with_storage(&self, pg: storage::PostgresStorage) -> Self {
+        let core = Self {
+            storage: storage::StorageBackend::Postgres(pg),
+            registry: self.registry.clone(),
+            provider_config: Arc::clone(&self.provider_config),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -566,6 +666,7 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -573,16 +674,88 @@ impl AtomicCore {
         Ok(core)
     }
 
-    /// Resolved settings map for background AI operations (embedding,
-    /// tagging, search, chat, agent). Returns the same merged view as
+    /// Snapshot of the active explicit provider configuration, if one was
+    /// injected at open time or set via
+    /// [`update_provider_config`](Self::update_provider_config). `None`
+    /// means provider config resolves from settings (the default).
+    pub fn active_provider_config(&self) -> Option<ProviderConfig> {
+        self.provider_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Atomically swap the active provider configuration. Subsequent AI
+    /// operations build their providers from `config`; operations already in
+    /// flight finish on the configuration they started with (each operation
+    /// snapshots its config once, at its start).
+    ///
+    /// This is the one live-reconfiguration mechanism for both modes:
+    ///
+    /// * Cores opened with an explicit config (see
+    ///   [`open_postgres_with_pool_and_provider`](Self::open_postgres_with_pool_and_provider))
+    ///   call this to rotate credentials without reopening.
+    /// * Cores in settings mode need no explicit refresh today — provider
+    ///   config is re-read from settings at the start of every operation, so
+    ///   a settings save takes effect on the next operation by construction
+    ///   (the provider cache in [`providers`] is keyed on config equality).
+    ///   Calling this on such a core promotes it to explicit mode: the given
+    ///   config becomes authoritative and settings writes stop affecting
+    ///   provider construction.
+    ///
+    /// The swap is shared with every core resolved from the same
+    /// `DatabaseManager` (see `sibling_with_storage`), so one call covers
+    /// all logical databases.
+    pub fn update_provider_config(&self, config: ProviderConfig) {
+        let mut guard = self
+            .provider_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(config);
+    }
+
+    /// Resolved settings map for AI operations (embedding, tagging, search,
+    /// chat, agent, wiki, reports). Returns the same merged view as
     /// `get_settings` — registry workspace defaults + this DB's per-DB
-    /// overrides + builtin fallbacks — so background helpers see exactly
-    /// what the API surfaces. Returning `None` here would make callers fall
-    /// back to reading just the storage layer, which would skip registry
-    /// defaults; we never want that, so we always return `Some` (or `None`
-    /// only on a hard read failure).
+    /// overrides + builtin fallbacks — with one addition: when an explicit
+    /// provider configuration is active, its keys are overlaid so
+    /// `ProviderConfig::from_settings` on the result reproduces it exactly
+    /// and the settings tables are never consulted for provider config.
+    ///
+    /// Every settings map that feeds `ProviderConfig::from_settings` must
+    /// come from here (or `settings_for_background`), never from
+    /// `get_settings` directly — otherwise explicit mode silently leaks back
+    /// to settings-resolved providers.
+    pub(crate) async fn settings_for_ai(&self) -> Result<HashMap<String, String>, AtomicCoreError> {
+        match self.active_provider_config() {
+            Some(config) => {
+                // Explicit mode: a settings read failure degrades to builtin
+                // defaults for the non-provider keys rather than failing the
+                // operation — provider resolution must not depend on the
+                // settings tables in this mode.
+                let mut settings = self.get_settings().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Settings read failed; explicit provider config proceeds with builtin defaults for non-provider settings");
+                    settings::DEFAULT_SETTINGS
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect()
+                });
+                config.apply_to_settings(&mut settings);
+                Ok(settings)
+            }
+            None => self.get_settings().await,
+        }
+    }
+
+    /// `Option`-shaped wrapper around [`settings_for_ai`](Self::settings_for_ai)
+    /// for the background helpers whose module-level fallbacks read the
+    /// storage layer's global tier on `None`. We effectively always return
+    /// `Some` (`None` only on a hard settings read failure in
+    /// settings-resolved mode) so those fallbacks — which would skip registry
+    /// defaults and any explicit provider config — stay unreachable from the
+    /// facade.
     async fn settings_for_background(&self) -> Option<HashMap<String, String>> {
-        self.get_settings().await.ok()
+        self.settings_for_ai().await.ok()
     }
 
     /// Get the storage path (for display purposes).
@@ -1446,7 +1619,7 @@ impl AtomicCore {
         }
 
         // Postgres path: use storage dispatch methods directly
-        let settings = self.get_settings().await?;
+        let settings = self.settings_for_ai().await?;
         let config = providers::ProviderConfig::from_settings(&settings);
         let tag_id = options.scope_tag_ids.first().map(|s| s.as_str());
         let cutoff = options.since_days.map(search::since_days_cutoff);
@@ -1582,7 +1755,7 @@ impl AtomicCore {
         tag_name: &str,
     ) -> Result<(wiki::WikiStrategy, wiki::WikiStrategyContext), AtomicCoreError> {
         const MAX_CROSS_LINK_TAGS: usize = 50;
-        let settings_map = self.get_settings().await?;
+        let settings_map = self.settings_for_ai().await?;
         let config = ProviderConfig::from_settings(&settings_map);
         let model = match config.provider_type {
             ProviderType::Ollama => config.llm_model().to_string(),
@@ -3316,7 +3489,7 @@ impl AtomicCore {
 
     /// Verify that the current provider is properly configured
     pub async fn verify_provider_configured(&self) -> Result<bool, AtomicCoreError> {
-        let settings_map = self.get_settings().await?;
+        let settings_map = self.settings_for_ai().await?;
         let config = ProviderConfig::from_settings(&settings_map);
 
         match config.provider_type {

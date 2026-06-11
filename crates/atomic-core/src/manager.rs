@@ -79,11 +79,35 @@ impl DatabaseManager {
         database_url: &str,
         pool_config: crate::storage::PgPoolConfig,
     ) -> Result<Self, AtomicCoreError> {
+        Self::new_postgres_with_pool_and_provider(_data_dir, database_url, pool_config, None).await
+    }
+
+    /// Like [`new_postgres_with_pool`](Self::new_postgres_with_pool), but
+    /// with an explicit provider configuration. `Some(config)` puts every
+    /// core resolved through this manager into explicit provider-config mode
+    /// (see [`AtomicCore::open_postgres_with_pool_and_provider`]): providers
+    /// are built from `config` and the settings tables are never consulted
+    /// for provider config. All cores share one live config slot, so
+    /// [`AtomicCore::update_provider_config`] on any of them rotates the
+    /// whole manager. `None` is byte-identical to
+    /// [`new_postgres_with_pool`](Self::new_postgres_with_pool).
+    #[cfg(feature = "postgres")]
+    pub async fn new_postgres_with_pool_and_provider(
+        _data_dir: impl AsRef<Path>,
+        database_url: &str,
+        pool_config: crate::storage::PgPoolConfig,
+        provider_config: Option<crate::providers::ProviderConfig>,
+    ) -> Result<Self, AtomicCoreError> {
         // Bootstrap with a placeholder db_id; we'll look up the real default from Postgres
         // once the schema has been migrated.
-        let core =
-            AtomicCore::open_postgres_with_pool(database_url, "default", None, pool_config.clone())
-                .await?;
+        let core = AtomicCore::open_postgres_with_pool_and_provider(
+            database_url,
+            "default",
+            None,
+            pool_config.clone(),
+            provider_config.clone(),
+        )
+        .await?;
 
         // Seed the default database row if the `databases` table is empty.
         let databases = core.storage.list_databases_sync().await?;
@@ -108,8 +132,14 @@ impl DatabaseManager {
 
         // If the bootstrap db_id doesn't match the resolved default, swap to a core scoped to the right db_id.
         let core = if default_id != "default" {
-            AtomicCore::open_postgres_with_pool(database_url, &default_id, None, pool_config)
-                .await?
+            AtomicCore::open_postgres_with_pool_and_provider(
+                database_url,
+                &default_id,
+                None,
+                pool_config,
+                provider_config,
+            )
+            .await?
         } else {
             core
         };
@@ -139,10 +169,11 @@ impl DatabaseManager {
             .expect("SQLite-only code path invoked without a registry (Postgres mode bug)")
     }
 
-    /// Helper: get a storage backend to call database management methods.
-    /// In Postgres mode, grabs the storage from any loaded core (they all share a pool).
+    /// Helper: get any loaded core. In Postgres mode every core shares one
+    /// pool and one provider-config slot, so any of them can serve as the
+    /// template for database management calls and sibling construction.
     #[cfg(feature = "postgres")]
-    fn any_storage(&self) -> Result<crate::storage::StorageBackend, AtomicCoreError> {
+    fn any_core(&self) -> Result<AtomicCore, AtomicCoreError> {
         let cores = self
             .cores
             .read()
@@ -150,8 +181,15 @@ impl DatabaseManager {
         cores
             .values()
             .next()
-            .map(|c| c.storage.clone())
+            .cloned()
             .ok_or_else(|| AtomicCoreError::Configuration("No cores loaded".to_string()))
+    }
+
+    /// Helper: get a storage backend to call database management methods.
+    /// In Postgres mode, grabs the storage from any loaded core (they all share a pool).
+    #[cfg(feature = "postgres")]
+    fn any_storage(&self) -> Result<crate::storage::StorageBackend, AtomicCoreError> {
+        self.any_core().map(|c| c.storage.clone())
     }
 
     /// Resolve a database identifier to its canonical ID.
@@ -233,7 +271,11 @@ impl DatabaseManager {
             if let Some(existing) = existing_core {
                 if let Some(pg) = existing.storage.as_postgres() {
                     let new_pg = pg.with_db_id(id);
-                    let core = AtomicCore::from_postgres_storage(new_pg);
+                    // Sibling construction shares the existing core's pool
+                    // and live provider-config slot, so an explicit config
+                    // (and any later `update_provider_config`) covers every
+                    // logical database resolved through this manager.
+                    let core = existing.sibling_with_storage(new_pg);
                     // Seed default tags for this db_id if needed.
                     let storage = core.storage.clone();
                     let all_tags = storage.get_all_tags_impl().await?;
@@ -343,13 +385,15 @@ impl DatabaseManager {
     pub async fn create_database(&self, name: &str) -> Result<DatabaseInfo, AtomicCoreError> {
         #[cfg(feature = "postgres")]
         if self.is_postgres() {
-            let storage = self.any_storage()?;
+            let existing = self.any_core()?;
+            let storage = existing.storage.clone();
             let info = storage.create_database_sync(name).await?;
 
-            // Create a core for the new database (shares Postgres pool, new db_id)
+            // Create a core for the new database (shares Postgres pool, new
+            // db_id, and the manager-wide provider-config slot)
             if let Some(pg) = storage.as_postgres() {
                 let new_pg = pg.with_db_id(&info.id);
-                let core = AtomicCore::from_postgres_storage(new_pg);
+                let core = existing.sibling_with_storage(new_pg);
                 // Seed default tags
                 let all_tags = core.storage.get_all_tags_impl().await?;
                 if all_tags.is_empty() {

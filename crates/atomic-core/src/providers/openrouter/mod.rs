@@ -23,16 +23,37 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    /// Construct against the default OpenRouter endpoint
+    /// ([`crate::providers::OPENROUTER_DEFAULT_BASE_URL`]).
     pub fn new(api_key: String) -> Self {
+        Self::with_base_url(
+            api_key,
+            crate::providers::OPENROUTER_DEFAULT_BASE_URL.to_string(),
+        )
+    }
+
+    /// Construct against an explicit base URL — a proxy, gateway, or test
+    /// server speaking the OpenRouter API. The URL is normalized the same
+    /// way as [`crate::providers::OpenAICompatProvider`]'s: trailing slashes
+    /// are trimmed and a `/v1` segment is appended when missing, so both
+    /// `http://host:port` and `http://host:port/api/v1` work.
+    pub fn with_base_url(api_key: String, base_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        let trimmed = base_url.trim_end_matches('/').to_string();
+        let base_url = if trimmed.ends_with("/v1") {
+            trimmed
+        } else {
+            format!("{}/v1", trimmed)
+        };
+
         Self {
             client,
             api_key,
-            base_url: "https://openrouter.ai/api/v1".to_string(),
+            base_url,
         }
     }
 
