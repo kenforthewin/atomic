@@ -51,7 +51,8 @@ pub use account_plane::{
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use control_plane::ControlPlane;
 pub use curated_models::{
-    validate_managed_model_config, MANAGED_EMBEDDING_MODEL, MANAGED_LLM_MODELS,
+    merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
+    MANAGED_LLM_MODELS,
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;

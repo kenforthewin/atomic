@@ -227,7 +227,19 @@ impl ProviderConfig {
     /// mode: AI operations resolve their settings map once per operation, and
     /// this overlay makes the active config authoritative over whatever the
     /// settings tables hold, without touching unrelated settings (prompts,
-    /// strategies, non-provider model selection).
+    /// strategies).
+    ///
+    /// **Model selection is part of provider config.** Beyond the keys
+    /// `from_settings` reads back, the overlay also pins the per-task model
+    /// keys (`wiki_model`, `chat_model`) to this config's
+    /// [`llm_model`](Self::llm_model): wiki generation, the chat agent, and
+    /// reports resolve their model from those settings keys (OpenRouter
+    /// only; the other providers already use `llm_model()` directly), and an
+    /// explicit config that left them settings-resolved would let a settings
+    /// write route traffic on the explicitly configured credential to any
+    /// model the key can reach — exactly what explicit mode exists to
+    /// prevent. The roundtrip property above is unaffected: `from_settings`
+    /// ignores both keys.
     pub(crate) fn apply_to_settings(&self, settings: &mut HashMap<String, String>) {
         let provider = match self.provider_type {
             ProviderType::OpenRouter => "openrouter",
@@ -252,6 +264,10 @@ impl ProviderConfig {
             "tagging_model".to_string(),
             self.openrouter_llm_model.clone(),
         );
+        // The per-task model keys (doc comment above): one explicit LLM
+        // selection governs tagging, wiki, chat, and reports alike.
+        settings.insert("wiki_model".to_string(), self.llm_model().to_string());
+        settings.insert("chat_model".to_string(), self.llm_model().to_string());
         match self.openrouter_context_length {
             Some(len) => settings.insert("openrouter_context_length".to_string(), len.to_string()),
             None => settings.remove("openrouter_context_length"),
@@ -793,13 +809,29 @@ mod tests {
             "http://stale".to_string(),
         );
         settings.insert("embedding_model".to_string(), "stale/embed".to_string());
-        settings.insert("wiki_model".to_string(), "keep/this-model".to_string());
+        settings.insert("wiki_model".to_string(), "frontier/expensive".to_string());
+        settings.insert("chat_model".to_string(), "frontier/expensive".to_string());
+        settings.insert(
+            "wiki_generation_prompt".to_string(),
+            "keep this prompt".to_string(),
+        );
 
         config.apply_to_settings(&mut settings);
         assert_eq!(ProviderConfig::from_settings(&settings), config);
+        // Model selection is provider config: the per-task model keys are
+        // pinned to the explicit config's LLM, so a settings write can never
+        // route wiki/chat/report traffic on the configured credential to a
+        // model the config didn't choose.
+        for key in ["wiki_model", "chat_model"] {
+            assert_eq!(
+                settings.get(key).map(|s| s.as_str()),
+                Some(config.llm_model()),
+                "{key} must be pinned to the explicit config's LLM"
+            );
+        }
         assert_eq!(
-            settings.get("wiki_model").map(|s| s.as_str()),
-            Some("keep/this-model"),
+            settings.get("wiki_generation_prompt").map(|s| s.as_str()),
+            Some("keep this prompt"),
             "non-provider settings must survive the overlay"
         );
 

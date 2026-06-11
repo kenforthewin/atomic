@@ -251,8 +251,11 @@ pub struct AtomicCore {
     /// constructor without a `_provider` variant) keeps today's behavior:
     /// provider config is resolved from the settings tables on every
     /// operation. `Some` makes the held config authoritative — the settings
-    /// tables are never consulted for provider config, only for non-provider
-    /// AI settings (prompts, strategies, wiki/chat model selection).
+    /// tables are never consulted for provider config (keys, base URLs,
+    /// provider selection, or any model selection, the per-task
+    /// `wiki_model`/`chat_model` keys included; see
+    /// `ProviderConfig::apply_to_settings`), only for non-provider AI
+    /// settings (prompts, strategies).
     ///
     /// Shared (`Arc`) across every core resolved from the same
     /// `DatabaseManager`, so a live swap via [`AtomicCore::update_provider_config`]
@@ -381,11 +384,14 @@ impl AtomicCore {
     ///
     /// * `Some(config)` — every AI operation builds its providers from
     ///   `config`; the settings tables are **never** consulted for provider
-    ///   config (keys, base URLs, provider selection, embedding/tagging
-    ///   models). Non-provider AI settings (prompts, strategies, wiki/chat
-    ///   model selection) still resolve from settings. Composing processes
-    ///   that manage provider credentials outside the settings tables use
-    ///   this; pair with [`update_provider_config`](Self::update_provider_config)
+    ///   config (keys, base URLs, provider selection, or model selection —
+    ///   the config's `llm_model` also governs the per-task
+    ///   `wiki_model`/`chat_model` keys, so a settings write cannot route
+    ///   traffic on the configured credential to a model the config didn't
+    ///   choose). Non-provider AI settings (prompts, strategies) still
+    ///   resolve from settings. Composing processes that manage provider
+    ///   credentials outside the settings tables use this; pair with
+    ///   [`update_provider_config`](Self::update_provider_config)
     ///   for live rotation.
     /// * `None` — identical to [`open_postgres`](Self::open_postgres):
     ///   provider config is read from settings on every operation.

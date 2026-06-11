@@ -36,9 +36,11 @@
 //!   row doesn't exist; a missing managed row is **not** re-provisioned
 //!   here — managed keys are minted at signup only.
 //! - **`PUT /api/account/provider/models`** — model selection on the active
-//!   row. Managed rows are curation-checked ([`crate::curated_models`]);
-//!   BYOK rows choose freely. An embedding-model change returns a loud
-//!   `reembed_warning` — every stored vector is invalidated by it.
+//!   row. Managed rows are curation-checked ([`crate::curated_models`]) and
+//!   merged over the stored config so platform-seeded keys survive; BYOK
+//!   rows choose freely and replace wholesale. An embedding-model change
+//!   returns a loud `reembed_warning` — every stored vector is invalidated
+//!   by it.
 //!
 //! **Live rotation** (plan steps 1-5): after any successful write the fresh
 //! [`ProviderConfig`] is applied to the account's cached entry via
@@ -46,7 +48,9 @@
 //! eviction, so in-flight operations finish on the config they started with
 //! and open WebSockets are untouched. Step 6 (clearing
 //! `accounts.provider_paused_until` when the circuit breaker is open)
-//! arrives with the dispatcher slice, which owns the breaker itself.
+//! arrives with the dispatcher slice, which owns the breaker itself. The
+//! three mutating routes are serialized per account ([`AccountLocks`]) so
+//! the stored and live configs cannot diverge under concurrent writes.
 //!
 //! # `DELETE /api/account` (plan: "Provisioning lifecycle" → "Account deletion")
 //!
@@ -127,6 +131,7 @@
 //! [`delete_account`]: crate::provision::delete_account
 //! [`AccountCache::evict`]: crate::account_cache::AccountCache::evict
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,7 +145,7 @@ use serde_json::{json, Value};
 use crate::account_cache::AccountCache;
 use crate::auth::{CloudAuth, ResolvedTenant};
 use crate::control_plane::ControlPlane;
-use crate::curated_models::validate_managed_model_config;
+use crate::curated_models::{merge_managed_model_config, validate_managed_model_config};
 use crate::error::CloudError;
 use crate::keyvault::{KeyVault, SecretKey};
 use crate::managed_keys::ManagedKeys;
@@ -188,6 +193,44 @@ struct PlaneState {
     /// the WebSocket channel it owns — would linger until the idle TTL);
     /// provider writes live-rotate through it.
     cache: Arc<AccountCache>,
+    /// Serializes the provider-mutation routes per account; see
+    /// [`AccountLocks`].
+    provider_locks: AccountLocks,
+}
+
+/// Per-account serialization of the provider-mutation routes (BYOK save,
+/// activation, models write). Each of those is a multi-step,
+/// non-transactional sequence — credential/pointer writes in the control
+/// plane followed by the live config swap ([`apply_live_config`]) — so two
+/// concurrent writes for the same account could interleave such that storage
+/// holds one winner while the in-memory config matches the other, a
+/// divergence nothing heals until the cache entry is rebuilt. Holding one
+/// per-account lock across the whole sequence makes storage order and apply
+/// order identical by construction; the rejected alternative — re-reading
+/// the stored active credentials after the flip and applying *that* — only
+/// shrinks the window, because the applies themselves can still invert.
+/// Same in-process keyed-lock idiom as [`AccountCache`]'s loading map.
+///
+/// Writes for different accounts never contend, and the map prunes entries
+/// nobody holds or awaits, so it stays bounded by in-flight writes.
+#[derive(Default)]
+struct AccountLocks {
+    inner: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AccountLocks {
+    /// Take the account's write lock, creating it on first use. The guard is
+    /// owned, so it can be held across the route's await points.
+    async fn acquire(&self, account_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.inner.lock().expect("account lock map poisoned");
+            // Prune idle entries: strong_count == 1 means only the map holds
+            // the Arc — no guard out, no waiter queued behind one.
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(map.entry(account_id.to_string()).or_default())
+        };
+        lock.lock_owned().await
+    }
 }
 
 /// The cloud-owned tenant-plane routes as a registrable unit: construct
@@ -215,6 +258,7 @@ impl TenantPlane {
                 managed,
                 vault,
                 cache,
+                provider_locks: AccountLocks::default(),
             }),
         }
     }
@@ -454,6 +498,13 @@ async fn save_byok_provider_route(
         );
     }
 
+    // One provider write per account at a time, from here through the live
+    // swap (see [`AccountLocks`]). Taken before validation as well — a save
+    // racing another save/activate/models write has no defined winner
+    // anyway, and serializing the whole sequence is what keeps the stored
+    // and live configs convergent.
+    let _write_guard = state.provider_locks.acquire(account_id).await;
+
     // Build the candidate config and validate it against the provider
     // BEFORE storing anything (plan: validation on save).
     let candidate = build_provider_config(provider, Some(&api_key), &model_config);
@@ -580,6 +631,9 @@ async fn activate_provider_route(
         Err(_) => return bad_request("invalid_origin", "origin must be \"managed\" or \"user\"."),
     };
 
+    // One provider write per account at a time (see [`AccountLocks`]).
+    let _write_guard = state.provider_locks.acquire(account_id).await;
+
     let target = match get_credentials(
         &state.control,
         state.vault.as_ref(),
@@ -635,9 +689,10 @@ async fn activate_provider_route(
     }))
 }
 
-/// Model-selection body. The full `model_config` replaces the active row's
-/// — the vocabulary is small enough that read-modify-write on the client is
-/// the honest contract.
+/// Model-selection body. On a BYOK row the full `model_config` replaces the
+/// stored one — the vocabulary is small enough that read-modify-write on
+/// the client is the honest contract. On a managed row the submitted keys
+/// are merged over the stored config instead (route docs below).
 #[derive(Deserialize)]
 struct UpdateModelsRequest {
     model_config: Value,
@@ -646,7 +701,9 @@ struct UpdateModelsRequest {
 /// `PUT /api/account/provider/models`: model selection on the **active**
 /// credentials row (plan: "Model curation"). Managed rows are
 /// curation-checked — pinned embedding model, curated LLM list, no base-URL
-/// overrides; BYOK rows choose freely, with a loud `reembed_warning` when
+/// overrides — and the write merges over the stored config so
+/// platform-owned keys survive ([`merge_managed_model_config`]); BYOK rows
+/// choose freely and replace wholesale, with a loud `reembed_warning` when
 /// the embedding model changes.
 async fn update_models_route(
     req: HttpRequest,
@@ -662,13 +719,16 @@ async fn update_models_route(
     let Some(body) = body.map(web::Json::into_inner) else {
         return bad_request("invalid_request", "Body must be {\"model_config\": {...}}.");
     };
-    let model_config = body.model_config;
-    if !model_config.is_object() {
+    let submitted = body.model_config;
+    if !submitted.is_object() {
         return bad_request(
             "invalid_model_config",
             "model_config must be a JSON object.",
         );
     }
+
+    // One provider write per account at a time (see [`AccountLocks`]).
+    let _write_guard = state.provider_locks.acquire(account_id).await;
 
     let active =
         match get_active_credentials(&state.control, state.vault.as_ref(), account_id).await {
@@ -683,15 +743,25 @@ async fn update_models_route(
     };
 
     // Curation is per-origin: managed model choices spend the platform's
-    // money (and the platform's key), BYOK choices are the user's own.
-    if active.origin == CredentialOrigin::Managed {
-        if let Err(violation) = validate_managed_model_config(&model_config) {
+    // money (and the platform's key), BYOK choices are the user's own. On
+    // managed rows the validated write is then MERGED over the stored
+    // config: curation means the user can only ever submit the user-writable
+    // model keys, so a wholesale replace would silently drop the
+    // platform-owned keys seeded at provision (notably a base-URL override
+    // routing managed traffic through a proxy). BYOK rows keep the
+    // documented read-modify-write contract — the user owns every key,
+    // having seeded them all at save time.
+    let model_config = if active.origin == CredentialOrigin::Managed {
+        if let Err(violation) = validate_managed_model_config(&submitted) {
             return HttpResponse::BadRequest().json(json!({
                 "error": "model_not_curated",
                 "message": violation,
             }));
         }
-    }
+        merge_managed_model_config(&active.model_config, &submitted)
+    } else {
+        submitted
+    };
 
     let old_config = config_for_credentials(&active);
     let updated = match update_model_config(
@@ -989,4 +1059,59 @@ fn deletion_failed() -> HttpResponse {
                     account is still reachable, request a fresh login link \
                     to sign in and try again.",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The provider-write ordering guard: same-account acquisitions
+    /// serialize, different accounts never contend, and the map prunes
+    /// entries once nobody holds or awaits them. A true HTTP-level race test
+    /// would be timing-dependent flake bait; this pins the seam the routes
+    /// rely on instead.
+    #[actix_web::test]
+    async fn account_locks_serialize_per_account() {
+        let locks = AccountLocks::default();
+
+        let guard_a = locks.acquire("acct-a").await;
+
+        // Same account: a second acquire must park behind the held guard.
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), locks.acquire("acct-a")).await;
+        assert!(
+            blocked.is_err(),
+            "same-account acquire must wait for the held guard"
+        );
+
+        // Different account: no contention.
+        let guard_b = tokio::time::timeout(Duration::from_millis(50), locks.acquire("acct-b"))
+            .await
+            .expect("different accounts must not contend");
+
+        // Release A: the next same-account acquire proceeds.
+        drop(guard_a);
+        let guard_a2 = tokio::time::timeout(Duration::from_millis(50), locks.acquire("acct-a"))
+            .await
+            .expect("released lock must be reacquirable");
+
+        // Pruning: once every guard is dropped, the next acquire sweeps the
+        // idle entries — the map holds exactly the key being acquired.
+        drop(guard_a2);
+        drop(guard_b);
+        let guard_c = locks.acquire("acct-c").await;
+        let live_keys: Vec<String> = locks
+            .inner
+            .lock()
+            .expect("lock map")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            live_keys,
+            vec!["acct-c".to_string()],
+            "idle entries must be pruned on acquire"
+        );
+        drop(guard_c);
+    }
 }

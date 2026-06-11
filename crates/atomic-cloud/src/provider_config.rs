@@ -27,7 +27,7 @@
 //! | key | meaning |
 //! |---|---|
 //! | `embedding_model` | embedding model id |
-//! | `llm_model` | tagging/wiki/chat model id |
+//! | `llm_model` | the LLM for every task — tagging, wiki, chat, reports |
 //! | `openrouter_base_url` | OpenRouter API base override (proxies, gateways, test servers) |
 //! | `openai_compat_base_url` | OpenAI-compatible API base (required for that provider to function) |
 //! | `embedding_dimension` | embedding vector width (OpenAI-compat only; OpenRouter models carry known dimensions) |
@@ -37,6 +37,16 @@
 //! provider routes before anything lands in the column. Everything not
 //! supplied falls back to atomic-core's own defaults, which keeps this
 //! builder a thin overlay rather than a second source of default truth.
+//!
+//! `llm_model` is the account's *entire* LLM selection: in explicit mode
+//! atomic-core pins the per-task `wiki_model`/`chat_model` settings keys to
+//! the config's LLM (`ProviderConfig::apply_to_settings`), so a tenant
+//! settings write can never route wiki/chat/report traffic to a model this
+//! column didn't choose — which is what makes managed curation
+//! ([`crate::curated_models`]) actually govern every LLM consumer, not just
+//! tagging. Distinct per-task models for BYOK accounts would be new
+//! vocabulary here *plus* per-task fields on `ProviderConfig`; deferred
+//! until someone asks.
 
 use std::collections::HashMap;
 

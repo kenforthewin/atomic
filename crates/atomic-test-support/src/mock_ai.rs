@@ -16,7 +16,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -45,6 +45,10 @@ pub struct MockAiServer {
 struct MockAiCounters {
     embedding_requests: AtomicUsize,
     chat_requests: AtomicUsize,
+    /// The `model` field of every `/v1/chat/completions` request body, in
+    /// arrival order — lets tests assert *which* model an operation selected,
+    /// not just that a call happened.
+    chat_models: Mutex<Vec<String>>,
 }
 
 impl MockAiServer {
@@ -90,9 +94,24 @@ impl MockAiServer {
         self.counters.chat_requests.load(Ordering::Relaxed)
     }
 
+    /// The `model` requested by each chat-completions call so far, in
+    /// arrival order.
+    pub fn chat_request_models(&self) -> Vec<String> {
+        self.counters
+            .chat_models
+            .lock()
+            .expect("chat_models lock")
+            .clone()
+    }
+
     pub fn reset_counts(&self) {
         self.counters.embedding_requests.store(0, Ordering::Relaxed);
         self.counters.chat_requests.store(0, Ordering::Relaxed);
+        self.counters
+            .chat_models
+            .lock()
+            .expect("chat_models lock")
+            .clear();
     }
 }
 
@@ -323,6 +342,13 @@ impl Respond for ChatResponder {
             Ok(v) => v,
             Err(_) => return ResponseTemplate::new(400),
         };
+        if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+            self.counters
+                .chat_models
+                .lock()
+                .expect("chat_models lock")
+                .push(model.to_string());
+        }
 
         // Streaming chat (agent loop). Detected by `stream: true` plus a
         // `tools` array — the chat agent always sends tools, while wiki /

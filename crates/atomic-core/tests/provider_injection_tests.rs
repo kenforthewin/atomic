@@ -228,6 +228,64 @@ async fn update_provider_config_switches_live_sqlite() {
     );
 }
 
+/// Model selection is provider config: in explicit mode the per-task
+/// `wiki_model`/`chat_model` settings keys are pinned to the config's
+/// `llm_model` (`ProviderConfig::apply_to_settings`), so a settings write
+/// cannot route traffic on the explicitly configured credential to a model
+/// the config didn't choose. Proven end to end: with both keys written to a
+/// frontier model, every LLM request the mock receives — tagging at create
+/// time and the chat agent — still carries the config's model. Remove the
+/// pinning overlay and the chat leg fails with the frontier model in the
+/// request body.
+#[tokio::test]
+async fn explicit_config_pins_per_task_models_sqlite() {
+    let dir = tempfile::TempDir::new().expect("create tempdir");
+    let core =
+        AtomicCore::open_or_create(dir.path().join("pinning.db")).expect("open sqlite test db");
+    seed_dead_provider_settings(&core).await;
+    core.configure_autotag_targets(&["Topics".to_string()], &[])
+        .await
+        .expect("configure autotag targets");
+
+    let mock = MockAiServer::start().await;
+    core.update_provider_config(mock_openrouter_config(&mock));
+
+    // A tenant-writable settings write points the per-task keys elsewhere.
+    for key in ["chat_model", "wiki_model"] {
+        core.set_setting(key, "frontier/expensive")
+            .await
+            .expect("write per-task model setting");
+    }
+
+    // Tagging (create pipeline) + the chat agent both resolve their model
+    // through `settings_for_ai`.
+    create_and_await(&core, "pinned-model atom about explicit configs").await;
+    let conversation = core
+        .create_conversation(&[], Some("pinning"))
+        .await
+        .expect("create conversation");
+    core.send_chat_message(
+        &conversation.conversation.id,
+        "what do my notes say about explicit configs?",
+        |_| {},
+    )
+    .await
+    .expect("chat through the explicit config");
+
+    let models = mock.chat_request_models();
+    assert!(
+        models.len() >= 2,
+        "expected tagging and chat LLM traffic, got {models:?}"
+    );
+    for model in &models {
+        assert_eq!(
+            model, "mock-llm",
+            "every LLM call must carry the explicit config's model, \
+             never the settings-written one: {models:?}"
+        );
+    }
+}
+
 // ==================== Manager-wide sharing ====================
 
 #[cfg(feature = "postgres")]

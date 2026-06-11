@@ -814,10 +814,38 @@ async fn model_curation_managed_pinned_byok_free() {
             assert_eq!(body["status"], "updated");
             assert_eq!(body["model_config"]["llm_model"], curated);
             assert_eq!(body["reembed_warning"], Value::Null, "{body}");
-            // NOTE: the curated write replaced the seeded model_config, so the
-            // managed row no longer carries the test-only base-URL override —
-            // embeds would now go to the real default. That's fine here; no
-            // managed embeds run after this point.
+            // The managed write MERGES over the stored config: the user can
+            // only submit the curated model keys, so the platform-seeded
+            // base-URL override (which curation forbids them from
+            // resubmitting) must survive the write — both in storage and in
+            // the response's echo of the effective config.
+            let mut expected = managed_model_config(&h.managed_mock);
+            expected["llm_model"] = json!(curated);
+            assert_eq!(
+                body["model_config"], expected,
+                "the response echoes the merged config"
+            );
+            let stored: Value = sqlx::query_scalar(
+                "SELECT model_config FROM provider_credentials \
+             WHERE account_id = $1 AND origin = 'managed'",
+            )
+            .bind(account_id)
+            .fetch_one(h.control.pool())
+            .await
+            .expect("read stored model config");
+            assert_eq!(
+                stored, expected,
+                "platform-seeded keys must survive a curated models write"
+            );
+            // And the preserved override is live, not just stored: a managed
+            // embed still lands on the managed mock, not the real endpoint.
+            let before = h.managed_mock.embedding_request_count();
+            h.embed_atom("alpha", &token, "Embedded after the curated models write.")
+                .await;
+            assert!(
+                h.managed_mock.embedding_request_count() > before,
+                "post-write managed embeds must still hit the managed mock"
+            );
 
             // BYOK origin: anything goes. Save a key against the BYOK mock,
             // then pick arbitrary models — a non-embedding change is silent, an
@@ -875,6 +903,156 @@ async fn model_curation_managed_pinned_byok_free() {
                     .is_some_and(|w| w.contains("re-embed")),
                 "BYOK embedding change warns loudly: {body}"
             );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The curation-bypass closure (plan: "Model curation"): wiki, chat, and
+/// report models resolve from the tenant-writable `wiki_model`/`chat_model`
+/// settings keys, and `PUT /api/settings/{key}` is live on cloud tenant
+/// hosts — so without atomic-core's explicit-mode overlay
+/// (`ProviderConfig::apply_to_settings` pins both keys to the config's
+/// `llm_model`), a managed tenant could route frontier inference onto the
+/// platform-funded key with one settings write. This pins the closure
+/// end-to-end: the settings writes succeed (they're inert, not blocked),
+/// but every LLM request reaching the managed mock still carries the
+/// curated managed model. Remove the overlay and this test fails with the
+/// frontier model in the request body.
+#[actix_web::test]
+async fn settings_writes_cannot_reroute_managed_llm_traffic() {
+    with_control_db(
+        "settings_writes_cannot_reroute_managed_llm_traffic",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (_account, token) = h.provision("alpha").await;
+            let curated_llm = managed_model_config(&h.managed_mock)["llm_model"]
+                .as_str()
+                .expect("seeded llm model")
+                .to_string();
+
+            // The tenant writes frontier models into the per-task keys. The
+            // writes succeed — settings stay writable; the overlay makes the
+            // provider-model keys inert rather than rejecting them.
+            const FRONTIER: &str = "frontier/extremely-expensive";
+            for key in ["chat_model", "wiki_model"] {
+                let resp = h
+                    .api(Method::PUT, "alpha", &format!("/api/settings/{key}"))
+                    .bearer_auth(&token)
+                    .json(&json!({ "value": FRONTIER }))
+                    .send()
+                    .await
+                    .expect("send settings put");
+                let (status, body) = h.read(resp).await;
+                assert_eq!(status, StatusCode::OK, "{key}: {body}");
+            }
+
+            // A chat round-trip through the live server — the cheapest
+            // operation that resolves its model from `chat_model`.
+            let resp = h
+                .api(Method::POST, "alpha", "/api/conversations")
+                .bearer_auth(&token)
+                .json(&json!({ "tag_ids": [], "title": "curation bypass" }))
+                .send()
+                .await
+                .expect("send create conversation");
+            let (status, conversation) = h.read(resp).await;
+            assert_eq!(status, StatusCode::CREATED, "{conversation}");
+            let conversation_id = conversation["id"].as_str().expect("conversation id");
+
+            let resp = h
+                .api(
+                    Method::POST,
+                    "alpha",
+                    &format!("/api/conversations/{conversation_id}/messages"),
+                )
+                .bearer_auth(&token)
+                .json(&json!({ "content": "What do my notes say about Rust workspaces?" }))
+                .send()
+                .await
+                .expect("send chat message");
+            let (status, message) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "{message}");
+
+            // Every LLM request that reached the managed endpoint carried
+            // the curated model — in explicit mode the per-task keys are
+            // pinned to the config's `llm_model`, so nothing else can occur.
+            let models = h.managed_mock.chat_request_models();
+            assert!(
+                !models.is_empty(),
+                "the chat round-trip must produce LLM traffic on the managed mock"
+            );
+            for model in &models {
+                assert_eq!(
+                    model, &curated_llm,
+                    "managed LLM traffic must carry the curated model, \
+                     never the settings-written one: {models:?}"
+                );
+            }
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// The key-echo scrub (module docs in `tenant_plane`: never include the key
+/// in error messages): a hostile or misconfigured validation endpoint that
+/// echoes the submitted key verbatim in its error body must produce a 400
+/// whose message carries `[redacted]` — with the surrounding provider
+/// context intact — and no response body anywhere containing the key.
+#[actix_web::test]
+async fn byok_validation_error_scrubs_echoed_key() {
+    with_control_db(
+        "byok_validation_error_scrubs_echoed_key",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (_account, token) = h.provision("alpha").await;
+
+            const ECHOED_KEY: &str = "sk-or-echo-victim-3cf09a";
+            let hostile = openrouter_auth_endpoint(
+                ECHOED_KEY,
+                401,
+                json!({ "error": {
+                    "message": format!("Invalid key {ECHOED_KEY} rejected by hostile endpoint")
+                }}),
+            )
+            .await;
+
+            let resp = h
+                .api(Method::PUT, "alpha", "/api/account/provider")
+                .bearer_auth(&token)
+                .json(&json!({
+                    "provider": "openrouter",
+                    "api_key": ECHOED_KEY,
+                    "model_config": { "openrouter_base_url": hostile.uri() },
+                }))
+                .send()
+                .await
+                .expect("send byok put");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "provider_validation_failed");
+            let message = body["message"].as_str().expect("message");
+            assert!(
+                message.contains("[redacted]"),
+                "the echo is scrubbed to a marker: {message}"
+            );
+            assert!(
+                !message.contains(ECHOED_KEY),
+                "the submitted key must not survive the scrub: {message}"
+            );
+            assert!(
+                message.contains("rejected by hostile endpoint"),
+                "the provider's error context survives around the scrub: {message}"
+            );
+
+            // Belt and braces: not in any body this harness has read, and the
+            // rejected save stored nothing.
+            h.assert_bodies_free_of(ECHOED_KEY, "echoed BYOK key");
+            assert!(!control_db_contains(&url, ECHOED_KEY).await);
 
             h.stop().await;
         },

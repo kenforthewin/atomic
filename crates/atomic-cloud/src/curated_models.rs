@@ -27,7 +27,7 @@
 //! embedding-model change is saved (plan text), produced by the routes, not
 //! here.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The fleet-wide pinned embedding model for managed keys. Matches
 /// atomic-core's OpenRouter default so settings-mode (self-hosted) and
@@ -44,11 +44,19 @@ pub const MANAGED_LLM_MODELS: &[&str] = &[
     "google/gemini-2.0-flash-001",
 ];
 
-/// The `model_config` keys a **user** may write on a managed row. Anything
-/// else is rejected — most importantly the base-URL override keys
-/// (`openrouter_base_url` / `openai_compat_base_url`, see
-/// [`crate::provider_config`]): a user-supplied base URL on a managed key
-/// would route the platform-funded credential to an arbitrary endpoint.
+/// The `model_config` keys a **user** may write on a managed row — the
+/// model selections, and nothing else. This is the user-writable half of
+/// the managed config split; everything outside it is **platform-owned**:
+/// seeded at provision time and only ever written platform-side — most
+/// importantly the base-URL override keys (`openrouter_base_url` /
+/// `openai_compat_base_url`, see [`crate::provider_config`]): a
+/// user-supplied base URL on a managed key would route the platform-funded
+/// credential to an arbitrary endpoint.
+///
+/// Reads as well as writes respect the split: [`validate_managed_model_config`]
+/// rejects user writes outside this list, and
+/// [`merge_managed_model_config`] preserves the platform-owned keys when a
+/// validated write lands.
 const MANAGED_ALLOWED_KEYS: &[&str] = &["embedding_model", "llm_model"];
 
 /// Validate a user-submitted `model_config` for a managed credentials row.
@@ -104,6 +112,28 @@ pub fn validate_managed_model_config(model_config: &Value) -> Result<(), String>
     }
 
     Ok(())
+}
+
+/// Merge a validated user write over a managed row's stored `model_config`,
+/// preserving the platform-owned keys (module docs:
+/// [`MANAGED_ALLOWED_KEYS`] is the user-writable set; everything else is
+/// platform-owned).
+///
+/// Curation rejects unknown keys, so a user can never *resubmit* a
+/// platform-seeded key like `openrouter_base_url` — a wholesale replace
+/// would silently drop it, rerouting a proxy deployment's managed traffic
+/// to the real endpoint. The merge keeps every stored key and overlays only
+/// what the user submitted; callers must run
+/// [`validate_managed_model_config`] on `submitted` first, which guarantees
+/// the overlay touches user-writable keys only.
+pub fn merge_managed_model_config(stored: &Value, submitted: &Value) -> Value {
+    let mut merged: Map<String, Value> = stored.as_object().cloned().unwrap_or_default();
+    if let Some(submitted) = submitted.as_object() {
+        for (key, value) in submitted {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 #[cfg(test)]
@@ -165,5 +195,43 @@ mod tests {
         assert!(validate_managed_model_config(&json!(["a"])).is_err());
         let err = validate_managed_model_config(&json!({ "llm_model": 42 })).unwrap_err();
         assert!(err.contains("must be a string"), "{err}");
+    }
+
+    #[test]
+    fn merge_preserves_platform_owned_keys() {
+        // A user picks a different curated LLM. The platform-seeded base-URL
+        // override (which curation forbids them from resubmitting) must
+        // survive, and the untouched embedding model stays put.
+        let stored = json!({
+            "embedding_model": MANAGED_EMBEDDING_MODEL,
+            "llm_model": MANAGED_LLM_MODELS[0],
+            "openrouter_base_url": "http://proxy.internal/api/v1",
+        });
+        let submitted = json!({ "llm_model": MANAGED_LLM_MODELS[1] });
+        let merged = merge_managed_model_config(&stored, &submitted);
+        assert_eq!(
+            merged,
+            json!({
+                "embedding_model": MANAGED_EMBEDDING_MODEL,
+                "llm_model": MANAGED_LLM_MODELS[1],
+                "openrouter_base_url": "http://proxy.internal/api/v1",
+            })
+        );
+    }
+
+    #[test]
+    fn merge_tolerates_degenerate_shapes() {
+        // Empty submission: a no-op. Non-object stored config (never written
+        // by us, but the column is JSONB): treated as empty rather than
+        // panicking, so the submission alone defines the result.
+        let stored = json!({ "llm_model": MANAGED_LLM_MODELS[0] });
+        assert_eq!(merge_managed_model_config(&stored, &json!({})), stored);
+        assert_eq!(
+            merge_managed_model_config(
+                &Value::Null,
+                &json!({ "llm_model": MANAGED_LLM_MODELS[2] })
+            ),
+            json!({ "llm_model": MANAGED_LLM_MODELS[2] })
+        );
     }
 }
