@@ -31,6 +31,17 @@
 //!   request's tenant. Cloud tokens live in the control plane
 //!   ([`crate::tokens`]), so [`cloud_plane_guard`] unroutes the family
 //!   entirely (404).
+//! - The **export-job family** (inside `api_scope`:
+//!   `POST /api/databases/{id}/exports/markdown`, `GET|DELETE
+//!   /api/exports/{id}`) reads `state.export_jobs` — under cloud, the single
+//!   inert fallback's `ExportJobManager`, one process-global namespace of
+//!   job ids and artifacts shared by every tenant. Any authenticated tenant
+//!   could fetch or delete another tenant's export by id, so
+//!   [`cloud_plane_guard`] unroutes the family (404) until a per-tenant
+//!   export story exists.
+//! - **`GET /api/logs`** (inside `api_scope`) reads `state.log_buffer` —
+//!   likewise a single process-wide ring buffer, not a per-tenant log
+//!   stream. Unrouted (404) for the same reason.
 //!
 //! # The fallback `AppState` decision
 //!
@@ -39,7 +50,8 @@
 //! [`RequestDatabaseManager`] / [`RequestEventChannel`] extensions: the `Db`
 //! extractor takes the state for its fallback unconditionally (see the
 //! `FromRequest` doc in `atomic-server/src/db_extractor.rs`), and several
-//! handlers extract `web::Data<AppState>` for `log_buffer` / `export_jobs`.
+//! handlers extract `web::Data<AppState>` for `log_buffer` / `export_jobs`
+//! (those handlers' routes are unrouted, per the list above).
 //! The state's `manager` field cannot be absent, so the cloud composition
 //! registers a **dedicated inert fallback** ([`FallbackAppState`]): an empty
 //! SQLite scratch store in a process-lifetime temp directory. It is a
@@ -50,9 +62,10 @@
 //! - [`cloud_plane_guard`] makes that an invariant rather than a happy-path
 //!   property: a request that somehow reaches the route table *without* the
 //!   tenant extension is failed closed (500), not served from the fallback.
-//! - The route families that bind the composition-time manager directly
-//!   (`/api/auth/*`, the public/MCP planes) are unrouted or 404'd, per the
-//!   list above.
+//! - The route families that bind composition-time state directly —
+//!   `/api/auth/*` (manager), the export-job family (`export_jobs`),
+//!   `/api/logs` (`log_buffer`), and the public/MCP planes — are unrouted
+//!   or 404'd, per the list above.
 //!
 //! The alternative — teaching atomic-server to serve without an `AppState` —
 //! would mean making the state's fields optional across ~78 routes for the
@@ -131,15 +144,42 @@ impl FallbackAppState {
     }
 }
 
+/// Whether `path` belongs to a route family whose handlers operate on
+/// composition-time [`AppState`] fields — under cloud, the single inert
+/// fallback shared by every tenant — rather than the request's resolved
+/// tenant. These planes are unrouted (404) in the cloud composition; the
+/// module docs enumerate each family and why:
+///
+/// - `/api/auth/*` — self-hosted's token plane (`state.manager`).
+/// - `/api/exports/{id}` and `/api/databases/{id}/exports/*` — the
+///   export-job plane (`state.export_jobs`): one process-global namespace of
+///   job ids and artifacts, so any tenant could read or delete another
+///   tenant's export by id.
+/// - `/api/logs` — the process-wide log ring buffer (`state.log_buffer`).
+fn fallback_bound_plane(path: &str) -> bool {
+    if path.starts_with("/api/auth/") || path.starts_with("/api/exports/") || path == "/api/logs" {
+        return true;
+    }
+    // `/api/databases/{id}/exports/...` — the export-start route lives under
+    // the databases prefix; match the whole exports subtree so a future
+    // export format added to atomic-server stays unrouted here by default.
+    path.strip_prefix("/api/databases/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, tail)| tail == "exports" || tail.starts_with("exports/"))
+}
+
 /// Composition-level guard between [`CloudAuth`] and atomic-server's routes.
 ///
 /// Two rules, both enforcing the boundary documented in the module docs:
 ///
-/// 1. **`/api/auth/*` is unrouted (404).** That family is self-hosted's
-///    token plane; its handlers operate on the composition-time
-///    [`AppState`] manager — in cloud, the inert fallback — rather than the
-///    request's tenant. Cloud tokens are control-plane rows managed via the
-///    CLI (and, in later slices, cloud-owned routes).
+/// 1. **Fallback-bound planes are unrouted (404).** The self-hosted token
+///    plane (`/api/auth/*`), the export-job family, and `/api/logs` all
+///    operate on composition-time [`AppState`] fields — in cloud, the inert
+///    fallback, one process-global namespace shared across tenants — rather
+///    than the request's tenant (see [`fallback_bound_plane`]). Cloud tokens
+///    are control-plane rows managed via the CLI (and, in later slices,
+///    cloud-owned routes); per-tenant export and log planes arrive in later
+///    slices.
 /// 2. **No tenant extension → fail closed (500).** [`CloudAuth`] installs
 ///    [`RequestDatabaseManager`] on every request it passes through, so this
 ///    can only fire on a composition bug — and when it does, the request
@@ -151,7 +191,7 @@ pub async fn cloud_plane_guard(
     req: ServiceRequest,
     next: Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-    if req.path().starts_with("/api/auth/") {
+    if fallback_bound_plane(req.path()) {
         let denial = HttpResponse::NotFound().json(serde_json::json!({ "error": "not_found" }));
         return Ok(req.into_response(denial));
     }
@@ -215,5 +255,41 @@ pub fn configure_cloud_app(
                     .wrap(auth.clone()),
             )
             .service(api_scope().wrap(from_fn(cloud_plane_guard)).wrap(auth));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_bound_planes_are_matched() {
+        for unrouted in [
+            "/api/auth/tokens",
+            "/api/auth/tokens/some-id",
+            "/api/exports/job-1",
+            "/api/exports/job-1/download",
+            "/api/databases/default/exports/markdown",
+            "/api/databases/abc-123/exports",
+            "/api/logs",
+        ] {
+            assert!(fallback_bound_plane(unrouted), "{unrouted} must be 404'd");
+        }
+    }
+
+    #[test]
+    fn tenant_routes_are_not_matched() {
+        for routed in [
+            "/api/atoms",
+            "/api/databases",
+            "/api/databases/default/stats",
+            "/api/databases/default/activate",
+            // Only the exact /api/logs path is the log plane.
+            "/api/logsearch",
+            // An atom id that happens to contain "exports" is not the plane.
+            "/api/atoms/exports",
+        ] {
+            assert!(!fallback_bound_plane(routed), "{routed} must stay routed");
+        }
     }
 }

@@ -102,6 +102,61 @@ async fn coalesced_loads_build_one_manager() {
     .await;
 }
 
+/// Issue: tenants on a shared cluster must get small pools (the plan
+/// budgets ~5 connections per tenant), not atomic-core's env default of 50.
+/// Asserts the cache's pool sizing reaches the tenant pool it builds — both
+/// the recorded options and the real behavior at the cap.
+#[tokio::test]
+async fn tenant_pool_honors_configured_cap() {
+    with_control_db("tenant_pool_honors_configured_cap", |url| async move {
+        let (control, cluster) = setup(&url).await;
+        let account_id = provision(&control, &cluster, "pooled").await;
+        let idle_timeout = Duration::from_secs(45);
+        let cache = cache_with(
+            &control,
+            &cluster,
+            AccountCacheConfig {
+                tenant_pool_max_connections: 1,
+                tenant_pool_idle_timeout: idle_timeout,
+                ..AccountCacheConfig::default()
+            },
+        );
+
+        let handle = cache.get_or_load(&account_id).await.expect("load");
+        let core = handle.manager.active_core().await.expect("active core");
+        let atomic_core::storage::StorageBackend::Postgres(pg) = core.storage() else {
+            panic!("tenant storage must be Postgres");
+        };
+        let options = pg.pool().options();
+        assert_eq!(
+            options.get_max_connections(),
+            1,
+            "cache config must bound the tenant pool"
+        );
+        assert_eq!(
+            options.get_idle_timeout(),
+            Some(idle_timeout),
+            "cache config must set the tenant pool's idle timeout"
+        );
+
+        // The cap is real, not cosmetic: with the single permitted
+        // connection checked out, a second acquire must block until the
+        // first is returned.
+        let held = pg.pool().acquire().await.expect("acquire at cap");
+        let starved = tokio::time::timeout(Duration::from_millis(500), pg.pool().acquire()).await;
+        assert!(
+            starved.is_err(),
+            "second acquire must block while the pool is saturated at cap 1"
+        );
+        drop(held);
+        pg.pool()
+            .acquire()
+            .await
+            .expect("released connection must be reusable");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn ttl_eviction_skips_live_receivers() {
     with_control_db("ttl_eviction_skips_live_receivers", |url| async move {
@@ -113,6 +168,7 @@ async fn ttl_eviction_skips_live_receivers() {
             AccountCacheConfig {
                 idle_ttl: Duration::from_millis(100),
                 max_entries: 1000,
+                ..AccountCacheConfig::default()
             },
         );
 
@@ -160,6 +216,7 @@ async fn hard_cap_evicts_least_recently_touched() {
             AccountCacheConfig {
                 idle_ttl: Duration::from_secs(3600),
                 max_entries: 2,
+                ..AccountCacheConfig::default()
             },
         );
 
@@ -193,6 +250,7 @@ async fn hard_cap_never_evicts_live_receivers_and_evict_removes() {
                 AccountCacheConfig {
                     idle_ttl: Duration::from_secs(3600),
                     max_entries: 1,
+                    ..AccountCacheConfig::default()
                 },
             );
 

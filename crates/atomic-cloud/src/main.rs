@@ -79,6 +79,31 @@ enum Command {
         /// Address to bind to.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+
+        /// Max connections in each cached tenant's Postgres pool. Every
+        /// active account holds its own pool, so keep this small (the plan
+        /// budgets ~5 per tenant behind pgbouncer).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_TENANT_POOL_MAX_CONNECTIONS",
+            default_value_t = 5
+        )]
+        tenant_pool_max_connections: u32,
+
+        /// Close a tenant pool's connections after this many seconds idle,
+        /// so quiet-but-cached accounts release connections back to the
+        /// cluster before their cache entry is evicted.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_TENANT_POOL_IDLE_TIMEOUT_SECS",
+            default_value_t = 300
+        )]
+        tenant_pool_idle_timeout_secs: u64,
+
+        /// How often the periodic idle sweep of the account cache runs, in
+        /// seconds. Defaults to a quarter of the cache idle TTL.
+        #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
+        cache_sweep_interval_secs: Option<u64>,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -193,7 +218,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             base_domain,
             port,
             bind,
-        } => serve(control, cluster.into_config(), base_domain, bind, port).await,
+            tenant_pool_max_connections,
+            tenant_pool_idle_timeout_secs,
+            cache_sweep_interval_secs,
+        } => {
+            let cache_config = AccountCacheConfig {
+                tenant_pool_max_connections,
+                tenant_pool_idle_timeout: std::time::Duration::from_secs(
+                    tenant_pool_idle_timeout_secs,
+                ),
+                ..AccountCacheConfig::default()
+            };
+            serve(
+                control,
+                cluster.into_config(),
+                base_domain,
+                bind,
+                port,
+                cache_config,
+                cache_sweep_interval_secs.map(std::time::Duration::from_secs),
+            )
+            .await
+        }
 
         Command::Account { action } => match action {
             AccountAction::Create {
@@ -266,19 +312,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Run the composed multi-tenant server until interrupted. See
 /// [`atomic_cloud::server`] for what the composition serves (and what it
 /// deliberately doesn't until later slices).
+///
+/// `sweep_interval` controls the periodic account-cache sweep; `None` means
+/// a quarter of the cache's idle TTL.
 async fn serve(
     control: ControlPlane,
     cluster: ClusterConfig,
     base_domain: String,
     bind: String,
     port: u16,
+    cache_config: AccountCacheConfig,
+    sweep_interval: Option<std::time::Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = Arc::new(AccountCache::new(
-        control.clone(),
-        cluster,
-        AccountCacheConfig::default(),
-    ));
-    let auth = CloudAuth::new(control, cache, &base_domain);
+    let sweep_interval = sweep_interval
+        .unwrap_or(cache_config.idle_ttl / 4)
+        .max(std::time::Duration::from_secs(1));
+    let cache = Arc::new(AccountCache::new(control.clone(), cluster, cache_config));
+    let auth = CloudAuth::new(control, Arc::clone(&cache), &base_domain);
+
+    // Periodic idle sweep. The cache also sweeps inline when a load inserts
+    // a new entry, but a stable working set produces no inserts — without
+    // this task, idle entries would hold their tenant pools forever. The
+    // sweep semantics themselves (TTL, live-WebSocket pinning) are pinned by
+    // tests/account_cache.rs, which drives `sweep()` with no insert traffic;
+    // this loop is interval glue around that tested method.
+    tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move {
+            let mut ticker = tokio::time::interval(sweep_interval);
+            // The first tick fires immediately; nothing can be idle yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                cache.sweep().await;
+            }
+        }
+    });
 
     // Must outlive the server: it owns the scratch directory backing the
     // inert fallback AppState (see server.rs module docs).

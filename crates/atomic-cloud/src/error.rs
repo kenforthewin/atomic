@@ -67,6 +67,15 @@ pub enum CloudError {
     #[error("account {0} has no active tenant database")]
     MissingTenantDatabase(String),
 
+    /// The accounts row stopped being `status = 'provisioning'` partway
+    /// through [`provision_account`](crate::provision::provision_account) —
+    /// a concurrent [`delete_account`](crate::provision::delete_account)
+    /// removed it (or a competing run changed it). The losing provision
+    /// aborts, dropping any tenant database it just created so nothing is
+    /// orphaned.
+    #[error("account {0} is no longer provisioning; provision aborted")]
+    AccountNoLongerProvisioning(String),
+
     /// A `cloud_tokens.scope` value didn't parse as a [`TokenScope`]
     /// (`account` | `database` | `mcp`).
     ///

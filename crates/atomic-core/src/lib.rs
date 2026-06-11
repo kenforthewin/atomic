@@ -73,6 +73,8 @@ pub use models::*;
 pub use providers::{ProviderConfig, ProviderType};
 pub use registry::{DatabaseInfo, OAuthCodeInfo, Registry};
 pub use search::{SearchMode, SearchOptions};
+#[cfg(feature = "postgres")]
+pub use storage::PgPoolConfig;
 pub use tokens::ApiTokenInfo;
 pub use wiki::runner::RegenOutcome;
 
@@ -302,15 +304,38 @@ impl AtomicCore {
     /// Most operations route through the Postgres storage backend. A few operations
     /// (search, wiki generation, chat agent) still require module-level refactoring
     /// and will return `Configuration` errors when used with Postgres.
+    ///
+    /// The connection pool is sized from the `ATOMIC_PG_*` environment
+    /// variables (see [`storage::PgPoolConfig::from_env`]); use
+    /// [`open_postgres_with_pool`](Self::open_postgres_with_pool) to size it
+    /// explicitly.
     #[cfg(feature = "postgres")]
     pub async fn open_postgres(
         database_url: &str,
         db_id: &str,
         registry: Option<Arc<registry::Registry>>,
     ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool(database_url, db_id, registry, PgPoolConfig::from_env()).await
+    }
+
+    /// Like [`open_postgres`](Self::open_postgres), but with an explicit
+    /// pool configuration instead of the `ATOMIC_PG_*` environment defaults.
+    ///
+    /// Callers that hold many independently pooled cores in one process can
+    /// use this to bound each pool so the sum stays within the Postgres
+    /// server's `max_connections`; `open_postgres` keeps the env-derived
+    /// default for the common one-core-per-process deployment.
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_pool(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        pool_config: PgPoolConfig,
+    ) -> Result<Self, AtomicCoreError> {
         use storage::PostgresStorage;
 
-        let pg_storage = PostgresStorage::connect(database_url, db_id).await?;
+        let pg_storage =
+            PostgresStorage::connect_with_config(database_url, db_id, pool_config).await?;
         pg_storage.initialize().await?;
 
         Self::reconcile_pg_vector_index(&pg_storage).await?;
@@ -571,10 +596,15 @@ impl AtomicCore {
         self.storage.as_sqlite().map(|s| Arc::clone(&s.db))
     }
 
-    /// Get a reference to the underlying storage backend. Used by sibling
-    /// modules (briefing, scheduler helpers) that need to issue storage
-    /// calls directly without going through the full facade surface.
-    pub(crate) fn storage(&self) -> &storage::StorageBackend {
+    /// Get a reference to the underlying storage backend.
+    ///
+    /// Used by sibling modules (briefing, scheduler helpers) that need to
+    /// issue storage calls directly without going through the full facade
+    /// surface. Public because composing layers occasionally need
+    /// backend-specific facilities the facade deliberately doesn't wrap —
+    /// per-database settings via the sync helpers, or inspecting the
+    /// Postgres connection pool.
+    pub fn storage(&self) -> &storage::StorageBackend {
         &self.storage
     }
 

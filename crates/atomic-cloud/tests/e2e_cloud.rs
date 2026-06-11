@@ -534,6 +534,52 @@ async fn unknown_subdomain_and_unauthenticated_requests() {
     .await;
 }
 
+/// The export-job and log planes are bound to composition-time state
+/// (`AppState.export_jobs` / `AppState.log_buffer` — under cloud, the single
+/// inert fallback shared by every tenant), making export jobs/artifacts and
+/// the log ring buffer one process-global namespace: any authenticated
+/// tenant could read or DELETE another tenant's export by id, or read
+/// cross-tenant logs. The composition unroutes those planes; pin the
+/// route-level 404 — including the guard's denial body, which distinguishes
+/// "unrouted" from a handler's own not-found — for an authenticated tenant.
+#[actix_web::test]
+async fn export_and_log_planes_are_unrouted() {
+    with_control_db("export_and_log_planes_are_unrouted", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+
+        for (method, path) in [
+            // Would otherwise start a job (202) against the fallback state.
+            (Method::POST, "/api/databases/default/exports/markdown"),
+            // Would otherwise read/delete jobs in the shared namespace.
+            (Method::GET, "/api/exports/any-job-id"),
+            (Method::DELETE, "/api/exports/any-job-id"),
+            // Would otherwise return the process-wide log buffer (200).
+            (Method::GET, "/api/logs"),
+        ] {
+            let resp = h
+                .api(method.clone(), &alpha.subdomain, path)
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} must be unrouted in cloud"
+            );
+            let body: Value = resp.json().await.expect("denial json");
+            assert_eq!(
+                body["error"], "not_found",
+                "{method} {path} must be denied by the route guard, not a handler"
+            );
+        }
+
+        h.stop().await;
+    })
+    .await;
+}
+
 /// Session-cookie auth works for a normal API call on the account's own
 /// subdomain.
 #[actix_web::test]
@@ -629,6 +675,7 @@ async fn live_ws_pins_cache_entry_against_eviction() {
                 AccountCacheConfig {
                     idle_ttl: Duration::from_millis(100),
                     max_entries: 1,
+                    ..AccountCacheConfig::default()
                 },
             )
             .await;

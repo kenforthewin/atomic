@@ -329,6 +329,188 @@ async fn provision_resumes_after_crash() {
     .await;
 }
 
+/// Issue: the `subdomains_reserved` pre-check and the claim INSERT are not
+/// atomic, so a concurrent `delete_account` can park the subdomain between
+/// them. The post-claim re-check (`ensure_claim_not_reserved`, the seam
+/// `provision_account` runs right after a fresh claim) must roll the claim
+/// back. The test drives the exact interleaved state by direct SQL: claim
+/// row inserted (pre-check already passed), then the deletion's hold lands.
+#[tokio::test]
+async fn claim_is_rolled_back_when_reservation_lands_mid_provision() {
+    with_control_db(
+        "claim_is_rolled_back_when_reservation_lands_mid_provision",
+        |url| async move {
+            let (control, _cluster) = setup(&url).await;
+
+            // The provision passed its pre-check (no hold yet) and claimed
+            // the subdomain...
+            let account_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ($1, 'contested', 'k@example.com', 'provisioning', 'free')",
+            )
+            .bind(account_id.to_string())
+            .execute(control.pool())
+            .await
+            .expect("insert claim row");
+
+            // ...and a concurrent delete_account parked the same subdomain.
+            // (Deletion writes this hold BEFORE hard-deleting its accounts
+            // row — the ordering that makes the post-claim re-check
+            // sufficient.)
+            sqlx::query(
+                "INSERT INTO subdomains_reserved (subdomain, expires_at) \
+                 VALUES ('contested', NOW() + INTERVAL '90 days')",
+            )
+            .execute(control.pool())
+            .await
+            .expect("park subdomain");
+
+            let err = atomic_cloud::provision::ensure_claim_not_reserved(
+                &control,
+                account_id,
+                "contested",
+            )
+            .await
+            .expect_err("post-claim re-check must reject the parked subdomain");
+            assert!(
+                matches!(err, CloudError::SubdomainReserved(ref s) if s == "contested"),
+                "expected SubdomainReserved, got {err:?}"
+            );
+            assert_eq!(
+                count(
+                    &control,
+                    "SELECT COUNT(*) FROM accounts WHERE subdomain = $1",
+                    "contested"
+                )
+                .await,
+                0,
+                "the losing claim must be rolled back"
+            );
+
+            // Without a hold the guard passes and leaves the claim alone.
+            let unchallenged = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ($1, 'unchallenged', 'k@example.com', 'provisioning', 'free')",
+            )
+            .bind(unchallenged.to_string())
+            .execute(control.pool())
+            .await
+            .expect("insert claim row");
+            atomic_cloud::provision::ensure_claim_not_reserved(
+                &control,
+                unchallenged,
+                "unchallenged",
+            )
+            .await
+            .expect("no hold, no rollback");
+            assert_eq!(
+                count(
+                    &control,
+                    "SELECT COUNT(*) FROM accounts WHERE subdomain = $1",
+                    "unchallenged"
+                )
+                .await,
+                1,
+                "an unchallenged claim must survive the re-check"
+            );
+        },
+    )
+    .await;
+}
+
+/// Issue: a `delete_account` completing while a resumed provision is in
+/// flight (claim done, migrations running) removes the accounts row out
+/// from under it; the provision's `account_databases` INSERT then hits a
+/// foreign-key violation — and without cleanup the tenant database it just
+/// re-created would be orphaned forever (no accounts row left to derive its
+/// name from). Drives the real interleaving: a resumed provision runs in a
+/// task, and the accounts row is deleted by direct SQL the moment the
+/// tenant database appears in `pg_database` (migrations still have hundreds
+/// of milliseconds to run, so the row is gone before the INSERT).
+#[tokio::test]
+async fn racing_deletion_does_not_orphan_tenant_database() {
+    with_control_db(
+        "racing_deletion_does_not_orphan_tenant_database",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            // Seed a crashed provision with a *known* account id so the
+            // tenant database name is known up front; provision_account
+            // resumes it (same email + subdomain, status 'provisioning').
+            let account_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ($1, 'race-victim', 'r@example.com', 'provisioning', 'free')",
+            )
+            .bind(account_id.to_string())
+            .execute(control.pool())
+            .await
+            .expect("seed crashed provision");
+            let db_name = atomic_cloud::tenant_db_name(account_id);
+
+            // Extra guard beyond with_control_db's bookkeeping: if the test
+            // fails *because* the database was orphaned, the accounts row is
+            // gone and the support cleanup can no longer discover the name.
+            with_db_guard(&cluster.cluster_url, &db_name, || async {
+                // Run the provision and the saboteur concurrently in one
+                // task (join!, not spawn — provision_account's sqlx futures
+                // trip rustc's "implementation is not general enough"
+                // higher-ranked lifetime check under spawn's Send bound).
+                let provision = provision_account(
+                    &control,
+                    &cluster,
+                    new_account("r@example.com", "race-victim"),
+                );
+                let saboteur = async {
+                    // Wait for CREATE DATABASE to land...
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !database_exists(&cluster.cluster_url, &db_name).await {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "tenant database never appeared; provision stalled"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    // ...then yank the accounts row, as the tail end of a
+                    // concurrent delete_account would.
+                    sqlx::query("DELETE FROM accounts WHERE id = $1")
+                        .bind(account_id.to_string())
+                        .execute(control.pool())
+                        .await
+                        .expect("delete accounts row mid-provision");
+                };
+
+                let (provision_result, ()) = tokio::join!(provision, saboteur);
+                let err =
+                    provision_result.expect_err("provision must fail once its account is gone");
+                assert!(
+                    matches!(err, CloudError::AccountNoLongerProvisioning(ref id)
+                        if *id == account_id.to_string()),
+                    "expected AccountNoLongerProvisioning, got {err:?}"
+                );
+                assert!(
+                    !database_exists(&cluster.cluster_url, &db_name).await,
+                    "the losing provision must drop the tenant database it created"
+                );
+                assert_eq!(
+                    count(
+                        &control,
+                        "SELECT COUNT(*) FROM account_databases WHERE account_id = $1",
+                        &account_id.to_string(),
+                    )
+                    .await,
+                    0,
+                    "no mapping row may survive"
+                );
+            })
+            .await;
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn delete_account_removes_everything_and_parks_subdomain() {
     with_control_db(

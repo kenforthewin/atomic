@@ -23,6 +23,20 @@
 //! already-dropped database and already-deleted rows, and the freed
 //! subdomain is reserved *before* the accounts row is hard-deleted so a
 //! crash between the two can't lose the 90-day reservation.
+//!
+//! # Provision/deletion races
+//!
+//! Provisioning and deletion can interleave on a live system; two guards in
+//! [`provision_account`] keep that safe:
+//!
+//! - [`ensure_claim_not_reserved`] re-checks `subdomains_reserved` *after*
+//!   the claim INSERT, rolling the claim back if a concurrent deletion
+//!   parked the subdomain between the pre-check and the claim.
+//! - Tenant-database creation re-verifies the account is still
+//!   `status = 'provisioning'`, and the `account_databases` INSERT treats a
+//!   foreign-key violation (the accounts row vanished mid-provision) as
+//!   "deletion won": the just-created database is dropped rather than
+//!   orphaned.
 
 use std::str::FromStr;
 
@@ -208,7 +222,14 @@ pub async fn provision_account(
     .await;
 
     let account_id = match claim {
-        Ok(_) => account_id,
+        Ok(_) => {
+            // Step 3½ — close the reservation TOCTOU: a `delete_account`
+            // for this subdomain may have parked it between the pre-check
+            // above and the INSERT. See `ensure_claim_not_reserved` for why
+            // the post-claim re-check is sufficient.
+            ensure_claim_not_reserved(control, account_id, &subdomain).await?;
+            account_id
+        }
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
             let existing: Option<(String, String, String)> =
                 sqlx::query_as("SELECT id, email, status FROM accounts WHERE subdomain = $1")
@@ -231,6 +252,30 @@ pub async fn provision_account(
     // Step 4 — create the tenant database. Identifiers can't be bound as
     // parameters, hence the pg_database check, the shape assertion, and the
     // quoted interpolation.
+    //
+    // Guard against a concurrent `delete_account` first: once deletion has
+    // dropped the tenant database and removed the accounts row, re-creating
+    // the database here would orphan it — the `account_databases` INSERT
+    // below would hit a foreign-key violation, and with no accounts row left
+    // nothing would ever derive the database's name to drop it. Verify the
+    // account is still mid-provision immediately before CREATE DATABASE
+    // (the FK-violation handler below covers a deletion landing after this
+    // point).
+    let still_provisioning: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND status = 'provisioning')",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db(
+        "re-checking account before tenant database creation",
+    ))?;
+    if !still_provisioning {
+        return Err(CloudError::AccountNoLongerProvisioning(
+            account_id.to_string(),
+        ));
+    }
+
     let db_name = tenant_db_name(account_id);
     let db_name = checked_tenant_db_name(&db_name)?.to_string();
     let mut conn = cluster.connect_maintenance().await?;
@@ -270,7 +315,7 @@ pub async fn provision_account(
 
     // Step 10 — record the account → tenant-database mapping. ON CONFLICT
     // keeps a resumed provision from duplicating the row.
-    sqlx::query(
+    let recorded = sqlx::query(
         "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
          VALUES ($1, $2, $3, 'active') \
          ON CONFLICT (account_id, db_name) DO NOTHING",
@@ -279,8 +324,23 @@ pub async fn provision_account(
     .bind(&cluster.cluster_id)
     .bind(&db_name)
     .execute(control.pool())
-    .await
-    .map_err(CloudError::db("recording account database"))?;
+    .await;
+    if let Err(e) = recorded {
+        // SQLSTATE 23503 foreign_key_violation: the accounts row vanished
+        // while migrations ran — a concurrent `delete_account` won despite
+        // the pre-CREATE guard above. Its DROP pass ran before our CREATE
+        // DATABASE (or never saw it), so the database we just created would
+        // be orphaned forever: no accounts row means nothing can derive its
+        // name again. Drop it now (best-effort, logged) before surfacing
+        // the typed error.
+        if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23503")) {
+            drop_tenant_database_best_effort(cluster, &db_name).await;
+            return Err(CloudError::AccountNoLongerProvisioning(
+                account_id.to_string(),
+            ));
+        }
+        return Err(CloudError::db("recording account database")(e));
+    }
 
     // Step 11 — activate.
     sqlx::query("UPDATE accounts SET status = 'active' WHERE id = $1")
@@ -303,6 +363,108 @@ pub async fn provision_account(
     })
 }
 
+/// Post-claim reservation guard, closing the TOCTOU between
+/// [`provision_account`]'s `subdomains_reserved` pre-check and its claim
+/// INSERT.
+///
+/// A concurrent [`delete_account`] for the same subdomain can interleave:
+/// the pre-check sees no hold, deletion then parks the subdomain and
+/// hard-deletes its accounts row, and the claim INSERT lands on the freshly
+/// parked name. Re-checking *after* the claim is sufficient because deletion
+/// writes the reservation **before** deleting the accounts row (the ordering
+/// invariant documented on [`delete_account`]): any deletion that freed the
+/// subdomain for our INSERT necessarily made its hold visible first. On a
+/// live hold, the just-inserted claim is rolled back and the typed
+/// reservation error returned.
+///
+/// Public so the interleaving regression test (`tests/provisioning.rs`) can
+/// drive the claim and the hold by direct SQL; production code reaches it
+/// only through [`provision_account`].
+pub async fn ensure_claim_not_reserved(
+    control: &ControlPlane,
+    account_id: Uuid,
+    subdomain: &str,
+) -> Result<(), CloudError> {
+    let reserved: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM subdomains_reserved \
+         WHERE subdomain = $1 AND expires_at > NOW())",
+    )
+    .bind(subdomain)
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db("re-checking subdomain reservation"))?;
+    if !reserved {
+        return Ok(());
+    }
+
+    // Roll back only our own fresh claim — the status filter keeps this
+    // from ever deleting an activated account.
+    sqlx::query("DELETE FROM accounts WHERE id = $1 AND status = 'provisioning'")
+        .bind(account_id.to_string())
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("rolling back reserved subdomain claim"))?;
+    tracing::info!(
+        account_id = %account_id,
+        subdomain,
+        "rolled back subdomain claim that raced a deletion's reservation"
+    );
+    Err(CloudError::SubdomainReserved(subdomain.to_string()))
+}
+
+/// Terminate any backends connected to `db_name` and drop it. The shared
+/// drop primitive for [`delete_account`] and the provisioning FK-violation
+/// cleanup: explicit termination keeps the drop from racing a reconnecting
+/// pool, and is harmless when no backends exist.
+async fn terminate_and_drop_database(
+    conn: &mut PgConnection,
+    db_name: &str,
+) -> Result<(), CloudError> {
+    let db_name = checked_tenant_db_name(db_name)?;
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(db_name)
+    .execute(&mut *conn)
+    .await
+    .map_err(CloudError::db("terminating tenant database backends"))?;
+    sqlx::raw_sql(&format!(
+        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+    ))
+    .execute(&mut *conn)
+    .await
+    .map_err(CloudError::db("dropping tenant database"))?;
+    Ok(())
+}
+
+/// Best-effort [`terminate_and_drop_database`], for the provisioning path
+/// that lost a race with [`delete_account`] (the SQLSTATE-23503 handler in
+/// [`provision_account`]). The caller is already returning an error;
+/// a failed drop here is logged loudly — it leaves an orphaned database
+/// that only an operator (or a future reaper pass) can reclaim.
+async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str) {
+    let result = async {
+        let mut conn = cluster.connect_maintenance().await?;
+        let dropped = terminate_and_drop_database(&mut conn, db_name).await;
+        let _ = conn.close().await;
+        dropped
+    }
+    .await;
+    match result {
+        Ok(()) => tracing::info!(
+            db_name,
+            "dropped tenant database created by a provision that raced a deletion"
+        ),
+        Err(e) => tracing::error!(
+            db_name,
+            error = %e,
+            "failed to drop orphaned tenant database after losing a \
+             provision/deletion race; manual cleanup required"
+        ),
+    }
+}
+
 /// Hard-delete an account: revoke its tokens, delete its sessions, drop its
 /// tenant database, remove its control-plane rows, and park the freed
 /// subdomain in `subdomains_reserved` for 90 days.
@@ -323,7 +485,11 @@ pub async fn provision_account(
 /// deviation from the plan: the subdomain reservation is written *before*
 /// the accounts row is hard-deleted — the reverse order could crash between
 /// the two and lose the reservation, since the subdomain is only knowable
-/// from the row being deleted.
+/// from the row being deleted. **This ordering is also a correctness
+/// invariant for provisioning**: [`ensure_claim_not_reserved`]'s post-claim
+/// re-check is only sufficient because a deletion that frees a subdomain
+/// makes its hold visible before the freed name can be re-claimed. Don't
+/// reorder steps 6a/6b without revisiting that guard.
 pub async fn delete_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
@@ -371,21 +537,7 @@ pub async fn delete_account(
     if !db_names.is_empty() {
         let mut conn = cluster.connect_maintenance().await?;
         for db_name in &db_names {
-            let db_name = checked_tenant_db_name(db_name)?;
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE datname = $1 AND pid <> pg_backend_pid()",
-            )
-            .bind(db_name)
-            .execute(&mut conn)
-            .await
-            .map_err(CloudError::db("terminating tenant database backends"))?;
-            sqlx::raw_sql(&format!(
-                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-            ))
-            .execute(&mut conn)
-            .await
-            .map_err(CloudError::db("dropping tenant database"))?;
+            terminate_and_drop_database(&mut conn, db_name).await?;
         }
         let _ = conn.close().await;
     }

@@ -48,14 +48,42 @@ impl DatabaseManager {
     /// `data_dir` is unused for storage but kept in the signature so callers
     /// (CLI, server bootstrap) can pass through the same flag for both backends.
     /// Settings, tokens, OAuth, and the `databases` index all live in Postgres.
+    ///
+    /// The connection pool is sized from the `ATOMIC_PG_*` environment
+    /// variables (see [`crate::storage::PgPoolConfig::from_env`]); use
+    /// [`new_postgres_with_pool`](Self::new_postgres_with_pool) to size it
+    /// explicitly.
     #[cfg(feature = "postgres")]
     pub async fn new_postgres(
         _data_dir: impl AsRef<Path>,
         database_url: &str,
     ) -> Result<Self, AtomicCoreError> {
+        Self::new_postgres_with_pool(
+            _data_dir,
+            database_url,
+            crate::storage::PgPoolConfig::from_env(),
+        )
+        .await
+    }
+
+    /// Like [`new_postgres`](Self::new_postgres), but with an explicit pool
+    /// configuration instead of the `ATOMIC_PG_*` environment defaults.
+    ///
+    /// Callers managing many managers in one process (one per database URL)
+    /// can use this to bound each manager's pool so the sum stays within the
+    /// Postgres server's `max_connections`. Every core resolved through this
+    /// manager shares the one pool, so the bound covers the whole manager.
+    #[cfg(feature = "postgres")]
+    pub async fn new_postgres_with_pool(
+        _data_dir: impl AsRef<Path>,
+        database_url: &str,
+        pool_config: crate::storage::PgPoolConfig,
+    ) -> Result<Self, AtomicCoreError> {
         // Bootstrap with a placeholder db_id; we'll look up the real default from Postgres
         // once the schema has been migrated.
-        let core = AtomicCore::open_postgres(database_url, "default", None).await?;
+        let core =
+            AtomicCore::open_postgres_with_pool(database_url, "default", None, pool_config.clone())
+                .await?;
 
         // Seed the default database row if the `databases` table is empty.
         let databases = core.storage.list_databases_sync().await?;
@@ -80,7 +108,8 @@ impl DatabaseManager {
 
         // If the bootstrap db_id doesn't match the resolved default, swap to a core scoped to the right db_id.
         let core = if default_id != "default" {
-            AtomicCore::open_postgres(database_url, &default_id, None).await?
+            AtomicCore::open_postgres_with_pool(database_url, &default_id, None, pool_config)
+                .await?
         } else {
             core
         };

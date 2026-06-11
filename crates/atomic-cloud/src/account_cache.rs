@@ -9,11 +9,13 @@
 //!
 //! # Eviction
 //!
-//! The sweep is **inline**: it runs while inserting a freshly loaded entry
-//! (the only moment the cache grows), so steady-state hits pay nothing and
-//! no background task needs a lifecycle. [`AccountCache::sweep`] exposes the
-//! same pass for callers that want explicit maintenance (tests, a future
-//! periodic job).
+//! The sweep runs in two places. It runs **inline** while inserting a
+//! freshly loaded entry (the only moment the cache grows), so steady-state
+//! hits pay nothing. And because a stable working set produces no inserts —
+//! idle entries would otherwise hold their pools forever — the `serve`
+//! binary also runs [`AccountCache::sweep`] from a **periodic task**
+//! (default every `idle_ttl / 4`; see `main.rs`). The cache itself owns no
+//! task lifecycle; `sweep` is a plain method the composition schedules.
 //!
 //! Two rules, in order:
 //!
@@ -44,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atomic_core::DatabaseManager;
+use atomic_core::{DatabaseManager, PgPoolConfig};
 use atomic_server::state::ServerEvent;
 use tokio::sync::{broadcast, Mutex};
 
@@ -68,6 +70,17 @@ pub struct AccountCacheConfig {
     /// Target ceiling on cached accounts. Exceeded only when every entry
     /// has live WebSocket subscribers. Default 1000.
     pub max_entries: usize,
+    /// Max connections in each tenant's pool. Every cached account holds an
+    /// open pool against the shared cluster, so each must stay small —
+    /// default 5, the plan's per-tenant budget ("Tenant model"). The rest of
+    /// the pool tuning (acquire timeout, slow-query logging) still comes
+    /// from the `ATOMIC_PG_*` environment.
+    pub tenant_pool_max_connections: u32,
+    /// Close a tenant pool's connections after this long idle, so a
+    /// quiet-but-cached account releases its connections back to the
+    /// cluster well before the cache entry itself is evicted. Default
+    /// 5 minutes.
+    pub tenant_pool_idle_timeout: Duration,
 }
 
 impl Default for AccountCacheConfig {
@@ -75,6 +88,8 @@ impl Default for AccountCacheConfig {
         Self {
             idle_ttl: Duration::from_secs(15 * 60),
             max_entries: 1000,
+            tenant_pool_max_connections: 5,
+            tenant_pool_idle_timeout: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -299,10 +314,18 @@ impl AccountCache {
         }
 
         let tenant_url = self.cluster.tenant_db_url(&db_name)?;
-        // `new_postgres` re-checks migrations and the default-KB seed on
-        // every open; for an already-provisioned tenant both are no-op
+        // Each cached account holds its own pool, so it must be small
+        // (config docs); everything the cache config doesn't own still comes
+        // from the `ATOMIC_PG_*` environment.
+        let pool_config = PgPoolConfig {
+            max_connections: self.config.tenant_pool_max_connections,
+            idle_timeout: Some(self.config.tenant_pool_idle_timeout),
+            ..PgPoolConfig::from_env()
+        };
+        // The manager open re-checks migrations and the default-KB seed on
+        // every call; for an already-provisioned tenant both are no-op
         // reads. The data-dir argument is unused on the Postgres path.
-        let manager = DatabaseManager::new_postgres(".", &tenant_url)
+        let manager = DatabaseManager::new_postgres_with_pool(".", &tenant_url, pool_config)
             .await
             .map_err(CloudError::core("opening tenant database manager"))?;
 
