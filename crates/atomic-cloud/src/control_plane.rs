@@ -2,8 +2,9 @@
 //!
 //! The control plane is a dedicated Postgres database on the shared cluster
 //! (default name [`DEFAULT_CONTROL_DB_NAME`]) holding cross-tenant state:
-//! accounts, account→tenant-database mappings, tokens, sessions, and
-//! subdomain reservations. It is deliberately separate from every tenant
+//! accounts, account→tenant-database mappings, tokens, sessions, subdomain
+//! reservations, and encrypted provider credentials. It is deliberately
+//! separate from every tenant
 //! database — tenant databases run atomic-core's migrations; the control
 //! plane runs its own, embedded here.
 //!
@@ -43,6 +44,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (
         3,
         include_str!("../migrations/003_subdomain_reservation_age.sql"),
+    ),
+    (
+        4,
+        include_str!("../migrations/004_provider_credentials.sql"),
     ),
 ];
 

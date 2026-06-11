@@ -29,7 +29,9 @@ pub mod auth;
 pub mod control_plane;
 pub mod email;
 pub mod error;
+pub mod keyvault;
 pub mod magic_links;
+pub mod provider_credentials;
 pub mod provision;
 pub mod rate_limit;
 pub mod reaper;
@@ -46,8 +48,14 @@ pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSI
 pub use control_plane::ControlPlane;
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
+pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
 pub use magic_links::{
     consume_magic_link, issue_magic_link, MagicLinkPurpose, MagicLinkRecord, MAGIC_LINK_TTL,
+};
+pub use provider_credentials::{
+    delete_credentials, get_active_credentials, get_credentials, record_validation,
+    set_active_provider, touch_last_used, upsert_credentials, CredentialOrigin, NewCredentials,
+    Provider, ProviderCredentials,
 };
 pub use provision::{
     delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,

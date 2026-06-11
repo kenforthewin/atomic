@@ -9,7 +9,7 @@ use atomic_cloud::reserved_subdomains::is_reserved;
 use atomic_cloud::ControlPlane;
 use support::with_control_db;
 
-/// Every table the control-plane migrations create (001 + 002).
+/// Every table the control-plane migrations create (001-004).
 const CONTROL_TABLES: &[&str] = &[
     "accounts",
     "account_databases",
@@ -17,6 +17,7 @@ const CONTROL_TABLES: &[&str] = &[
     "sessions",
     "subdomains_reserved",
     "magic_links",
+    "provider_credentials",
 ];
 
 async fn table_exists(control: &ControlPlane, table: &str) -> bool {

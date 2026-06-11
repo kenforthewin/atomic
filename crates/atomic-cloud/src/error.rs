@@ -98,6 +98,62 @@ pub enum CloudError {
     #[error("email send failed: {0}")]
     EmailSend(String),
 
+    /// The provider-credential master key is missing or malformed. Raised
+    /// at vault construction — i.e. at boot — never mid-request. The
+    /// message names the environment variable and the expected shape; it
+    /// **never** contains key material, valid or not.
+    #[error("invalid provider-credential master key: {0}")]
+    InvalidMasterKey(String),
+
+    /// A stored `provider_credentials.encryption_version` is one this
+    /// build's [`KeyVault`] doesn't know. Decrypting under the wrong key
+    /// generation would fail confusingly (or worse, succeed by accident
+    /// under a future scheme); reject typed instead.
+    ///
+    /// [`KeyVault`]: crate::keyvault::KeyVault
+    #[error("unknown provider-credential encryption version {0}")]
+    UnknownEncryptionVersion(i32),
+
+    /// AES-256-GCM encryption failed. Practically unreachable with a valid
+    /// key and fresh nonce (the cipher only rejects absurd plaintext
+    /// lengths); kept typed so the vault never panics on provider input.
+    #[error("provider-credential encryption failed")]
+    CredentialEncrypt,
+
+    /// AEAD authentication failed on decrypt: wrong master key, a
+    /// ciphertext presented under a different (account, provider) binding
+    /// than it was encrypted for, or a corrupt row. The message carries
+    /// only that context — never key bytes or ciphertext.
+    #[error("provider-credential decryption failed: {0}")]
+    CredentialDecrypt(String),
+
+    /// A `provider_credentials.provider` value didn't parse as a
+    /// [`Provider`] (`openrouter` | `openai_compat`).
+    ///
+    /// [`Provider`]: crate::provider_credentials::Provider
+    #[error("unknown provider {0:?}")]
+    InvalidProvider(String),
+
+    /// A `provider_credentials.origin` value didn't parse as a
+    /// [`CredentialOrigin`] (`managed` | `user`).
+    ///
+    /// [`CredentialOrigin`]: crate::provider_credentials::CredentialOrigin
+    #[error("unknown credential origin {0:?}")]
+    InvalidCredentialOrigin(String),
+
+    /// [`set_active_provider`] was asked to point an account at a
+    /// `(provider, origin)` with no stored credentials row (or the account
+    /// itself doesn't exist). The flip is refused — an active pointer must
+    /// always resolve to a decryptable row.
+    ///
+    /// [`set_active_provider`]: crate::provider_credentials::set_active_provider
+    #[error("account {account_id} has no {provider}/{origin} provider credentials")]
+    MissingProviderCredentials {
+        account_id: String,
+        provider: crate::provider_credentials::Provider,
+        origin: crate::provider_credentials::CredentialOrigin,
+    },
+
     /// A control-plane invariant the code relies on was violated (e.g. an
     /// `accounts.id` that isn't a UUID). Indicates corruption or a bug, not
     /// a user error.

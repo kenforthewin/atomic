@@ -12,6 +12,20 @@
 //! Every command takes `--control-url` (or `ATOMIC_CLOUD_CONTROL_URL`) before
 //! the subcommand and runs migrations first, so any command works against a
 //! fresh cluster.
+//!
+//! # Master key
+//!
+//! `serve` additionally requires the provider-credential master key (env
+//! var named by `--master-key-env`, default `ATOMIC_CLOUD_MASTER_KEY`) and
+//! refuses to boot without a valid one — provider features are integral to
+//! serving (managed keys are provisioned at signup; BYOK settings routes
+//! decrypt stored keys), so a missing/malformed key is a deployment error
+//! best surfaced at boot, not on the first signup. The other subcommands
+//! (`migrate`, `account`, `token`) deliberately never load the vault: none
+//! of them read or write `encrypted_key` (managed-key lifecycle calls use
+//! the cleartext `external_key_id`; deletion cascades the rows), so
+//! operator tooling stays runnable from hosts that don't hold the
+//! production master key.
 
 use std::sync::Arc;
 
@@ -19,8 +33,8 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
-    EmailSender, FallbackAppState, LogSender, MailgunSender, NewAccount, RateLimits, TenantPlane,
-    TokenScope,
+    EmailSender, EnvMasterKeyVault, FallbackAppState, KeyVault, LogSender, MailgunSender,
+    NewAccount, RateLimits, TenantPlane, TokenScope,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -117,6 +131,15 @@ enum Command {
 
         #[command(flatten)]
         email: EmailArgs,
+
+        /// Name of the environment variable holding the master key that
+        /// encrypts provider credentials at rest (32 bytes, hex or
+        /// base64). The key VALUE is only ever read from the environment —
+        /// argv leaks into process listings. serve fails at boot without a
+        /// valid key; see atomic_cloud::keyvault for the custody runbook
+        /// (loss of this key = unrecoverable credentials).
+        #[arg(long, default_value = atomic_cloud::MASTER_KEY_ENV)]
+        master_key_env: String,
 
         /// Derive the client IP for rate limiting from `X-Forwarded-For`
         /// (rightmost entry — the one appended by your proxy) instead of
@@ -334,10 +357,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cache_sweep_interval_secs,
             reaper_interval_secs,
             email,
+            master_key_env,
             trust_proxy_header,
             app_public_url,
             max_concurrent_provisions,
         } => {
+            // Boot-time master-key check (plan: "Encryption at rest").
+            // Constructing the vault validates the key, so a deployment
+            // with a missing or malformed master key dies here with a
+            // message naming the variable — never on the first signup.
+            // The slice's managed-key and BYOK wiring receives this vault;
+            // the boot contract it pins is: serve does not start unless
+            // stored provider credentials are decryptable.
+            let _vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
                 tenant_pool_idle_timeout: std::time::Duration::from_secs(
