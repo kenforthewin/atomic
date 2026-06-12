@@ -1173,6 +1173,62 @@ twin does drive one); a rotation landing inside `set_setting_with_reembed`'s
 two config reads can queue one spurious same-dimension re-embed (cost
 noise, not correctness; dimension mismatch impossible under the pin).
 
+### Slice 4 — dispatcher, worker pools, backpressure (2026-06-12, branch `cloud-dispatcher`)
+
+Landed: migration 006 (`dispatch_hints` with clear-if-older mid-scan
+survival) and 007 (`provider_paused_until` + streak); the per-pod
+dispatcher (hint fast-path + slow-path full scan, N+1 poll over tenant
+ledgers, one-job-per-pop round-robin, per-tenant poll timeout); four
+bounded worker pools at the plan's caps with per-work-type overrides
+(reports cap 1 counts report in-flight, not the whole llm class); provider
+backpressure — 429 Retry-After into ledger horizons (clamped, 15-min cap),
+the per-tenant circuit breaker (3 provider-classified failures in 60s,
+doubling cooldown, only provider-touching work participates), 402 →
+credits pause with jobs sitting in ledger and the structured
+`out_of_ai_credits` error on interactive routes, 401/403 → provider-kind
+pause; provider mutations clear pauses AND re-arm backed-off rows in both
+ledgers; per-tenant chat-stream semaphore (cap 3, permit tied to the
+response stream's lifetime).
+
+**Key design facts (study findings worth keeping):**
+
+- atomic-core itself spawns pipeline work on the request path (every save
+  path claims + spawns in-process). The cloud-unaware `inline_pipeline`
+  knob gates **before the claim** — gating after would lease-lock jobs
+  away from the dispatcher for 30 minutes. Default true; self-hosted
+  byte-identical.
+- Hints are marked AFTER the handler completes (ledger-write-then-hint
+  makes the conditional clear sound) by a coarse mutating-method
+  middleware — a false-positive hint costs one empty poll. The slow-path
+  scan (5 min) bounds hint loss.
+- `RunHandle::defer_until` in the scheduler ledger: environmental
+  (provider-classified) failures release the lease, set `next_attempt_at`,
+  and **refund the attempt** — the lease-reclaim precedent extended to
+  classifiable failures. No policy installed → `fail()` unchanged.
+  Cloud installs the classification policy; self-hosted untouched.
+
+**Deviations and choices (review-vetted):**
+
+- The breaker detection window is per-pod in-memory (the pause itself is
+  control-plane, honored by all pods); "3 consecutive" is implemented as
+  3-in-60s among provider-touching outcomes only.
+- Rate-limit pauses gate background dispatch only; credits pauses also gate
+  interactive AI routes (atom CRUD always works). Interactive routes do
+  not trip the breaker themselves (asymmetry documented in code).
+- Feeds on idle tenants ride the slow scan (up to ~5 min latency vs 60s
+  self-hosted) — acceptable for v1, noted.
+
+**Known limitation (deliberate, v1):** dispatcher worker events publish to
+the executing pod's in-process channel — in a multi-pod deployment, WS
+subscribers on another pod miss that execution's progress events. Durable
+state is always correct and the frontend self-heals on fetch. Cross-pod
+event relay (e.g. Postgres LISTEN/NOTIFY) is the planned follow-up; do it
+before running >1 pod in production.
+
+**Deferred:** plan-tier weighted fairness (uniform v1), outbox pattern,
+leader election, `upgrade_url` content in the credits error (billing
+slice), the failed-migrations reaper arm (deploy gating).
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -1411,3 +1467,16 @@ and link the discussion if it lives in a memory file.
 - **2026-06-11** — KeyVault AAD binds (account_id, provider, origin) with
   length-prefixed encoding; managed/BYOK ciphertexts are not swappable
   even with direct DB write access.
+- **2026-06-12** — Slice 4 landed (see Implementation log). Dispatcher is
+  per-pod with no leader election; claims ride the existing ledger lease
+  machinery; pipeline execution moves behind the cloud-unaware
+  `inline_pipeline` knob (gated before the claim).
+- **2026-06-12** — Environmental failures defer, never fail:
+  `RunHandle::defer_until` refunds the attempt (extending the
+  lease-reclaim precedent); 402/429/401-classified background work sits in
+  the ledger and provider mutations re-arm it immediately. Breaker
+  accounting counts only provider-touching executions.
+- **2026-06-12** — Multi-pod WS event delivery is a known v1 limitation:
+  worker events are per-pod in-memory; build the cross-pod relay
+  (Postgres LISTEN/NOTIFY) before running more than one pod in
+  production. Durable state is unaffected.
