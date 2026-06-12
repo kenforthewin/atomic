@@ -15,8 +15,10 @@
 //!   ([`record_migration_success`] / [`record_migration_failure`]). The
 //!   deploy gate around it (readiness, the failure-rate policy, the
 //!   `deploy_runs` history) lives in [`crate::deploy`].
-//! - **The reaper's failed-migrations arm** retries rows whose
-//!   `migration_retry_after` has passed, through the same record functions.
+//! - **The reaper's failed-migrations arm** ([`crate::reaper`], arm 4)
+//!   retries rows whose `migration_retry_after` has passed
+//!   ([`list_retryable_failures`]) through the same per-tenant step and
+//!   record functions ([`migrate_tenant`]).
 //! - **CloudAuth's straggler gate** reads `last_migrated_version` on its
 //!   per-request account lookup and returns the structured 503
 //!   `account_upgrading` while a tenant lags [`tenant_schema_target`] (see
@@ -169,6 +171,37 @@ fn truncate_error(error: &str) -> String {
     error.chars().take(MIGRATION_ERROR_MAX_LEN).collect()
 }
 
+/// The reaper's failed-migrations worklist (plan: "Failure recovery & the
+/// reaper": `account_databases WHERE migration_failed_at IS NOT NULL AND
+/// (migration_retry_after IS NULL OR migration_retry_after <= now())`):
+/// active rows with recorded failure state whose backoff horizon has passed
+/// (or was never written), oldest failure first — the tenants that have
+/// been broken longest get retried soonest.
+///
+/// Deliberately *no* version filter: a row can carry failure state while
+/// its stamp is already current (a concurrent pod's success raced this
+/// pod's failure recording). Retrying it is an idempotent no-op
+/// `initialize()` whose success recording clears the stale failure state —
+/// self-healing, where a version filter would strand it forever. And
+/// conversely, a lagging row with **no** failure state is *not* this list's
+/// business — unattempted tenants belong to the boot runner
+/// ([`list_unmigrated`]), not the reaper.
+pub async fn list_retryable_failures(
+    control: &ControlPlane,
+) -> Result<Vec<UnmigratedTenant>, CloudError> {
+    sqlx::query_as(
+        "SELECT account_id, db_name, last_migrated_version, migration_failed_at, \
+                migration_retry_after, migration_retry_count \
+         FROM account_databases \
+         WHERE status = 'active' AND migration_failed_at IS NOT NULL \
+           AND (migration_retry_after IS NULL OR migration_retry_after <= NOW()) \
+         ORDER BY migration_failed_at ASC, account_id ASC",
+    )
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing retryable failed migrations"))
+}
+
 /// An `account_databases` row carrying recorded migration-failure state —
 /// the operator's triage view (`atomic-cloud deploy status`).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -260,6 +293,14 @@ pub struct FleetRunOutcome {
     /// Tenants whose migration failed; each has `migration_failed_at`,
     /// `last_migration_error`, and a `migration_retry_after` backoff
     /// recorded for the reaper.
+    ///
+    /// This deliberately also counts the rarer fault where the migration
+    /// itself *succeeded* but the control-plane success recording failed
+    /// (fail-closed: an unstamped tenant is still gated, so claiming it
+    /// migrated would be a lie). A control plane flaky enough during boot
+    /// to inflate this count into the review band is itself worth an
+    /// operator's attention; the error-level log on each such recording
+    /// failure is the discriminator.
     pub failed: usize,
     /// Whether the run hit [`FleetMigrationConfig::wall_clock_limit`].
     pub timed_out: bool,
@@ -444,7 +485,15 @@ impl FleetMigrator {
 /// `last_migration_error`, and the exponential `migration_retry_after`
 /// horizon — and never aborts the fleet run. A failure *recording* failure
 /// is logged (the tenant stays enumerated either way).
-async fn migrate_tenant(
+///
+/// `pub(crate)`: the reaper's failed-migrations arm
+/// ([`crate::reaper`], arm 4) retries [`list_retryable_failures`] rows
+/// through this exact step, so a reaper retry and a boot-runner attempt are
+/// indistinguishable in what they run and what they record. Of its
+/// [`FleetMigrationConfig`] only the per-tenant fields matter here
+/// (`tenant_connect_timeout`, `retry_backoff_base`, `retry_backoff_cap`);
+/// the run-shaping fields belong to [`FleetMigrator::run`].
+pub(crate) async fn migrate_tenant(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     config: &FleetMigrationConfig,

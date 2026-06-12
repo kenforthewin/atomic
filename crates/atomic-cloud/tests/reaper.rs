@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use atomic_cloud::reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 use atomic_cloud::{
-    provision_account, tenant_db_name, ClusterConfig, ControlPlane, ManagedKeys, NewAccount,
-    ProvisionedAccount,
+    provision_account, tenant_db_name, tenant_schema_target, ClusterConfig, ControlPlane,
+    ManagedKeys, NewAccount, ProvisionedAccount,
 };
 use sqlx::{Connection, PgConnection};
 use support::{create_database, drop_database, with_control_db, with_db_guard};
@@ -1132,6 +1132,316 @@ async fn provider_outage_past_the_ceiling_rolls_back() {
                 !database_exists(&cluster.cluster_url, &tenant_db_name(account_id)).await,
                 "the resume attempt's tenant database is dropped by the rollback"
             );
+        },
+    )
+    .await;
+}
+
+// ==================== Arm 4: failed tenant migrations ====================
+
+/// Insert an active account plus an active mapping row at version 0
+/// carrying recorded migration-failure state. `failed_minutes_ago` orders
+/// the arm's worklist (oldest failure first); `retry_in_secs` positions the
+/// backoff horizon relative to now (negative = due). The db_name may or may
+/// not exist — pointing it at a nonexistent database is the honest failure
+/// injection (a real connect error), pointing it at a real empty database
+/// makes the retry a real migration.
+async fn seed_failed_migration(
+    control: &ControlPlane,
+    account_id: &str,
+    db_name: &str,
+    retry_count: i32,
+    failed_minutes_ago: i32,
+    retry_in_secs: f64,
+) {
+    sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan) \
+         VALUES ($1, $1, 'k@example.com', 'active', 'free')",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .expect("insert account");
+    sqlx::query(
+        "INSERT INTO account_databases \
+             (account_id, cluster_id, db_name, status, last_migrated_version, \
+              migration_failed_at, last_migration_error, migration_retry_after, \
+              migration_retry_count) \
+         VALUES ($1, 'c1', $2, 'active', 0, NOW() - make_interval(mins => $3), \
+                 'seeded failure', NOW() + make_interval(secs => $4), $5)",
+    )
+    .bind(account_id)
+    .bind(db_name)
+    .bind(failed_minutes_ago)
+    .bind(retry_in_secs)
+    .bind(retry_count)
+    .execute(control.pool())
+    .await
+    .expect("insert failed mapping row");
+}
+
+/// One mapping row's migration-tracking state:
+/// (last_migrated_version, has failure state, migration_retry_count).
+async fn migration_row_state(control: &ControlPlane, account_id: &str) -> (i32, bool, i32) {
+    sqlx::query_as(
+        "SELECT last_migrated_version, migration_failed_at IS NOT NULL, migration_retry_count \
+         FROM account_databases WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(control.pool())
+    .await
+    .expect("read mapping row state")
+}
+
+/// The happy arm: a due failed row pointing at a real (empty) tenant
+/// database is retried, the migration actually runs, the stamp lands at the
+/// compiled target, and the failure state clears — while a lagging row with
+/// NO failure state (an unattempted straggler — the boot runner's job, not
+/// the reaper's) and a failed row whose backoff horizon hasn't passed are
+/// both left strictly alone.
+#[tokio::test]
+async fn due_failed_migration_is_retried_to_recovery() {
+    with_control_db(
+        "due_failed_migration_is_retried_to_recovery",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let target = tenant_schema_target();
+
+            // The recoverable straggler: real, empty tenant database.
+            let real_db = tenant_db_name(Uuid::new_v4());
+            create_database(&cluster.cluster_url, &real_db).await;
+            seed_failed_migration(&control, "recoverable", &real_db, 1, 10, -60.0).await;
+
+            // Lagging but never failed: not arm 4's business.
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan) \
+                 VALUES ('unattempted', 'unattempted', 'k@example.com', 'active', 'free')",
+            )
+            .execute(control.pool())
+            .await
+            .expect("insert unattempted account");
+            sqlx::query(
+                "INSERT INTO account_databases \
+                     (account_id, cluster_id, db_name, status, last_migrated_version) \
+                 VALUES ('unattempted', 'c1', $1, 'active', 0)",
+            )
+            .bind(tenant_db_name(Uuid::new_v4()))
+            .execute(control.pool())
+            .await
+            .expect("insert unattempted mapping row");
+
+            // Failed but inside its backoff horizon: not due yet.
+            seed_failed_migration(
+                &control,
+                "backing-off",
+                &tenant_db_name(Uuid::new_v4()),
+                2,
+                10,
+                3600.0,
+            )
+            .await;
+
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.migrations_recovered,
+                vec!["recoverable".to_string()]
+            );
+            assert!(summary.migrations_still_failing.is_empty(), "{summary:?}");
+            assert!(summary.migration_alerts.is_empty(), "{summary:?}");
+            assert!(summary.migrations_deferred.is_empty(), "{summary:?}");
+
+            let (version, has_failure, retries) =
+                migration_row_state(&control, "recoverable").await;
+            assert_eq!(version, target, "recovered row stamped at the target");
+            assert!(!has_failure, "failure state cleared");
+            assert_eq!(retries, 0, "retry count reset");
+
+            // The stamp is honest: the retry ran the real migrations.
+            let tenant_url = cluster.tenant_db_url(&real_db).expect("tenant url");
+            let mut conn = PgConnection::connect(&tenant_url)
+                .await
+                .expect("connect recovered tenant");
+            let schema: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&mut conn)
+                .await
+                .expect("read tenant schema version");
+            conn.close().await.expect("close");
+            assert_eq!(schema, target, "tenant schema is really at the target");
+
+            // Bystanders untouched.
+            let (version, has_failure, retries) =
+                migration_row_state(&control, "unattempted").await;
+            assert_eq!((version, has_failure, retries), (0, false, 0));
+            let (version, has_failure, retries) =
+                migration_row_state(&control, "backing-off").await;
+            assert_eq!((version, has_failure, retries), (0, true, 2));
+
+            // The arm is idempotent at steady state: nothing left due.
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert!(summary.migrations_recovered.is_empty(), "{summary:?}");
+            assert!(summary.migrations_still_failing.is_empty(), "{summary:?}");
+        },
+    )
+    .await;
+}
+
+/// The unhappy arm, honestly injected (the database does not exist): a
+/// failed retry re-records with a doubled backoff horizon and a bumped
+/// count, the count crossing the alert threshold escalates, the per-pass
+/// cap defers surplus rows, and — crucially — the freshly backed-off row is
+/// NOT retried again by an immediate next pass (the horizon is honored).
+#[tokio::test]
+async fn still_failing_migration_backs_off_and_alerts() {
+    with_control_db(
+        "still_failing_migration_backs_off_and_alerts",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            // Seeded at the alert threshold: one more failure crosses it.
+            // Oldest failure, so the capped pass picks it first.
+            seed_failed_migration(
+                &control,
+                "alerting",
+                &tenant_db_name(Uuid::new_v4()),
+                5,
+                30,
+                -60.0,
+            )
+            .await;
+            seed_failed_migration(
+                &control,
+                "deferred",
+                &tenant_db_name(Uuid::new_v4()),
+                0,
+                10,
+                -60.0,
+            )
+            .await;
+
+            let policy = ReaperPolicy {
+                max_migration_retries_per_pass: 1,
+                ..ReaperPolicy::default()
+            };
+            let first = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
+            assert_no_errors(&first);
+            assert_eq!(first.migrations_still_failing, vec!["alerting".to_string()]);
+            assert_eq!(
+                first.migration_alerts,
+                vec!["alerting".to_string()],
+                "count 6 > threshold 5 escalates"
+            );
+            assert_eq!(
+                first.migrations_deferred,
+                vec!["deferred".to_string()],
+                "surplus row deferred by the per-pass cap, not dropped"
+            );
+            assert!(first.migrations_recovered.is_empty());
+
+            let (version, has_failure, retries) = migration_row_state(&control, "alerting").await;
+            assert_eq!(version, 0, "a failed retry never moves the stamp");
+            assert!(has_failure);
+            assert_eq!(retries, 6, "the failed retry bumped the count");
+            let horizon_is_future: bool = sqlx::query_scalar(
+                "SELECT migration_retry_after > NOW() FROM account_databases \
+                 WHERE account_id = 'alerting'",
+            )
+            .fetch_one(control.pool())
+            .await
+            .expect("read backoff horizon");
+            assert!(horizon_is_future, "a fresh backoff horizon was recorded");
+
+            // Next pass: 'alerting' is inside its new horizon — only the
+            // previously deferred row is due, and at count 1 it does not
+            // alert.
+            let second = run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
+            assert_no_errors(&second);
+            assert_eq!(
+                second.migrations_still_failing,
+                vec!["deferred".to_string()],
+                "the backed-off row must not be retried again: {second:?}"
+            );
+            assert!(second.migration_alerts.is_empty(), "{second:?}");
+            assert!(second.migrations_deferred.is_empty(), "{second:?}");
+            let (_, _, retries) = migration_row_state(&control, "deferred").await;
+            assert_eq!(retries, 1);
+        },
+    )
+    .await;
+}
+
+/// The advisory-lock skip for arm 4: while a rival session holds the
+/// account's lock, the due row is skipped untouched; after the release, the
+/// next pass recovers it.
+#[tokio::test]
+async fn contended_lock_defers_failed_migration_retry() {
+    with_control_db(
+        "contended_lock_defers_failed_migration_retry",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let real_db = tenant_db_name(Uuid::new_v4());
+            create_database(&cluster.cluster_url, &real_db).await;
+            seed_failed_migration(&control, "contended-mig", &real_db, 1, 10, -60.0).await;
+
+            let mut rival = PgConnection::connect(&url).await.expect("rival session");
+            let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(reaper_lock_key("contended-mig"))
+                .fetch_one(&mut rival)
+                .await
+                .expect("rival takes lock");
+            assert!(got, "rival lock must be free initially");
+
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.migrations_skipped_locked,
+                vec!["contended-mig".to_string()]
+            );
+            assert!(summary.migrations_recovered.is_empty());
+            let (version, has_failure, retries) =
+                migration_row_state(&control, "contended-mig").await;
+            assert_eq!(
+                (version, has_failure, retries),
+                (0, true, 1),
+                "a skipped row must be untouched"
+            );
+
+            rival.close().await.expect("close rival session");
+
+            let summary = run_reaper_pass(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                &ReaperPolicy::default(),
+            )
+            .await;
+            assert_no_errors(&summary);
+            assert_eq!(
+                summary.migrations_recovered,
+                vec!["contended-mig".to_string()]
+            );
+            let (version, has_failure, _) = migration_row_state(&control, "contended-mig").await;
+            assert_eq!(version, tenant_schema_target());
+            assert!(!has_failure);
         },
     )
     .await;

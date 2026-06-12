@@ -84,9 +84,10 @@ pub use dispatcher::{
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
 pub use fleet_migration::{
-    list_failed_migrations, list_unmigrated, migration_backoff_horizon, record_migration_failure,
-    record_migration_success, tenant_schema_target, FailedTenantMigration, FleetMigrationConfig,
-    FleetMigrator, FleetRunOutcome, UnmigratedTenant, MIGRATION_ERROR_MAX_LEN,
+    list_failed_migrations, list_retryable_failures, list_unmigrated, migration_backoff_horizon,
+    record_migration_failure, record_migration_success, tenant_schema_target,
+    FailedTenantMigration, FleetMigrationConfig, FleetMigrator, FleetRunOutcome, UnmigratedTenant,
+    MIGRATION_ERROR_MAX_LEN,
 };
 pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
 pub use magic_links::{

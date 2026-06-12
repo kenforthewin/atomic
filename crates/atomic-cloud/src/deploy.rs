@@ -254,6 +254,18 @@ pub enum AdvanceOutcome {
 /// version (rather than one run id) is what makes the acknowledgment
 /// fleet-wide — each pod boots its own row, and all of them are reviews of
 /// the same binary.
+///
+/// The gate is the single *most recently started* run, deliberately: a
+/// fresh `migrating` row means some pod is still mid-fleet-run at this
+/// target, and acknowledging before its verdict lands could advance a
+/// review the operator never saw. The operational consequence on multi-pod
+/// boots is that `deploy advance` may answer [`NothingToAdvance`] (status
+/// `migrating`, or `ready` from the pod that raced past an earlier pod's
+/// review) while an earlier run still holds `awaiting_review` — retry once
+/// the latest run settles. Conservative by design: the command can refuse
+/// and be re-run, but it can never acknowledge a review sight-unseen.
+///
+/// [`NothingToAdvance`]: AdvanceOutcome::NothingToAdvance
 pub async fn advance_deploy(control: &ControlPlane) -> Result<AdvanceOutcome, CloudError> {
     let Some(latest) = latest_deploy_run(control).await? else {
         return Ok(AdvanceOutcome::NoRuns);

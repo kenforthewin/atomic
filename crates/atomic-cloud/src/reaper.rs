@@ -4,7 +4,7 @@
 //! One periodic job. Every serve process runs [`run_reaper_pass`] on an
 //! interval (`main.rs` wires the loop with a jittered start; the pass itself
 //! is a plain async function so tests and operators can call it directly).
-//! A pass has five arms, in order:
+//! A pass has six arms, in order:
 //!
 //! 1. **Stuck provisions** — `accounts` rows parked in
 //!    `status = 'provisioning'` longer than
@@ -74,7 +74,26 @@
 //!    milliseconds-wide step-5→6 window; that is safe — `delete_account`
 //!    is idempotent and writes its reservation before the row delete.
 //!
-//! 4. **Self-reservations** — `subdomains_reserved` rows whose subdomain
+//! 4. **Failed tenant migrations** — `account_databases` rows with recorded
+//!    failure state whose backoff horizon has passed (plan: "Failure
+//!    recovery & the reaper" → `migration_failed_at IS NOT NULL AND
+//!    (migration_retry_after IS NULL OR migration_retry_after <= now())`).
+//!    These are the deploy gate's sub-threshold stragglers: the boot fleet
+//!    run recorded their failure and went ready without them, CloudAuth is
+//!    503ing their requests with `account_upgrading`, and this arm is what
+//!    eventually heals them short of another pod boot. Each due row is
+//!    retried through the boot runner's own per-tenant step
+//!    ([`fleet_migration::migrate_tenant`]): success stamps the target and
+//!    clears the failure state (the straggler starts serving on its next
+//!    request); failure re-records with a doubled backoff horizon. Retries
+//!    are capped per pass ([`ReaperPolicy::max_migration_retries_per_pass`])
+//!    for the same reason resumes are; a row whose retry count climbs past
+//!    [`ReaperPolicy::migration_alert_retries`] is escalated to
+//!    `tracing::error!` (plan: "alerts when retry_count > 5") — backoff has
+//!    reached its cap and the tenant needs a human
+//!    (`atomic-cloud deploy status` shows the stored error).
+//!
+//! 5. **Self-reservations** — `subdomains_reserved` rows whose subdomain
 //!    belongs to an *active* account: the residue of a deletion that crashed
 //!    between reserving the subdomain and deleting the accounts row (the
 //!    slice-1 follow-up). Cleared only once the reservation is older than
@@ -86,7 +105,7 @@
 //!    deleting is invisible here (the join needs an *active* accounts row),
 //!    which is why the two arms cannot fight.
 //!
-//! 5. **Hygiene** — purge `magic_links` expired more than
+//! 6. **Hygiene** — purge `magic_links` expired more than
 //!    [`ReaperPolicy::magic_link_retention_after_expiry`] ago (the recently
 //!    expired keep their forensic value a little longer), expired
 //!    `sessions`, and lapsed `subdomains_reserved` rows. All three are
@@ -99,7 +118,7 @@
 //! deletions (none of which take reaper locks). Three mechanisms make that
 //! safe; each arm documents which it leans on:
 //!
-//! - **Per-account advisory locks.** Row processing in arms 1–3 happens
+//! - **Per-account advisory locks.** Row processing in arms 1–4 happens
 //!   under `pg_try_advisory_lock` on the control plane, keyed by
 //!   [`reaper_lock_key`] over the account id. Contention means another pass
 //!   owns the row — skip it (recorded in the summary), never wait. The lock
@@ -108,6 +127,13 @@
 //!   the *database name's* account id makes orphan-reclaim and
 //!   stuck-rollback mutually exclusive per account — the rollback's
 //!   row-deleted-but-not-yet-dropped window is invisible to other passes.
+//!   Arm 4's retry can additionally race a *booting pod's* fleet runner
+//!   (which takes no reaper locks); that race is safe by the same two
+//!   mechanisms the multi-pod boot itself leans on — atomic-core's
+//!   per-database migration advisory lock serializes the actual DDL, and
+//!   both sides' recordings converge (monotone `GREATEST` stamping on
+//!   success; a redundant failure recording just re-arms a backoff the next
+//!   success clears).
 //!
 //! - **Under-lock re-checks.** The work lists are read unlocked, so every
 //!   row is re-verified after its lock is acquired: arm 1 re-reads the
@@ -123,7 +149,7 @@
 //!   double-processing (the interleavings are walked through on
 //!   [`roll_back_stuck_provision`]).
 //!
-//! Arms 4 and 5 are single atomic SQL statements — concurrent passes
+//! Arms 5 and 6 are single atomic SQL statements — concurrent passes
 //! running them twice is harmless (the second deletes nothing), so they
 //! take no locks.
 
@@ -176,7 +202,36 @@ pub struct ReaperPolicy {
     /// its own caller.
     pub deletion_recovery_grace: Duration,
 
-    /// Minimum age of a self-reservation before arm 4 clears it. Younger
+    /// Maximum failed-migration retries (arm 4) per pass — the same
+    /// rationale as [`max_resumes_per_pass`](Self::max_resumes_per_pass):
+    /// each retry can run tenant migrations for seconds (or burn a connect
+    /// timeout on an unreachable database), and a backlog must not turn the
+    /// 60-second job into a minutes-long one. Surplus rows are deferred to
+    /// the next pass ([`ReaperSummary::migrations_deferred`]); a *large*
+    /// backlog of broken tenants is the boot runner's problem (a restart
+    /// re-runs the whole fleet under real concurrency), not the reaper's.
+    pub max_migration_retries_per_pass: usize,
+
+    /// Escalation threshold for arm 4 (plan: "alerts when
+    /// `retry_count > 5`"): after a failed retry leaves a row's
+    /// `migration_retry_count` *above* this, the row is logged at error
+    /// level and recorded in [`ReaperSummary::migration_alerts`]. By count
+    /// 5 the backoff has hit its cap — every further failure means the
+    /// tenant needs a human, and re-alerting once per capped horizon is the
+    /// alert staying honest, not spam.
+    pub migration_alert_retries: i32,
+
+    /// Per-tenant knobs for arm 4's retries — deliberately the boot
+    /// runner's own config type, so `serve` can hand the reaper the exact
+    /// `--fleet-*` configuration and the two writers of
+    /// `migration_retry_after` can never disagree on backoff arithmetic.
+    /// Only the per-tenant fields apply (`tenant_connect_timeout`,
+    /// `retry_backoff_base`, `retry_backoff_cap`); the run-shaping fields
+    /// (`concurrency`, `wall_clock_limit`) govern fleet runs and are unused
+    /// here — arm 4 is serial under its per-pass cap.
+    pub migration_retry: crate::fleet_migration::FleetMigrationConfig,
+
+    /// Minimum age of a self-reservation before arm 5 clears it. Younger
     /// rows are presumed to be a `delete_account` in flight between its
     /// reserve and row-delete steps.
     pub self_reservation_grace: Duration,
@@ -197,6 +252,12 @@ impl Default for ReaperPolicy {
             max_resumes_per_pass: crate::account_plane::DEFAULT_MAX_CONCURRENT_PROVISIONS,
             provision_rollback_ceiling: Duration::from_secs(60 * 60),
             deletion_recovery_grace: Duration::from_secs(5 * 60),
+            // Worst case ~80s of fast-fail connect timeouts per pass under
+            // the default 10s tenant_connect_timeout.
+            max_migration_retries_per_pass: 8,
+            // The plan's number ("alerts when retry_count > 5").
+            migration_alert_retries: 5,
+            migration_retry: crate::fleet_migration::FleetMigrationConfig::default(),
             self_reservation_grace: Duration::from_secs(5 * 60),
             magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
         }
@@ -235,6 +296,21 @@ pub struct ReaperSummary {
     /// Interrupted-deletion candidates skipped because another pass holds
     /// their lock.
     pub deletions_skipped_locked: Vec<String>,
+    /// Failed tenant migrations retried to success (account ids; stamps
+    /// current, failure state cleared — the stragglers stop 503ing).
+    pub migrations_recovered: Vec<String>,
+    /// Failed-migration retries that failed again (account ids; fresh
+    /// backoff horizons and bumped retry counts recorded).
+    pub migrations_still_failing: Vec<String>,
+    /// Failed-migration rows skipped because another pass holds their lock.
+    pub migrations_skipped_locked: Vec<String>,
+    /// Failed-migration rows past
+    /// [`ReaperPolicy::max_migration_retries_per_pass`], deferred untouched.
+    pub migrations_deferred: Vec<String>,
+    /// Failed-migration rows whose retry count climbed past
+    /// [`ReaperPolicy::migration_alert_retries`] this pass — each was
+    /// escalated with a `tracing::error!` naming the tenant.
+    pub migration_alerts: Vec<String>,
     /// Reservations cleared because their subdomain belongs to an active
     /// account (subdomains).
     pub self_reservations_cleared: Vec<String>,
@@ -263,6 +339,11 @@ impl ReaperSummary {
             && self.orphan_dbs_skipped_locked.is_empty()
             && self.deletions_completed.is_empty()
             && self.deletions_skipped_locked.is_empty()
+            && self.migrations_recovered.is_empty()
+            && self.migrations_still_failing.is_empty()
+            && self.migrations_skipped_locked.is_empty()
+            && self.migrations_deferred.is_empty()
+            && self.migration_alerts.is_empty()
             && self.self_reservations_cleared.is_empty()
             && self.expired_magic_links_purged == 0
             && self.expired_sessions_purged == 0
@@ -304,6 +385,9 @@ pub async fn run_reaper_pass(
         complete_interrupted_deletions(control, cluster, managed, policy, &mut summary).await
     {
         record_error(&mut summary, "interrupted-deletion arm", &e);
+    }
+    if let Err(e) = retry_failed_migrations(control, cluster, policy, &mut summary).await {
+        record_error(&mut summary, "failed-migration arm", &e);
     }
     if let Err(e) = clear_self_reservations(control, policy, &mut summary).await {
         record_error(&mut summary, "self-reservation arm", &e);
@@ -880,7 +964,152 @@ async fn complete_interrupted_deletions(
     Ok(())
 }
 
-/// Arm 4 — self-reservations: one atomic DELETE, age-guarded (see module
+/// What arm 4 decided about one due failed-migration row, post-lock.
+enum MigrationRetryOutcome {
+    /// The retry succeeded: stamp current, failure state cleared.
+    Recovered,
+    /// The retry failed again; a doubled backoff horizon and the bumped
+    /// retry count are recorded.
+    StillFailing { retry_count: i32 },
+    /// The under-lock re-check found the row no longer due — a concurrent
+    /// pass (or a booting pod's fleet runner) already healed it, or pushed
+    /// its horizon. Nothing to do.
+    AlreadySettled,
+}
+
+/// Arm 4 — failed tenant migrations (plan: "Failure recovery & the reaper":
+/// `account_databases WHERE migration_failed_at IS NOT NULL AND
+/// (migration_retry_after IS NULL OR migration_retry_after <= now())`).
+/// Each due row is retried through the boot fleet runner's own per-tenant
+/// step under the per-account advisory lock; see the module docs for why
+/// racing a booting pod is safe.
+async fn retry_failed_migrations(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    policy: &ReaperPolicy,
+    summary: &mut ReaperSummary,
+) -> Result<(), CloudError> {
+    let due = crate::fleet_migration::list_retryable_failures(control).await?;
+
+    let mut retries_used = 0usize;
+    for tenant in due {
+        if retries_used >= policy.max_migration_retries_per_pass {
+            summary.migrations_deferred.push(tenant.account_id);
+            continue;
+        }
+        let account_id = tenant.account_id.clone();
+        let lock = match AccountLock::try_acquire(control, &account_id).await {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                summary.migrations_skipped_locked.push(account_id);
+                continue;
+            }
+            Err(e) => {
+                record_error(
+                    summary,
+                    &format!("locking failed migration {account_id}"),
+                    &e,
+                );
+                continue;
+            }
+        };
+        let outcome = process_failed_migration(control, cluster, policy, &tenant).await;
+        lock.release().await;
+        // Same charging rule as arm 1: settled rows cost one indexed
+        // re-read and must not crowd real retries out of the pass; a failed
+        // retry burned its connect timeout (or a real migration's runtime)
+        // and counts.
+        if !matches!(outcome, Ok(MigrationRetryOutcome::AlreadySettled)) {
+            retries_used += 1;
+        }
+        match outcome {
+            Ok(MigrationRetryOutcome::Recovered) => summary.migrations_recovered.push(account_id),
+            Ok(MigrationRetryOutcome::StillFailing { retry_count }) => {
+                if retry_count > policy.migration_alert_retries {
+                    tracing::error!(
+                        account_id,
+                        db_name = tenant.db_name,
+                        retry_count,
+                        "failed tenant migration has exhausted its backoff \
+                         schedule and needs an operator (see `atomic-cloud \
+                         deploy status` for the stored error)"
+                    );
+                    summary.migration_alerts.push(account_id.clone());
+                }
+                summary.migrations_still_failing.push(account_id);
+            }
+            Ok(MigrationRetryOutcome::AlreadySettled) => {}
+            Err(e) => record_error(
+                summary,
+                &format!("retrying failed migration {account_id}"),
+                &e,
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// One due failed-migration row, lock held: re-check, then retry through
+/// [`fleet_migration::migrate_tenant`] — the boot runner's exact per-tenant
+/// step, so what runs and what gets recorded are identical either way.
+///
+/// [`fleet_migration::migrate_tenant`]: crate::fleet_migration::migrate_tenant
+async fn process_failed_migration(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    policy: &ReaperPolicy,
+    tenant: &crate::fleet_migration::UnmigratedTenant,
+) -> Result<MigrationRetryOutcome, CloudError> {
+    // Re-read under the lock: between the unlocked listing and lock
+    // acquisition, a concurrent pass or a booting pod's fleet runner may
+    // have healed the row (failure state cleared) or re-failed it (horizon
+    // pushed into the future). The fresh row also carries the current retry
+    // count, which the backoff arithmetic below must not understate.
+    let row: Option<crate::fleet_migration::UnmigratedTenant> = sqlx::query_as(
+        "SELECT account_id, db_name, last_migrated_version, migration_failed_at, \
+                migration_retry_after, migration_retry_count \
+         FROM account_databases \
+         WHERE account_id = $1 AND db_name = $2 AND status = 'active' \
+           AND migration_failed_at IS NOT NULL \
+           AND (migration_retry_after IS NULL OR migration_retry_after <= NOW())",
+    )
+    .bind(&tenant.account_id)
+    .bind(&tenant.db_name)
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("re-reading failed migration under lock"))?;
+    let Some(fresh) = row else {
+        return Ok(MigrationRetryOutcome::AlreadySettled);
+    };
+
+    let retry_count = fresh.migration_retry_count;
+    let recovered = crate::fleet_migration::migrate_tenant(
+        control,
+        cluster,
+        &policy.migration_retry,
+        fresh,
+        crate::fleet_migration::tenant_schema_target(),
+    )
+    .await;
+    if recovered {
+        tracing::info!(
+            account_id = tenant.account_id,
+            db_name = tenant.db_name,
+            "reaper recovered a failed tenant migration; the straggler is \
+             current and serving again"
+        );
+        Ok(MigrationRetryOutcome::Recovered)
+    } else {
+        // migrate_tenant recorded the new failure state (bumping the count
+        // by one) and warned with the error; the caller decides whether the
+        // new count crosses the alert threshold.
+        Ok(MigrationRetryOutcome::StillFailing {
+            retry_count: retry_count + 1,
+        })
+    }
+}
+
+/// Arm 5 — self-reservations: one atomic DELETE, age-guarded (see module
 /// docs for why the grace shields in-flight deletions).
 async fn clear_self_reservations(
     control: &ControlPlane,
@@ -910,7 +1139,7 @@ async fn clear_self_reservations(
     Ok(())
 }
 
-/// Arm 5 — hygiene purges. Each target is already inert before deletion
+/// Arm 6 — hygiene purges. Each target is already inert before deletion
 /// (every reader filters on expiry/consumption), so these are independent
 /// single statements with no locking.
 async fn purge_expired_rows(
@@ -958,13 +1187,27 @@ mod tests {
     #[test]
     fn default_policy_numbers() {
         let policy = ReaperPolicy::default();
-        // The plan's number ("created_at < now() - interval '5 minutes'").
+        // The plan's numbers ("created_at < now() - interval '5 minutes'";
+        // "alerts when retry_count > 5").
         assert_eq!(policy.stuck_provision_age, Duration::from_secs(300));
-        // Our choices (the plan fixes neither).
+        assert_eq!(policy.migration_alert_retries, 5);
+        // Our choices (the plan fixes none of these).
         assert_eq!(policy.deletion_recovery_grace, Duration::from_secs(300));
+        assert_eq!(policy.max_migration_retries_per_pass, 8);
         assert_eq!(
             policy.magic_link_retention_after_expiry,
             Duration::from_secs(24 * 60 * 60)
+        );
+        // Arm 4's backoff knobs default to the boot fleet runner's, so the
+        // two writers of migration_retry_after agree out of the box.
+        let fleet = crate::fleet_migration::FleetMigrationConfig::default();
+        assert_eq!(
+            policy.migration_retry.retry_backoff_base,
+            fleet.retry_backoff_base
+        );
+        assert_eq!(
+            policy.migration_retry.retry_backoff_cap,
+            fleet.retry_backoff_cap
         );
     }
 
@@ -981,5 +1224,10 @@ mod tests {
             ..ReaperSummary::default()
         };
         assert!(!skipped.is_quiet());
+        let still_failing = ReaperSummary {
+            migrations_still_failing: vec!["id".into()],
+            ..ReaperSummary::default()
+        };
+        assert!(!still_failing.is_quiet());
     }
 }

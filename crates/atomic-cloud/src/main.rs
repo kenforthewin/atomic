@@ -1110,6 +1110,7 @@ async fn serve(
         cluster.clone(),
         managed.clone(),
         reaper_interval,
+        fleet_config.clone(),
     );
 
     // Deploy gate (plan: "Schema migration on deploy"): boot in migrating
@@ -1222,8 +1223,15 @@ async fn run_reaper_loop(
     cluster: ClusterConfig,
     managed: ManagedKeys,
     reaper_interval: std::time::Duration,
+    fleet_config: FleetMigrationConfig,
 ) {
-    let policy = atomic_cloud::ReaperPolicy::default();
+    // The failed-migrations arm retries through the boot fleet runner's
+    // per-tenant step; handing it the serve-level `--fleet-*` config keeps
+    // the two writers of migration_retry_after on one backoff schedule.
+    let policy = atomic_cloud::ReaperPolicy {
+        migration_retry: fleet_config,
+        ..atomic_cloud::ReaperPolicy::default()
+    };
     let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
         &mut rand::thread_rng(),
         0..=reaper_interval.as_millis() as u64,
