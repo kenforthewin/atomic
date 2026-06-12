@@ -2151,6 +2151,76 @@ where
     Ok(total_count as i32)
 }
 
+/// Claim up to `limit` due embedding/tagging jobs from the durable queue and
+/// process them to completion before returning.
+///
+/// The bounded-batch counterpart of [`process_queued_pipeline_jobs`], for
+/// hosts that run pipeline execution in a dedicated worker rather than
+/// spawning it from the save path: one claim, one batch, awaited inline. No
+/// task is spawned and [`crate::executor::EMBEDDING_BATCH_SEMAPHORE`] is not
+/// taken — the caller owns its own concurrency discipline (that semaphore
+/// exists to keep the fire-and-forget spawn path from stampeding a single
+/// process). Emits the same `PipelineQueue*` event family as the spawning
+/// path, scoped to this batch. Returns the number of jobs claimed; `0`
+/// means nothing was due.
+pub async fn run_pipeline_jobs_batch<F>(
+    storage: StorageBackend,
+    limit: i32,
+    on_event: F,
+    external_settings: Option<HashMap<String, String>>,
+    canvas_cache: Option<CanvasCache>,
+) -> Result<i32, String>
+where
+    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
+{
+    let now = chrono::Utc::now();
+    let lease_until = (now + chrono::Duration::minutes(30)).to_rfc3339();
+    let now = now.to_rfc3339();
+    let jobs = storage
+        .claim_pipeline_jobs_sync(limit, &lease_until, &now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let total_jobs = jobs.len();
+    let embedding_total = jobs.iter().filter(|job| job.embed_requested).count();
+    on_event(EmbeddingEvent::PipelineQueueStarted {
+        run_id: run_id.clone(),
+        total_jobs,
+        embedding_total,
+    });
+    if embedding_total > 0 {
+        on_event(EmbeddingEvent::PipelineQueueProgress {
+            run_id: run_id.clone(),
+            stage: "embedding".to_string(),
+            completed: 0,
+            total: embedding_total,
+        });
+    }
+
+    let progress = Arc::new(QueueRunProgress::new(run_id.clone()));
+    process_pipeline_jobs_batch(
+        storage,
+        jobs,
+        on_event.clone(),
+        external_settings,
+        canvas_cache,
+        progress.clone(),
+        embedding_total,
+    )
+    .await;
+
+    on_event(EmbeddingEvent::PipelineQueueCompleted {
+        run_id,
+        total_jobs,
+        failed_jobs: progress.failed_jobs(),
+    });
+    Ok(total_jobs as i32)
+}
+
 /// Convert L2 distance to cosine similarity for normalized vectors
 /// Formula: cosine_similarity = 1 - (L2_distance² / 2)
 /// This derives from: L2² = 2(1 - cos(θ)) for unit vectors

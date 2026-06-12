@@ -36,11 +36,11 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
-    EmailSender, EnvMasterKeyVault, FallbackAppState, KeyVault, LogSender, MailgunSender,
-    ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, RateLimits, TenantPlane,
-    TokenScope,
+    Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState, KeyVault,
+    LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning,
+    PoolCaps, RateLimits, TenantPlane, TokenScope, WorkerPoolsConfig,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "atomic-cloud", about = "Atomic Cloud multi-tenant server")]
@@ -175,6 +175,9 @@ enum Command {
 
         #[command(flatten)]
         provisioning: ProvisioningArgs,
+
+        #[command(flatten)]
+        dispatcher: DispatcherArgs,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -316,6 +319,136 @@ impl ProvisioningArgs {
                 })
             }
         }
+    }
+}
+
+/// The per-pod background dispatcher (plan: "Worker fairness & job queue").
+/// On by default for `serve`: tenant saves enqueue durable
+/// `atom_pipeline_jobs` rows only, and this pod's dispatcher executes them
+/// (plus scheduled tasks, feed polls, wiki-regen retries, and reports)
+/// through four bounded worker pools with per-tenant round-robin fairness.
+/// Disabling it (`--dispatcher=false`) restores inline pipeline execution
+/// in the serving process and runs NO background work — only sensible for
+/// debugging a single pod while another pod's dispatcher covers the fleet.
+#[derive(Args)]
+struct DispatcherArgs {
+    /// Run the background dispatcher in this process.
+    #[arg(
+        long = "dispatcher",
+        env = "ATOMIC_CLOUD_DISPATCHER",
+        default_value_t = true,
+        action = ArgAction::Set,
+        num_args = 1
+    )]
+    dispatcher: bool,
+
+    /// Milliseconds between dispatcher ticks. Each pod offsets its first
+    /// tick by a random fraction of this so a fleet doesn't synchronize.
+    #[arg(long, env = "ATOMIC_CLOUD_DISPATCHER_TICK_MS", default_value_t = 2_000)]
+    dispatcher_tick_ms: u64,
+
+    /// Seconds between slow-path full scans of ALL active accounts (the
+    /// recovery bound for lost dispatch hints and for time-driven work on
+    /// otherwise-idle tenants). The first tick after boot always full-scans.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_SLOW_SCAN_SECS",
+        default_value_t = 300
+    )]
+    dispatcher_slow_scan_secs: u64,
+
+    /// Pipeline jobs claimed per embedding-pool batch.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_PIPELINE_BATCH",
+        default_value_t = 8
+    )]
+    dispatcher_pipeline_batch: i32,
+
+    /// Embedding pool: total in-flight batches per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_EMBEDDING_POOL_TOTAL", default_value_t = 32)]
+    embedding_pool_total: usize,
+
+    /// Embedding pool: in-flight batches per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_EMBEDDING_POOL_PER_TENANT",
+        default_value_t = 4
+    )]
+    embedding_pool_per_tenant: usize,
+
+    /// LLM pool (wiki regeneration, reports): total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_LLM_POOL_TOTAL", default_value_t = 16)]
+    llm_pool_total: usize,
+
+    /// LLM pool: in-flight per tenant.
+    #[arg(long, env = "ATOMIC_CLOUD_LLM_POOL_PER_TENANT", default_value_t = 2)]
+    llm_pool_per_tenant: usize,
+
+    /// Ingestion pool (feed polls): total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_INGESTION_POOL_TOTAL", default_value_t = 16)]
+    ingestion_pool_total: usize,
+
+    /// Ingestion pool: in-flight per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_INGESTION_POOL_PER_TENANT",
+        default_value_t = 4
+    )]
+    ingestion_pool_per_tenant: usize,
+
+    /// Maintenance pool (draft pipeline, graph maintenance, ledger GC):
+    /// total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_MAINTENANCE_POOL_TOTAL", default_value_t = 8)]
+    maintenance_pool_total: usize,
+
+    /// Maintenance pool: in-flight per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MAINTENANCE_POOL_PER_TENANT",
+        default_value_t = 1
+    )]
+    maintenance_pool_per_tenant: usize,
+
+    /// Per-tenant in-flight cap for report runs (a work-type override
+    /// inside the LLM pool; the plan serializes reports per tenant).
+    #[arg(long, env = "ATOMIC_CLOUD_REPORTS_PER_TENANT_CAP", default_value_t = 1)]
+    reports_per_tenant_cap: usize,
+}
+
+impl DispatcherArgs {
+    /// `Some(config)` when the dispatcher is enabled, `None` otherwise.
+    fn into_config(self) -> Option<DispatcherConfig> {
+        if !self.dispatcher {
+            return None;
+        }
+        Some(DispatcherConfig {
+            // tokio::time::interval panics on a zero period; clamp.
+            tick_interval: std::time::Duration::from_millis(self.dispatcher_tick_ms.max(1)),
+            slow_scan_interval: std::time::Duration::from_secs(
+                self.dispatcher_slow_scan_secs.max(1),
+            ),
+            pipeline_batch_size: self.dispatcher_pipeline_batch.max(1),
+            reports_per_tenant_cap: self.reports_per_tenant_cap.max(1),
+            pools: WorkerPoolsConfig {
+                embedding: PoolCaps {
+                    total: self.embedding_pool_total,
+                    per_tenant: self.embedding_pool_per_tenant,
+                },
+                llm: PoolCaps {
+                    total: self.llm_pool_total,
+                    per_tenant: self.llm_pool_per_tenant,
+                },
+                ingestion: PoolCaps {
+                    total: self.ingestion_pool_total,
+                    per_tenant: self.ingestion_pool_per_tenant,
+                },
+                maintenance: PoolCaps {
+                    total: self.maintenance_pool_total,
+                    per_tenant: self.maintenance_pool_per_tenant,
+                },
+            },
+        })
     }
 }
 
@@ -461,6 +594,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             app_public_url,
             max_concurrent_provisions,
             provisioning,
+            dispatcher,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
@@ -470,12 +604,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // provider credentials are decryptable.
             let vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
             let managed = provisioning.into_managed_keys(Arc::clone(&vault))?;
+            let dispatcher_config = dispatcher.into_config();
 
             let cache_config = AccountCacheConfig {
                 tenant_pool_max_connections,
                 tenant_pool_idle_timeout: std::time::Duration::from_secs(
                     tenant_pool_idle_timeout_secs,
                 ),
+                // With a dispatcher attached, tenant saves are enqueue-only
+                // (durable `atom_pipeline_jobs` rows) and the dispatcher's
+                // embedding pool owns execution. Never flip this off
+                // without a dispatcher: enqueued work would sit unexecuted.
+                inline_pipeline: dispatcher_config.is_none(),
                 ..AccountCacheConfig::default()
             };
             let plane_config = AccountPlaneConfig {
@@ -499,6 +639,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 std::time::Duration::from_secs(reaper_interval_secs.max(1)),
                 email.into_sender()?,
                 plane_config,
+                dispatcher_config,
             )
             .await
         }
@@ -595,7 +736,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// `sweep_interval` controls the periodic account-cache sweep; `None` means
 /// a quarter of the cache's idle TTL. `reaper_interval` paces the
-/// failure-recovery reaper.
+/// failure-recovery reaper. `dispatcher_config` (`Some` by default —
+/// `--dispatcher=false` to disable) runs the per-pod background dispatcher;
+/// the caller must have built `cache_config` with `inline_pipeline` set to
+/// the matching value (off exactly when a dispatcher runs).
 #[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
 async fn serve(
     control: ControlPlane,
@@ -610,6 +754,7 @@ async fn serve(
     reaper_interval: std::time::Duration,
     email: Arc<dyn EmailSender>,
     plane_config: AccountPlaneConfig,
+    dispatcher_config: Option<DispatcherConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -663,6 +808,30 @@ async fn serve(
             }
         }
     });
+
+    // Per-pod background dispatcher (plan: "Worker fairness & job queue").
+    // Spawned over the SAME AccountCache the request path uses, so worker
+    // events land on the channels live WebSocket clients subscribe to.
+    // No leader election: ledger claims are the cross-pod exclusion, and
+    // run_loop jitters its first tick.
+    match dispatcher_config {
+        Some(config) => {
+            tracing::info!(
+                tick_ms = config.tick_interval.as_millis() as u64,
+                slow_scan_secs = config.slow_scan_interval.as_secs(),
+                "dispatcher enabled; tenant pipeline execution runs in worker pools"
+            );
+            let dispatcher =
+                Arc::new(Dispatcher::new(control.clone(), Arc::clone(&cache), config).await?);
+            tokio::spawn(dispatcher.run_loop());
+        }
+        None => {
+            tracing::warn!(
+                "dispatcher disabled: background work (feeds, reports, scheduled tasks) \
+                 will not run in this process; tenant pipelines execute inline"
+            );
+        }
+    }
 
     // Must outlive the server: it owns the scratch directory backing the
     // inert fallback AppState (see server.rs module docs).

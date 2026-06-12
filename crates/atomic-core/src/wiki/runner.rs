@@ -111,6 +111,57 @@ async fn execute(
     }
 }
 
+/// Claim and execute one runnable `wiki.regenerate` row, typically
+/// discovered by a ledger scan
+/// ([`AtomicCore::list_runnable_task_runs`](crate::AtomicCore::list_runnable_task_runs)).
+/// This is the per-row body of [`sweep_due_wiki_regens`], public so hosts
+/// that schedule rows individually (rather than sweeping a whole database
+/// at once) drive the identical lifecycle:
+///
+/// - The tag is resolved fresh, so retries synthesize against its *current*
+///   name. A tag deleted while the retry was pending settles the row as a
+///   moot success (no artifact) and returns [`RegenOutcome::Skipped`] —
+///   the work no longer exists.
+/// - The conditional claim ([`ledger::claim_existing`]) fences peers: a row
+///   that settled or was claimed between the caller's scan and this call
+///   returns [`RegenOutcome::Skipped`].
+pub async fn run_runnable_wiki_regen(
+    core: &AtomicCore,
+    run: &crate::models::TaskRun,
+) -> Result<RegenOutcome, AtomicCoreError> {
+    let Some(tag_id) = run.subject_id.clone() else {
+        // Defensive: wiki runs are always subject-keyed. An unkeyed row
+        // can't be executed, so leave it for inspection rather than
+        // claiming something we can't settle meaningfully.
+        tracing::warn!(run_id = %run.id, "[wiki.regenerate] row without subject_id; skipping");
+        return Ok(RegenOutcome::Skipped);
+    };
+
+    let tag = match core.storage().get_tag_sync(&tag_id).await? {
+        Some(tag) => tag,
+        None => {
+            // The tag was deleted while the retry was pending — the work
+            // is moot, not failed. Settle the row (no artifact) so it
+            // doesn't stay runnable forever.
+            if let Some(handle) = ledger::claim_existing(core, run).await? {
+                let _ = handle.complete(None).await;
+                tracing::info!(
+                    tag_id = %tag_id,
+                    "[wiki.regenerate] tag deleted while retry pending; run settled"
+                );
+            }
+            return Ok(RegenOutcome::Skipped);
+        }
+    };
+
+    let handle = match ledger::claim_existing(core, run).await? {
+        Some(h) => h,
+        None => return Ok(RegenOutcome::Skipped), // a peer won the row between scan and claim
+    };
+
+    execute(core, &tag, handle).await
+}
+
 /// One retry sweep over a single database: claim and re-execute every
 /// runnable `wiki.regenerate` row. Returns the tag ids whose articles were
 /// regenerated; failures settle on their ledger rows (re-backed-off or
@@ -138,45 +189,8 @@ pub async fn sweep_due_wiki_regens(core: &AtomicCore) -> Vec<String> {
 
     let mut regenerated = Vec::new();
     for run in due {
-        let Some(tag_id) = run.subject_id.clone() else {
-            // Defensive: wiki runs are always subject-keyed. An unkeyed row
-            // can't be executed, so leave it for inspection rather than
-            // claiming something we can't settle meaningfully.
-            tracing::warn!(run_id = %run.id, "[wiki.regenerate] row without subject_id; skipping");
-            continue;
-        };
-
-        let tag = match core.storage().get_tag_sync(&tag_id).await {
-            Ok(Some(tag)) => tag,
-            Ok(None) => {
-                // The tag was deleted while the retry was pending — the work
-                // is moot, not failed. Settle the row (no artifact) so it
-                // doesn't stay runnable forever.
-                if let Ok(Some(handle)) = ledger::claim_existing(core, &run).await {
-                    let _ = handle.complete(None).await;
-                    tracing::info!(
-                        tag_id = %tag_id,
-                        "[wiki.regenerate] tag deleted while retry pending; run settled"
-                    );
-                }
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(tag_id = %tag_id, error = %e, "[wiki.regenerate] tag lookup failed");
-                continue;
-            }
-        };
-
-        let handle = match ledger::claim_existing(core, &run).await {
-            Ok(Some(h)) => h,
-            Ok(None) => continue, // a peer won the row between scan and claim
-            Err(e) => {
-                tracing::warn!(tag_id = %tag_id, error = %e, "[wiki.regenerate] claim failed");
-                continue;
-            }
-        };
-
-        match execute(core, &tag, handle).await {
+        let tag_id = run.subject_id.clone().unwrap_or_default();
+        match run_runnable_wiki_regen(core, &run).await {
             Ok(RegenOutcome::Generated(_)) => regenerated.push(tag_id),
             Ok(RegenOutcome::Failed { error }) => {
                 tracing::warn!(

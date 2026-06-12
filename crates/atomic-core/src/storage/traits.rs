@@ -576,6 +576,13 @@ pub trait ChunkStore: Send + Sync {
 
     /// Count active durable pipeline jobs for this database.
     async fn count_pipeline_jobs(&self) -> StorageResult<i32>;
+
+    /// Count pipeline jobs claimable right now — the same predicate as
+    /// [`Self::claim_pipeline_jobs`] (pending or expired-lease, `not_before`
+    /// passed, requested stage executable) without claiming anything. Lets
+    /// schedulers that drive the ledger from a dedicated worker size their
+    /// batches before committing a claim.
+    async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32>;
 }
 
 // ==================== Search Storage ====================
@@ -1099,6 +1106,13 @@ pub trait TaskRunStore: Send + Sync {
         task_id: &str,
         now: &str,
     ) -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Count every non-terminal row (`pending` or `running`) across all
+    /// tasks and subjects, regardless of timing. "Is there any ledger work
+    /// outstanding at all?" — the emptiness check schedulers use to decide
+    /// whether a database still needs watching (a backed-off pending row or
+    /// an in-flight lease both count; terminal history does not).
+    async fn count_active_task_runs(&self) -> StorageResult<i32>;
 
     /// Find any non-terminal row for `(task_id, subject_id)` regardless of
     /// timing — i.e., pending OR running, with `next_attempt_at` and

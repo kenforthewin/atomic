@@ -513,6 +513,8 @@ dispatch! {
         => sqlite: clear_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: clear_pipeline_jobs;
     fn count_pipeline_jobs_sync(&self) -> Result<i32, AtomicCoreError>
         => sqlite: count_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_pipeline_jobs;
+    fn count_due_pipeline_jobs_sync(&self, now: &str) -> Result<i32, AtomicCoreError>
+        => sqlite: count_due_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_due_pipeline_jobs;
 
     // ---- SearchStore ----
     fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
@@ -672,6 +674,8 @@ dispatch! {
         => sqlite: find_runnable_task_run_sync, pg_trait: TaskRunStore, pg_method: find_runnable_task_run;
     fn list_runnable_task_runs_sync(&self, task_id: &str, now: &str) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: list_runnable_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_runnable_task_runs;
+    fn count_active_task_runs_sync(&self) -> Result<i32, AtomicCoreError>
+        => sqlite: count_active_task_runs_sync, pg_trait: TaskRunStore, pg_method: count_active_task_runs;
     fn find_active_task_run_sync(&self, task_id: &str, subject_id: Option<&str>) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: find_active_task_run_sync, pg_trait: TaskRunStore, pg_method: find_active_task_run;
     fn claim_pending_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>

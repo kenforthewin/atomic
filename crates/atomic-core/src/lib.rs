@@ -2464,6 +2464,92 @@ impl AtomicCore {
         }
     }
 
+    /// Claim up to `limit` due jobs from the durable pipeline ledger and
+    /// process them to completion before returning.
+    ///
+    /// The execution entry point for hosts that turned inline pipeline
+    /// execution off ([`set_inline_pipeline`](Self::set_inline_pipeline))
+    /// and drive the ledger from a dedicated worker instead: unlike
+    /// [`process_queued_pipeline_jobs`](Self::process_queued_pipeline_jobs)
+    /// it neither consults the inline flag nor spawns — the worker claims a
+    /// bounded batch when it has capacity and awaits it, owning its own
+    /// concurrency and backpressure. Events flow through `on_event` exactly
+    /// as on the inline path. Returns the number of jobs claimed (`0` =
+    /// nothing due).
+    pub async fn run_pipeline_jobs_batch<F>(
+        &self,
+        limit: i32,
+        on_event: F,
+    ) -> Result<i32, AtomicCoreError>
+    where
+        F: Fn(EmbeddingEvent) + Send + Sync + 'static,
+    {
+        let on_event = self.wrap_event_for_cache(on_event);
+        let canvas_cache = Some(self.canvas_cache.clone());
+        let settings = self.settings_for_background().await;
+        embedding::run_pipeline_jobs_batch(
+            self.storage.clone(),
+            limit,
+            on_event,
+            settings,
+            canvas_cache,
+        )
+        .await
+        .map_err(AtomicCoreError::Embedding)
+    }
+
+    // ==================== Ledger scanning ====================
+    //
+    // Read-only visibility into the two durable work ledgers
+    // (`atom_pipeline_jobs`, `task_runs`). Hosts that run background
+    // execution in dedicated workers (see `set_inline_pipeline` /
+    // `run_pipeline_jobs_batch`) poll these to learn whether a database has
+    // outstanding work without claiming anything; they're equally useful
+    // for ops tooling and tests.
+
+    /// Number of pipeline jobs claimable right now — pending (or
+    /// expired-lease) rows whose `not_before` has passed and whose
+    /// requested stage is executable. The sizing input for
+    /// [`run_pipeline_jobs_batch`](Self::run_pipeline_jobs_batch).
+    pub async fn count_due_pipeline_jobs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage
+            .count_due_pipeline_jobs_sync(&chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Total pipeline-job rows, regardless of state or timing — in-flight
+    /// leases and backed-off retries included. `0` means the pipeline
+    /// ledger is fully drained.
+    pub async fn count_pipeline_jobs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage.count_pipeline_jobs_sync().await
+    }
+
+    /// Non-terminal `task_runs` rows (pending or running) across all tasks
+    /// and subjects. `0` means the run ledger holds only history.
+    pub async fn count_active_task_runs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage.count_active_task_runs_sync().await
+    }
+
+    /// Runnable `task_runs` rows for `task_id` as of now: pending rows past
+    /// their `next_attempt_at` plus crashed rows with expired leases. The
+    /// sweep input for event-triggered tasks (see
+    /// [`wiki::runner::run_runnable_wiki_regen`]).
+    pub async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskRun>, AtomicCoreError> {
+        self.storage
+            .list_runnable_task_runs_sync(task_id, &chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Feeds due for polling right now — the same due-ness the poll sweep
+    /// uses ([`ingest::poller::poll_due_feeds`]), exposed so hosts can
+    /// schedule per-feed polls themselves.
+    pub async fn list_due_feeds(&self) -> Result<Vec<Feed>, AtomicCoreError> {
+        self.storage.get_due_feeds_sync().await
+    }
+
     /// Process pending embeddings only for atoms last updated at or before
     /// `cutoff`. Used by the draft-pipeline scheduler so active edits can
     /// settle before background AI work begins.

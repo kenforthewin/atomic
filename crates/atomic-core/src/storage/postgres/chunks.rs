@@ -1462,6 +1462,35 @@ impl ChunkStore for PostgresStorage {
                 })?;
         Ok(count as i32)
     }
+
+    /// Count jobs the claim query would return right now. Mirrors the
+    /// claimability predicate in [`Self::claim_pipeline_jobs`] exactly; keep
+    /// the two in sync.
+    async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM atom_pipeline_jobs j
+             INNER JOIN atoms a ON a.id = j.atom_id AND a.db_id = j.db_id
+             WHERE j.db_id = $1
+               AND (
+                 j.state = 'pending'
+                 OR (j.state = 'processing' AND j.lease_until IS NOT NULL AND j.lease_until <= $2)
+               )
+               AND j.not_before <= $2
+               AND (
+                 j.embed_requested
+                 OR (j.tag_requested AND a.embedding_status = 'complete')
+               )",
+        )
+        .bind(&self.db_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Failed to count due pipeline jobs: {}", e))
+        })?;
+        Ok(count as i32)
+    }
 }
 
 // ==================== Pipeline status ====================

@@ -238,6 +238,18 @@ impl TaskRunStore for PostgresStorage {
         rows.iter().map(row_to_task_run).collect()
     }
 
+    async fn count_active_task_runs(&self) -> StorageResult<i32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_runs
+             WHERE db_id = $1 AND state IN ('pending', 'running')",
+        )
+        .bind(&self.db_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(count as i32)
+    }
+
     async fn find_active_task_run(
         &self,
         task_id: &str,

@@ -216,6 +216,18 @@ impl SqliteStorage {
         Ok(rows)
     }
 
+    /// Count every non-terminal row regardless of task, subject, or timing
+    /// — the ledger-emptiness check (see the trait docs).
+    pub(crate) fn count_active_task_runs_sync(&self) -> StorageResult<i32> {
+        let conn = self.db.read_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE state IN ('pending', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AtomicCoreError::from)
+    }
+
     /// Find any non-terminal row for `(task_id, subject_id)` — pending OR
     /// running — regardless of timing. Most-recent first. Used by the
     /// scheduler to detect "this task already has work in flight" before
@@ -578,6 +590,13 @@ impl TaskRunStore for SqliteStorage {
         let task_id = task_id.to_string();
         let now = now.to_string();
         tokio::task::spawn_blocking(move || storage.list_runnable_task_runs_sync(&task_id, &now))
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn count_active_task_runs(&self) -> StorageResult<i32> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.count_active_task_runs_sync())
             .await
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }

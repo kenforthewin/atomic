@@ -29,11 +29,13 @@ pub mod auth;
 pub mod control_plane;
 pub mod curated_models;
 pub mod dispatch_hints;
+pub mod dispatcher;
 pub mod email;
 pub mod error;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod pools;
 pub mod provider_config;
 pub mod provider_credentials;
 pub mod provision;
@@ -58,6 +60,10 @@ pub use curated_models::{
 pub use dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint, DispatchHint,
 };
+pub use dispatcher::{
+    CoreExecutor, Dispatcher, DispatcherConfig, ExecOutcome, TenantQueue, TickOutcome,
+    WorkExecutor, WorkItem,
+};
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
 pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
@@ -67,6 +73,7 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
+pub use pools::{PoolCaps, PoolPermit, WorkClass, WorkerPools, WorkerPoolsConfig};
 pub use provider_config::{
     build_provider_config, config_for_credentials, keyless_provider_config,
     validate_byok_model_config, BYOK_ALLOWED_KEYS,
