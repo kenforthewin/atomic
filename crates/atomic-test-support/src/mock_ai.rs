@@ -86,6 +86,10 @@ struct MockAiCounters {
     /// When set, `/v1/chat/completions` serves this failure instead of a
     /// completion.
     chat_failure: Mutex<Option<InjectedFailure>>,
+    /// When set, every `/v1/chat/completions` response (success or injected
+    /// failure) is held for this long before being sent — latency injection
+    /// for tests that need requests to genuinely overlap in flight.
+    chat_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl MockAiServer {
@@ -159,6 +163,14 @@ impl MockAiServer {
             .chat_failure
             .lock()
             .expect("chat_failure lock") = failure;
+    }
+
+    /// Hold every `/v1/chat/completions` response for `delay` until cleared
+    /// with `None`. Lets tests keep several chat requests concurrently
+    /// in flight (e.g. concurrency-cap assertions) without racing the
+    /// responder.
+    pub fn set_chat_delay(&self, delay: Option<std::time::Duration>) {
+        *self.counters.chat_delay.lock().expect("chat_delay lock") = delay;
     }
 
     pub fn reset_counts(&self) {
@@ -247,16 +259,23 @@ fn streaming_chat_response(body: &Value) -> ResponseTemplate {
     } else {
         // First leg: ask the runtime to run `search_atoms`. The query is
         // lifted from the most recent user message so the search hits the
-        // seeded atoms verbatim.
+        // seeded atoms verbatim. The tool-call id must be unique per
+        // response — the runtime persists tool calls by this id, and
+        // concurrent conversations would otherwise collide on it.
         let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
         let arguments = json!({ "query": query, "limit": 5 }).to_string();
+        static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let call_id = format!(
+            "call_mock_search_{}",
+            TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let chunks = [
             json!({
                 "choices": [{
                     "delta": {
                         "tool_calls": [{
                             "index": 0,
-                            "id": "call_mock_search",
+                            "id": call_id,
                             "type": "function",
                             "function": {
                                 "name": "search_atoms",
@@ -403,17 +422,24 @@ struct ChatResponder {
 impl Respond for ChatResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
+        // Latency injection applies to every chat response uniformly —
+        // success, injected failure, or malformed-request 400.
+        let delay = *self.counters.chat_delay.lock().expect("chat_delay lock");
+        let with_delay = |response: ResponseTemplate| match delay {
+            Some(d) => response.set_delay(d),
+            None => response,
+        };
         if let Some(failure) = *self
             .counters
             .chat_failure
             .lock()
             .expect("chat_failure lock")
         {
-            return failure.response();
+            return with_delay(failure.response());
         }
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
-            Err(_) => return ResponseTemplate::new(400),
+            Err(_) => return with_delay(ResponseTemplate::new(400)),
         };
         if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
             self.counters
@@ -440,7 +466,7 @@ impl Respond for ChatResponder {
             .map(|t| !t.is_empty())
             .unwrap_or(false);
         if is_streaming && has_tools {
-            return streaming_chat_response(&body);
+            return with_delay(streaming_chat_response(&body));
         }
 
         // Non-streaming chat with tools — used by the reports agentic loop.
@@ -450,7 +476,7 @@ impl Respond for ChatResponder {
         // out of the report e2e tests (search-based tool flow is already
         // covered by slice 3c's chat suite).
         if !is_streaming && has_tools {
-            return ResponseTemplate::new(200).set_body_json(json!({
+            return with_delay(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "mock-cmpl",
                 "object": "chat.completion",
                 "choices": [{
@@ -469,7 +495,7 @@ impl Respond for ChatResponder {
                     },
                     "finish_reason": "tool_calls"
                 }]
-            }));
+            })));
         }
 
         // Inspect the requested schema name so this responder can serve
@@ -521,9 +547,9 @@ impl Respond for ChatResponder {
             // distinguish the two.
             "wiki_generation_result" => {
                 if request_text.contains("wikifail") {
-                    return ResponseTemplate::new(400).set_body_json(json!({
+                    return with_delay(ResponseTemplate::new(400).set_body_json(json!({
                         "error": { "message": "mock wiki generation failure" }
-                    }));
+                    })));
                 }
                 let n = count_numbered_sources(&body);
                 if let Some(new_index) = first_new_source_index(&body) {
@@ -627,6 +653,6 @@ impl Respond for ChatResponder {
         if schema_name == "wiki_generation_result" && request_text.contains("wikislow") {
             response = response.set_delay(std::time::Duration::from_millis(1500));
         }
-        response
+        with_delay(response)
     }
 }

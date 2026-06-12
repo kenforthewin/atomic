@@ -35,10 +35,11 @@ use std::sync::Arc;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, delete_account, issue_token, provision_account, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
-    Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState, KeyVault,
-    LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning,
-    PoolCaps, RateLimits, TenantPlane, TokenScope, WorkerPoolsConfig,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
+    ClusterConfig, ControlPlane, Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault,
+    FallbackAppState, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
+    NewAccount, OpenRouterProvisioning, PoolCaps, RateLimits, TenantPlane, TokenScope,
+    WorkerPoolsConfig,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
@@ -178,6 +179,18 @@ enum Command {
 
         #[command(flatten)]
         dispatcher: DispatcherArgs,
+
+        /// Max concurrent streaming-chat requests per account in this
+        /// process (plan: streaming chat is not pooled — a per-tenant
+        /// semaphore at the route caps it). Over-cap chat sends get a
+        /// structured 429 with a Retry-After hint. Independent of
+        /// --dispatcher: the cap guards the interactive route either way.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_CHAT_STREAMS_PER_ACCOUNT",
+            default_value_t = atomic_cloud::DEFAULT_CHAT_STREAMS_PER_ACCOUNT
+        )]
+        chat_streams_per_account: usize,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -332,7 +345,12 @@ impl ProvisioningArgs {
 /// debugging a single pod while another pod's dispatcher covers the fleet.
 #[derive(Args)]
 struct DispatcherArgs {
-    /// Run the background dispatcher in this process.
+    /// Run the background dispatcher in this process. On by default:
+    /// tenant saves enqueue durable ledger rows and this pod's worker
+    /// pools execute them (plus scheduled tasks, feed polls, wiki-regen
+    /// retries, and reports). --dispatcher=false restores inline pipeline
+    /// execution and runs NO background work — self-hosted parity mode,
+    /// only sensible for debugging while another pod covers the fleet.
     #[arg(
         long = "dispatcher",
         env = "ATOMIC_CLOUD_DISPATCHER",
@@ -599,6 +617,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_concurrent_provisions,
             provisioning,
             dispatcher,
+            chat_streams_per_account,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
@@ -644,6 +663,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 email.into_sender()?,
                 plane_config,
                 dispatcher_config,
+                ChatStreamLimiter::new(chat_streams_per_account),
             )
             .await
         }
@@ -744,6 +764,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// `--dispatcher=false` to disable) runs the per-pod background dispatcher;
 /// the caller must have built `cache_config` with `inline_pipeline` set to
 /// the matching value (off exactly when a dispatcher runs).
+/// `chat_streams` is the process-wide streaming-chat semaphore, cloned into
+/// every HTTP worker.
 #[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
 async fn serve(
     control: ControlPlane,
@@ -759,6 +781,7 @@ async fn serve(
     email: Arc<dyn EmailSender>,
     plane_config: AccountPlaneConfig,
     dispatcher_config: Option<DispatcherConfig>,
+    chat_streams: ChatStreamLimiter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -857,6 +880,7 @@ async fn serve(
             account_plane.clone(),
             tenant_plane.clone(),
             control.clone(),
+            chat_streams.clone(),
         ))
     })
     .workers(4)

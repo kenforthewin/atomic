@@ -22,9 +22,10 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
     list_hinted_accounts, provision_account, set_active_provider, upsert_credentials, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane,
-    CredentialOrigin, FallbackAppState, ManagedKeys, NewAccount, NewCredentials, Provider,
-    SecretKey, TenantPlane, TokenScope, SESSION_COOKIE,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
+    ClusterConfig, ControlPlane, CredentialOrigin, FallbackAppState, ManagedKeys, NewAccount,
+    NewCredentials, Provider, SecretKey, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -119,6 +120,7 @@ impl CloudHarness {
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
         let control_for_app = control.clone();
+        let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -126,6 +128,7 @@ impl CloudHarness {
                 account_plane.clone(),
                 tenant_plane.clone(),
                 control_for_app.clone(),
+                chat_streams.clone(),
             ))
         })
         .workers(1)

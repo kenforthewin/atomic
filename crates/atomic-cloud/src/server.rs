@@ -107,6 +107,7 @@ use tokio::sync::broadcast;
 use crate::account_plane::AccountPlane;
 use crate::auth::CloudAuth;
 use crate::backpressure::out_of_credits_guard;
+use crate::chat_streams::{chat_stream_guard, ChatStreamLimiter};
 use crate::control_plane::ControlPlane;
 use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
@@ -268,6 +269,10 @@ async fn cloud_ws(
 ///   `api_scope` plane carries it — the cloud-owned `/api/account*` routes
 ///   mutate control-plane state, never the tenant's work ledgers, and `/ws`
 ///   is read-only.
+/// - `chat_streams` — the per-account streaming-chat semaphore
+///   ([`crate::chat_streams`]). MUST be one process-wide instance cloned
+///   into every worker's call (it counts in memory; a per-worker instance
+///   would multiply the cap by the worker count).
 ///
 /// Returns `impl FnOnce` rather than taking `&mut ServiceConfig` directly
 /// because the registration captures per-caller values; the server factory
@@ -278,6 +283,7 @@ pub fn configure_cloud_app(
     account_plane: AccountPlane,
     tenant_plane: TenantPlane,
     control: ControlPlane,
+    chat_streams: ChatStreamLimiter,
 ) -> impl FnOnce(&mut web::ServiceConfig) {
     move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(state).route("/health", web::get().to(health));
@@ -296,16 +302,19 @@ pub fn configure_cloud_app(
         .service(
             api_scope()
                 .app_data(web::Data::new(DispatchHintWriter::new(control)))
+                .app_data(web::Data::new(chat_streams))
                 // Execution order is outermost-last-registered: auth
                 // resolves the tenant, the guard fails closed / unroutes the
                 // fallback-bound planes, the credits guard 402s the
                 // AI-interactive routes while the tenant's credits pause is
-                // in force (crate::backpressure — a denied request never
-                // reaches a handler, so it also never marks a hint), and
+                // in force (crate::backpressure), the chat-stream guard
+                // 429s an over-cap chat send (crate::chat_streams), and
                 // only then does the hint writer see the request — so
-                // unrouted planes and unauthenticated requests never mark
-                // hints.
+                // unrouted planes, unauthenticated requests, and denied
+                // requests (402/429 — neither ever reaches a handler)
+                // never mark hints.
                 .wrap(from_fn(mark_hint_on_mutation))
+                .wrap(from_fn(chat_stream_guard))
                 .wrap(from_fn(out_of_credits_guard))
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth),

@@ -59,6 +59,16 @@
 //! any execution that ran (or failed — failures leave backed-off retry rows
 //! the fast path must keep watching).
 //!
+//! # What is deliberately NOT here: streaming chat
+//!
+//! Every ledger-backed work-type flows through these pools; streaming chat
+//! does not (plan: "Streaming chat (not in a pool)"). It is request-driven,
+//! user-facing, and latency-critical — queueing a chat send behind another
+//! tenant's wiki synthesis would be product-breaking, and there is no
+//! durable row to re-claim on restart anyway. Its bound is a per-account
+//! semaphore at the route instead: [`crate::chat_streams`], wired into the
+//! data plane by `configure_cloud_app`.
+//!
 //! # Provider backpressure (plan: "Provider rate-limit handling")
 //!
 //! [`CoreExecutor`] classifies provider failures

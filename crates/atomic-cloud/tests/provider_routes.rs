@@ -22,9 +22,9 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
-    AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState,
-    ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, TenantPlane, TokenScope,
-    MANAGED_LLM_MODELS, SESSION_COOKIE,
+    AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
+    FallbackAppState, ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, TenantPlane,
+    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, MANAGED_LLM_MODELS, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -149,6 +149,7 @@ impl ProviderHarness {
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
         let control_for_app = control.clone();
+        let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -156,6 +157,7 @@ impl ProviderHarness {
                 account_plane.clone(),
                 tenant_plane.clone(),
                 control_for_app.clone(),
+                chat_streams.clone(),
             ))
         })
         .workers(1)

@@ -27,6 +27,7 @@ pub mod account_cache;
 pub mod account_plane;
 pub mod auth;
 pub mod backpressure;
+pub mod chat_streams;
 pub mod control_plane;
 pub mod curated_models;
 pub mod dispatch_hints;
@@ -56,6 +57,10 @@ pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSI
 pub use backpressure::{
     ai_interactive_route, out_of_credits_guard, BreakerConfig, PauseKind, ProviderBreaker,
     ProviderPause,
+};
+pub use chat_streams::{
+    chat_stream_guard, chat_stream_route, ChatStreamLimiter, ChatStreamPermit,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 pub use control_plane::ControlPlane;
 pub use curated_models::{

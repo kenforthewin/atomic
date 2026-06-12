@@ -23,8 +23,9 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
-    AccountPlane, AccountPlaneConfig, CloudAuth, ClusterConfig, ControlPlane, FallbackAppState,
-    MagicLinkPurpose, ManagedKeys, NewAccount, RateLimits, TenantPlane, TokenScope, SESSION_COOKIE,
+    AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
+    FallbackAppState, MagicLinkPurpose, ManagedKeys, NewAccount, RateLimits, TenantPlane,
+    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use reqwest::header::{HOST, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::{Method, StatusCode};
@@ -119,6 +120,7 @@ impl PlaneHarness {
         let state = fallback.data();
         let plane = account_plane.clone();
         let control_for_app = control.clone();
+        let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -126,6 +128,7 @@ impl PlaneHarness {
                 account_plane.clone(),
                 tenant_plane.clone(),
                 control_for_app.clone(),
+                chat_streams.clone(),
             ))
         })
         .workers(1)

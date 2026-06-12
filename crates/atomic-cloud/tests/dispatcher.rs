@@ -25,10 +25,11 @@ use actix_web::{App, HttpServer};
 use atomic_cloud::{
     configure_cloud_app, issue_token, list_hinted_accounts, mark_hint, provision_account,
     set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
-    AccountPlaneConfig, BreakerConfig, CloudAuth, CloudError, ClusterConfig, ControlPlane,
-    CoreExecutor, CredentialOrigin, Dispatcher, DispatcherConfig, ExecOutcome, FallbackAppState,
-    ManagedKeys, NewAccount, NewCredentials, PoolCaps, Provider, ProviderBreaker, SecretKey,
-    TenantPlane, TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem, WorkerPoolsConfig,
+    AccountPlaneConfig, BreakerConfig, ChatStreamLimiter, CloudAuth, CloudError, ClusterConfig,
+    ControlPlane, CoreExecutor, CredentialOrigin, Dispatcher, DispatcherConfig, ExecOutcome,
+    FallbackAppState, ManagedKeys, NewAccount, NewCredentials, PoolCaps, Provider, ProviderBreaker,
+    SecretKey, TenantPlane, TenantQueue, TokenScope, WorkClass, WorkExecutor, WorkItem,
+    WorkerPoolsConfig, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use atomic_core::models::{TaskRunState, TaskRunTrigger};
 use atomic_core::{DatabaseManager, TaskRun};
@@ -1043,6 +1044,7 @@ impl DispatcherHarness {
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
         let control_for_app = control.clone();
+        let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
@@ -1050,6 +1052,7 @@ impl DispatcherHarness {
                 account_plane.clone(),
                 tenant_plane.clone(),
                 control_for_app.clone(),
+                chat_streams.clone(),
             ))
         })
         .workers(1)
