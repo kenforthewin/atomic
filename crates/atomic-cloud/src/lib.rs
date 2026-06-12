@@ -34,6 +34,7 @@ pub mod dispatch_hints;
 pub mod dispatcher;
 pub mod email;
 pub mod error;
+pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
@@ -76,6 +77,10 @@ pub use dispatcher::{
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
+pub use fleet_migration::{
+    list_unmigrated, record_migration_failure, record_migration_success, tenant_schema_target,
+    UnmigratedTenant, MIGRATION_ERROR_MAX_LEN,
+};
 pub use keyvault::{EnvMasterKeyVault, KeyVault, SecretKey, ENCRYPTION_VERSION, MASTER_KEY_ENV};
 pub use magic_links::{
     consume_magic_link, issue_magic_link, MagicLinkPurpose, MagicLinkRecord, MAGIC_LINK_TTL,

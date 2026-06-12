@@ -364,16 +364,33 @@ pub async fn provision_account(
         .ensure_managed_key(control, &account_id.to_string())
         .await?;
 
-    // Step 10 — record the account → tenant-database mapping. ON CONFLICT
-    // keeps a resumed provision from duplicating the row.
+    // Step 10 — record the account → tenant-database mapping, stamped with
+    // the schema version steps 5+6 just migrated the tenant to (the compiled
+    // target) so a fresh tenant is never a straggler to CloudAuth's gate
+    // (see crate::fleet_migration). ON CONFLICT keeps a resumed provision
+    // from duplicating the row; the DO UPDATE arm re-records the success the
+    // resume's own migration run just earned — GREATEST so an old binary
+    // resuming a row a newer binary already stamped can't regress it, and
+    // the failure/backoff columns reset because a full `initialize()`
+    // verifiably succeeded moments ago.
     let recorded = sqlx::query(
-        "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
-         VALUES ($1, $2, $3, 'active') \
-         ON CONFLICT (account_id, db_name) DO NOTHING",
+        "INSERT INTO account_databases \
+             (account_id, cluster_id, db_name, status, \
+              last_migrated_version, last_migrated_at) \
+         VALUES ($1, $2, $3, 'active', $4, NOW()) \
+         ON CONFLICT (account_id, db_name) DO UPDATE \
+         SET last_migrated_version = \
+                 GREATEST(account_databases.last_migrated_version, EXCLUDED.last_migrated_version), \
+             last_migrated_at = NOW(), \
+             migration_failed_at = NULL, \
+             last_migration_error = NULL, \
+             migration_retry_after = NULL, \
+             migration_retry_count = 0",
     )
     .bind(account_id.to_string())
     .bind(&cluster.cluster_id)
     .bind(&db_name)
+    .bind(crate::fleet_migration::tenant_schema_target())
     .execute(control.pool())
     .await;
     if let Err(e) = recorded {

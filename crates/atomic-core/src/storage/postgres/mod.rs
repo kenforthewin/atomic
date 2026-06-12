@@ -125,6 +125,44 @@ impl Default for PgPoolConfig {
 #[cfg(feature = "postgres")]
 pub(crate) const GLOBAL_SETTINGS_DB_ID: &str = "_global";
 
+/// Embedded migration registry: `(version, sql)`. Each migration's SQL
+/// inserts its own `schema_version` row. The registry's maximum version is
+/// the compiled schema target ([`PostgresStorage::target_schema_version`]).
+#[cfg(feature = "postgres")]
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("migrations/001_initial.sql")),
+    (2, include_str!("migrations/002_add_db_id.sql")),
+    (3, include_str!("migrations/003_add_error_columns.sql")),
+    (4, include_str!("migrations/004_wiki_proposals.sql")),
+    (5, include_str!("migrations/005_autotag_target.sql")),
+    (6, include_str!("migrations/006_oauth.sql")),
+    (7, include_str!("migrations/007_briefings.sql")),
+    (8, include_str!("migrations/008_global_search_vectors.sql")),
+    (9, include_str!("migrations/009_atom_links.sql")),
+    (10, include_str!("migrations/010_pipeline_jobs.sql")),
+    (11, include_str!("migrations/011_edges_status.sql")),
+    (12, include_str!("migrations/012_autotag_description.sql")),
+    (13, include_str!("migrations/013_atom_tags_source.sql")),
+    (14, include_str!("migrations/014_atoms_kind.sql")),
+    (15, include_str!("migrations/015_task_runs.sql")),
+    (16, include_str!("migrations/016_reports.sql")),
+    (
+        17,
+        include_str!("migrations/017_task_runs_active_unique.sql"),
+    ),
+    (18, include_str!("migrations/018_briefings_teardown.sql")),
+    (
+        19,
+        include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
+    ),
+    (20, include_str!("migrations/020_atom_positions_double.sql")),
+    (21, include_str!("migrations/021_settings_db_id.sql")),
+    (
+        22,
+        include_str!("migrations/022_settings_db_id_backfill.sql"),
+    ),
+];
+
 /// Postgres-backed storage implementation using sqlx + pgvector.
 ///
 /// Each instance is scoped to a `db_id` for multi-database isolation.
@@ -214,44 +252,32 @@ impl PostgresStorage {
         self.run_migrations().await
     }
 
+    /// The schema version this binary's compiled migration registry targets
+    /// — the highest version in [`MIGRATIONS`], i.e. what
+    /// [`initialize`](Self::initialize) brings a database to.
+    ///
+    /// A single-database deployment never needs this: it just calls
+    /// `initialize` and is current. Hosts that run many databases on this
+    /// storage backend need the compiled target to coordinate upgrades —
+    /// recording which databases have been brought up to it and which still
+    /// lag after a binary upgrade.
+    pub const fn target_schema_version() -> i32 {
+        let mut max = 0;
+        let mut i = 0;
+        while i < MIGRATIONS.len() {
+            if MIGRATIONS[i].0 > max {
+                max = MIGRATIONS[i].0;
+            }
+            i += 1;
+        }
+        max
+    }
+
     /// Run migrations incrementally based on schema_version.
     /// Uses a Postgres advisory lock to serialize concurrent callers
     /// (e.g., parallel test threads).
     async fn run_migrations(&self) -> Result<(), AtomicCoreError> {
-        // Migration registry: (version, sql)
-        let migrations: &[(i32, &str)] = &[
-            (1, include_str!("migrations/001_initial.sql")),
-            (2, include_str!("migrations/002_add_db_id.sql")),
-            (3, include_str!("migrations/003_add_error_columns.sql")),
-            (4, include_str!("migrations/004_wiki_proposals.sql")),
-            (5, include_str!("migrations/005_autotag_target.sql")),
-            (6, include_str!("migrations/006_oauth.sql")),
-            (7, include_str!("migrations/007_briefings.sql")),
-            (8, include_str!("migrations/008_global_search_vectors.sql")),
-            (9, include_str!("migrations/009_atom_links.sql")),
-            (10, include_str!("migrations/010_pipeline_jobs.sql")),
-            (11, include_str!("migrations/011_edges_status.sql")),
-            (12, include_str!("migrations/012_autotag_description.sql")),
-            (13, include_str!("migrations/013_atom_tags_source.sql")),
-            (14, include_str!("migrations/014_atoms_kind.sql")),
-            (15, include_str!("migrations/015_task_runs.sql")),
-            (16, include_str!("migrations/016_reports.sql")),
-            (
-                17,
-                include_str!("migrations/017_task_runs_active_unique.sql"),
-            ),
-            (18, include_str!("migrations/018_briefings_teardown.sql")),
-            (
-                19,
-                include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
-            ),
-            (20, include_str!("migrations/020_atom_positions_double.sql")),
-            (21, include_str!("migrations/021_settings_db_id.sql")),
-            (
-                22,
-                include_str!("migrations/022_settings_db_id_backfill.sql"),
-            ),
-        ];
+        let migrations = MIGRATIONS;
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations
         const MIGRATION_LOCK_KEY: i64 = 0x61746f6d69635f6d; // "atomic_m"
@@ -361,5 +387,20 @@ impl Storage for PostgresStorage {
     fn storage_path(&self) -> &std::path::Path {
         // Postgres doesn't have a file path; return a placeholder
         std::path::Path::new("postgres")
+    }
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_schema_version_is_the_registry_max() {
+        let max = MIGRATIONS.iter().map(|&(v, _)| v).max().unwrap();
+        assert_eq!(PostgresStorage::target_schema_version(), max);
+        // The registry is append-only and contiguous from 1; a gap or a
+        // duplicate would skip or double-apply a migration.
+        let versions: Vec<i32> = MIGRATIONS.iter().map(|&(v, _)| v).collect();
+        assert_eq!(versions, (1..=max).collect::<Vec<_>>());
     }
 }

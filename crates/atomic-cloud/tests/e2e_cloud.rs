@@ -21,11 +21,11 @@ use std::time::Duration;
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
     cloud_plane_guard, configure_cloud_app, create_session, delete_account, issue_token,
-    list_hinted_accounts, provision_account, set_active_provider, upsert_credentials, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
-    ClusterConfig, ControlPlane, CredentialOrigin, FallbackAppState, ManagedKeys, NewAccount,
-    NewCredentials, Provider, SecretKey, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
-    SESSION_COOKIE,
+    list_hinted_accounts, provision_account, set_active_provider, tenant_schema_target,
+    upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
+    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin, FallbackAppState,
+    ManagedKeys, NewAccount, NewCredentials, Provider, SecretKey, TenantPlane, TokenScope,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -1244,5 +1244,144 @@ async fn mutating_requests_mark_dispatch_hints() {
         h.poll_pipeline_done(&alpha, &atom_id).await;
         h.stop().await;
     })
+    .await;
+}
+
+/// The deploy-gating straggler gate, end to end (plan: "Schema migration on
+/// deploy" → "Stragglers"): an account whose tenant database lags the
+/// compiled schema target gets the structured 503 `account_upgrading` —
+/// exact body, `Retry-After` header, on the data plane AND the WebSocket
+/// upgrade — while accounts at the target, `/health`, and the account plane
+/// are untouched; stamping the account current restores service. The lag is
+/// driven by SQL (the honest simulation of a tenant the fleet runner hasn't
+/// reached — fresh provisions are stamped current, as `tests/provisioning.rs`
+/// pins).
+#[actix_web::test]
+async fn straggler_accounts_get_account_upgrading_503() {
+    with_control_db(
+        "straggler_accounts_get_account_upgrading_503",
+        |url| async move {
+            let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+            let alpha = h.provision("alpha").await;
+            let bravo = h.provision("bravo").await;
+            let target = tenant_schema_target();
+
+            let stamp_alpha = |version: i32| {
+                let control = h.control.clone();
+                let account_id = alpha.account_id.clone();
+                async move {
+                    sqlx::query(
+                        "UPDATE account_databases SET last_migrated_version = $2 \
+                         WHERE account_id = $1",
+                    )
+                    .bind(&account_id)
+                    .bind(version)
+                    .execute(control.pool())
+                    .await
+                    .expect("stamp last_migrated_version");
+                }
+            };
+
+            // Mark alpha as mid-upgrade.
+            stamp_alpha(target - 1).await;
+
+            // Data plane → the plan's 503, verbatim, with Retry-After.
+            let resp = h
+                .api(Method::GET, &alpha.subdomain, "/api/atoms")
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .map(|v| v.as_bytes()),
+                Some("60".as_bytes())
+            );
+            let body: Value = resp.json().await.expect("json");
+            assert_eq!(
+                body,
+                json!({
+                    "error": "account_upgrading",
+                    "message": "Your account is being upgraded. Try again shortly.",
+                    "retry_after_seconds": 60,
+                }),
+                "the straggler body is the plan's, verbatim"
+            );
+
+            // The gate fires before credentials are read (the
+            // account_provisioning sibling's behavior).
+            let resp = h
+                .api(Method::GET, &alpha.subdomain, "/api/atoms")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            // The WebSocket upgrade is gated identically: 503, not a socket.
+            let mut request = format!("ws://127.0.0.1:{}/ws", h.port)
+                .into_client_request()
+                .expect("ws request");
+            request.headers_mut().insert(
+                "Host",
+                format!("alpha.{BASE_DOMAIN}").parse().expect("host header"),
+            );
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", alpha.token)
+                    .parse()
+                    .expect("auth header"),
+            );
+            match tokio_tungstenite::connect_async(request).await {
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                    assert_eq!(resp.status().as_u16(), 503, "ws upgrade must 503");
+                    let body = resp.body().as_deref().unwrap_or_default();
+                    assert!(
+                        String::from_utf8_lossy(body).contains("account_upgrading"),
+                        "ws denial carries the structured body"
+                    );
+                }
+                other => panic!("ws connect must be refused with HTTP 503, got {other:?}"),
+            }
+
+            // An account at the target is untouched.
+            h.list_atoms(&bravo).await;
+
+            // /health never passes through the gate.
+            let resp = h
+                .client
+                .get(format!("{}/health", h.base_url))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // The account plane (app host) never passes through it either:
+            // a login link request for the upgrading account's email gets
+            // the neutral 200, not a leaked 503.
+            let resp = h
+                .client
+                .post(format!("{}/login/request-link", h.base_url))
+                .header(HOST, BASE_DOMAIN)
+                .json(&json!({ "email": "alpha@example.com" }))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "the account plane must not surface the straggler 503"
+            );
+
+            // Stamped current → serves again, including the WebSocket.
+            stamp_alpha(target).await;
+            h.list_atoms(&alpha).await;
+            let ws = h.ws_connect(&alpha).await;
+            drop(ws);
+
+            h.stop().await;
+        },
+    )
     .await;
 }

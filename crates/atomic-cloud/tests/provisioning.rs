@@ -358,6 +358,124 @@ async fn provision_resumes_after_crash() {
     .await;
 }
 
+/// Provisioning stamps the migration-tracking columns (plan: "Schema
+/// migration on deploy" — fresh tenants are never stragglers): the mapping
+/// row records the compiled tenant schema target the provision just
+/// migrated the tenant to, and a resumed provision re-records its success
+/// without ever regressing a higher stamp.
+#[tokio::test]
+async fn provision_stamps_migration_tracking() {
+    with_control_db("provision_stamps_migration_tracking", |url| async move {
+        let (control, cluster) = setup(&url).await;
+        let target = atomic_cloud::tenant_schema_target();
+
+        let acct = provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            new_account("kenny@example.com", "stamped"),
+        )
+        .await
+        .expect("provision succeeds");
+
+        type Tracking = (
+            i32,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            i32,
+        );
+        let read_tracking = || async {
+            let row: Tracking = sqlx::query_as(
+                "SELECT last_migrated_version, last_migrated_at, migration_failed_at, \
+                        last_migration_error, migration_retry_count \
+                 FROM account_databases WHERE account_id = $1",
+            )
+            .bind(&acct.account_id)
+            .fetch_one(control.pool())
+            .await
+            .expect("read tracking columns");
+            row
+        };
+
+        let (version, at, failed_at, error, retries) = read_tracking().await;
+        assert_eq!(
+            version, target,
+            "fresh provision stamps the compiled target"
+        );
+        assert!(at.is_some(), "fresh provision records last_migrated_at");
+        assert!(failed_at.is_none());
+        assert!(error.is_none());
+        assert_eq!(retries, 0);
+
+        // A resumed provision re-runs the tenant migrations and re-records
+        // the success — including clearing failure state a prior attempt
+        // left behind. Drive the exact pre-resume state by SQL.
+        sqlx::query("UPDATE accounts SET status = 'provisioning' WHERE id = $1")
+            .bind(&acct.account_id)
+            .execute(control.pool())
+            .await
+            .expect("flip status back to provisioning");
+        sqlx::query(
+            "UPDATE account_databases \
+             SET last_migrated_version = 0, last_migrated_at = NULL, \
+                 migration_failed_at = NOW(), last_migration_error = 'boom', \
+                 migration_retry_after = NOW() + INTERVAL '1 hour', \
+                 migration_retry_count = 3 \
+             WHERE account_id = $1",
+        )
+        .bind(&acct.account_id)
+        .execute(control.pool())
+        .await
+        .expect("simulate a failed pre-resume state");
+
+        provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            new_account("kenny@example.com", "stamped"),
+        )
+        .await
+        .expect("resume completes");
+
+        let (version, at, failed_at, error, retries) = read_tracking().await;
+        assert_eq!(version, target, "resume re-stamps the compiled target");
+        assert!(at.is_some());
+        assert!(failed_at.is_none(), "resume clears failure state");
+        assert!(error.is_none());
+        assert_eq!(retries, 0);
+
+        // GREATEST: a stamp from a newer binary survives an older binary's
+        // resume (rolling deploys must not regress the recorded version).
+        sqlx::query("UPDATE accounts SET status = 'provisioning' WHERE id = $1")
+            .bind(&acct.account_id)
+            .execute(control.pool())
+            .await
+            .expect("flip status back to provisioning again");
+        sqlx::query(
+            "UPDATE account_databases SET last_migrated_version = $2 WHERE account_id = $1",
+        )
+        .bind(&acct.account_id)
+        .bind(target + 5)
+        .execute(control.pool())
+        .await
+        .expect("simulate a newer binary's stamp");
+
+        provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            new_account("kenny@example.com", "stamped"),
+        )
+        .await
+        .expect("resume completes again");
+
+        let (version, ..) = read_tracking().await;
+        assert_eq!(version, target + 5, "resume never regresses a higher stamp");
+    })
+    .await;
+}
+
 /// Issue: the `subdomains_reserved` pre-check and the claim INSERT are not
 /// atomic, so a concurrent `delete_account` can park the subdomain between
 /// them. The post-claim re-check (`ensure_claim_not_reserved`, the seam

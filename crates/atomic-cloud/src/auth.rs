@@ -6,11 +6,13 @@
 //!
 //! 1. `Host` header → strip the configured base domain → subdomain.
 //!    Malformed, missing, or foreign hosts → 404.
-//! 2. `accounts WHERE subdomain = ?` → 404 when absent. A non-`active`
+//! 2. `accounts WHERE subdomain = ?` → 404 when absent. A non-serveable
 //!    account is blocked before credentials are even read: `provisioning`
-//!    returns a structured 503 (the plan's hold-message pattern; the
-//!    deploy-gating `account_upgrading` variant joins it in a later slice),
-//!    anything else (`failed`, …) is indistinguishable from absent — 404.
+//!    returns a structured 503 (the plan's hold-message pattern), an active
+//!    account whose tenant database lags the binary's compiled schema
+//!    target gets the sibling 503 `account_upgrading` (the deploy-gating
+//!    straggler gate — see below), anything else (`failed`, …) is
+//!    indistinguishable from absent — 404.
 //! 3. Credentials: `Authorization: Bearer` first, the session cookie
 //!    ([`SESSION_COOKIE`]) as fallback. Neither → 401.
 //! 4. Verification is **scoped by account**: `WHERE account_id = ? AND
@@ -47,6 +49,28 @@
 //! deferred to the slice that also writes it on explicit switches; until
 //! then the tenant-internal active database (the manager's default KB)
 //! keeps today's behavior.
+//!
+//! # The straggler gate (plan: "Schema migration on deploy" → "Stragglers")
+//!
+//! The per-request account lookup also reads the account's
+//! `account_databases.last_migrated_version` (the same already-paid-for
+//! query the provider generation and circuit-breaker pause ride on). When
+//! it lags the binary's compiled tenant schema target
+//! ([`crate::fleet_migration::tenant_schema_target`]) — a failed or
+//! not-yet-reached tenant during a fleet migration — the request gets the
+//! structured 503 `account_upgrading` with `Retry-After`, before
+//! credentials are read, exactly like the `account_provisioning` sibling.
+//! Serving a request against a behind-schema tenant would let new code
+//! query columns/tables that don't exist there yet.
+//!
+//! **WebSocket connects are gated identically**: the cloud `/ws` route sits
+//! behind this middleware, so an upgrading account's upgrade request
+//! receives the same 503 instead of a socket. That is deliberate — a WS
+//! session is a long-lived data-plane consumer; admitting one mid-upgrade
+//! would hold a live subscription to a tenant the HTTP plane is refusing to
+//! touch. Clients reconnect (with backoff) exactly as they do for any other
+//! 503. Health (`/health`) and the account plane (signup/login on the app
+//! host) never pass through this middleware and are unaffected.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -230,19 +254,25 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         .and_then(|host| subdomain_from_host(host, &ctx.base_domain))
         .ok_or_else(not_found)?;
 
-    // 2 — subdomain → account. The provider generation and the circuit-
-    // breaker pause ride along on the lookup this middleware already makes
-    // per request (no auth caching), making the cache's rotation-convergence
-    // check in step 7 — and the out-of-credits guard — free.
+    // 2 — subdomain → account. The provider generation, the circuit-breaker
+    // pause, and the tenant's migration progress all ride along on the
+    // lookup this middleware already makes per request (no auth caching),
+    // making the cache's rotation-convergence check in step 7, the
+    // out-of-credits guard, and the straggler gate free. The migration
+    // progress is the MIN over the account's active mapping rows (exactly
+    // one in v1): if ANY serving database lags, the account is mid-upgrade.
     type AccountRow = (
         String,
         String,
         i64,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
+        Option<i32>,
     );
     let account: Option<AccountRow> = sqlx::query_as(
-        "SELECT id, status, provider_generation, provider_paused_until, provider_pause_kind \
+        "SELECT id, status, provider_generation, provider_paused_until, provider_pause_kind, \
+                (SELECT MIN(last_migrated_version) FROM account_databases \
+                 WHERE account_id = accounts.id AND status = 'active') \
          FROM accounts WHERE subdomain = $1",
     )
     .bind(&subdomain)
@@ -252,7 +282,7 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         tracing::error!(error = %e, "account lookup failed");
         internal_error()
     })?;
-    let (account_id, status, provider_generation, paused_until, pause_kind) =
+    let (account_id, status, provider_generation, paused_until, pause_kind, migrated_version) =
         account.ok_or_else(not_found)?;
     let provider_pause =
         crate::backpressure::ProviderPause::from_columns(paused_until, pause_kind.as_deref());
@@ -264,6 +294,18 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         // 'provisioning'/'active' exists today — failed provisions are
         // hard-deleted by the reaper, never tombstoned.)
         _ => return Err(not_found()),
+    }
+
+    // 2½ — the straggler gate (module docs): an otherwise-serveable account
+    // whose tenant database lags the compiled schema target holds with the
+    // plan's 503 until the fleet runner or the reaper brings it current.
+    // `None` means no active mapping row at all — an interrupted deletion,
+    // not a straggler: fall through and let the tenant load fail on its own
+    // terms (the reaper's recovery arm owns that state).
+    if let Some(version) = migrated_version {
+        if version < crate::fleet_migration::tenant_schema_target() {
+            return Err(account_upgrading());
+        }
     }
 
     // 3 + 4 + 5 — credentials → verified principal. Bearer wins when both
@@ -438,6 +480,19 @@ fn account_provisioning() -> HttpResponse {
         .json(serde_json::json!({
             "error": "account_provisioning",
             "message": "Your account is being set up. Try again shortly.",
+            "retry_after_seconds": 60,
+        }))
+}
+
+/// The plan's straggler response, verbatim ("Schema migration on deploy" →
+/// "Stragglers"): the account's tenant database is mid-fleet-migration.
+/// The frontend renders an upgrade screen; MCP clients back off and retry.
+fn account_upgrading() -> HttpResponse {
+    HttpResponse::ServiceUnavailable()
+        .insert_header((header::RETRY_AFTER, "60"))
+        .json(serde_json::json!({
+            "error": "account_upgrading",
+            "message": "Your account is being upgraded. Try again shortly.",
             "retry_after_seconds": 60,
         }))
 }
