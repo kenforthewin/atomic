@@ -22,7 +22,19 @@
 //!   trips the breaker. Per-pod detection is deliberate — sharing failure
 //!   counts across pods would buy a slightly earlier trip at the cost of a
 //!   control-plane write per failure; a noisy tenant trips every pod's
-//!   window within seconds anyway.
+//!   window within seconds anyway. The map self-bounds: a trip and a
+//!   provider-class success both drop the tenant's window, and every
+//!   failure note also sweeps out windows whose newest entry has aged past
+//!   the detection horizon, so tenants that fail a couple of times and go
+//!   quiet don't accumulate.
+//! - **Only provider-touching work feeds detection.** Maintenance tasks
+//!   and non-inline feed polls never call the provider, so their successes
+//!   say nothing about the provider's health — they must neither reset the
+//!   streak nor clear the window (or interleaved housekeeping would keep a
+//!   chronically rate-limited tenant from ever tripping, and keep a
+//!   tripped one from ever escalating). The dispatcher's executor owns
+//!   that gating (see `crate::dispatcher`): `record_healthy` is called
+//!   only for provider-class executions that genuinely succeeded.
 //! - **The pause itself is control plane**, so every pod honors it:
 //!   `accounts.provider_paused_until` (+ `provider_pause_kind`,
 //!   `provider_pause_streak`; migration 007). The dispatcher skips paused
@@ -37,6 +49,15 @@
 //!   recheck horizon (1h). It does not touch the streak — it isn't a
 //!   rate-limit escalation, it's a billing wall that lifts on reset,
 //!   upgrade, or key rotation.
+//! - **Credential rejection (401/403)** — a BYOK key expired, revoked, or
+//!   mis-scoped — pauses immediately with `kind = 'provider'` (the plan's
+//!   "BYOK key expired" breaker case): no retry succeeds until the user
+//!   fixes the key, so background dispatch holds until a provider mutation
+//!   clears the pause (or the recheck horizon re-probes, in case the 401
+//!   was the provider's own hiccup). Like credits, it never touches the
+//!   rate-limit streak; unlike credits, interactive routes keep their
+//!   current behavior — the user gets the provider's real auth error,
+//!   which is the actionable one.
 //!
 //! # The rate-limit / credits asymmetry
 //!
@@ -61,7 +82,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use actix_web::body::MessageBody;
@@ -71,9 +92,24 @@ use actix_web::middleware::Next;
 use actix_web::{HttpMessage, HttpResponse};
 use chrono::{DateTime, Utc};
 
+use atomic_core::providers::{classify_provider_failure, ProviderFailureClass};
+use atomic_core::scheduler::ledger::{FailureDisposition, FailureDispositionPolicy};
+
 use crate::auth::ResolvedTenant;
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+
+/// Layer-1 re-dispatch delay for rate-limited work when the provider sent
+/// no `Retry-After` hint. Matches the task ledger's backoff base unit
+/// (`scheduler::ledger::BACKOFF_BASE`) so both ledgers retry on the same
+/// conventions.
+pub const RATE_LIMIT_REQUEUE_DELAY: Duration = Duration::from_secs(60);
+
+/// Default ceiling on a provider-supplied `Retry-After` hint
+/// ([`DispatcherConfig::retry_after_cap`](crate::dispatcher::DispatcherConfig)).
+/// A hostile or buggy provider must not be able to strand a tenant's work
+/// behind an arbitrary horizon; anything longer is the breaker's job.
+pub const DEFAULT_RETRY_AFTER_CAP: Duration = Duration::from_secs(15 * 60);
 
 /// Why a tenant's provider dispatch is paused. Serialized to text in
 /// `accounts.provider_pause_kind`.
@@ -87,6 +123,12 @@ pub enum PauseKind {
     /// dispatch pauses AND the AI-interactive routes return the structured
     /// `out_of_ai_credits` error.
     Credits,
+    /// The provider rejected the stored credentials (401/403 — an expired,
+    /// revoked, or mis-scoped key): the provider configuration itself is
+    /// broken. Background dispatch pauses until a provider mutation clears
+    /// it (or the recheck horizon re-probes); interactive routes are
+    /// unaffected — the provider's own auth error is the actionable answer.
+    Provider,
 }
 
 impl PauseKind {
@@ -95,6 +137,7 @@ impl PauseKind {
         match self {
             PauseKind::RateLimit => "rate_limit",
             PauseKind::Credits => "credits",
+            PauseKind::Provider => "provider",
         }
     }
 }
@@ -112,6 +155,7 @@ impl FromStr for PauseKind {
         match s {
             "rate_limit" => Ok(PauseKind::RateLimit),
             "credits" => Ok(PauseKind::Credits),
+            "provider" => Ok(PauseKind::Provider),
             other => Err(CloudError::InvalidPauseKind(other.to_string())),
         }
     }
@@ -265,26 +309,68 @@ impl ProviderBreaker {
         let until = resets_at.unwrap_or_else(|| {
             Utc::now() + chrono::Duration::from_std(self.config.credits_recheck).unwrap()
         });
+        let paused = self
+            .pause_immediately(account_id, PauseKind::Credits, until)
+            .await?;
+        if paused {
+            tracing::warn!(
+                account_id,
+                paused_until = %until,
+                "tenant out of AI credits; dispatch paused and interactive AI routes blocked"
+            );
+            Ok(Some(until))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Record a credential-rejection (401/403) failure: pause immediately
+    /// with `kind = 'provider'` for the recheck horizon (module docs: a
+    /// broken key is fixed by a provider mutation, which clears the pause;
+    /// the horizon is only the re-probe bound for a provider-side hiccup).
+    /// Returns the pause horizon; `Ok(None)` when the account vanished
+    /// concurrently. The rate-limit streak is untouched.
+    pub async fn record_auth_failed(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, CloudError> {
+        let until = Utc::now() + chrono::Duration::from_std(self.config.credits_recheck).unwrap();
+        let paused = self
+            .pause_immediately(account_id, PauseKind::Provider, until)
+            .await?;
+        if paused {
+            tracing::warn!(
+                account_id,
+                paused_until = %until,
+                "provider rejected the tenant's credentials; dispatch paused until rotation"
+            );
+            Ok(Some(until))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Shared immediate-pause write for the non-escalating kinds (credits,
+    /// provider). Returns whether the account row still existed.
+    async fn pause_immediately(
+        &self,
+        account_id: &str,
+        kind: PauseKind,
+        until: DateTime<Utc>,
+    ) -> Result<bool, CloudError> {
         let updated = sqlx::query(
             "UPDATE accounts SET \
                  provider_paused_until = $2, \
-                 provider_pause_kind = 'credits' \
+                 provider_pause_kind = $3 \
              WHERE id = $1",
         )
         .bind(account_id)
         .bind(until)
+        .bind(kind.as_str())
         .execute(self.control.pool())
         .await
-        .map_err(CloudError::db("pausing tenant on credit exhaustion"))?;
-        if updated.rows_affected() == 0 {
-            return Ok(None);
-        }
-        tracing::warn!(
-            account_id,
-            paused_until = %until,
-            "tenant out of AI credits; dispatch paused and interactive AI routes blocked"
-        );
-        Ok(Some(until))
+        .map_err(CloudError::db("pausing tenant on provider failure"))?;
+        Ok(updated.rows_affected() > 0)
     }
 
     /// Record a healthy (provider-failure-free) execution: drop the
@@ -310,8 +396,18 @@ impl ProviderBreaker {
     /// Slide the window and decide whether this failure trips the breaker.
     /// Pure in-memory bookkeeping, split out (and instant-parameterized) so
     /// the threshold/window semantics are unit-testable without a clock.
+    /// Each call also prunes *other* tenants' fully aged-out windows
+    /// (module docs: the map self-bounds) — failures are rare enough that
+    /// the O(tenants) sweep is free in practice.
     fn note_failure(&self, account_id: &str, now: Instant) -> bool {
         let mut windows = self.windows.lock().expect("breaker windows poisoned");
+        // Drop every window whose NEWEST entry has aged past the detection
+        // horizon — nothing in it can ever count toward a trip again.
+        windows.retain(|_, window| {
+            window
+                .back()
+                .is_some_and(|newest| now.duration_since(*newest) <= self.config.window)
+        });
         let window = windows.entry(account_id.to_string()).or_default();
         window.push_back(now);
         while let Some(front) = window.front() {
@@ -330,6 +426,58 @@ impl ProviderBreaker {
             false
         }
     }
+
+    /// Number of tenants with live detection windows. Metrics/tests.
+    pub fn tracked_windows(&self) -> usize {
+        self.windows.lock().expect("breaker windows poisoned").len()
+    }
+}
+
+// --- The task-ledger failure-disposition policy ------------------------------
+
+/// Build the [`FailureDispositionPolicy`] cloud tenants run with: the
+/// layer-1 half of "jobs sit in the ledger, never fail" for the `task_runs`
+/// ledger (plan: "Allowance exhausted" — and its rate-limit/auth siblings).
+///
+/// Provider failures are *environmental* — a month-long credit exhaustion
+/// must not burn through `max_attempts` in three probes and terminally
+/// abandon work (wiki regeneration above all: nothing but a ledger scan
+/// ever re-fires it). The policy classifies each failure message with
+/// [`classify_provider_failure`] and defers instead of failing:
+///
+/// - **Rate limit** → defer to the provider's `Retry-After` (clamped to
+///   `retry_after_cap`), or [`RATE_LIMIT_REQUEUE_DELAY`] without a hint —
+///   the same horizon the pipeline ledger's re-enqueue uses, and the
+///   layer-1 contract ("record the rate-limit-reset header into
+///   `task_runs.next_attempt_at`") made literal.
+/// - **Credits / auth** → defer to `pause_recheck` (the breaker's recheck
+///   horizon — [`BreakerConfig::credits_recheck`]); the matching tenant
+///   pause holds dispatch anyway, and a provider mutation re-arms both
+///   (see `AtomicCore::rearm_provider_blocked_task_runs`).
+/// - **Anything else** → [`FailureDisposition::Fail`]: logic failures keep
+///   consuming retry budget exactly as before.
+///
+/// Installed per tenant manager by the [`crate::account_cache`] build path.
+pub fn provider_failure_policy(
+    pause_recheck: Duration,
+    retry_after_cap: Duration,
+) -> FailureDispositionPolicy {
+    Arc::new(move |error: &str| match classify_provider_failure(error) {
+        ProviderFailureClass::RateLimited { retry_after_secs } => {
+            let delay = retry_after_secs
+                .map(|secs| Duration::from_secs(secs).min(retry_after_cap))
+                .unwrap_or(RATE_LIMIT_REQUEUE_DELAY);
+            FailureDisposition::DeferUntil(
+                Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default(),
+            )
+        }
+        ProviderFailureClass::PaymentRequired | ProviderFailureClass::AuthFailed => {
+            FailureDisposition::DeferUntil(
+                Utc::now() + chrono::Duration::from_std(pause_recheck).unwrap_or_default(),
+            )
+        }
+        ProviderFailureClass::Other => FailureDisposition::Fail,
+    })
 }
 
 // --- The interactive out-of-credits surface ---------------------------------
@@ -431,7 +579,11 @@ mod tests {
 
     #[test]
     fn pause_kind_round_trips_through_text() {
-        for kind in [PauseKind::RateLimit, PauseKind::Credits] {
+        for kind in [
+            PauseKind::RateLimit,
+            PauseKind::Credits,
+            PauseKind::Provider,
+        ] {
             assert_eq!(kind.as_str().parse::<PauseKind>().unwrap(), kind);
         }
         assert!(matches!(
@@ -499,6 +651,73 @@ mod tests {
             "b has one failure, not three"
         );
         assert!(breaker.note_failure("a", t0));
+    }
+
+    /// Stale tenants don't accumulate: a tenant that failed a couple of
+    /// times and went quiet is swept out of the in-memory map once its
+    /// newest failure ages past the window (module docs: the map
+    /// self-bounds). Pre-fix, such entries lived until process exit.
+    #[tokio::test]
+    async fn stale_windows_are_pruned() {
+        let breaker = breaker_without_db();
+        let t0 = Instant::now();
+        assert!(!breaker.note_failure("quiet", t0));
+        assert!(!breaker.note_failure("noisy", t0 + Duration::from_secs(30)));
+        assert_eq!(breaker.tracked_windows(), 2);
+
+        // 90s later: "quiet"'s newest entry (t0) is past the 60s window —
+        // pruned by the next note; "noisy" (30s old... now 60s) survives
+        // exactly at the boundary.
+        assert!(!breaker.note_failure("noisy", t0 + Duration::from_secs(90)));
+        assert_eq!(
+            breaker.tracked_windows(),
+            1,
+            "fully aged-out tenants must be swept from the map"
+        );
+    }
+
+    /// The failure-disposition policy: provider-class failures defer
+    /// (Retry-After clamped; credits/auth on the recheck horizon), logic
+    /// failures keep failing.
+    #[test]
+    fn provider_failure_policy_classifies_and_clamps() {
+        let recheck = Duration::from_secs(3600);
+        let cap = Duration::from_secs(900);
+        let policy = provider_failure_policy(recheck, cap);
+        let until = |disposition: FailureDisposition| match disposition {
+            FailureDisposition::DeferUntil(ts) => (ts - Utc::now()).num_seconds(),
+            FailureDisposition::Fail => panic!("expected a deferral"),
+        };
+
+        // Retry-After honored…
+        let secs = until(policy("Rate limited, retry after 120 seconds"));
+        assert!((115..=125).contains(&secs), "got {secs}s");
+        // …and clamped: a hostile 24h hint lands at the 15-minute cap.
+        let secs = until(policy("Rate limited, retry after 86400 seconds"));
+        assert!(
+            (895..=905).contains(&secs),
+            "hint must clamp to cap, got {secs}s"
+        );
+        // No hint → the base delay.
+        let secs = until(policy("Rate limited"));
+        assert!((55..=65).contains(&secs), "got {secs}s");
+        // Credits and auth → the recheck horizon.
+        for environmental in [
+            "Embedding error: API error (402): out of credits",
+            "Wiki error: API error (401): bad key",
+        ] {
+            let secs = until(policy(environmental));
+            assert!(
+                (3595..=3605).contains(&secs),
+                "got {secs}s for {environmental:?}"
+            );
+        }
+        // Logic failures keep consuming retry budget.
+        assert_eq!(
+            policy("Parse error: bad JSON"),
+            FailureDisposition::Fail,
+            "non-provider failures must not defer"
+        );
     }
 
     /// `note_failure` is pure in-memory bookkeeping, so a lazy pool that is

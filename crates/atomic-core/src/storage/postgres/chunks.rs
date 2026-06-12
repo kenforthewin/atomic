@@ -1491,6 +1491,27 @@ impl ChunkStore for PostgresStorage {
         })?;
         Ok(count as i32)
     }
+
+    async fn rearm_pipeline_jobs(&self, reason: &str, now: &str) -> StorageResult<u64> {
+        let result = sqlx::query(
+            "UPDATE atom_pipeline_jobs
+                SET not_before = $3,
+                    updated_at = $3
+              WHERE db_id = $1
+                AND state = 'pending'
+                AND reason = $2
+                AND not_before > $3",
+        )
+        .bind(&self.db_id)
+        .bind(reason)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Failed to re-arm pipeline jobs: {}", e))
+        })?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ==================== Pipeline status ====================

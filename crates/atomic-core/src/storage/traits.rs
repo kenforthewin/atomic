@@ -583,6 +583,13 @@ pub trait ChunkStore: Send + Sync {
     /// schedulers that drive the ledger from a dedicated worker size their
     /// batches before committing a claim.
     async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32>;
+
+    /// Reset `not_before` to `now` on pending jobs stamped with `reason`
+    /// whose `not_before` is still in the future, returning the number of
+    /// rows re-armed. The environment-changed escape hatch for backed-off
+    /// work (see `AtomicCore::rearm_pipeline_jobs`); in-flight leases and
+    /// other reasons are untouched.
+    async fn rearm_pipeline_jobs(&self, reason: &str, now: &str) -> StorageResult<u64>;
 }
 
 // ==================== Search Storage ====================
@@ -1197,6 +1204,35 @@ pub trait TaskRunStore: Send + Sync {
         last_error: &str,
         finished_at: &str,
     ) -> StorageResult<bool>;
+
+    /// `running → pending` **without consuming retry budget**: sets
+    /// `next_attempt_at`, records `last_error`, clears `lease_until` and
+    /// `started_at`, and *decrements* `attempts` — refunding the increment
+    /// the claim charged, the same way `reclaim_expired_task_run` never
+    /// charges one. The storage half of
+    /// `scheduler::ledger::RunHandle::defer_until` (environmental failures;
+    /// see `scheduler::ledger::FailureDisposition`). Same fenced predicate
+    /// as `complete_task_run`.
+    async fn defer_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Every `pending` row across all tasks whose `next_attempt_at` is
+    /// still in the future — work waiting out a backoff or deferral
+    /// horizon. The scan feeding `AtomicCore::rearm_provider_blocked_task_runs`.
+    async fn list_waiting_task_runs(&self, now: &str)
+        -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Reset `next_attempt_at` to `now` on the given rows, gated on
+    /// `state = 'pending'` (a row claimed or settled since the caller's
+    /// scan is skipped — its horizon is no longer ours to rewrite).
+    /// Returns the number of rows re-armed.
+    async fn rearm_task_runs(&self, ids: &[String], now: &str) -> StorageResult<u64>;
 
     /// Force-settle every non-terminal row for `(task_id, subject_id)` as a
     /// moot success: `state = 'succeeded'` with no `result_id` — the same

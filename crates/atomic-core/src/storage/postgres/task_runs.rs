@@ -436,6 +436,88 @@ impl TaskRunStore for PostgresStorage {
         Ok(row.is_some())
     }
 
+    /// Deferral (environmental failure): back to `pending` at the caller's
+    /// horizon with the claim's attempt increment refunded — see
+    /// `TaskRunStore::defer_task_run`. `GREATEST(attempts - 1, 0)` rather
+    /// than a bare decrement so a defensive caller can never drive the
+    /// counter negative.
+    async fn defer_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool> {
+        let row = sqlx::query(
+            "UPDATE task_runs
+                SET state           = 'pending',
+                    attempts        = GREATEST(attempts - 1, 0),
+                    last_error      = $2,
+                    next_attempt_at = $4,
+                    lease_until     = NULL,
+                    started_at      = NULL,
+                    updated_at      = $3
+              WHERE id = $1
+                AND state = 'running'
+                AND lease_until = $5
+                AND db_id = $6
+              RETURNING id",
+        )
+        .bind(id)
+        .bind(last_error)
+        .bind(now)
+        .bind(next_attempt_at)
+        .bind(expected_lease)
+        .bind(&self.db_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    async fn list_waiting_task_runs(&self, now: &str) -> StorageResult<Vec<TaskRun>> {
+        let sql = format!(
+            "SELECT {COLS}
+             FROM task_runs
+             WHERE db_id = $1
+               AND state = 'pending'
+               AND next_attempt_at > $2
+             ORDER BY next_attempt_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&self.db_id)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        rows.iter().map(row_to_task_run).collect()
+    }
+
+    async fn rearm_task_runs(&self, ids: &[String], now: &str) -> StorageResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET next_attempt_at = $2,
+                        updated_at      = $2
+                  WHERE id = ANY($1)
+                    AND state = 'pending'
+                    AND db_id = $3",
+            )
+            .bind(ids)
+            .bind(now)
+            .bind(&self.db_id)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn fail_task_run_abandon(
         &self,
         id: &str,

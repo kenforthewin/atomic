@@ -569,6 +569,184 @@ async fn test_list_runnable_task_runs(storage: &dyn TaskRunStore) {
     assert!(other.iter().all(|r| r.task_id != task_id));
 }
 
+/// Deferral (environmental failures — provider limits/outages): the row
+/// returns to `pending` at the caller's horizon with the claim's attempt
+/// charge REFUNDED and the lease released. The retry-budget sibling of the
+/// reclaim rule pinned in `pg_expired_lease_reclaimed_through_claim_path` /
+/// `dispatch_reclaims_running_row_with_expired_lease`: neither a crash nor
+/// an environment-caused failure consumes `max_attempts`. Same lease fence
+/// as every other settle.
+async fn test_defer_task_run_refunds_attempt_and_releases_lease(storage: &dyn TaskRunStore) {
+    let task_id = format!("defer::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let lease = (now + chrono::Duration::minutes(2)).to_rfc3339();
+    let mut row = task_run_row(
+        &task_id,
+        "subject",
+        TaskRunState::Running,
+        &now_str,
+        Some(&lease),
+    );
+    row.started_at = Some(now_str.clone());
+    storage.insert_task_run(&row).await.unwrap();
+
+    let horizon = (now + chrono::Duration::hours(1)).to_rfc3339();
+    let error = "Embedding error: API error (402): out of credits";
+
+    // A stale lease is fenced out and the row is untouched.
+    assert!(
+        !storage
+            .defer_task_run(&row.id, "someone-elses-lease", error, &now_str, &horizon)
+            .await
+            .unwrap(),
+        "a mismatched lease must not settle the row"
+    );
+    let untouched = storage.get_task_run(&row.id).await.unwrap().unwrap();
+    assert_eq!(untouched.state, TaskRunState::Running);
+    assert_eq!(untouched.attempts, 1);
+
+    // The lease holder defers: pending at the horizon, attempt refunded,
+    // lease and started_at cleared, failure recorded.
+    assert!(storage
+        .defer_task_run(&row.id, &lease, error, &now_str, &horizon)
+        .await
+        .unwrap());
+    let deferred = storage.get_task_run(&row.id).await.unwrap().unwrap();
+    assert_eq!(
+        deferred.state,
+        TaskRunState::Pending,
+        "re-armed, not failed"
+    );
+    assert_eq!(
+        deferred.attempts, 0,
+        "deferral must refund the claim's attempt — environmental failures never consume retry budget"
+    );
+    assert_eq!(deferred.next_attempt_at, horizon);
+    assert!(deferred.lease_until.is_none(), "lease released");
+    assert!(deferred.started_at.is_none());
+    assert_eq!(deferred.last_error.as_deref(), Some(error));
+}
+
+/// `rearm_task_runs` resets `next_attempt_at` on exactly the given ids, and
+/// only while they are still `pending` — a row claimed (or settled) since
+/// the caller's scan keeps its own horizon. `list_waiting_task_runs` is the
+/// scan feeding it: pending rows with future horizons, nothing else.
+async fn test_rearm_task_runs_gated_on_pending(storage: &dyn TaskRunStore) {
+    let task_id = format!("rearm::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+    let live_lease = (now + chrono::Duration::minutes(2)).to_rfc3339();
+
+    let waiting = task_run_row(&task_id, "deferred", TaskRunState::Pending, &future, None);
+    let running = task_run_row(
+        &task_id,
+        "claimed",
+        TaskRunState::Running,
+        &future,
+        Some(&live_lease),
+    );
+    let due = task_run_row(
+        &task_id,
+        "already-due",
+        TaskRunState::Pending,
+        &now_str,
+        None,
+    );
+    for row in [&waiting, &running, &due] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    // The scan sees the future-pending row, not the running or already-due ones.
+    let scanned: Vec<String> = storage
+        .list_waiting_task_runs(&now_str)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(scanned.contains(&waiting.id), "waiting row is scanned");
+    assert!(
+        !scanned.contains(&running.id),
+        "claimed rows are not waiting"
+    );
+    assert!(
+        !scanned.contains(&due.id),
+        "already-due rows are not waiting"
+    );
+
+    // Re-arm both the waiting and the (stale-scanned) running row: only the
+    // pending one moves.
+    let rearmed = storage
+        .rearm_task_runs(&[waiting.id.clone(), running.id.clone()], &now_str)
+        .await
+        .unwrap();
+    assert_eq!(rearmed, 1, "only the pending row is ours to rewrite");
+    let waiting_after = storage.get_task_run(&waiting.id).await.unwrap().unwrap();
+    assert_eq!(waiting_after.next_attempt_at, now_str);
+    let running_after = storage.get_task_run(&running.id).await.unwrap().unwrap();
+    assert_eq!(
+        running_after.next_attempt_at, future,
+        "a claimed row keeps its own horizon"
+    );
+}
+
+/// `rearm_pipeline_jobs` resets `not_before` to now on pending jobs stamped
+/// with exactly the given reason — the environment-changed escape hatch for
+/// provider-backed-off pipeline work. Other reasons keep their horizons.
+async fn test_rearm_pipeline_jobs_scoped_to_reason(atoms: &dyn AtomStore, chunks: &dyn ChunkStore) {
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let future = (now + chrono::Duration::minutes(10)).to_rfc3339();
+
+    let mut atom_ids = Vec::new();
+    for _ in 0..2 {
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = CreateAtomRequest {
+            content: "pipeline re-arm fixture".to_string(),
+            ..Default::default()
+        };
+        atoms.insert_atom(&id, &request, &now_str).await.unwrap();
+        atom_ids.push(id);
+    }
+    let job = |atom_id: &str, reason: &str| AtomPipelineJobRequest {
+        atom_id: atom_id.to_string(),
+        embed_requested: true,
+        tag_requested: false,
+        not_before: Some(future.clone()),
+        reason: reason.to_string(),
+        replace_existing: true,
+    };
+    chunks
+        .enqueue_pipeline_jobs(&[
+            job(&atom_ids[0], "provider-backoff"),
+            job(&atom_ids[1], "save"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(chunks.count_due_pipeline_jobs(&now_str).await.unwrap(), 0);
+
+    let rearmed = chunks
+        .rearm_pipeline_jobs("provider-backoff", &now_str)
+        .await
+        .unwrap();
+    assert_eq!(rearmed, 1, "exactly the provider-backoff row re-arms");
+    assert_eq!(
+        chunks.count_due_pipeline_jobs(&now_str).await.unwrap(),
+        1,
+        "the re-armed row is immediately due; the 'save' row keeps waiting"
+    );
+    // Nothing left to re-arm — the call is idempotent on already-due rows.
+    assert_eq!(
+        chunks
+            .rearm_pipeline_jobs("provider-backoff", &now_str)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 // ==================== task_runs retention GC ====================
 //
 // `gc_task_runs` is one bounded delete batch; the policy lives entirely in
@@ -1145,6 +1323,24 @@ async fn sqlite_settle_task_runs_moot() {
 }
 
 #[tokio::test]
+async fn sqlite_defer_task_run_refunds_attempt_and_releases_lease() {
+    let (s, _dir) = sqlite_storage().await;
+    test_defer_task_run_refunds_attempt_and_releases_lease(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_rearm_task_runs_gated_on_pending() {
+    let (s, _dir) = sqlite_storage().await;
+    test_rearm_task_runs_gated_on_pending(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_rearm_pipeline_jobs_scoped_to_reason() {
+    let (s, _dir) = sqlite_storage().await;
+    test_rearm_pipeline_jobs_scoped_to_reason(&s, &s).await;
+}
+
+#[tokio::test]
 async fn sqlite_create_conversation() {
     let (s, _dir) = sqlite_storage().await;
     test_create_conversation(&s).await;
@@ -1296,6 +1492,24 @@ mod postgres_tests {
         test_gc_task_runs_batches_are_bounded
     );
     pg_test!(pg_settle_task_runs_moot, test_settle_task_runs_moot);
+    pg_test!(
+        pg_defer_task_run_refunds_attempt_and_releases_lease,
+        test_defer_task_run_refunds_attempt_and_releases_lease
+    );
+    pg_test!(
+        pg_rearm_task_runs_gated_on_pending,
+        test_rearm_task_runs_gated_on_pending
+    );
+
+    #[tokio::test]
+    async fn pg_rearm_pipeline_jobs_scoped_to_reason() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        test_rearm_pipeline_jobs_scoped_to_reason(s, s).await;
+    }
+
     pg_test!(pg_create_conversation, test_create_conversation);
     pg_test!(pg_save_and_get_messages, test_save_and_get_messages);
     pg_test!(pg_delete_conversation, test_delete_conversation);
@@ -1824,6 +2038,100 @@ mod postgres_tests {
         let row = storage.get_task_run(&crashed.id).await.unwrap().unwrap();
         assert_eq!(row.state, TaskRunState::Succeeded);
         assert_eq!(row.attempts, 1);
+    }
+
+    /// Deferral against Postgres through the real fail path: with a
+    /// failure-disposition policy installed, `RunHandle::fail` on a
+    /// provider-classified error routes to `defer_until` — the row re-arms
+    /// `pending` at the policy's horizon with the claim's attempt refunded,
+    /// while a logic failure through the same policy still consumes budget.
+    /// The PG companion of
+    /// `provider_classified_failure_defers_without_consuming_attempts` in
+    /// lib.rs, mirroring the reclaim test above.
+    #[tokio::test]
+    async fn pg_provider_failure_defers_through_fail_path() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        use atomic_core::providers::{classify_provider_failure, ProviderFailureClass};
+        use atomic_core::scheduler::ledger::{self, FailureDisposition};
+
+        let storage = s.with_db_id("task_runs_defer");
+        let core = atomic_core::AtomicCore::from_postgres_storage(storage.clone());
+        core.set_failure_disposition_policy(Some(Arc::new(|error: &str| {
+            match classify_provider_failure(error) {
+                ProviderFailureClass::Other => FailureDisposition::Fail,
+                _ => {
+                    FailureDisposition::DeferUntil(chrono::Utc::now() + chrono::Duration::hours(1))
+                }
+            }
+        })));
+
+        let task_id = format!("defer::{}", uuid::Uuid::new_v4());
+        let handle = ledger::claim_or_create(
+            &core,
+            &task_id,
+            Some("subject"),
+            TaskRunTrigger::Schedule,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("fresh claim");
+        let run_id = handle.run().id.clone();
+        assert_eq!(handle.run().attempts, 1, "the claim charges an attempt");
+
+        // Environmental failure → deferred, attempt refunded.
+        assert!(handle
+            .fail("Rate limited, retry after 300 seconds".to_string())
+            .await
+            .unwrap());
+        let row = storage.get_task_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskRunState::Pending);
+        assert_eq!(
+            row.attempts, 0,
+            "a provider-classified failure must not consume retry budget"
+        );
+        assert!(row.lease_until.is_none(), "the deferral released the lease");
+        let horizon_mins = (chrono::DateTime::parse_from_rfc3339(&row.next_attempt_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            - chrono::Utc::now())
+        .num_minutes();
+        assert!(
+            (55..=65).contains(&horizon_mins),
+            "deferred to the policy's horizon, got {horizon_mins}m"
+        );
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("Rate limited, retry after 300 seconds")
+        );
+
+        // A logic failure through the same policy still consumes budget.
+        sqlx::query("UPDATE task_runs SET next_attempt_at = $2 WHERE id = $1")
+            .bind(&run_id)
+            .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        let handle = ledger::claim_or_create(
+            &core,
+            &task_id,
+            Some("subject"),
+            TaskRunTrigger::Schedule,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("re-claim after deferral");
+        assert!(handle
+            .fail("Parse error: bad JSON".to_string())
+            .await
+            .unwrap());
+        let row = storage.get_task_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskRunState::Pending, "retry scheduled");
+        assert_eq!(row.attempts, 1, "logic failures keep consuming the budget");
     }
 
     /// Deleting a feed settles its stranded ledger rows on Postgres too:

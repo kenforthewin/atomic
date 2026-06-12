@@ -66,6 +66,7 @@ fn dispatcher_config(pools: WorkerPoolsConfig, pipeline_batch: i32) -> Dispatche
         reports_per_tenant_cap: 1,
         pools,
         breaker: BreakerConfig::default(),
+        ..DispatcherConfig::default()
     }
 }
 
@@ -120,6 +121,15 @@ impl E2eHarness {
             support::test_vault(),
             AccountCacheConfig {
                 inline_pipeline: inline,
+                // The serve composition installs the deferral policy exactly
+                // when a dispatcher runs (main.rs); mirror that here so the
+                // harness exercises the production task-run settle path.
+                failure_disposition_policy: (!inline).then(|| {
+                    atomic_cloud::provider_failure_policy(
+                        BreakerConfig::default().credits_recheck,
+                        atomic_cloud::DEFAULT_RETRY_AFTER_CAP,
+                    )
+                }),
                 ..AccountCacheConfig::default()
             },
         ));
@@ -875,6 +885,92 @@ async fn dispatcher_off_preserves_inline_pipeline_behavior() {
                 );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+/// A wedged tenant database must not head-of-line-block the tick
+/// (`DispatcherConfig::tenant_poll_timeout`). Construction is honest: the
+/// wedged tenant's `atom_pipeline_jobs` table is held under an
+/// ACCESS EXCLUSIVE lock by an open transaction, so its ledger poll
+/// genuinely hangs at the database — exactly the failure mode of a stuck
+/// tenant DB — while another tenant's work must still dispatch in the same
+/// tick. Releasing the lock lets the next tick pick the skipped tenant
+/// back up (its hint was retained, never cleared).
+#[actix_web::test]
+async fn wedged_tenant_poll_times_out_without_blocking_others() {
+    with_control_db(
+        "wedged_tenant_poll_times_out_without_blocking_others",
+        |url| async move {
+            let mut config = dispatcher_config(WorkerPoolsConfig::default(), 8);
+            config.tenant_poll_timeout = Duration::from_secs(1);
+            let h = E2eHarness::spawn(&url, Mode::ManualTick(config), 3).await;
+            let wedged = h.provision("wedged").await;
+            let healthy = h.provision("healthy").await;
+
+            let wedged_atom = h
+                .create_atom(&wedged, "note stuck behind a wedged database")
+                .await;
+            let healthy_atom = h
+                .create_atom(&healthy, "note that must not wait in line")
+                .await;
+
+            // Wedge: hold the table the poll reads first under an exclusive
+            // lock for the duration of the tick.
+            let wedged_url = cluster_config()
+                .tenant_db_url(&wedged.db_name)
+                .expect("tenant url");
+            let mut lock_conn = PgConnection::connect(&wedged_url)
+                .await
+                .expect("connect wedged tenant db");
+            let mut tx = sqlx::Connection::begin(&mut lock_conn)
+                .await
+                .expect("open lock transaction");
+            sqlx::query("LOCK TABLE atom_pipeline_jobs IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await
+                .expect("lock wedged ledger");
+
+            // The tick must bound the wedged tenant at the poll timeout and
+            // still dispatch the healthy tenant's work.
+            let started = std::time::Instant::now();
+            let scheduled = h.tick_and_settle().await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(8),
+                "the wedged tenant must cost at most the poll timeout, not the tick: {elapsed:?}"
+            );
+            assert_eq!(scheduled, 1, "the healthy tenant's batch must dispatch");
+            assert_eq!(
+                h.atom_embedding_status(&healthy, &healthy_atom).await,
+                "complete",
+                "a wedged neighbor must not stall the healthy tenant"
+            );
+            assert_eq!(
+                h.atom_embedding_status(&wedged, &wedged_atom).await,
+                "pending",
+                "the wedged tenant was skipped, not failed"
+            );
+
+            // Lock released → the skipped tenant's retained hint gets it
+            // polled again and its work completes.
+            tx.rollback().await.expect("release wedge");
+            let mut budget = 10;
+            while h.pipeline_backlog(&wedged).await > 0 {
+                budget -= 1;
+                assert!(
+                    budget > 0,
+                    "wedged tenant did not recover after the lock lifted"
+                );
+                h.tick_and_settle().await;
+            }
+            assert_eq!(
+                h.atom_embedding_status(&wedged, &wedged_atom).await,
+                "complete"
+            );
 
             h.stop().await;
         },

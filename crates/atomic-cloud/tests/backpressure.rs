@@ -26,12 +26,15 @@ use std::time::Duration;
 
 use actix_web::{App, HttpServer};
 use atomic_cloud::{
-    configure_cloud_app, issue_token, provision_account, set_active_provider, upsert_credentials,
-    AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig, BreakerConfig,
-    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, CredentialOrigin, Dispatcher,
-    DispatcherConfig, FallbackAppState, ManagedKeys, NewAccount, NewCredentials, Provider,
-    ProviderBreaker, SecretKey, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    configure_cloud_app, issue_token, provider_failure_policy, provision_account,
+    set_active_provider, upsert_credentials, AccountCache, AccountCacheConfig, AccountPlane,
+    AccountPlaneConfig, BreakerConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
+    CredentialOrigin, Dispatcher, DispatcherConfig, FallbackAppState, ManagedKeys, NewAccount,
+    NewCredentials, Provider, ProviderBreaker, SecretKey, TenantPlane, TokenScope,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT, DEFAULT_RETRY_AFTER_CAP,
 };
+use atomic_core::models::{TaskRun, TaskRunState};
+use atomic_core::wiki::runner::WIKI_REGENERATE_TASK_ID;
 use atomic_test_support::{InjectedFailure, MockAiServer};
 use chrono::{DateTime, Utc};
 use reqwest::header::HOST;
@@ -58,8 +61,11 @@ async fn connect_control(control_url: &str) -> ControlPlane {
     control
 }
 
-/// The dispatcher composition's cache shape: inline pipeline OFF, saves are
-/// enqueue-only, the dispatcher owns execution.
+/// The dispatcher composition's cache shape, exactly as `serve` builds it:
+/// inline pipeline OFF (saves are enqueue-only, the dispatcher owns
+/// execution) and the provider failure-disposition policy installed, so
+/// provider-classified `task_runs` failures defer instead of consuming
+/// retry budget.
 fn dispatch_cache(control: &ControlPlane) -> Arc<AccountCache> {
     Arc::new(AccountCache::new(
         control.clone(),
@@ -67,6 +73,10 @@ fn dispatch_cache(control: &ControlPlane) -> Arc<AccountCache> {
         support::test_vault(),
         AccountCacheConfig {
             inline_pipeline: false,
+            failure_disposition_policy: Some(provider_failure_policy(
+                BreakerConfig::default().credits_recheck,
+                DEFAULT_RETRY_AFTER_CAP,
+            )),
             ..AccountCacheConfig::default()
         },
     ))
@@ -131,27 +141,99 @@ fn mock_model_config(mock: &MockAiServer) -> Value {
     })
 }
 
+/// Raw connection to the tenant's database — for the settings pokes and
+/// ledger inspection the production paths never need.
+async fn tenant_conn(tenant: &Tenant) -> PgConnection {
+    let tenant_url = cluster_config()
+        .tenant_db_url(&tenant.db_name)
+        .expect("tenant url");
+    PgConnection::connect(&tenant_url)
+        .await
+        .expect("connect tenant db")
+}
+
+/// Upsert one per-DB setting on the tenant's default knowledge base.
+async fn set_tenant_setting(tenant: &Tenant, key: &str, value: &str) {
+    let mut conn = tenant_conn(tenant).await;
+    sqlx::query(
+        "INSERT INTO settings (db_id, key, value) VALUES ('default', $1, $2)
+         ON CONFLICT (db_id, key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&mut conn)
+    .await
+    .expect("write tenant setting");
+    conn.close().await.expect("close");
+}
+
 /// Disable every system task on the tenant's default knowledge base so only
 /// the pipeline rows under test dispatch (same per-DB settings poke as the
 /// dispatcher suite).
 async fn disable_system_tasks(tenant: &Tenant) {
-    let tenant_url = cluster_config()
-        .tenant_db_url(&tenant.db_name)
-        .expect("tenant url");
-    let mut conn = PgConnection::connect(&tenant_url)
-        .await
-        .expect("connect tenant db");
     for task_id in ["draft_pipeline", "graph_maintenance", "task_runs_gc"] {
-        sqlx::query(
-            "INSERT INTO settings (db_id, key, value) VALUES ('default', $1, 'false')
-             ON CONFLICT (db_id, key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(format!("task.{task_id}.enabled"))
+        set_tenant_setting(tenant, &format!("task.{task_id}.enabled"), "false").await;
+    }
+}
+
+/// Dispatch one REAL maintenance execution (`task_runs_gc` — it never
+/// touches the provider) between provider failures: enable it, blank its
+/// `last_run` so it's due, tick, disable it again. The issue-1 regression
+/// vehicle — pre-fix, each of these successes fed `record_healthy` and
+/// reset the breaker's detection window and trip streak.
+async fn run_interleaved_maintenance(dispatcher: &Dispatcher, tenant: &Tenant) {
+    set_tenant_setting(tenant, "task.task_runs_gc.enabled", "true").await;
+    set_tenant_setting(tenant, "task.task_runs_gc.last_run", "").await;
+    let scheduled = tick_and_settle(dispatcher).await;
+    assert!(
+        scheduled >= 1,
+        "the interleaved maintenance task must dispatch"
+    );
+    set_tenant_setting(tenant, "task.task_runs_gc.enabled", "false").await;
+}
+
+/// Force the pause horizon into the past — the "cooldown elapsed" clock
+/// advance, leaving kind and streak exactly as the breaker wrote them.
+async fn expire_pause(control: &ControlPlane, account_id: &str) {
+    sqlx::query(
+        "UPDATE accounts SET provider_paused_until = NOW() - interval '1 second' WHERE id = $1",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .expect("expire pause");
+}
+
+/// Pull a `task_runs` row's horizon into the past — simulating the wait-out
+/// of a deferral/backoff window so the next tick probes it again.
+async fn force_run_due(tenant: &Tenant, run_id: &str) {
+    let mut conn = tenant_conn(tenant).await;
+    sqlx::query("UPDATE task_runs SET next_attempt_at = $2 WHERE id = $1")
+        .bind(run_id)
+        .bind((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
         .execute(&mut conn)
         .await
-        .expect("disable task");
-    }
+        .expect("rewind next_attempt_at");
     conn.close().await.expect("close");
+}
+
+/// The tag's single `wiki.regenerate` ledger row.
+async fn wiki_regen_run(core: &atomic_core::AtomicCore, tag_id: &str) -> TaskRun {
+    let mut runs = core
+        .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(tag_id), 10)
+        .await
+        .expect("list regen runs");
+    assert_eq!(runs.len(), 1, "exactly one regen row per tag");
+    runs.remove(0)
+}
+
+/// Seconds from now until an RFC3339 timestamp (negative when past).
+fn secs_until(ts: &str) -> i64 {
+    (DateTime::parse_from_rfc3339(ts)
+        .expect("rfc3339 timestamp")
+        .with_timezone(&Utc)
+        - Utc::now())
+    .num_seconds()
 }
 
 /// The account's pause columns, straight off the control plane.
@@ -485,6 +567,59 @@ impl Harness {
             .await
             .expect("active core")
     }
+
+    /// Create a tag and one tagged atom over HTTP, then drive the pipeline
+    /// to completion against the (healthy) mock so wiki generation has
+    /// embedded sources. Returns the tag id.
+    async fn seed_wiki_sources(&self, tenant: &Tenant, token: &str, tag_name: &str) -> String {
+        let resp = self
+            .api(Method::POST, &tenant.subdomain, "/api/tags")
+            .bearer_auth(token)
+            .json(&json!({ "name": tag_name, "parent_id": null }))
+            .send()
+            .await
+            .expect("create tag");
+        assert_eq!(resp.status(), StatusCode::CREATED, "tag create");
+        let tag: Value = resp.json().await.expect("tag json");
+        let tag_id = tag["id"].as_str().expect("tag id").to_string();
+
+        let resp = self
+            .api(Method::POST, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(token)
+            .json(&json!({
+                "content": "Notes about wave functions and superposition for the wiki.",
+                "tag_ids": [tag_id],
+            }))
+            .send()
+            .await
+            .expect("create atom");
+        assert_eq!(resp.status(), StatusCode::CREATED, "atom create");
+        let atom: Value = resp.json().await.expect("atom json");
+        let atom_id = atom["id"].as_str().expect("atom id").to_string();
+
+        let core = self.tenant_core(tenant).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            tick_and_settle(&self.dispatcher).await;
+            let status = core
+                .get_atom(&atom_id)
+                .await
+                .expect("get atom")
+                .expect("atom exists")
+                .atom
+                .embedding_status;
+            if status == "complete" {
+                break;
+            }
+            assert_ne!(status, "failed", "seed pipeline must not fail");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seed pipeline did not finish (status {status:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tag_id
+    }
 }
 
 // ==================== 402 → credits pause → interactive guard ===============
@@ -764,20 +899,15 @@ async fn provider_mutation_clears_pause_and_dispatch_resumes() {
                 "the pause clear rides the generation bump"
             );
 
-            // Dispatch resumes: rewind the backed-off rows' not_before (in
-            // lieu of waiting out the Retry-After horizon) and tick — the
-            // jobs complete against the recovered provider.
-            let tenant_url = cluster_config()
-                .tenant_db_url(&tenant.db_name)
-                .expect("tenant url");
-            let mut conn = PgConnection::connect(&tenant_url)
-                .await
-                .expect("connect tenant db");
-            sqlx::query("UPDATE atom_pipeline_jobs SET not_before = '2000-01-01T00:00:00+00:00'")
-                .execute(&mut conn)
-                .await
-                .expect("rewind not_before");
-            conn.close().await.expect("close");
+            // Dispatch resumes through the REAL recovery path: the mutation
+            // also re-armed every `provider-backoff` row's not_before to
+            // "now" (no manual rewind), so the backed-off jobs are due
+            // immediately instead of waiting out their 300s Retry-After.
+            assert_eq!(
+                core.count_due_pipeline_jobs().await.expect("due"),
+                3,
+                "the provider mutation must re-arm every backed-off pipeline row"
+            );
 
             let mut budget = 10;
             while core.count_pipeline_jobs().await.expect("count") > 0 {
@@ -797,5 +927,540 @@ async fn provider_mutation_clears_pause_and_dispatch_resumes() {
             h.stop().await;
         },
     )
+    .await;
+}
+
+// ==================== Breaker: only provider work feeds detection ===========
+
+/// Only provider-touching executions feed the breaker. A chronically
+/// rate-limited tenant whose failures are interleaved with healthy
+/// maintenance runs (`task_runs_gc` never calls the provider) still trips
+/// at exactly the threshold, and the cooldown keeps escalating
+/// 60s → 120s → 240s across consecutive trips. Pre-fix, every maintenance
+/// success called `record_healthy`: the detection window never reached
+/// threshold and the streak reset between trips, so a chronic-429 tenant
+/// with any background housekeeping never escalated (or never even
+/// tripped).
+#[tokio::test]
+async fn breaker_escalates_across_trips_despite_interleaved_maintenance() {
+    with_control_db(
+        "breaker_escalates_despite_interleaved_maintenance",
+        |url| async move {
+            let control = connect_control(&url).await;
+            let mock = MockAiServer::start().await;
+            let tenant = provision_tenant(&control, &mock, "alpha").await;
+            disable_system_tasks(&tenant).await;
+
+            let cache = dispatch_cache(&control);
+            let dispatcher = Dispatcher::new(
+                control.clone(),
+                Arc::clone(&cache),
+                DispatcherConfig {
+                    tick_interval: Duration::from_millis(100),
+                    pipeline_batch_size: 1,
+                    ..DispatcherConfig::default()
+                },
+            );
+            let core = cache
+                .get_or_load(&tenant.account_id)
+                .await
+                .expect("load tenant")
+                .manager
+                .active_core()
+                .await
+                .expect("active core");
+
+            mock.set_embedding_failure(Some(InjectedFailure::RateLimited {
+                retry_after_secs: Some(300),
+            }));
+
+            let mut atom_n = 0usize;
+            for (trip, band) in [(1i32, 30..=90i64), (2, 90..=150), (3, 210..=270)] {
+                for failure in 0..3 {
+                    if failure > 0 {
+                        // A REAL provider-free execution between failures.
+                        run_interleaved_maintenance(&dispatcher, &tenant).await;
+                        let (paused_until, _, streak) =
+                            pause_state(&control, &tenant.account_id).await;
+                        assert!(
+                            paused_until.is_none_or(|t| t <= Utc::now()),
+                            "trip {trip}: maintenance must not pause the tenant"
+                        );
+                        assert_eq!(
+                            streak,
+                            trip - 1,
+                            "trip {trip}: a maintenance success must not reset the trip streak"
+                        );
+                    }
+                    atom_n += 1;
+                    enqueue_atom(&core, &format!("rate-limited note {atom_n}")).await;
+                    assert_eq!(
+                        tick_and_settle(&dispatcher).await,
+                        1,
+                        "trip {trip}: exactly the fresh job dispatches"
+                    );
+                }
+
+                let (paused_until, kind, streak) = pause_state(&control, &tenant.account_id).await;
+                let paused_until = paused_until
+                    .unwrap_or_else(|| panic!("trip {trip}: the third failure must trip"));
+                assert!(paused_until > Utc::now(), "trip {trip}: future pause");
+                assert_eq!(kind.as_deref(), Some("rate_limit"));
+                assert_eq!(streak, trip, "trip {trip}: streak escalates per trip");
+                let secs = (paused_until - Utc::now()).num_seconds();
+                assert!(
+                    band.contains(&secs),
+                    "trip {trip}: cooldown must escalate despite interleaved \
+                     maintenance (expected {band:?}, got {secs}s)"
+                );
+
+                // The cooldown "elapses" so the next trip's failures dispatch.
+                expire_pause(&control, &tenant.account_id).await;
+            }
+        },
+    )
+    .await;
+}
+
+/// The flip side of the gating: a GENUINE provider-class success still
+/// resets detection. Two rate-limited failures, then one healthy pipeline
+/// execution, then two more failures — no trip, because the success
+/// cleared the window (without the reset, the third failure overall would
+/// have tripped). The third post-reset failure trips.
+#[tokio::test]
+async fn provider_class_success_genuinely_resets_breaker_detection() {
+    with_control_db(
+        "provider_class_success_resets_breaker_detection",
+        |url| async move {
+            let control = connect_control(&url).await;
+            let mock = MockAiServer::start().await;
+            let tenant = provision_tenant(&control, &mock, "alpha").await;
+            disable_system_tasks(&tenant).await;
+
+            let cache = dispatch_cache(&control);
+            let dispatcher = Dispatcher::new(
+                control.clone(),
+                Arc::clone(&cache),
+                DispatcherConfig {
+                    tick_interval: Duration::from_millis(100),
+                    pipeline_batch_size: 1,
+                    ..DispatcherConfig::default()
+                },
+            );
+            let core = cache
+                .get_or_load(&tenant.account_id)
+                .await
+                .expect("load tenant")
+                .manager
+                .active_core()
+                .await
+                .expect("active core");
+
+            let fail_once = |n: usize| {
+                let dispatcher = &dispatcher;
+                let core = &core;
+                async move {
+                    enqueue_atom(core, &format!("rate-limited note {n}")).await;
+                    assert_eq!(tick_and_settle(dispatcher).await, 1);
+                }
+            };
+
+            mock.set_embedding_failure(Some(InjectedFailure::RateLimited {
+                retry_after_secs: Some(300),
+            }));
+            fail_once(1).await;
+            fail_once(2).await;
+
+            // One healthy provider-class execution.
+            mock.set_embedding_failure(None);
+            enqueue_atom(&core, "healthy note about recovery").await;
+            assert_eq!(tick_and_settle(&dispatcher).await, 1);
+
+            // Two more failures: still below threshold — the success reset
+            // the window. (Without the reset, the first of these would have
+            // been the window's third failure and tripped.)
+            mock.set_embedding_failure(Some(InjectedFailure::RateLimited {
+                retry_after_secs: Some(300),
+            }));
+            fail_once(3).await;
+            fail_once(4).await;
+            let (paused_until, _, _) = pause_state(&control, &tenant.account_id).await;
+            assert!(
+                paused_until.is_none(),
+                "a provider-class success must genuinely reset the detection window"
+            );
+
+            // The third post-reset failure trips.
+            fail_once(5).await;
+            let (paused_until, kind, streak) = pause_state(&control, &tenant.account_id).await;
+            assert!(paused_until.expect("third post-reset failure trips") > Utc::now());
+            assert_eq!(kind.as_deref(), Some("rate_limit"));
+            assert_eq!(streak, 1);
+        },
+    )
+    .await;
+}
+
+// ==================== task_runs deferral: 402 / 429 =========================
+
+/// Plan: "Allowance exhausted → jobs sit in the ledger as blocked". A wiki
+/// regeneration hitting the provider's credit wall DEFERS its `task_runs`
+/// row — back to pending at the credits-recheck horizon, lease released,
+/// retry budget untouched — instead of consuming `max_attempts` (3) and
+/// terminally abandoning the regen, which a month-long exhaustion would
+/// otherwise do in three probes. Recovery is the real mechanism end to
+/// end: the BYOK rotation clears the pause AND re-arms the deferred
+/// horizon, and the next tick regenerates.
+#[actix_web::test]
+async fn credit_exhausted_wiki_regen_defers_without_burning_attempts() {
+    with_control_db("wiki_regen_defers_on_credit_exhaustion", |url| async move {
+        let h = Harness::spawn(&url).await;
+        let tenant = provision_tenant(&h.control, &h.mock, "alpha").await;
+        disable_system_tasks(&tenant).await;
+        let token = issue_token(
+            &h.control,
+            &tenant.account_id,
+            TokenScope::Account,
+            None,
+            "e2e",
+        )
+        .await
+        .expect("issue token");
+        let core = h.tenant_core(&tenant).await;
+        let tag_id = h.seed_wiki_sources(&tenant, &token, "Quantum Notes").await;
+
+        let assert_deferred = |run: &TaskRun, label: &str| {
+            assert_eq!(
+                run.state,
+                TaskRunState::Pending,
+                "{label}: deferred — pending, never failed/abandoned"
+            );
+            assert_eq!(
+                run.attempts, 0,
+                "{label}: deferral refunds the claim's attempt — retry budget untouched"
+            );
+            assert!(run.lease_until.is_none(), "{label}: lease released");
+            let horizon = secs_until(&run.next_attempt_at);
+            assert!(
+                (3000..=4000).contains(&horizon),
+                "{label}: horizon at the credits recheck (~1h), got {horizon}s"
+            );
+            assert!(
+                run.last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("API error (402)"),
+                "{label}: the provider failure is recorded as last_error"
+            );
+        };
+
+        // The credit wall goes up; the user requests a wiki. The route
+        // fails (500), but the ledger row defers through the installed
+        // policy — same core, same policy, transport-independent.
+        h.mock
+            .set_chat_failure(Some(InjectedFailure::PaymentRequired));
+        let resp = h
+            .api(
+                Method::POST,
+                &tenant.subdomain,
+                &format!("/api/wiki/{tag_id}/generate"),
+            )
+            .bearer_auth(&token)
+            .json(&json!({ "tag_name": "Quantum Notes" }))
+            .send()
+            .await
+            .expect("generate wiki");
+        assert!(
+            !resp.status().is_success(),
+            "generation against the credit wall must fail"
+        );
+        let run = wiki_regen_run(&core, &tag_id).await;
+        assert_deferred(&run, "after the route-inline failure");
+        let run_id = run.id;
+
+        // A month of exhaustion: more probes than the whole retry
+        // budget. Each deferral horizon "passes", the dispatcher
+        // re-probes, the 402 re-defers. Pre-fix, probe 3 would have
+        // abandoned the row for good.
+        for probe in 1..=4 {
+            expire_pause(&h.control, &tenant.account_id).await;
+            force_run_due(&tenant, &run_id).await;
+            tick_and_settle(&h.dispatcher).await;
+            let run = wiki_regen_run(&core, &tag_id).await;
+            assert_eq!(run.id, run_id, "probe {probe}: same row, never re-created");
+            assert_deferred(&run, &format!("probe {probe}"));
+        }
+        // The dispatched 402s also paused the tenant as credits.
+        let (paused_until, kind, _) = pause_state(&h.control, &tenant.account_id).await;
+        assert!(paused_until.expect("dispatched 402 must pause") > Utc::now());
+        assert_eq!(kind.as_deref(), Some("credits"));
+
+        // Billing fixed → the rotation clears the pause AND re-arms the
+        // deferred horizon to "now" (the real recovery, no manual
+        // rewind)...
+        h.mock.set_chat_failure(None);
+        let resp = h
+            .api(Method::PUT, &tenant.subdomain, "/api/account/provider")
+            .bearer_auth(&token)
+            .json(&json!({
+                "provider": "openai_compat",
+                "api_key": "rotated-key",
+                "model_config": mock_model_config(&h.mock),
+            }))
+            .send()
+            .await
+            .expect("rotate BYOK key");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (paused_until, kind, _) = pause_state(&h.control, &tenant.account_id).await;
+        assert!(
+            paused_until.is_none() && kind.is_none(),
+            "the rotation clears the pause"
+        );
+        let run = wiki_regen_run(&core, &tag_id).await;
+        assert_eq!(run.state, TaskRunState::Pending);
+        assert!(
+            secs_until(&run.next_attempt_at) <= 1,
+            "the rotation must re-arm the deferred horizon to now"
+        );
+
+        // ...and the next tick regenerates with the full budget intact.
+        let scheduled = tick_and_settle(&h.dispatcher).await;
+        assert!(scheduled >= 1, "the re-armed regen dispatches immediately");
+        let run = wiki_regen_run(&core, &tag_id).await;
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert_eq!(
+            run.attempts, 1,
+            "the successful run consumed exactly its own claim"
+        );
+        assert!(run.result_id.is_some(), "the article landed");
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// Layer 1 for the task ledger, made literal: a 429's `Retry-After` lands
+/// in `task_runs.next_attempt_at` (the plan's "record the rate-limit-reset
+/// header"), clamped to the configured cap against hostile hints — and the
+/// pipeline ledger's re-enqueued `not_before` clamps the same way.
+#[actix_web::test]
+async fn rate_limit_retry_after_lands_in_ledger_horizons_clamped() {
+    with_control_db(
+        "rate_limit_retry_after_lands_in_ledger_horizons",
+        |url| async move {
+            let h = Harness::spawn(&url).await;
+            let tenant = provision_tenant(&h.control, &h.mock, "alpha").await;
+            disable_system_tasks(&tenant).await;
+            let token = issue_token(
+                &h.control,
+                &tenant.account_id,
+                TokenScope::Account,
+                None,
+                "e2e",
+            )
+            .await
+            .expect("issue token");
+            let core = h.tenant_core(&tenant).await;
+            let tag_id = h.seed_wiki_sources(&tenant, &token, "Tides Notes").await;
+
+            // Retry-After honored: 120s lands in next_attempt_at.
+            h.mock.set_chat_failure(Some(InjectedFailure::RateLimited {
+                retry_after_secs: Some(120),
+            }));
+            let resp = h
+                .api(
+                    Method::POST,
+                    &tenant.subdomain,
+                    &format!("/api/wiki/{tag_id}/generate"),
+                )
+                .bearer_auth(&token)
+                .json(&json!({ "tag_name": "Tides Notes" }))
+                .send()
+                .await
+                .expect("generate wiki");
+            assert!(!resp.status().is_success());
+            let run = wiki_regen_run(&core, &tag_id).await;
+            assert_eq!(run.state, TaskRunState::Pending);
+            assert_eq!(run.attempts, 0, "a rate-limit deferral never burns budget");
+            let horizon = secs_until(&run.next_attempt_at);
+            assert!(
+                (100..=140).contains(&horizon),
+                "Retry-After must land in next_attempt_at, got {horizon}s"
+            );
+            // One 429 must not pause (threshold is 3) — the deferred
+            // horizon alone holds the row.
+            let (paused_until, _, _) = pause_state(&h.control, &tenant.account_id).await;
+            assert!(paused_until.is_none());
+
+            // A hostile hint clamps to the cap (default 15 min).
+            h.mock.set_chat_failure(Some(InjectedFailure::RateLimited {
+                retry_after_secs: Some(86_400),
+            }));
+            force_run_due(&tenant, &run.id).await;
+            tick_and_settle(&h.dispatcher).await;
+            let run = wiki_regen_run(&core, &tag_id).await;
+            assert_eq!(run.attempts, 0);
+            let horizon = secs_until(&run.next_attempt_at);
+            assert!(
+                (840..=960).contains(&horizon),
+                "a hostile Retry-After must clamp to the cap, got {horizon}s"
+            );
+
+            // The pipeline ledger's re-enqueue clamps the same hint into
+            // not_before.
+            h.mock
+                .set_embedding_failure(Some(InjectedFailure::RateLimited {
+                    retry_after_secs: Some(86_400),
+                }));
+            let resp = h
+                .api(Method::POST, &tenant.subdomain, "/api/atoms")
+                .bearer_auth(&token)
+                .json(&json!({ "content": "A note behind a hostile rate limit." }))
+                .send()
+                .await
+                .expect("create atom");
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let atom: Value = resp.json().await.expect("atom json");
+            let atom_id = atom["id"].as_str().expect("atom id").to_string();
+            tick_and_settle(&h.dispatcher).await;
+
+            let mut conn = tenant_conn(&tenant).await;
+            let (not_before, reason): (String, String) = sqlx::query_as(
+                "SELECT not_before, reason FROM atom_pipeline_jobs WHERE atom_id = $1",
+            )
+            .bind(&atom_id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("re-enqueued pipeline row");
+            conn.close().await.expect("close");
+            assert_eq!(reason, "provider-backoff");
+            let horizon = secs_until(&not_before);
+            assert!(
+                (840..=960).contains(&horizon),
+                "the pipeline not_before must clamp the same hint, got {horizon}s"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+// ==================== 401/403 → provider-kind pause ==========================
+
+/// Credential rejections (the plan's "BYOK key expired" breaker case) enter
+/// the pause machinery as `kind = 'provider'`: background dispatch holds,
+/// the blocked job sits at the pause horizon, interactive routes stay
+/// un-gated (the user's own action gets the provider's real auth error) —
+/// and a key rotation clears the pause, re-arms the blocked row, and
+/// dispatch resumes within one tick.
+#[actix_web::test]
+async fn auth_failure_pauses_as_provider_kind_and_rotation_recovers() {
+    with_control_db("auth_failure_pauses_as_provider_kind", |url| async move {
+        let h = Harness::spawn(&url).await;
+        let tenant = provision_tenant(&h.control, &h.mock, "alpha").await;
+        disable_system_tasks(&tenant).await;
+        let token = issue_token(
+            &h.control,
+            &tenant.account_id,
+            TokenScope::Account,
+            None,
+            "e2e",
+        )
+        .await
+        .expect("issue token");
+        let core = h.tenant_core(&tenant).await;
+
+        // The key "expires": every embedding call rejects with 401.
+        h.mock
+            .set_embedding_failure(Some(InjectedFailure::Unauthorized));
+        let resp = h
+            .api(Method::POST, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&token)
+            .json(&json!({ "content": "A note behind an expired API key." }))
+            .send()
+            .await
+            .expect("create atom");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let atom: Value = resp.json().await.expect("atom json");
+        let atom_id = atom["id"].as_str().expect("atom id").to_string();
+        assert_eq!(tick_and_settle(&h.dispatcher).await, 1);
+
+        let (paused_until, kind, streak) = pause_state(&h.control, &tenant.account_id).await;
+        let paused_until = paused_until.expect("a credential rejection must pause immediately");
+        assert_eq!(kind.as_deref(), Some("provider"));
+        assert_eq!(streak, 0, "auth pauses never touch the rate-limit streak");
+        let horizon = (paused_until - Utc::now()).num_seconds();
+        assert!(
+            (3000..=4200).contains(&horizon),
+            "the provider pause re-probes on the recheck horizon, got {horizon}s"
+        );
+
+        // The job sits blocked at the pause horizon — not failed-and-gone.
+        assert_eq!(core.count_pipeline_jobs().await.expect("count"), 1);
+        assert_eq!(core.count_due_pipeline_jobs().await.expect("due"), 0);
+        assert_eq!(
+            tick_and_settle(&h.dispatcher).await,
+            0,
+            "a provider-paused tenant must not dispatch"
+        );
+
+        // Unlike credits, the interactive guard stays open — the chat
+        // route proceeds into its handler (and fails on the missing
+        // conversation), never with the structured credits error.
+        let resp = h
+            .api(
+                Method::POST,
+                &tenant.subdomain,
+                "/api/conversations/no-such-conversation/messages",
+            )
+            .bearer_auth(&token)
+            .json(&json!({ "content": "still here?" }))
+            .send()
+            .await
+            .expect("send chat message");
+        assert_ne!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body: Value = resp.json().await.expect("body");
+        assert_ne!(body["error"], "out_of_ai_credits");
+
+        // Rotation (validated against the healed mock) clears the pause,
+        // re-arms the blocked row, and the next tick drains it.
+        h.mock.set_embedding_failure(None);
+        let resp = h
+            .api(Method::PUT, &tenant.subdomain, "/api/account/provider")
+            .bearer_auth(&token)
+            .json(&json!({
+                "provider": "openai_compat",
+                "api_key": "rotated-key",
+                "model_config": mock_model_config(&h.mock),
+            }))
+            .send()
+            .await
+            .expect("rotate BYOK key");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (paused_until, kind, _) = pause_state(&h.control, &tenant.account_id).await;
+        assert!(
+            paused_until.is_none() && kind.is_none(),
+            "the rotation must clear the provider pause"
+        );
+        assert_eq!(
+            core.count_due_pipeline_jobs().await.expect("due"),
+            1,
+            "the rotation must re-arm the blocked row to now"
+        );
+        assert_eq!(
+            tick_and_settle(&h.dispatcher).await,
+            1,
+            "dispatch resumes within one tick of the rotation"
+        );
+        let atom = core
+            .get_atom(&atom_id)
+            .await
+            .expect("get atom")
+            .expect("atom exists");
+        assert_eq!(atom.atom.embedding_status, "complete");
+
+        h.stop().await;
+    })
     .await;
 }

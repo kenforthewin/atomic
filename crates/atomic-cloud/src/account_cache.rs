@@ -102,7 +102,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 4096;
 /// Tuning knobs for [`AccountCache`]. Defaults are the plan's initial
 /// guesses ("Open questions" → idle-TTL and hard-cap numbers); tune from
 /// production data.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AccountCacheConfig {
     /// Entries untouched this long are evicted (unless a WebSocket
     /// subscriber is live). Default 15 minutes.
@@ -131,6 +131,15 @@ pub struct AccountCacheConfig {
     /// without a dispatcher attached: enqueued work would sit in the
     /// ledgers unexecuted.
     pub inline_pipeline: bool,
+    /// Failure-disposition policy installed on every tenant manager built
+    /// by this cache (`AtomicCore::set_failure_disposition_policy`).
+    /// `None` (the default) keeps atomic-core's historical settle-by-fail
+    /// behavior; the cloud serve composition installs
+    /// [`crate::backpressure::provider_failure_policy`] so
+    /// provider-classified `task_runs` failures defer without consuming
+    /// retry budget (plan: jobs sit in the ledger, never fail).
+    pub failure_disposition_policy:
+        Option<atomic_core::scheduler::ledger::FailureDispositionPolicy>,
 }
 
 impl Default for AccountCacheConfig {
@@ -141,7 +150,27 @@ impl Default for AccountCacheConfig {
             tenant_pool_max_connections: 5,
             tenant_pool_idle_timeout: Duration::from_secs(5 * 60),
             inline_pipeline: true,
+            failure_disposition_policy: None,
         }
+    }
+}
+
+impl std::fmt::Debug for AccountCacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountCacheConfig")
+            .field("idle_ttl", &self.idle_ttl)
+            .field("max_entries", &self.max_entries)
+            .field(
+                "tenant_pool_max_connections",
+                &self.tenant_pool_max_connections,
+            )
+            .field("tenant_pool_idle_timeout", &self.tenant_pool_idle_timeout)
+            .field("inline_pipeline", &self.inline_pipeline)
+            .field(
+                "failure_disposition_policy",
+                &self.failure_disposition_policy.is_some(),
+            )
+            .finish()
     }
 }
 
@@ -580,16 +609,22 @@ impl AccountCache {
         .await
         .map_err(CloudError::core("opening tenant database manager"))?;
 
-        // Pipeline execution mode (config docs): the flag slot is shared by
-        // every core the manager resolves — sibling construction clones it —
-        // so flipping it once on the bootstrap core covers all of the
-        // account's knowledge bases, current and future.
-        if !self.config.inline_pipeline {
-            manager
+        // Pipeline execution mode + failure-disposition policy (config
+        // docs): both slots are shared by every core the manager resolves —
+        // sibling construction clones them — so installing once on the
+        // bootstrap core covers all of the account's knowledge bases,
+        // current and future.
+        if !self.config.inline_pipeline || self.config.failure_disposition_policy.is_some() {
+            let bootstrap = manager
                 .active_core()
                 .await
-                .map_err(CloudError::core("resolving core for pipeline mode"))?
-                .set_inline_pipeline(false);
+                .map_err(CloudError::core("resolving core for tenant configuration"))?;
+            if !self.config.inline_pipeline {
+                bootstrap.set_inline_pipeline(false);
+            }
+            if let Some(policy) = &self.config.failure_disposition_policy {
+                bootstrap.set_failure_disposition_policy(Some(Arc::clone(policy)));
+            }
         }
 
         // Stamp the credential's last_used_at: handing the key to a serving

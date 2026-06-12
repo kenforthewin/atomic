@@ -67,6 +67,20 @@
 //! account ([`AccountLocks`]) so the stored and live configs cannot diverge
 //! under concurrent writes.
 //!
+//! The pause clear alone is not a full recovery, though: ledger rows the
+//! breaker's layer 1 pushed out — pipeline jobs re-enqueued with a
+//! `not_before` horizon, `task_runs` deferred to the pause-recheck horizon
+//! — would still sit dead for up to the *remaining* horizon (an hour, for a
+//! credits pause) after the user fixed their key. So every successful
+//! provider mutation also **re-arms the provider-held ledger work** in the
+//! tenant database ([`rearm_provider_held_work`]): pipeline rows stamped
+//! `provider-backoff` and task runs whose recorded failure classifies as a
+//! provider failure get their horizons reset to now, and the next
+//! dispatcher tick redispatches them against the configuration the user
+//! just fixed. Best-effort by design — a re-arm failure leaves the rows to
+//! retry at their stored horizons, which is degraded freshness, not lost
+//! work.
+//!
 //! # `DELETE /api/account` (plan: "Provisioning lifecycle" → "Account deletion")
 //!
 //! Hard-deletes the authenticated account. It lives on the tenant subdomain
@@ -1009,13 +1023,21 @@ fn reembed_warning(previous: Option<&ProviderConfig>, next: &ProviderConfig) -> 
 /// diverged with no eviction to heal them, so the request fails loudly and
 /// the honest instruction is to retry (the retry re-runs the whole write,
 /// idempotently, and re-attempts the swap).
+///
+/// On success this also re-arms the tenant's provider-held ledger work
+/// (module docs) — the mutation is the user's recovery action, and the rows
+/// the old configuration's failures pushed out should redispatch on the
+/// next tick, not after their stale horizons.
 async fn apply_live_config(
     state: &PlaneState,
     account_id: &str,
     config: ProviderConfig,
 ) -> Result<(), HttpResponse> {
     match state.cache.update_provider_config(account_id, config).await {
-        Ok(_was_cached) => Ok(()),
+        Ok(_was_cached) => {
+            rearm_provider_held_work(state, account_id).await;
+            Ok(())
+        }
         Err(e) => {
             tracing::error!(
                 account_id,
@@ -1027,6 +1049,66 @@ async fn apply_live_config(
                 "message": "The provider configuration was saved but could not be applied \
                             to the running session. Retry the request.",
             })))
+        }
+    }
+}
+
+/// Reset the horizons on ledger work held back by provider failures, in
+/// every knowledge base of the account's tenant database: pipeline jobs the
+/// dispatcher re-enqueued with `reason = 'provider-backoff'`
+/// (`AtomicCore::rearm_pipeline_jobs`) and pending task runs whose recorded
+/// `last_error` classifies as a provider failure — deferred rows and
+/// provider-classified backoffs alike
+/// (`AtomicCore::rearm_provider_blocked_task_runs`). Best-effort: failures
+/// log loudly and the rows simply wait out their stored horizons instead.
+async fn rearm_provider_held_work(state: &PlaneState, account_id: &str) {
+    let handle = match state.cache.get_or_load(account_id).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(account_id, error = %e, "re-arm: tenant load failed");
+            return;
+        }
+    };
+    let databases = match handle.manager.list_databases().await {
+        Ok((databases, _)) => databases,
+        Err(e) => {
+            tracing::warn!(account_id, error = %e, "re-arm: listing knowledge bases failed");
+            return;
+        }
+    };
+    for db in &databases {
+        let core = match handle.manager.get_core(&db.id).await {
+            Ok(core) => core,
+            Err(e) => {
+                tracing::warn!(account_id, db_id = db.id, error = %e, "re-arm: core resolve failed");
+                continue;
+            }
+        };
+        let pipeline = match core
+            .rearm_pipeline_jobs(crate::dispatcher::PROVIDER_BACKOFF_REASON)
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(account_id, db_id = db.id, error = %e, "re-arm: pipeline jobs failed");
+                0
+            }
+        };
+        let task_runs = match core.rearm_provider_blocked_task_runs().await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(account_id, db_id = db.id, error = %e, "re-arm: task runs failed");
+                0
+            }
+        };
+        if pipeline > 0 || task_runs > 0 {
+            tracing::info!(
+                account_id,
+                db_id = db.id,
+                pipeline_jobs = pipeline,
+                task_runs,
+                "provider mutation re-armed held ledger work"
+            );
         }
     }
 }

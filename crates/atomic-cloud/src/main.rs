@@ -428,10 +428,64 @@ struct DispatcherArgs {
     )]
     maintenance_pool_per_tenant: usize,
 
-    /// Per-tenant in-flight cap for report runs (a work-type override
+    /// Per-tenant in-flight cap for report runs (a work-type carve-out
     /// inside the LLM pool; the plan serializes reports per tenant).
     #[arg(long, env = "ATOMIC_CLOUD_REPORTS_PER_TENANT_CAP", default_value_t = 1)]
     reports_per_tenant_cap: usize,
+
+    /// Ceiling in seconds on one tenant's ledger poll inside a dispatcher
+    /// tick: a wedged or unreachable tenant database is skipped for the
+    /// tick (and retried next tick) instead of head-of-line-blocking every
+    /// other tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_TENANT_POLL_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    dispatcher_tenant_poll_timeout_secs: u64,
+
+    /// Ceiling in seconds on a provider-supplied Retry-After hint when
+    /// scheduling backoff — a hostile or buggy provider must not strand a
+    /// tenant's jobs behind an arbitrary horizon.
+    #[arg(long, env = "ATOMIC_CLOUD_RETRY_AFTER_CAP_SECS", default_value_t = 900)]
+    retry_after_cap_secs: u64,
+
+    /// Circuit breaker: sliding detection window in seconds for
+    /// rate-limit-classified provider failures.
+    #[arg(long, env = "ATOMIC_CLOUD_BREAKER_WINDOW_SECS", default_value_t = 60)]
+    breaker_window_secs: u64,
+
+    /// Circuit breaker: rate-limit failures within the window that trip a
+    /// tenant pause.
+    #[arg(long, env = "ATOMIC_CLOUD_BREAKER_THRESHOLD", default_value_t = 3)]
+    breaker_threshold: usize,
+
+    /// Circuit breaker: first trip's cooldown in seconds (doubles per
+    /// consecutive trip).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_BASE_COOLDOWN_SECS",
+        default_value_t = 60
+    )]
+    breaker_base_cooldown_secs: u64,
+
+    /// Circuit breaker: cooldown ceiling in seconds.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_MAX_COOLDOWN_SECS",
+        default_value_t = 3600
+    )]
+    breaker_max_cooldown_secs: u64,
+
+    /// Circuit breaker: credits/auth pause horizon in seconds when the
+    /// provider exposes no reset time — how long until dispatch re-probes.
+    /// Also the deferral horizon for credits/auth-classified task runs.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_CREDITS_RECHECK_SECS",
+        default_value_t = 3600
+    )]
+    breaker_credits_recheck_secs: u64,
 }
 
 impl DispatcherArgs {
@@ -446,8 +500,12 @@ impl DispatcherArgs {
             slow_scan_interval: std::time::Duration::from_secs(
                 self.dispatcher_slow_scan_secs.max(1),
             ),
+            tenant_poll_timeout: std::time::Duration::from_secs(
+                self.dispatcher_tenant_poll_timeout_secs.max(1),
+            ),
             pipeline_batch_size: self.dispatcher_pipeline_batch.max(1),
             reports_per_tenant_cap: self.reports_per_tenant_cap.max(1),
+            retry_after_cap: std::time::Duration::from_secs(self.retry_after_cap_secs.max(1)),
             pools: WorkerPoolsConfig {
                 embedding: PoolCaps {
                     total: self.embedding_pool_total,
@@ -466,10 +524,17 @@ impl DispatcherArgs {
                     per_tenant: self.maintenance_pool_per_tenant,
                 },
             },
-            // The breaker's numbers are the plan's (3×429 in 60s → 60s
-            // cooldown, doubling, 1h cap); promote to CLI flags when a real
-            // deployment needs to tune them.
-            breaker: atomic_cloud::BreakerConfig::default(),
+            breaker: atomic_cloud::BreakerConfig {
+                window: std::time::Duration::from_secs(self.breaker_window_secs.max(1)),
+                threshold: self.breaker_threshold.max(1),
+                base_cooldown: std::time::Duration::from_secs(
+                    self.breaker_base_cooldown_secs.max(1),
+                ),
+                max_cooldown: std::time::Duration::from_secs(self.breaker_max_cooldown_secs.max(1)),
+                credits_recheck: std::time::Duration::from_secs(
+                    self.breaker_credits_recheck_secs.max(1),
+                ),
+            },
         })
     }
 }
@@ -639,6 +704,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // embedding pool owns execution. Never flip this off
                 // without a dispatcher: enqueued work would sit unexecuted.
                 inline_pipeline: dispatcher_config.is_none(),
+                // And under the dispatcher composition, provider-classified
+                // task-run failures defer instead of consuming retry budget
+                // (plan: jobs sit in the ledger, never fail). Derived from
+                // the breaker config so the deferral horizons match the
+                // pauses that gate dispatch.
+                failure_disposition_policy: dispatcher_config.as_ref().map(|config| {
+                    atomic_cloud::provider_failure_policy(
+                        config.breaker.credits_recheck,
+                        config.retry_after_cap,
+                    )
+                }),
                 ..AccountCacheConfig::default()
             };
             let plane_config = AccountPlaneConfig {

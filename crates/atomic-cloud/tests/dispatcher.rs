@@ -88,6 +88,7 @@ fn test_config(pools: WorkerPoolsConfig) -> DispatcherConfig {
         reports_per_tenant_cap: 1,
         pools,
         breaker: BreakerConfig::default(),
+        ..DispatcherConfig::default()
     }
 }
 
@@ -766,8 +767,11 @@ async fn expired_lease_is_reclaimed_and_completed() {
                 control.clone(),
                 BreakerConfig::default(),
             ));
-            let counting =
-                CountingExecutor::new(Arc::new(CoreExecutor::new(Arc::clone(&cache), breaker)));
+            let counting = CountingExecutor::new(Arc::new(CoreExecutor::new(
+                Arc::clone(&cache),
+                breaker,
+                atomic_cloud::DEFAULT_RETRY_AFTER_CAP,
+            )));
             let executor: Arc<dyn WorkExecutor> = counting.clone();
             let dispatcher = Dispatcher::with_executor(
                 control.clone(),

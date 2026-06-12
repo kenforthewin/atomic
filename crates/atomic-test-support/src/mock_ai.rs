@@ -52,6 +52,8 @@ pub enum InjectedFailure {
     RateLimited { retry_after_secs: Option<u64> },
     /// HTTP 402 with a provider-style error body.
     PaymentRequired,
+    /// HTTP 401 with a provider-style error body (expired/revoked API key).
+    Unauthorized,
 }
 
 impl InjectedFailure {
@@ -68,6 +70,9 @@ impl InjectedFailure {
             }
             InjectedFailure::PaymentRequired => ResponseTemplate::new(402).set_body_json(json!({
                 "error": { "message": "mock insufficient credits" }
+            })),
+            InjectedFailure::Unauthorized => ResponseTemplate::new(401).set_body_json(json!({
+                "error": { "message": "mock invalid api key" }
             })),
         }
     }

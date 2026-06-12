@@ -273,6 +273,15 @@ pub struct AtomicCore {
     /// exactly like `provider_config`, so one composition-time switch
     /// covers all of a manager's logical databases.
     inline_pipeline: Arc<std::sync::atomic::AtomicBool>,
+    /// Host-installed classifier deciding whether a failed `task_runs`
+    /// execution consumes retry budget or defers (see
+    /// [`scheduler::ledger::FailureDisposition`]). `None` (every
+    /// constructor's default) keeps the historical behavior: every failure
+    /// counts against `max_attempts`. Shared across every core resolved from
+    /// the same Postgres `DatabaseManager`, exactly like `provider_config`,
+    /// so one composition-time install covers all logical databases.
+    failure_disposition_policy:
+        Arc<std::sync::RwLock<Option<scheduler::ledger::FailureDispositionPolicy>>>,
     /// Per-tag locks to serialize wiki operations (update, propose, accept,
     /// dismiss) against the same article. Prevents background + manual runs
     /// from racing and ensures supersede semantics are consistent. Entries are
@@ -295,6 +304,7 @@ impl AtomicCore {
             registry: None,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
             inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -460,6 +470,7 @@ impl AtomicCore {
             registry,
             provider_config: Arc::new(std::sync::RwLock::new(provider_config)),
             inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -547,6 +558,7 @@ impl AtomicCore {
             registry: None,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
             inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -568,6 +580,7 @@ impl AtomicCore {
             registry: self.registry.clone(),
             provider_config: Arc::clone(&self.provider_config),
             inline_pipeline: Arc::clone(&self.inline_pipeline),
+            failure_disposition_policy: Arc::clone(&self.failure_disposition_policy),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -687,6 +700,7 @@ impl AtomicCore {
             registry,
             provider_config: Arc::new(std::sync::RwLock::new(None)),
             inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -764,6 +778,43 @@ impl AtomicCore {
     pub fn set_inline_pipeline(&self, inline: bool) {
         self.inline_pipeline
             .store(inline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Install (or clear, with `None`) the failure-disposition policy
+    /// consulted by [`scheduler::ledger::RunHandle::fail`]: a classifier
+    /// that decides, per failure message, whether the failure consumes
+    /// retry budget ([`scheduler::ledger::FailureDisposition::Fail`]) or
+    /// defers the run to a later time without consuming an attempt
+    /// ([`scheduler::ledger::FailureDisposition::DeferUntil`]) — see
+    /// [`scheduler::ledger::FailureDisposition`] for the
+    /// environmental-vs-logical rationale.
+    ///
+    /// Like [`update_provider_config`](Self::update_provider_config), the
+    /// slot is shared with every core resolved from the same Postgres
+    /// `DatabaseManager` (see `sibling_with_storage`), so one install
+    /// covers all of a manager's logical databases.
+    pub fn set_failure_disposition_policy(
+        &self,
+        policy: Option<scheduler::ledger::FailureDispositionPolicy>,
+    ) {
+        let mut guard = self
+            .failure_disposition_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+
+    /// Classify a failure message through the installed policy;
+    /// [`scheduler::ledger::FailureDisposition::Fail`] with no policy.
+    pub(crate) fn failure_disposition(&self, error: &str) -> scheduler::ledger::FailureDisposition {
+        let guard = self
+            .failure_disposition_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(policy) => policy(error),
+            None => scheduler::ledger::FailureDisposition::Fail,
+        }
     }
 
     /// Resolved settings map for AI operations (embedding, tagging, search,
@@ -2569,6 +2620,59 @@ impl AtomicCore {
     /// schedule per-feed polls themselves.
     pub async fn list_due_feeds(&self) -> Result<Vec<Feed>, AtomicCoreError> {
         self.storage.get_due_feeds_sync().await
+    }
+
+    // ==================== Ledger re-arming ====================
+    //
+    // When the *environment* a backoff was scheduled around changes — the
+    // canonical case being a provider configuration change after provider
+    // failures pushed work out — the stored horizons describe a world that
+    // no longer exists. These helpers reset them to "now" so the next
+    // scheduling pass redispatches immediately instead of waiting out a
+    // horizon computed for the old configuration. Both are precise about
+    // which rows they touch: only rows whose recorded cause matches.
+
+    /// Reset the `not_before` horizon to now on every pending pipeline job
+    /// whose `reason` equals `reason` — the marker a host's re-enqueue path
+    /// stamps when it backs work off (e.g. around a provider's
+    /// `Retry-After`). Rows enqueued for other reasons, in-flight leases,
+    /// and already-due rows are untouched. Returns the number of rows
+    /// re-armed.
+    pub async fn rearm_pipeline_jobs(&self, reason: &str) -> Result<u64, AtomicCoreError> {
+        self.storage
+            .rearm_pipeline_jobs_sync(reason, &chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Reset `next_attempt_at` to now on every pending `task_runs` row that
+    /// is (a) waiting on a future horizon and (b) waiting *because of a
+    /// provider failure* — its recorded `last_error` classifies as a
+    /// rate-limit, billing, or credential rejection
+    /// ([`providers::classify_provider_failure`]). This covers both
+    /// deferred rows ([`scheduler::ledger::RunHandle::defer_until`]) and
+    /// backed-off retries whose failure was provider-classified. Rows
+    /// waiting out logic-failure backoff are untouched — a provider change
+    /// doesn't make a broken task less broken. Returns the number of rows
+    /// re-armed.
+    pub async fn rearm_provider_blocked_task_runs(&self) -> Result<u64, AtomicCoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let waiting = self.storage.list_waiting_task_runs_sync(&now).await?;
+        let ids: Vec<String> = waiting
+            .into_iter()
+            .filter(|run| {
+                run.last_error.as_deref().is_some_and(|error| {
+                    !matches!(
+                        providers::classify_provider_failure(error),
+                        providers::ProviderFailureClass::Other
+                    )
+                })
+            })
+            .map(|run| run.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.storage.rearm_task_runs_sync(&ids, &now).await
     }
 
     /// Process pending embeddings only for atoms last updated at or before
@@ -7694,6 +7798,78 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, TaskRunState::Succeeded);
         assert_eq!(row.attempts, 1, "reclaim does not bump attempts");
+    }
+
+    #[tokio::test]
+    async fn provider_classified_failure_defers_without_consuming_attempts() {
+        // The environmental-failure sibling of the reclaim rule above: with
+        // a host policy installed, `RunHandle::fail` on a provider-classified
+        // error routes to `defer_until` — pending at the policy's horizon,
+        // the claim's attempt refunded, lease released — while a logic
+        // failure through the same policy keeps consuming retry budget.
+        let (db, _temp) = create_test_db().await;
+        db.set_failure_disposition_policy(Some(Arc::new(|error: &str| {
+            match crate::providers::classify_provider_failure(error) {
+                crate::providers::ProviderFailureClass::Other => ledger::FailureDisposition::Fail,
+                _ => {
+                    ledger::FailureDisposition::DeferUntil(Utc::now() + chrono::Duration::hours(1))
+                }
+            }
+        })));
+
+        let handle = ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("fresh claim");
+        assert_eq!(handle.run().attempts, 1, "the claim charges an attempt");
+        assert!(handle
+            .fail("Embedding error: API error (402): out of credits".to_string())
+            .await
+            .unwrap());
+
+        let row = &db.list_task_runs("stub_defer", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "deferred, not failed");
+        assert_eq!(
+            row.attempts, 0,
+            "deferral refunds the claim's attempt — environmental failures \
+             never consume retry budget"
+        );
+        assert!(row.lease_until.is_none(), "the deferral released the lease");
+        assert!(
+            row.next_attempt_at.as_str()
+                > (Utc::now() + chrono::Duration::minutes(55))
+                    .to_rfc3339()
+                    .as_str(),
+            "re-armed at the policy's horizon, not the ledger's backoff"
+        );
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("Embedding error: API error (402): out of credits")
+        );
+
+        // The deferred row gates re-claims exactly like a backoff window…
+        assert!(
+            ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+                .await
+                .unwrap()
+                .is_none(),
+            "a deferred row is owned work — no duplicate claim"
+        );
+
+        // …and once due again, a LOGIC failure through the same policy
+        // still consumes budget (the historical retry/abandon path).
+        force_retry_due(&db, "stub_defer").await;
+        let handle = ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("re-claim after deferral");
+        assert!(handle
+            .fail("Parse error: bad JSON".to_string())
+            .await
+            .unwrap());
+        let row = &db.list_task_runs("stub_defer", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "retry scheduled");
+        assert_eq!(row.attempts, 1, "logic failures keep consuming the budget");
     }
 
     #[tokio::test]

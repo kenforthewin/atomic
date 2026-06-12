@@ -55,8 +55,8 @@ pub use account_plane::{
 };
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use backpressure::{
-    ai_interactive_route, out_of_credits_guard, BreakerConfig, PauseKind, ProviderBreaker,
-    ProviderPause,
+    ai_interactive_route, out_of_credits_guard, provider_failure_policy, BreakerConfig, PauseKind,
+    ProviderBreaker, ProviderPause, DEFAULT_RETRY_AFTER_CAP,
 };
 pub use chat_streams::{
     chat_stream_guard, chat_stream_route, ChatStreamLimiter, ChatStreamPermit,
@@ -72,7 +72,7 @@ pub use dispatch_hints::{
 };
 pub use dispatcher::{
     CoreExecutor, Dispatcher, DispatcherConfig, ExecOutcome, TenantQueue, TickOutcome,
-    WorkExecutor, WorkItem, RATE_LIMIT_REQUEUE_DELAY,
+    WorkExecutor, WorkItem, PROVIDER_BACKOFF_REASON, RATE_LIMIT_REQUEUE_DELAY,
 };
 pub use email::{EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
@@ -83,7 +83,7 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
-pub use pools::{PoolCaps, PoolPermit, WorkClass, WorkerPools, WorkerPoolsConfig};
+pub use pools::{PoolCaps, PoolPermit, WorkClass, WorkTypeCap, WorkerPools, WorkerPoolsConfig};
 pub use provider_config::{
     build_provider_config, config_for_credentials, keyless_provider_config,
     validate_byok_model_config, BYOK_ALLOWED_KEYS,

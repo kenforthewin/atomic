@@ -97,6 +97,10 @@ pub enum ProviderFailureClass {
     /// The provider refused the call for billing reasons (HTTP 402 — e.g.
     /// an exhausted prepaid balance or per-key credit limit).
     PaymentRequired,
+    /// The provider rejected the stored credentials (HTTP 401/403 — an
+    /// expired, revoked, or mis-scoped API key). Like billing failures,
+    /// these are environmental: no retry succeeds until the key is fixed.
+    AuthFailed,
     /// Anything else (including messages this classifier doesn't recognize).
     Other,
 }
@@ -132,6 +136,10 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     // `ProviderError::Api { status: 402, .. }` renders as "API error (402): …".
     if message.contains("API error (402)") {
         return ProviderFailureClass::PaymentRequired;
+    }
+    // `ProviderError::Api { status: 401 | 403, .. }` — credential rejections.
+    if message.contains("API error (401)") || message.contains("API error (403)") {
+        return ProviderFailureClass::AuthFailed;
     }
     ProviderFailureClass::Other
 }
@@ -192,6 +200,18 @@ mod classification_tests {
             classify_provider_failure(&payment.to_string()),
             ProviderFailureClass::PaymentRequired
         );
+
+        for status in [401u16, 403] {
+            let auth = ProviderError::Api {
+                status,
+                message: "key revoked".to_string(),
+            };
+            assert_eq!(
+                classify_provider_failure(&auth.to_string()),
+                ProviderFailureClass::AuthFailed,
+                "{status} must classify as an auth failure"
+            );
+        }
     }
 
     /// Real failure strings arrive wrapped in caller context; the substring
@@ -217,7 +237,6 @@ mod classification_tests {
     fn classify_leaves_unrelated_errors_alone() {
         for message in [
             "API error (500): upstream exploded",
-            "API error (401): bad key",
             "Network error: connection refused",
             "Parse error: bad JSON",
             "Model not found: gpt-nonexistent",

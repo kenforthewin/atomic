@@ -42,13 +42,25 @@
 //! expire, and the next scan (here or on a peer pod) reclaims the work. The
 //! dispatcher never extends or bypasses lease semantics.
 //!
-//! # Events
+//! # Events — single-pod fidelity only
 //!
 //! Workers route pipeline/ingestion events into the tenant's own event
 //! channel (the [`AccountCache`] entry's `event_tx` — the channel the
 //! tenant's WebSocket sessions subscribe to) through the same
-//! `atomic-server::event_bridge` adapters the request path uses, so the
-//! frontend experience is identical to inline execution.
+//! `atomic-server::event_bridge` adapters the request path uses.
+//!
+//! **This delivery is per-pod, in-memory.** The channel a worker publishes
+//! into is the executing pod's cache entry; a WebSocket session subscribed
+//! on a *different* pod — or on this pod after the entry was evicted and
+//! rebuilt mid-execution — receives none of that execution's progress
+//! events. Durable state is always correct (ledger rows, atom statuses,
+//! and artifacts land in the tenant database regardless), and the frontend
+//! self-heals on its next fetch, but live progress is only faithful when
+//! the executing pod and the subscribed pod are the same — i.e.
+//! single-pod deployments. A cross-pod event relay (e.g. Postgres
+//! LISTEN/NOTIFY fan-out) is a planned follow-up for multi-pod
+//! deployments; until then, expect missing WS progress events whenever a
+//! peer pod wins the claim.
 //!
 //! # Follow-on work
 //!
@@ -75,23 +87,37 @@
 //! ([`classify_provider_failure`]) out of both ledgers' failure surfaces
 //! and applies the two layers:
 //!
-//! - **Layer 1, local backoff.** `task_runs` failures already get
-//!   exponential `next_attempt_at` backoff from the ledger itself
-//!   (`RunHandle::fail`); the dispatcher adds nothing there — its base unit
-//!   (60s with jitter) dominates typical `Retry-After` hints, and the
-//!   breaker pause is the provider-level hold. Pipeline-job failures are
-//!   terminal in core (atom status `failed`, row cleared), so the executor
-//!   **re-enqueues** rate-limit/credits-classified atoms with `not_before`
-//!   honoring the provider's `Retry-After` hint (default
-//!   [`RATE_LIMIT_REQUEUE_DELAY`]; credits failures wait out the pause
-//!   horizon) — the job *sits in the ledger*, exactly the plan's
-//!   blocked-not-failed semantics, and the claim predicate keeps it
-//!   undispatchable until `not_before` passes.
-//! - **Layer 2, the circuit breaker.** Each execution feeds
-//!   [`ProviderBreaker`]: at most one rate-limit observation per executed
-//!   item (one provider 429 can fan out across a batch's atoms — that's
-//!   still one rate-limit response), an immediate credits pause on a 402,
-//!   and a streak reset on a failure-free execution.
+//! - **Layer 1, local backoff — jobs sit, they never fail.** For the
+//!   `task_runs` ledger, the tenant cores run with the
+//!   [`provider_failure_policy`](crate::backpressure::provider_failure_policy)
+//!   installed (see [`crate::account_cache`]): a provider-classified
+//!   failure *defers* the row (`RunHandle::defer_until` — lease released,
+//!   `next_attempt_at` set to the provider's `Retry-After` clamped to
+//!   [`DispatcherConfig::retry_after_cap`], or the pause-recheck horizon
+//!   for credits/auth) **without consuming retry budget**, so a month of
+//!   credit exhaustion can't burn `max_attempts` and terminally abandon
+//!   wiki regeneration. Logic failures keep the ledger's own exponential
+//!   backoff and attempt accounting. Pipeline-job failures are terminal in
+//!   core (atom status `failed`, row cleared), so the executor
+//!   **re-enqueues** provider-classified atoms with `not_before` honoring
+//!   the same horizons (default [`RATE_LIMIT_REQUEUE_DELAY`]) — the job
+//!   *sits in the ledger* and the claim predicate keeps it undispatchable
+//!   until `not_before` passes. A provider mutation (rotation, activation,
+//!   model change) re-arms both ledgers' provider-held horizons to "now"
+//!   (see [`crate::tenant_plane`]), so the user's recovery action takes
+//!   effect on the next tick instead of waiting out stale backoff.
+//! - **Layer 2, the circuit breaker.** **Only provider-touching executions
+//!   feed [`ProviderBreaker`]** ([`WorkItem::touches_provider`]):
+//!   embedding batches and llm work call the provider; maintenance tasks
+//!   and (non-inline) feed polls do not, and their outcomes are neutral
+//!   both ways — a draft-pipeline success says nothing about the
+//!   provider's health and must not reset the streak or clear the
+//!   detection window. Per provider-class execution: at most one
+//!   rate-limit observation (one provider 429 can fan out across a batch's
+//!   atoms — that's still one rate-limit response), an immediate credits
+//!   pause on a 402, an immediate provider-kind pause on a 401/403
+//!   credential rejection, and a streak reset on a failure-free
+//!   provider-class execution.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -108,19 +134,21 @@ use rand::Rng;
 use tokio::task::JoinHandle;
 
 use crate::account_cache::{AccountCache, TenantHandle};
-use crate::backpressure::{BreakerConfig, ProviderBreaker};
+use crate::backpressure::{BreakerConfig, ProviderBreaker, DEFAULT_RETRY_AFTER_CAP};
 use crate::control_plane::ControlPlane;
 use crate::dispatch_hints::{
     clear_hint_if_older, list_active_account_ids, list_hinted_accounts, mark_hint,
 };
 use crate::error::CloudError;
-use crate::pools::{WorkClass, WorkerPools, WorkerPoolsConfig};
+use crate::pools::{WorkClass, WorkTypeCap, WorkerPools, WorkerPoolsConfig};
 
-/// Layer-1 re-enqueue delay for a rate-limited pipeline job when the
-/// provider sent no `Retry-After` hint. Matches the task ledger's backoff
-/// base unit (`scheduler::ledger::BACKOFF_BASE`) so both ledgers retry on
-/// the same conventions.
-pub const RATE_LIMIT_REQUEUE_DELAY: Duration = Duration::from_secs(60);
+pub use crate::backpressure::RATE_LIMIT_REQUEUE_DELAY;
+
+/// `atom_pipeline_jobs.reason` stamped by the executor's layer-1 re-enqueue
+/// of provider-classified failures. The provider-mutation effects path
+/// re-arms exactly the rows carrying this marker
+/// (`AtomicCore::rearm_pipeline_jobs`; see [`crate::tenant_plane`]).
+pub const PROVIDER_BACKOFF_REASON: &str = "provider-backoff";
 
 /// Tuning knobs for the dispatcher. Every field is a `serve` CLI flag.
 #[derive(Debug, Clone)]
@@ -132,15 +160,26 @@ pub struct DispatcherConfig {
     /// How often a tick also sweeps ALL active accounts instead of only
     /// hinted ones — the recovery bound for lost hint writes and for purely
     /// time-driven work (cron reports, feed intervals) on tenants nobody is
-    /// mutating. The first tick after boot always full-scans.
+    /// mutating. The first tick after boot always full-scans; a failed full
+    /// scan doesn't consume the interval (it retries next tick).
     pub slow_scan_interval: Duration,
+    /// Ceiling on one tenant's ledger poll inside a tick. A wedged or
+    /// unreachable tenant database must not head-of-line-block every other
+    /// tenant's dispatch; a timed-out tenant is skipped for the tick (its
+    /// hint is retained, so the next tick retries).
+    pub tenant_poll_timeout: Duration,
     /// Jobs per pipeline-batch claim. One batch occupies one embedding-pool
     /// slot for its whole execution, so this trades per-claim overhead
     /// against fairness granularity.
     pub pipeline_batch_size: i32,
-    /// Per-tenant in-flight cap for report runs — a work-type override
-    /// tighter than the llm class cap (plan table: reports per-tenant 1).
+    /// Per-tenant in-flight cap for report runs — a work-type carve-out
+    /// inside the llm class (plan table: reports per-tenant 1; see
+    /// [`WorkTypeCap`]).
     pub reports_per_tenant_cap: usize,
+    /// Ceiling on a provider-supplied `Retry-After` hint when scheduling
+    /// layer-1 backoff (pipeline `not_before`, deferred `task_runs`
+    /// horizons) — a hostile or buggy provider must not strand jobs.
+    pub retry_after_cap: Duration,
     /// The four class pools' total / per-tenant caps.
     pub pools: WorkerPoolsConfig,
     /// Provider circuit-breaker tuning (window, threshold, cooldowns) for
@@ -153,8 +192,10 @@ impl Default for DispatcherConfig {
         Self {
             tick_interval: Duration::from_secs(2),
             slow_scan_interval: Duration::from_secs(300),
+            tenant_poll_timeout: Duration::from_secs(10),
             pipeline_batch_size: 8,
             reports_per_tenant_cap: 1,
+            retry_after_cap: DEFAULT_RETRY_AFTER_CAP,
             pools: WorkerPoolsConfig::default(),
             breaker: BreakerConfig::default(),
         }
@@ -207,12 +248,33 @@ impl WorkItem {
         }
     }
 
-    /// Work-type-specific per-tenant cap override (plan: reports = llm
-    /// class with per-tenant cap 1).
-    fn per_tenant_cap_override(&self, config: &DispatcherConfig) -> Option<usize> {
+    /// Work-type-specific per-tenant carve-out (plan: reports = llm class
+    /// with per-tenant cap 1). Counted against the work type's own
+    /// in-flight, not the tenant's total llm in-flight — concurrent wiki
+    /// work must not starve reports (see [`WorkTypeCap`]).
+    fn work_type_cap(&self, config: &DispatcherConfig) -> Option<WorkTypeCap> {
         match self {
-            WorkItem::Report { .. } => Some(config.reports_per_tenant_cap),
+            WorkItem::Report { .. } => Some(WorkTypeCap {
+                work_type: "report",
+                per_tenant: config.reports_per_tenant_cap,
+            }),
             _ => None,
+        }
+    }
+
+    /// Whether executing this item performs provider (AI) work — the gate
+    /// on circuit-breaker accounting (module docs: only provider-touching
+    /// executions feed the breaker). Embedding batches and llm syntheses
+    /// call the provider; maintenance tasks never do, and feed polls only
+    /// fetch/parse/ingest — under the dispatcher composition their atom
+    /// saves are enqueue-only, so the provider work happens in a later
+    /// pipeline batch, not here.
+    pub fn touches_provider(&self) -> bool {
+        match self {
+            WorkItem::PipelineBatch { .. }
+            | WorkItem::WikiRegen { .. }
+            | WorkItem::Report { .. } => true,
+            WorkItem::SystemTask { .. } | WorkItem::FeedPoll { .. } => false,
         }
     }
 }
@@ -265,11 +327,22 @@ struct PipelineFailure {
 pub struct CoreExecutor {
     cache: Arc<AccountCache>,
     breaker: Arc<ProviderBreaker>,
+    /// Ceiling on provider `Retry-After` hints when re-enqueueing
+    /// ([`DispatcherConfig::retry_after_cap`]).
+    retry_after_cap: Duration,
 }
 
 impl CoreExecutor {
-    pub fn new(cache: Arc<AccountCache>, breaker: Arc<ProviderBreaker>) -> Self {
-        Self { cache, breaker }
+    pub fn new(
+        cache: Arc<AccountCache>,
+        breaker: Arc<ProviderBreaker>,
+        retry_after_cap: Duration,
+    ) -> Self {
+        Self {
+            cache,
+            breaker,
+            retry_after_cap,
+        }
     }
 
     async fn resolve(
@@ -287,59 +360,80 @@ impl CoreExecutor {
     }
 
     /// Apply both backpressure layers after an execution settles: feed the
-    /// breaker (at most one rate-limit observation and one credits
-    /// observation per execution — one provider response can fan out over a
-    /// batch), re-enqueue classified pipeline failures with an honest
-    /// `not_before`, and reset the streak on a clean run. Backpressure
-    /// errors are logged, never propagated — the execution outcome is
-    /// already settled in the durable ledgers.
+    /// breaker (at most one observation per failure class per execution —
+    /// one provider response can fan out over a batch), re-enqueue
+    /// classified pipeline failures with an honest `not_before`, and reset
+    /// the streak on a clean run. Backpressure errors are logged, never
+    /// propagated — the execution outcome is already settled in the durable
+    /// ledgers.
+    ///
+    /// **Breaker accounting is gated on [`WorkItem::touches_provider`]**:
+    /// outcomes of work that never calls the provider (maintenance, feed
+    /// polls) are neutral in both directions. They carry no rate-limit
+    /// evidence, and crediting their successes as "healthy" would let
+    /// interleaved housekeeping hold the detection window below threshold
+    /// forever and reset the escalation streak between trips (the
+    /// adversarial finding this gate closes).
     async fn settle_backpressure(
         &self,
         account_id: &str,
         core: &AtomicCore,
+        item: &WorkItem,
         outcome: &ExecOutcome,
         pipeline_failures: Vec<PipelineFailure>,
     ) {
         let mut rate_limited = false;
         let mut payment_required = false;
+        let mut auth_failed = false;
+        let mut observe = |class: &ProviderFailureClass| match class {
+            ProviderFailureClass::RateLimited { .. } => rate_limited = true,
+            ProviderFailureClass::PaymentRequired => payment_required = true,
+            ProviderFailureClass::AuthFailed => auth_failed = true,
+            ProviderFailureClass::Other => {}
+        };
         for failure in &pipeline_failures {
-            match failure.class {
-                ProviderFailureClass::RateLimited { .. } => rate_limited = true,
-                ProviderFailureClass::PaymentRequired => payment_required = true,
-                ProviderFailureClass::Other => {}
-            }
+            observe(&failure.class);
         }
         // task_runs failures surface as the item's outcome; the ledger has
-        // already scheduled its own next_attempt_at backoff (layer 1).
+        // already settled it (deferred for provider classes via the
+        // installed policy, backed off otherwise — layer 1).
         if let ExecOutcome::Failed(error) = outcome {
-            match classify_provider_failure(error) {
-                ProviderFailureClass::RateLimited { .. } => rate_limited = true,
-                ProviderFailureClass::PaymentRequired => payment_required = true,
-                ProviderFailureClass::Other => {}
-            }
+            observe(&classify_provider_failure(error));
         }
 
-        // Rate-limit first, credits second: when one execution somehow saw
-        // both, the credits pause (which also gates interactive routes) is
-        // the one that must win the shared kind column.
+        // Rate-limit first, then the immediate pause kinds: when one
+        // execution somehow saw several, credits — which also gates the
+        // interactive routes — must win the shared kind column last-write.
         if rate_limited {
             if let Err(e) = self.breaker.record_rate_limited(account_id).await {
                 tracing::warn!(account_id, error = %e, "[dispatcher] breaker rate-limit record failed");
             }
         }
-        let mut credits_until = None;
+        let mut pause_until = None;
+        if auth_failed {
+            match self.breaker.record_auth_failed(account_id).await {
+                Ok(until) => pause_until = until,
+                Err(e) => {
+                    tracing::warn!(account_id, error = %e, "[dispatcher] breaker auth record failed")
+                }
+            }
+        }
         if payment_required {
             // OpenRouter's key-usage endpoint exposes no reset timestamp
             // (see provisioning_api::RuntimeKeyUsage), so the pause uses
             // the configured recheck horizon.
             match self.breaker.record_payment_required(account_id, None).await {
-                Ok(until) => credits_until = until,
+                Ok(until) => pause_until = until,
                 Err(e) => {
                     tracing::warn!(account_id, error = %e, "[dispatcher] breaker credits record failed")
                 }
             }
         }
-        if !rate_limited && !payment_required && matches!(outcome, ExecOutcome::Executed) {
+        let provider_failure = rate_limited || payment_required || auth_failed;
+        // record_healthy only for provider-class work that genuinely
+        // succeeded; everything else is neutral (module docs).
+        if item.touches_provider() && !provider_failure && matches!(outcome, ExecOutcome::Executed)
+        {
             if let Err(e) = self.breaker.record_healthy(account_id).await {
                 tracing::warn!(account_id, error = %e, "[dispatcher] breaker healthy record failed");
             }
@@ -347,7 +441,7 @@ impl CoreExecutor {
 
         if !pipeline_failures.is_empty() {
             if let Err(e) = self
-                .requeue_pipeline_failures(core, pipeline_failures, credits_until)
+                .requeue_pipeline_failures(core, pipeline_failures, pause_until)
                 .await
             {
                 tracing::warn!(
@@ -361,18 +455,20 @@ impl CoreExecutor {
     }
 
     /// Layer 1 for the pipeline ledger: core settles a failed job as
-    /// terminal (atom status `failed`, row cleared), so rate-limit/credits
+    /// terminal (atom status `failed`, row cleared), so provider-classified
     /// failures — which WILL succeed later — are re-enqueued here with
-    /// `not_before` pushed past the provider's horizon. The enqueue
-    /// re-derives stage flags from durable state: a failed embedding
-    /// re-requests embedding (plus tagging iff the atom's tagging is still
-    /// pending — never invent a tagging request the save path didn't make);
-    /// a failed tagging re-requests tagging alone.
+    /// `not_before` pushed past the provider's horizon (`Retry-After`
+    /// clamped to the configured cap; pause horizon for credits/auth). The
+    /// enqueue re-derives stage flags from durable state: a failed
+    /// embedding re-requests embedding (plus tagging iff the atom's tagging
+    /// is still pending — never invent a tagging request the save path
+    /// didn't make); a failed tagging re-requests tagging alone. One atom's
+    /// read failure skips that atom (logged), never the rest of the batch.
     async fn requeue_pipeline_failures(
         &self,
         core: &AtomicCore,
         failures: Vec<PipelineFailure>,
-        credits_until: Option<DateTime<Utc>>,
+        pause_until: Option<DateTime<Utc>>,
     ) -> Result<(), CloudError> {
         let now = Utc::now();
         let mut requests = Vec::new();
@@ -380,24 +476,37 @@ impl CoreExecutor {
             let not_before = match failure.class {
                 ProviderFailureClass::RateLimited { retry_after_secs } => {
                     let delay = retry_after_secs
-                        .map(Duration::from_secs)
+                        .map(|secs| Duration::from_secs(secs).min(self.retry_after_cap))
                         .unwrap_or(RATE_LIMIT_REQUEUE_DELAY);
                     now + chrono::Duration::from_std(delay).unwrap_or_default()
                 }
-                ProviderFailureClass::PaymentRequired => credits_until.unwrap_or_else(|| {
-                    now + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY).unwrap_or_default()
-                }),
+                ProviderFailureClass::PaymentRequired | ProviderFailureClass::AuthFailed => {
+                    pause_until.unwrap_or_else(|| {
+                        now + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY)
+                            .unwrap_or_default()
+                    })
+                }
                 // Genuine failures stay settled; retrying them is the
                 // user's call (the existing retry routes).
                 ProviderFailureClass::Other => continue,
             };
             let (embed_requested, tag_requested) = if failure.embedding_stage {
-                let tagging_pending = core
-                    .get_atom(&failure.atom_id)
-                    .await
-                    .map_err(CloudError::core("reading atom for pipeline re-enqueue"))?
-                    .map(|found| found.atom.tagging_status == "pending")
-                    .unwrap_or(false);
+                let tagging_pending = match core.get_atom(&failure.atom_id).await {
+                    Ok(found) => found
+                        .map(|found| found.atom.tagging_status == "pending")
+                        .unwrap_or(false),
+                    Err(e) => {
+                        // Skip-and-continue: one unreadable atom must not
+                        // abandon the whole batch's re-enqueue. This atom
+                        // stays status=failed until a manual retry.
+                        tracing::warn!(
+                            atom_id = failure.atom_id,
+                            error = %e,
+                            "[dispatcher] atom read failed during pipeline re-enqueue; skipping it"
+                        );
+                        continue;
+                    }
+                };
                 (true, tagging_pending)
             } else {
                 (false, true)
@@ -407,7 +516,7 @@ impl CoreExecutor {
                 embed_requested,
                 tag_requested,
                 not_before: Some(not_before.to_rfc3339()),
-                reason: "provider-backoff".to_string(),
+                reason: PROVIDER_BACKOFF_REASON.to_string(),
                 replace_existing: false,
             });
         }
@@ -567,7 +676,7 @@ impl WorkExecutor for CoreExecutor {
             }
         }?;
 
-        self.settle_backpressure(account_id, &core, &outcome, pipeline_failures)
+        self.settle_backpressure(account_id, &core, item, &outcome, pipeline_failures)
             .await;
         Ok(outcome)
     }
@@ -626,7 +735,11 @@ impl Dispatcher {
             control.clone(),
             config.breaker.clone(),
         ));
-        let executor = Arc::new(CoreExecutor::new(Arc::clone(&cache), breaker));
+        let executor = Arc::new(CoreExecutor::new(
+            Arc::clone(&cache),
+            breaker,
+            config.retry_after_cap,
+        ));
         Self::with_executor(control, cache, config, executor)
     }
 
@@ -705,15 +818,30 @@ impl Dispatcher {
                 continue;
             }
             outcome.polled += 1;
-            let poll = match self.poll_tenant(&account_id).await {
-                Ok(p) => p,
-                Err(e) => {
-                    // Leave the hint alone — the next tick (or the slow
-                    // scan) retries this tenant.
+            // Bounded per tenant: one wedged or unreachable tenant database
+            // must not head-of-line-block every other tenant's dispatch.
+            // Timeout and error both skip the tenant for this tick with its
+            // hint retained — the next tick (or the slow scan) retries.
+            let poll = match tokio::time::timeout(
+                self.config.tenant_poll_timeout,
+                self.poll_tenant(&account_id),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
                     tracing::warn!(
                         account_id,
                         error = %e,
                         "[dispatcher] tenant poll failed; skipping this tick"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        account_id,
+                        timeout_ms = self.config.tenant_poll_timeout.as_millis() as u64,
+                        "[dispatcher] tenant poll timed out; skipping this tick"
                     );
                     continue;
                 }
@@ -779,7 +907,7 @@ impl Dispatcher {
                     .try_acquire(
                         item.class(),
                         &tq.account_id,
-                        item.per_tenant_cap_override(&self.config),
+                        item.work_type_cap(&self.config),
                     )
                     .map(|permit| (idx, permit))
             });
@@ -859,8 +987,13 @@ impl Dispatcher {
             .map(|h| (h.account_id, Some(h.last_enqueued_at)))
             .collect();
 
-        if self.take_slow_scan_due() {
-            for account_id in list_active_account_ids(&self.control).await? {
+        if self.slow_scan_due() {
+            // The marker advances only after the scan SUCCEEDS: a failed
+            // full scan (the `?` below) retries on the next tick instead of
+            // silently waiting out a whole interval.
+            let active = list_active_account_ids(&self.control).await?;
+            self.mark_slow_scan_done();
+            for account_id in active {
                 if seen.insert(account_id.clone()) {
                     candidates.push((account_id, None));
                 }
@@ -869,21 +1002,24 @@ impl Dispatcher {
         Ok(candidates)
     }
 
-    /// Whether this tick should full-scan, advancing the marker when it
-    /// does. The first tick after boot always full-scans — restart recovery
-    /// should not wait out a whole interval.
-    fn take_slow_scan_due(&self) -> bool {
-        let mut last = self
+    /// Whether this tick should full-scan. The first tick after boot always
+    /// full-scans — restart recovery should not wait out a whole interval.
+    /// Read-only: the marker advances via [`Self::mark_slow_scan_done`],
+    /// and only on success.
+    fn slow_scan_due(&self) -> bool {
+        self.last_slow_scan
+            .lock()
+            .expect("slow-scan marker poisoned")
+            .map(|t| t.elapsed() >= self.config.slow_scan_interval)
+            .unwrap_or(true)
+    }
+
+    /// Consume the slow-scan interval after a successful full scan.
+    fn mark_slow_scan_done(&self) {
+        *self
             .last_slow_scan
             .lock()
-            .expect("slow-scan marker poisoned");
-        let due = last
-            .map(|t| t.elapsed() >= self.config.slow_scan_interval)
-            .unwrap_or(true);
-        if due {
-            *last = Some(Instant::now());
-        }
-        due
+            .expect("slow-scan marker poisoned") = Some(Instant::now());
     }
 
     /// The tenant-pause gate (plan: per-tenant circuit breaker). The
@@ -1022,4 +1158,75 @@ struct TenantPoll {
     /// produced no item this tick, e.g. a backed-off retry) — the "keep
     /// the hint" signal.
     ledger_active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker_dispatcher(interval: Duration) -> Dispatcher {
+        struct NoopExecutor;
+        #[async_trait::async_trait]
+        impl WorkExecutor for NoopExecutor {
+            async fn execute(
+                &self,
+                _account_id: &str,
+                _item: &WorkItem,
+            ) -> Result<ExecOutcome, CloudError> {
+                Ok(ExecOutcome::Skipped)
+            }
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let control = ControlPlane::from_pool_for_tests(pool);
+        let cache = Arc::new(AccountCache::new(
+            control.clone(),
+            crate::provision::ClusterConfig {
+                cluster_id: "test".to_string(),
+                cluster_url: "postgres://unused:unused@127.0.0.1:1/unused".to_string(),
+            },
+            Arc::new(crate::keyvault::EnvMasterKeyVault::new([0u8; 32])),
+            crate::account_cache::AccountCacheConfig::default(),
+        ));
+        Dispatcher::with_executor(
+            control,
+            cache,
+            DispatcherConfig {
+                slow_scan_interval: interval,
+                ..DispatcherConfig::default()
+            },
+            Arc::new(NoopExecutor),
+        )
+    }
+
+    /// The slow-scan interval is consumed only when a full scan SUCCEEDS:
+    /// `slow_scan_due` is a pure read (a failed scan retries next tick),
+    /// and `mark_slow_scan_done` is the success-path consumption.
+    #[tokio::test]
+    async fn slow_scan_marker_consumed_only_on_success() {
+        let dispatcher = marker_dispatcher(Duration::from_secs(3600));
+
+        // Boot: always due — and STILL due after a read (a failed scan
+        // must not consume the interval).
+        assert!(dispatcher.slow_scan_due());
+        assert!(
+            dispatcher.slow_scan_due(),
+            "reading due-ness must not consume the interval"
+        );
+
+        // Success consumes it.
+        dispatcher.mark_slow_scan_done();
+        assert!(
+            !dispatcher.slow_scan_due(),
+            "a successful scan must start the interval"
+        );
+
+        // A short interval becomes due again after it elapses.
+        let dispatcher = marker_dispatcher(Duration::from_millis(10));
+        dispatcher.mark_slow_scan_done();
+        assert!(!dispatcher.slow_scan_due());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(dispatcher.slow_scan_due());
+    }
 }

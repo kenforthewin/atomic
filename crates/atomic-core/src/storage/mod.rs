@@ -515,6 +515,8 @@ dispatch! {
         => sqlite: count_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_pipeline_jobs;
     fn count_due_pipeline_jobs_sync(&self, now: &str) -> Result<i32, AtomicCoreError>
         => sqlite: count_due_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_due_pipeline_jobs;
+    fn rearm_pipeline_jobs_sync(&self, reason: &str, now: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: rearm_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: rearm_pipeline_jobs;
 
     // ---- SearchStore ----
     fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
@@ -690,6 +692,12 @@ dispatch! {
         => sqlite: fail_task_run_retry_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_retry;
     fn fail_task_run_abandon_sync(&self, id: &str, expected_lease: &str, last_error: &str, finished_at: &str) -> Result<bool, AtomicCoreError>
         => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
+    fn defer_task_run_sync(&self, id: &str, expected_lease: &str, last_error: &str, now: &str, next_attempt_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: defer_task_run_sync, pg_trait: TaskRunStore, pg_method: defer_task_run;
+    fn list_waiting_task_runs_sync(&self, now: &str) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_waiting_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_waiting_task_runs;
+    fn rearm_task_runs_sync(&self, ids: &[String], now: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: rearm_task_runs_sync, pg_trait: TaskRunStore, pg_method: rearm_task_runs;
     fn settle_task_runs_moot_sync(&self, task_id: &str, subject_id: &str, finished_at: &str) -> Result<u64, AtomicCoreError>
         => sqlite: settle_task_runs_moot_sync, pg_trait: TaskRunStore, pg_method: settle_task_runs_moot;
     fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
