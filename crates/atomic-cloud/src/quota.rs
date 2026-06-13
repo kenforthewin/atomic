@@ -148,6 +148,16 @@ fn quota_target(method: &Method, path: &str) -> Option<QuotaTarget> {
         "/api/atoms/bulk" => Some(QuotaTarget::AtomBulk),
         "/api/ingest/urls" => Some(QuotaTarget::IngestUrls),
         "/api/databases" => Some(QuotaTarget::Kb),
+        // Manual-trigger routes carry a dynamic `{id}` segment, so they fall
+        // through the exact-path arm. `POST /api/reports/{id}/run` writes a
+        // finding atom and `POST /api/feeds/{id}/poll` ingests feed-entry
+        // atoms — the same atom-creating work the dispatcher's atom-limit gate
+        // defers for *scheduled* runs. Gating the manual trigger closes the
+        // at-ceiling evasion (a user clicking "run"/"poll now" past the limit).
+        // Single-atom delta: a poll's entry count isn't known ahead of time, so
+        // these admit only while the tenant is at least one atom under the ceiling.
+        _ if path.starts_with("/api/reports/") && path.ends_with("/run") => Some(QuotaTarget::Atom),
+        _ if path.starts_with("/api/feeds/") && path.ends_with("/poll") => Some(QuotaTarget::Atom),
         _ => None,
     }
 }
@@ -455,6 +465,16 @@ mod tests {
             Some(QuotaTarget::IngestUrls)
         );
         assert_eq!(quota_target(&post, "/api/databases"), Some(QuotaTarget::Kb));
+        // Manual-trigger atom-creating routes (dynamic {id} segment) are gated
+        // as single-atom deltas, closing the at-ceiling evasion.
+        assert_eq!(
+            quota_target(&post, "/api/reports/abc/run"),
+            Some(QuotaTarget::Atom)
+        );
+        assert_eq!(
+            quota_target(&post, "/api/feeds/abc/poll"),
+            Some(QuotaTarget::Atom)
+        );
         // Updates, reads, and nested paths are not resource creates.
         for ignored in [
             "/api/atoms/abc",
@@ -462,6 +482,11 @@ mod tests {
             "/api/databases/default",
             "/api/databases/default/activate",
             "/api/tags",
+            // Reads/other report+feed routes are not atom creates.
+            "/api/reports/abc",
+            "/api/reports",
+            "/api/feeds/abc",
+            "/api/feeds",
         ] {
             assert_eq!(quota_target(&post, ignored), None, "{ignored} ignored");
         }
