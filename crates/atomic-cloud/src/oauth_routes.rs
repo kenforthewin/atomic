@@ -48,12 +48,17 @@
 //!
 //! # MCP token default scope (resolves the plan's open question)
 //!
-//! Tokens minted by this flow default to **account scope**
-//! ([`TokenScope::Account`], `allowed_db_id = NULL`) — one MCP URL per
-//! account, full access to its knowledge bases, matching "one account = one
-//! user" in v1. The db-pinned case still works: an authorization carrying an
+//! Tokens minted by this flow are classified [`TokenScope::Mcp`] (so a glance
+//! at `cloud_tokens` tells an MCP-issued credential apart from a CLI account
+//! token or a UI session) and default to **account-level access**:
+//! `allowed_db_id = NULL`, i.e. no KB pin — one MCP URL per account, full
+//! access to all its knowledge bases, matching "one account = one user" in v1.
+//! CloudAuth's chokepoint keys on `allowed_db_id`, not the scope variant, so a
+//! `Mcp` token with no pin is exactly as broad as an account token.
+//!
+//! The db-pinned case still works: an authorization carrying an
 //! `allowed_db_id` mints a [`TokenScope::Mcp`] token pinned to that KB, and
-//! CloudAuth's chokepoint enforces the pin (a db-scoped token can't read
+//! CloudAuth's chokepoint enforces the pin (a db-scoped MCP token can't read
 //! another KB via header override). Per-KB-MCP-by-default is deferred.
 
 use actix_web::http::header;

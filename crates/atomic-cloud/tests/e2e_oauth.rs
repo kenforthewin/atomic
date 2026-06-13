@@ -44,6 +44,10 @@ const REDIRECT_URI: &str = "https://claude.ai/api/mcp/auth_callback";
 
 struct Account {
     account_id: String,
+    /// An account-scope token minted at provision time, used to seed the
+    /// tenant's KB over `/api/*` so the MCP `tools/call` has something real to
+    /// read back (the OAuth-minted token is exercised separately).
+    account_token: String,
 }
 
 struct OAuthHarness {
@@ -196,9 +200,115 @@ impl OAuthHarness {
         .await
         .expect("activate mock provider credentials");
 
+        // An account-scope token to seed atoms over /api/* (the data plane the
+        // OAuth-minted MCP token later reads).
+        let account_token = issue_token(
+            &self.control,
+            &account.account_id,
+            TokenScope::Account,
+            None,
+            "test: seed",
+        )
+        .await
+        .expect("issue account token");
+
         Account {
             account_id: account.account_id,
+            account_token,
         }
+    }
+
+    /// Seed an atom on `subdomain`'s default KB via the account token and
+    /// return its id. Atom creation is synchronous from the caller's
+    /// perspective (the embedding pipeline runs in the background), so the id
+    /// is readable immediately — no provider round-trip is needed for a
+    /// subsequent `read_atom`.
+    async fn seed_atom(&self, subdomain: &str, token: &str, content: &str) -> String {
+        let resp = self
+            .req(Method::POST, subdomain, "/api/atoms")
+            .bearer_auth(token)
+            .json(&json!({ "content": content }))
+            .send()
+            .await
+            .expect("send create atom");
+        assert_eq!(resp.status(), StatusCode::CREATED, "seed atom");
+        let body: Value = resp.json().await.expect("atom json");
+        body["id"]
+            .as_str()
+            .or_else(|| body["atom"]["id"].as_str())
+            .expect("atom id in create response")
+            .to_string()
+    }
+
+    /// Drive the MCP Streamable-HTTP handshake against `subdomain`'s `/mcp`
+    /// with `token`, then issue a single `tools/call`. Returns the tool
+    /// result's first text content.
+    ///
+    /// rmcp's transport is stateful: `initialize` mints a session id (the
+    /// `mcp-session-id` response header), the client confirms with a
+    /// `notifications/initialized`, and only then are `tools/call`s accepted —
+    /// the same handshake the transport's own unit tests drive.
+    async fn mcp_tools_call(
+        &self,
+        subdomain: &str,
+        token: &str,
+        tool: &str,
+        arguments: Value,
+    ) -> String {
+        let init = self.mcp_initialize(subdomain, token).await;
+        assert_eq!(init.status(), StatusCode::OK, "mcp initialize");
+        let session_id = init
+            .headers()
+            .get("mcp-session-id")
+            .expect("initialize establishes a session")
+            .to_str()
+            .expect("session id str")
+            .to_string();
+
+        // Confirm the session before calling tools.
+        let initialized = self
+            .req(Method::POST, subdomain, "/mcp")
+            .bearer_auth(token)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send initialized");
+        assert!(
+            initialized.status().is_success(),
+            "initialized notification accepted: {}",
+            initialized.status()
+        );
+
+        let resp = self
+            .req(Method::POST, subdomain, "/mcp")
+            .bearer_auth(token)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send tools/call");
+        assert_eq!(resp.status(), StatusCode::OK, "tools/call");
+        let body = resp.text().await.expect("tools/call body");
+        tool_result_text(&body)
     }
 
     fn req(&self, method: Method, subdomain: &str, path: &str) -> reqwest::RequestBuilder {
@@ -325,6 +435,22 @@ impl OAuthHarness {
             .await
             .expect("send token")
     }
+}
+
+/// Pull the first text content out of an MCP `tools/call` response. The
+/// Streamable-HTTP transport frames the JSON-RPC reply as an SSE `data:` line;
+/// dig out `result.content[0].text`.
+fn tool_result_text(body: &str) -> String {
+    let payload = body
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .unwrap_or(body);
+    let value: Value = serde_json::from_str(payload)
+        .unwrap_or_else(|e| panic!("tools/call body is not JSON-RPC: {e}\nbody = {body}"));
+    value["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content in tools/call result: {value}"))
+        .to_string()
 }
 
 /// Extract the `code` query parameter from a redirect Location.
@@ -486,6 +612,97 @@ async fn full_flow_session_to_mcp_scoped_token_that_cloudauth_accepts() {
             assert!(
                 mcp.headers().contains_key("mcp-session-id"),
                 "mcp session established"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn oauth_token_tools_call_operates_on_owning_tenant_kb() {
+    // The full Claude-Desktop journey, carried through to a real `tools/call`:
+    // the OAuth-minted token reads back an atom that lives only in alpha's KB,
+    // and the SAME tool call cannot see beta's atom — proving the token both
+    // operates on its owning tenant's data AND is tenant-isolated at the data
+    // layer, not merely at the auth boundary.
+    with_control_db(
+        "oauth_token_tools_call_operates_on_owning_tenant_kb",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let alpha = h.provision("alpha").await;
+            let bravo = h.provision("bravo").await;
+
+            // Seed one atom in each tenant's KB over the account API.
+            let alpha_atom = h
+                .seed_atom(
+                    "alpha",
+                    &alpha.account_token,
+                    "ALPHA-SECRET: the rust workspace layout",
+                )
+                .await;
+            let bravo_atom = h
+                .seed_atom(
+                    "bravo",
+                    &bravo.account_token,
+                    "BRAVO-SECRET: the postgres tenant schema",
+                )
+                .await;
+
+            // Mint an MCP token for alpha through the real OAuth flow.
+            let (client_id, client_secret) = h.register_client("alpha").await;
+            let session = h.session(&alpha.account_id).await;
+            let location = h
+                .approve("alpha", &session, &client_id, RFC7636_CHALLENGE, "s")
+                .await;
+            let code = code_from_location(&location);
+            let resp = h
+                .token(
+                    "alpha",
+                    &client_id,
+                    &client_secret,
+                    &code,
+                    RFC7636_VERIFIER,
+                    REDIRECT_URI,
+                )
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK, "token issued");
+            let token = resp.json::<Value>().await.expect("token json")["access_token"]
+                .as_str()
+                .expect("access_token")
+                .to_string();
+
+            // read_atom on alpha's atom via MCP returns its body: the OAuth
+            // token operates on alpha's own knowledge base (CloudAuth injects
+            // alpha's manager; the transport resolves it per-request).
+            let text = h
+                .mcp_tools_call(
+                    "alpha",
+                    &token,
+                    "read_atom",
+                    json!({ "atom_id": alpha_atom }),
+                )
+                .await;
+            assert!(
+                text.contains("ALPHA-SECRET"),
+                "read_atom returns alpha's atom body via the oauth token: {text}"
+            );
+
+            // The same tool call for BRAVO's atom id — still on alpha's /mcp,
+            // alpha's token — cannot see it: bravo's atom lives in bravo's
+            // tenant DB, which alpha's resolved manager never touches.
+            let text = h
+                .mcp_tools_call(
+                    "alpha",
+                    &token,
+                    "read_atom",
+                    json!({ "atom_id": bravo_atom }),
+                )
+                .await;
+            assert!(
+                text.contains("Atom not found"),
+                "alpha's mcp token cannot read bravo's atom across tenants: {text}"
             );
 
             h.stop().await;

@@ -72,6 +72,43 @@ A `cloud_plane_guard` ([`server.rs`](src/server.rs)) **fail-closes** routes that
 bind atomic-server's process-global state and have no per-tenant story yet —
 `/api/auth/*`, `/api/exports/*`, `/api/logs` all return 404 under cloud.
 
+### OAuth + MCP on the tenant subdomain
+
+Each tenant subdomain also serves cloud's **own** OAuth 2.0 flow and the MCP
+endpoint, so Claude Desktop's `https://<slug>.<base>/mcp` connect-and-authorize
+journey works per account:
+
+- **OAuth** ([`oauth_routes.rs`](src/oauth_routes.rs)) — discovery
+  (`/.well-known/oauth-authorization-server`,
+  `/.well-known/oauth-protected-resource[/mcp]`), Dynamic Client Registration
+  (`POST /oauth/register`), Authorization Code + PKCE (`GET`/`POST
+  /oauth/authorize`, `POST /oauth/token`). These sit **alongside** CloudAuth,
+  not behind it (a bootstrapping client has no token yet); each handler
+  resolves the account from `Host` itself and scopes every
+  [`oauth_store`](src/oauth_store.rs) query by `account_id` — the same
+  cross-tenant chokepoint. The approve step authenticates the **session
+  cookie** (the user is logged in on their subdomain), not a pasted token, so
+  the flow is structurally atomic-server's shape with a control-plane store and
+  a session-based approving identity. atomic-server's self-hosted OAuth
+  handlers are untouched.
+- **`/mcp`** sits **behind** CloudAuth (it carries the bearer MCP token the
+  OAuth flow mints). CloudAuth injects the tenant's `DatabaseManager` as a
+  `RequestDatabaseManager` extension; atomic-server's MCP transport resolves
+  its manager from that extension per-request (falling back to its baked-in
+  manager when none is installed — exactly how self-hosted runs). An
+  unauthenticated `/mcp` request gets a 401 with the MCP-compliant
+  `WWW-Authenticate` challenge pointing at *this tenant's* protected-resource
+  metadata, so the client discovers the right per-account OAuth flow.
+
+**MCP-token default scope** (the plan's open question, resolved): OAuth-minted
+tokens are classified `scope='mcp'` in `cloud_tokens` and default to
+**account-level access** (`allowed_db_id = NULL`) — one MCP URL per account,
+full access to all its KBs, matching "one account = one user" in v1. A db-pinned
+authorization still mints a KB-pinned `mcp` token, and CloudAuth's
+`allowed_db_id` chokepoint enforces the pin (a pinned MCP token can't reach
+another KB via the `X-Atomic-Database` header). Per-KB-MCP-by-default is
+deferred.
+
 ## Module map
 
 **Composition & entry**
@@ -215,7 +252,7 @@ process listings.
 
 ## Migrations
 
-Control-plane migrations live in [`migrations/`](migrations) (`001`–`013`) and
+Control-plane migrations live in [`migrations/`](migrations) (`001`–`014`) and
 run through the hardened runner in `control_plane.rs` (schema-version table,
 advisory lock on a detached connection, errors propagated). Tenant databases run
 atomic-core's own migrations via `initialize()`.
@@ -228,7 +265,7 @@ crate's and atomic-core's migration directories. Drops happen N+1 deploys later.
 
 ## Testing
 
-~197 test functions across [`tests/`](tests) and inline `#[cfg(test)]` modules.
+~198 test functions across [`tests/`](tests) and inline `#[cfg(test)]` modules.
 Tests are **Postgres-gated**: they skip cleanly when `ATOMIC_TEST_DATABASE_URL`
 is unset, and create + drop their own uniquely-named databases (control plane and
 tenant) with guard-based cleanup.
@@ -257,11 +294,36 @@ provider or sends real email.
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
 - Several capabilities are scoped to later slices — backups, observability
   metrics/tracing, the user-facing `account_events` log, and the
-  signup/billing/OAuth-consent frontend (the OAuth flow ships as API + a
-  minimal server-rendered approve form). See the plan doc's Implementation log
-  for the current frontier.
+  signup/billing SPA frontend. The OAuth flow is shipped as API + a minimal
+  server-rendered consent/approve form (no SPA); a richer consent UI is later.
+  See the plan doc's Implementation log for the current frontier.
 
-## What's shipped (this slice: billing & quotas)
+## What's shipped (this slice: OAuth & per-tenant MCP)
+
+- **Per-account OAuth 2.0** — cloud's own Dynamic Client Registration +
+  Authorization Code + PKCE (S256) flow on the tenant subdomain
+  ([`oauth_routes.rs`](src/oauth_routes.rs)), storing clients/codes in the
+  control plane scoped by `account_id` ([`oauth_store.rs`](src/oauth_store.rs),
+  migration `014`). Discovery is per-tenant (issuer = the addressed origin);
+  the approve step authenticates the session cookie, not a pasted token.
+  Hash-only client secrets and codes, single-use 60s codes, S256 verification
+  against an RFC 7636 fixture. atomic-server's self-hosted OAuth handlers are
+  left untouched.
+- **Per-tenant MCP** — `/mcp` mounts behind CloudAuth; atomic-server's MCP
+  transport resolves its `DatabaseManager` from the per-request
+  `RequestDatabaseManager` extension (a cloud-unaware generality mirroring the
+  data plane's `Db` extractor — self-hosted runs byte-identical via the
+  baked-in fallback), so each tenant's MCP tool calls hit its own KB. An
+  unauthenticated `/mcp` returns the MCP `WWW-Authenticate` challenge pointing
+  at *this tenant's* OAuth discovery.
+- **MCP token default scope** — OAuth-minted tokens are `scope='mcp'` with
+  account-level access (`allowed_db_id = NULL`); db-pinned tokens are still
+  honored and chokepoint-enforced. The full Claude-Desktop journey
+  (discovery → DCR → authorize → token → `initialize` + `tools/call`) and the
+  cross-tenant isolation / PKCE-replay / expired-code / db-pin cases are driven
+  over real HTTP in [`tests/e2e_oauth.rs`](tests/e2e_oauth.rs).
+
+## Previously shipped (billing & quotas)
 
 - **Plan-tier resource limits** — `plans` catalogue + `accounts.plan_id`,
   live atom/KB enforcement (402 `quota_exceeded`); free-tier defaults (100
