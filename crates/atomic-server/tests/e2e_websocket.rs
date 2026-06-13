@@ -118,9 +118,7 @@ async fn ws_rejects_invalid_token_sqlite() {
 #[actix_web::test]
 async fn ws_rejects_invalid_token_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!(
-            "ws_rejects_invalid_token_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
-        );
+        eprintln!("ws_rejects_invalid_token_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
         return;
     }
     run_ws_rejects_invalid_token(Backend::Postgres).await;

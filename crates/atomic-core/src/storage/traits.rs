@@ -243,6 +243,9 @@ pub trait TagStore: Send + Sync {
         offset: i32,
     ) -> StorageResult<PaginatedTagChildren>;
 
+    /// Fetch a single tag by id. `None` when no tag with that id exists.
+    async fn get_tag(&self, id: &str) -> StorageResult<Option<Tag>>;
+
     /// Create a new tag.
     async fn create_tag(&self, name: &str, parent_id: Option<&str>) -> StorageResult<Tag>;
 
@@ -573,6 +576,20 @@ pub trait ChunkStore: Send + Sync {
 
     /// Count active durable pipeline jobs for this database.
     async fn count_pipeline_jobs(&self) -> StorageResult<i32>;
+
+    /// Count pipeline jobs claimable right now — the same predicate as
+    /// [`Self::claim_pipeline_jobs`] (pending or expired-lease, `not_before`
+    /// passed, requested stage executable) without claiming anything. Lets
+    /// schedulers that drive the ledger from a dedicated worker size their
+    /// batches before committing a claim.
+    async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32>;
+
+    /// Reset `not_before` to `now` on pending jobs stamped with `reason`
+    /// whose `not_before` is still in the future, returning the number of
+    /// rows re-armed. The environment-changed escape hatch for backed-off
+    /// work (see `AtomicCore::rearm_pipeline_jobs`); in-flight leases and
+    /// other reasons are untouched.
+    async fn rearm_pipeline_jobs(&self, reason: &str, now: &str) -> StorageResult<u64>;
 }
 
 // ==================== Search Storage ====================
@@ -856,8 +873,16 @@ pub trait FeedStore: Send + Sync {
     /// Get feeds that are due for polling.
     async fn get_due_feeds(&self) -> StorageResult<Vec<Feed>>;
 
-    /// Record that a feed was polled (update timestamp and error).
+    /// Record that a poll *settled*: advance `last_polled_at` (the due
+    /// check's fast-path) and set or clear `last_error`. Callers must only
+    /// invoke this for terminal outcomes — success, or a feed-poll run that
+    /// exhausted its retry budget.
     async fn mark_feed_polled(&self, id: &str, error: Option<&str>) -> StorageResult<()>;
+
+    /// Stamp `last_error` without touching `last_polled_at` — used for
+    /// retryable poll failures so the feed stays due while the `task_runs`
+    /// backoff window decides when the retry fires.
+    async fn set_feed_error(&self, id: &str, error: &str) -> StorageResult<()>;
 
     /// Atomically claim a feed item GUID. Returns true if this call claimed it.
     async fn claim_feed_item(&self, feed_id: &str, guid: &str) -> StorageResult<bool>;
@@ -924,6 +949,19 @@ pub trait ClusterStore: Send + Sync {
 // ==================== Settings Storage ====================
 
 /// Storage operations for key-value settings.
+///
+/// Two tiers:
+///
+/// * The **scoped** methods (`get_setting` & co.) address the per-database
+///   settings table — `task.{id}.*` scheduler state, seed flags, per-DB
+///   overrides.
+/// * The **global** methods (`get_global_setting` & co.) address the
+///   registry-role tier — provider/model config and other deployment-wide
+///   settings that SQLite keeps in `registry.db`. On SQLite each data DB is
+///   its own file, so the defaults below (delegate to the scoped methods)
+///   are already correct: physical separation does the scoping. Postgres
+///   has one settings table for all logical databases and overrides the
+///   global methods to target the `'_global'` sentinel `db_id`.
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
     /// Get all settings as a key-value map.
@@ -938,6 +976,28 @@ pub trait SettingsStore: Send + Sync {
     /// Delete a setting row. No-op if the key isn't present. Used to clear a
     /// per-DB override so the resolver falls back to the workspace default.
     async fn delete_setting(&self, key: &str) -> StorageResult<()>;
+
+    /// Get all global-tier (registry-role) settings.
+    async fn get_global_settings(
+        &self,
+    ) -> StorageResult<std::collections::HashMap<String, String>> {
+        self.get_all_settings().await
+    }
+
+    /// Get a single global-tier setting by key.
+    async fn get_global_setting(&self, key: &str) -> StorageResult<Option<String>> {
+        self.get_setting(key).await
+    }
+
+    /// Set a global-tier setting value (upsert).
+    async fn set_global_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+        self.set_setting(key, value).await
+    }
+
+    /// Delete a global-tier setting row. No-op if the key isn't present.
+    async fn delete_global_setting(&self, key: &str) -> StorageResult<()> {
+        self.delete_setting(key).await
+    }
 }
 
 // ==================== Token Storage ====================
@@ -1042,6 +1102,25 @@ pub trait TaskRunStore: Send + Sync {
         now: &str,
     ) -> StorageResult<Option<crate::models::TaskRun>>;
 
+    /// Every runnable row for `task_id` across all subjects: `pending` rows
+    /// whose `next_attempt_at <= now` plus `running` rows whose lease has
+    /// expired (crash-recovery candidates). Earliest `next_attempt_at`
+    /// first. This is the sweep query for event-triggered tasks (wiki
+    /// regen): nothing on a schedule re-fires them, so a failed run's
+    /// backed-off retry has to be discovered by scanning the ledger itself.
+    async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Count every non-terminal row (`pending` or `running`) across all
+    /// tasks and subjects, regardless of timing. "Is there any ledger work
+    /// outstanding at all?" — the emptiness check schedulers use to decide
+    /// whether a database still needs watching (a backed-off pending row or
+    /// an in-flight lease both count; terminal history does not).
+    async fn count_active_task_runs(&self) -> StorageResult<i32>;
+
     /// Find any non-terminal row for `(task_id, subject_id)` regardless of
     /// timing — i.e., pending OR running, with `next_attempt_at` and
     /// `lease_until` ignored. The intended caller is `claim_or_create`: if
@@ -1126,6 +1205,59 @@ pub trait TaskRunStore: Send + Sync {
         finished_at: &str,
     ) -> StorageResult<bool>;
 
+    /// `running → pending` **without consuming retry budget**: sets
+    /// `next_attempt_at`, records `last_error`, clears `lease_until` and
+    /// `started_at`, and *decrements* `attempts` — refunding the increment
+    /// the claim charged, the same way `reclaim_expired_task_run` never
+    /// charges one. The storage half of
+    /// `scheduler::ledger::RunHandle::defer_until` (environmental failures;
+    /// see `scheduler::ledger::FailureDisposition`). Same fenced predicate
+    /// as `complete_task_run`.
+    async fn defer_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool>;
+
+    /// Every `pending` row across all tasks whose `next_attempt_at` is
+    /// still in the future — work waiting out a backoff or deferral
+    /// horizon. The scan feeding `AtomicCore::rearm_provider_blocked_task_runs`.
+    async fn list_waiting_task_runs(&self, now: &str)
+        -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Reset `next_attempt_at` to `now` on the given rows, gated on
+    /// `state = 'pending'` (a row claimed or settled since the caller's
+    /// scan is skipped — its horizon is no longer ours to rewrite).
+    /// Returns the number of rows re-armed.
+    async fn rearm_task_runs(&self, ids: &[String], now: &str) -> StorageResult<u64>;
+
+    /// Force-settle every non-terminal row for `(task_id, subject_id)` as a
+    /// moot success: `state = 'succeeded'` with no `result_id` — the same
+    /// terminal shape `wiki::runner` gives a pending regen whose tag was
+    /// deleted. Called when the subject's *definition* is deleted (e.g. a
+    /// feed), so the work can never run to a meaningful result again.
+    ///
+    /// Unlike the other terminal writers this deliberately skips both the
+    /// lease fence and the runnability gate: a backed-off `pending` row
+    /// (future `next_attempt_at`) or a `running` row with a live lease is
+    /// unclaimable through the normal path, and with the definition gone no
+    /// sweep will ever revisit it — a non-terminal row would sit in the
+    /// ledger forever (GC never deletes live execution state). A worker
+    /// whose in-flight row is settled out from under it loses its own
+    /// terminal write on the `state = 'running'` predicate and exits
+    /// quietly — the same semantics as being reclaimed by a peer.
+    ///
+    /// Returns the number of rows settled.
+    async fn settle_task_runs_moot(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64>;
+
     /// Most-recent-first run history for a task. `subject_id = None` matches
     /// any subject_id (history-by-task); `Some(...)` filters to that subject.
     async fn list_recent_task_runs(
@@ -1134,6 +1266,35 @@ pub trait TaskRunStore: Send + Sync {
         subject_id: Option<&str>,
         limit: i32,
     ) -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Delete one batch of terminal rows eligible under the retention
+    /// policy (see `scheduler::gc`). Returns the number of rows deleted;
+    /// the caller loops until a batch comes back short of `batch_size`.
+    ///
+    /// Eligibility, evaluated entirely in SQL so both backends share one
+    /// contract:
+    ///
+    /// - Only terminal rows (`succeeded` / `failed` / `abandoned`) are
+    ///   candidates — `pending` and `running` rows are live execution
+    ///   state and are never touched.
+    /// - A terminal row is eligible when it falls outside the most-recent
+    ///   `keep_per_subject` terminal rows of its `(task_id, subject_id)`
+    ///   group, OR its `created_at` is older than `age_cutoff` (the hard
+    ///   age cap applies even inside the keep window).
+    /// - Exception: the most recent terminal *failure* per group is
+    ///   retained regardless of the above while its `created_at` is at or
+    ///   after `failed_cutoff` — "why did this stop working?" must stay
+    ///   answerable longer than success noise.
+    ///
+    /// Deletes oldest-first so a bounded batch always makes progress on
+    /// the least valuable history.
+    async fn gc_task_runs(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64>;
 }
 
 // ==================== Reports ====================

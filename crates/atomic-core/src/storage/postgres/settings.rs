@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::PostgresStorage;
+use super::{PostgresStorage, GLOBAL_SETTINGS_DB_ID};
 use crate::error::AtomicCoreError;
 use crate::registry::DatabaseInfo;
 use crate::storage::traits::*;
@@ -13,33 +13,48 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 // ==================== Settings ====================
+//
+// The settings table is scoped by `db_id`: per-DB rows carry the logical
+// database id, registry-role rows the `GLOBAL_SETTINGS_DB_ID` sentinel.
+// Both tiers share the four query shapes below; the trait impl picks the
+// scope.
 
-#[async_trait]
-impl SettingsStore for PostgresStorage {
-    async fn get_all_settings(&self) -> StorageResult<HashMap<String, String>> {
-        let rows = sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+impl PostgresStorage {
+    async fn settings_for_scope(&self, db_id: &str) -> StorageResult<HashMap<String, String>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT key, value FROM settings WHERE db_id = $1",
+        )
+        .bind(db_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         Ok(rows.into_iter().collect())
     }
 
-    async fn get_setting(&self, key: &str) -> StorageResult<Option<String>> {
-        let value: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+    async fn setting_for_scope(&self, db_id: &str, key: &str) -> StorageResult<Option<String>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE db_id = $1 AND key = $2")
+                .bind(db_id)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         Ok(value)
     }
 
-    async fn set_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+    async fn upsert_setting_for_scope(
+        &self,
+        db_id: &str,
+        key: &str,
+        value: &str,
+    ) -> StorageResult<()> {
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2)
-             ON CONFLICT (key) DO UPDATE SET value = $2",
+            "INSERT INTO settings (db_id, key, value) VALUES ($1, $2, $3)
+             ON CONFLICT (db_id, key) DO UPDATE SET value = $3",
         )
+        .bind(db_id)
         .bind(key)
         .bind(value)
         .execute(&self.pool)
@@ -49,14 +64,52 @@ impl SettingsStore for PostgresStorage {
         Ok(())
     }
 
-    async fn delete_setting(&self, key: &str) -> StorageResult<()> {
-        sqlx::query("DELETE FROM settings WHERE key = $1")
+    async fn delete_setting_for_scope(&self, db_id: &str, key: &str) -> StorageResult<()> {
+        sqlx::query("DELETE FROM settings WHERE db_id = $1 AND key = $2")
+            .bind(db_id)
             .bind(key)
             .execute(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl SettingsStore for PostgresStorage {
+    async fn get_all_settings(&self) -> StorageResult<HashMap<String, String>> {
+        self.settings_for_scope(&self.db_id).await
+    }
+
+    async fn get_setting(&self, key: &str) -> StorageResult<Option<String>> {
+        self.setting_for_scope(&self.db_id, key).await
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+        self.upsert_setting_for_scope(&self.db_id, key, value).await
+    }
+
+    async fn delete_setting(&self, key: &str) -> StorageResult<()> {
+        self.delete_setting_for_scope(&self.db_id, key).await
+    }
+
+    async fn get_global_settings(&self) -> StorageResult<HashMap<String, String>> {
+        self.settings_for_scope(GLOBAL_SETTINGS_DB_ID).await
+    }
+
+    async fn get_global_setting(&self, key: &str) -> StorageResult<Option<String>> {
+        self.setting_for_scope(GLOBAL_SETTINGS_DB_ID, key).await
+    }
+
+    async fn set_global_setting(&self, key: &str, value: &str) -> StorageResult<()> {
+        self.upsert_setting_for_scope(GLOBAL_SETTINGS_DB_ID, key, value)
+            .await
+    }
+
+    async fn delete_global_setting(&self, key: &str) -> StorageResult<()> {
+        self.delete_setting_for_scope(GLOBAL_SETTINGS_DB_ID, key)
+            .await
     }
 }
 
@@ -226,12 +279,16 @@ impl TokenStore for PostgresStorage {
     }
 
     async fn migrate_legacy_token(&self) -> StorageResult<bool> {
-        // Check if legacy token exists in settings
-        let legacy_token: Option<String> =
-            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'server_auth_token'")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        // Check if legacy token exists in settings. The token is a
+        // registry-role setting, so it lives in the global tier (and any
+        // pre-021 row landed there via the migration default).
+        let legacy_token: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM settings WHERE db_id = $1 AND key = 'server_auth_token'",
+        )
+        .bind(GLOBAL_SETTINGS_DB_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         let legacy_token = match legacy_token {
             Some(t) if !t.is_empty() => t,
@@ -268,7 +325,8 @@ impl TokenStore for PostgresStorage {
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
         // Remove the legacy setting
-        sqlx::query("DELETE FROM settings WHERE key = 'server_auth_token'")
+        sqlx::query("DELETE FROM settings WHERE db_id = $1 AND key = 'server_auth_token'")
+            .bind(GLOBAL_SETTINGS_DB_ID)
             .execute(&self.pool)
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
@@ -461,6 +519,13 @@ impl DatabaseStore for PostgresStorage {
             "atom_tags",
             "atoms",
             "tags",
+            // Scoped settings rows (task.{id}.* state, seed flags). The
+            // global tier is untouched: '_global' is never a database id.
+            "settings",
+            // Ledger history. A deleted database's GC sweep never runs
+            // again, so any rows left behind would leak forever on a
+            // shared cluster.
+            "task_runs",
         ];
 
         for table in &tables {

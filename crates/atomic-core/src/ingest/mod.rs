@@ -6,6 +6,7 @@
 
 pub mod extract;
 pub mod fetch;
+pub mod poller;
 pub mod rss;
 
 use serde::{Deserialize, Serialize};

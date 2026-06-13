@@ -28,19 +28,39 @@ pub async fn get_wiki_status(db: Db, path: web::Path<String>) -> HttpResponse {
 
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct GenerateWikiBody {
-    /// Tag name for the wiki article
+    /// Tag name for the wiki article. Retained for API compatibility; the
+    /// server resolves the canonical name from the tag id, so this value is
+    /// no longer used for synthesis.
     pub tag_name: String,
 }
 
-#[utoipa::path(post, path = "/api/wiki/{tag_id}/generate", params(("tag_id" = String, Path, description = "Tag ID")), request_body = GenerateWikiBody, responses((status = 200, description = "Generated wiki article", body = atomic_core::WikiArticleWithCitations), (status = 400, description = "Error", body = ApiErrorResponse)), tag = "wiki")]
+#[utoipa::path(post, path = "/api/wiki/{tag_id}/generate", params(("tag_id" = String, Path, description = "Tag ID")), request_body = GenerateWikiBody, responses((status = 200, description = "Generated wiki article", body = atomic_core::WikiArticleWithCitations), (status = 404, description = "Tag not found", body = ApiErrorResponse), (status = 409, description = "A regeneration for this tag is already in flight or backing off after a failure", body = ApiErrorResponse), (status = 400, description = "Error", body = ApiErrorResponse)), tag = "wiki")]
 pub async fn generate_wiki(
     db: Db,
     path: web::Path<String>,
-    body: web::Json<GenerateWikiBody>,
+    _body: web::Json<GenerateWikiBody>,
 ) -> HttpResponse {
     let tag_id = path.into_inner();
-    match db.0.generate_wiki(&tag_id, &body.tag_name).await {
-        Ok(article) => HttpResponse::Ok().json(article),
+    // Regeneration rides the `task_runs` ledger (`task_id =
+    // "wiki.regenerate"`, `subject_id = <tag id>`): a regeneration already
+    // in flight for this tag — or a failed one inside its backoff window —
+    // comes back as `Skipped` instead of double-running, and a failure here
+    // leaves a pending row the scheduler's retry sweep picks up with
+    // backoff instead of being lost.
+    match db
+        .0
+        .regenerate_wiki(&tag_id, atomic_core::TaskRunTrigger::Manual)
+        .await
+    {
+        Ok(atomic_core::RegenOutcome::Generated(article)) => HttpResponse::Ok().json(article),
+        Ok(atomic_core::RegenOutcome::Failed { error }) => {
+            crate::error::error_response(atomic_core::AtomicCoreError::Wiki(error))
+        }
+        Ok(atomic_core::RegenOutcome::Skipped) => HttpResponse::Conflict().json(ApiErrorResponse {
+            error:
+                "a regeneration for this tag is already in flight or backing off after a failure"
+                    .to_string(),
+        }),
         Err(e) => crate::error::error_response(e),
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! These endpoints early-return 404 when `state.public_url` is unset, so
 //! the suite spins up a `TestCtx` with `public_url: Some(<server URL>)`
-//! and mounts the public routes via `spawn_live_server_with_public_routes`.
+//! and serves the full production route table via `spawn_live_server`.
 
 mod support;
 
@@ -21,7 +21,7 @@ use base64::Engine;
 use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{spawn_live_server_with_public_routes, Backend, TestCtx, TestCtxOptions};
+use support::{spawn_live_server, Backend, TestCtx, TestCtxOptions};
 
 // ==================== PKCE helpers ====================
 
@@ -40,7 +40,7 @@ fn s256_challenge(verifier: &str) -> String {
 }
 
 /// Spin up a TestCtx with `public_url` populated so the OAuth handlers
-/// stop early-returning 404, then mount the public routes alongside `/api`.
+/// stop early-returning 404, then serve the full route table.
 async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
     let addr = listener.local_addr().ok()?;
@@ -51,7 +51,7 @@ async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
         ..Default::default()
     };
     let ctx = TestCtx::new_with(backend, opts).await?;
-    let server = spawn_live_server_with_public_routes(&ctx).await;
+    let server = spawn_live_server(&ctx).await;
     Some((ctx, server))
 }
 
@@ -87,8 +87,14 @@ async fn run_oauth_dcr_issues_client_credentials(backend: Backend) {
         .expect("register");
     assert_eq!(resp.status(), 201);
     let body: Value = resp.json().await.expect("parse register");
-    assert!(body["client_id"].as_str().filter(|s| !s.is_empty()).is_some());
-    assert!(body["client_secret"].as_str().filter(|s| !s.is_empty()).is_some());
+    assert!(body["client_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_some());
+    assert!(body["client_secret"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_some());
 
     server.stop().await;
 }

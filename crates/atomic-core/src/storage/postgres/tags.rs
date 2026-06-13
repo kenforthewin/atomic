@@ -315,6 +315,26 @@ impl TagStore for PostgresStorage {
         Ok(PaginatedTagChildren { children, total })
     }
 
+    async fn get_tag(&self, id: &str) -> StorageResult<Option<Tag>> {
+        let row: Option<(String, String, Option<String>, String, bool, String)> = sqlx::query_as(
+            "SELECT id, name, parent_id, created_at, is_autotag_target, autotag_description
+             FROM tags WHERE id = $1 AND db_id = $2",
+        )
+        .bind(id)
+        .bind(&self.db_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(row.map(|r| Tag {
+            id: r.0,
+            name: r.1,
+            parent_id: r.2,
+            created_at: r.3,
+            is_autotag_target: r.4,
+            autotag_description: r.5,
+        }))
+    }
+
     async fn create_tag(&self, name: &str, parent_id: Option<&str>) -> StorageResult<Tag> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -1039,10 +1059,7 @@ impl TagStore for PostgresStorage {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            AtomicCoreError::DatabaseOperation(format!(
-                "Failed to upsert tag '{}': {}",
-                trimmed, e
-            ))
+            AtomicCoreError::DatabaseOperation(format!("Failed to upsert tag '{}': {}", trimmed, e))
         })?;
 
         // We "created" the tag iff the returned created_at matches the

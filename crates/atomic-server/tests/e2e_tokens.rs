@@ -22,7 +22,9 @@ async fn create_token_returns_raw_value_sqlite() {
 #[actix_web::test]
 async fn create_token_returns_raw_value_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("create_token_returns_raw_value_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "create_token_returns_raw_value_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_create_token_returns_raw_value(Backend::Postgres).await;
@@ -149,10 +151,7 @@ async fn run_revoked_token_rejected_on_subsequent_requests(backend: Backend) {
         .insert_header(("Authorization", format!("Bearer {victim_raw}")))
         .to_request();
     let resp = actix_test::try_call_service(&app, req).await;
-    assert!(
-        resp.is_err(),
-        "revoked token must not pass BearerAuth"
-    );
+    assert!(resp.is_err(), "revoked token must not pass BearerAuth");
 }
 
 // ==================== K4. Cannot revoke last token ====================

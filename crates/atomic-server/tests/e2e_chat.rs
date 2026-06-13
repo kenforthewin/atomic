@@ -29,10 +29,12 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 async fn connect_ws(
     base_url: &str,
     token: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
-    let ws_url = format!("{}/ws?token={}", base_url.replace("http://", "ws://"), token);
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let ws_url = format!(
+        "{}/ws?token={}",
+        base_url.replace("http://", "ws://"),
+        token
+    );
     let (ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .expect("ws upgrade should succeed");
@@ -56,10 +58,7 @@ async fn create_conversation(
         .expect("POST /api/conversations");
     assert_eq!(resp.status(), 201);
     let body: Value = resp.json().await.expect("parse conversation");
-    body["id"]
-        .as_str()
-        .expect("conversation id")
-        .to_string()
+    body["id"].as_str().expect("conversation id").to_string()
 }
 
 /// POST an atom and wait until its pipeline reaches a terminal state. The
@@ -383,8 +382,13 @@ async fn run_conversation_scoped_to_tag_filters_search(backend: Backend) {
     )
     .await;
 
-    let conv_id =
-        create_conversation(&client, &server.base_url, &ctx.token, &[physics_tag.as_str()]).await;
+    let conv_id = create_conversation(
+        &client,
+        &server.base_url,
+        &ctx.token,
+        &[physics_tag.as_str()],
+    )
+    .await;
 
     let send_handle = {
         let base_url = server.base_url.clone();
@@ -486,10 +490,7 @@ async fn run_chat_message_persists_to_storage(backend: Backend) {
 
     // Read the conversation back; it should contain both turns in order.
     let resp = client
-        .get(format!(
-            "{}/api/conversations/{}",
-            server.base_url, conv_id
-        ))
+        .get(format!("{}/api/conversations/{}", server.base_url, conv_id))
         .bearer_auth(&ctx.token)
         .send()
         .await

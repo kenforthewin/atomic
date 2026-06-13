@@ -5,7 +5,7 @@
 //! mock provider with the `merge_result` schema, which we extend in
 //! `atomic_test_support::mock_ai` to emit a deterministic merge.
 //!
-//! Settings cover two related contracts:
+//! Settings cover three related contracts:
 //!   1. The plain `PUT /api/settings/{key}` → `GET /api/settings` round
 //!      trip for non-embedding-space keys (writes go to registry or per-DB
 //!      override based on routing).
@@ -13,6 +13,10 @@
 //!      against an embedding key reaches `set_setting_with_reembed`,
 //!      whose behavior is exhaustively covered by `atomic-core`'s
 //!      pipeline tests. This suite only pins the HTTP gate.
+//!   3. The two-tier scope split: deployment-wide settings span logical
+//!      databases (registry on SQLite, the `'_global'` settings tier on
+//!      Postgres) while per-DB scheduler state stays fenced to the
+//!      database that wrote it.
 
 mod support;
 
@@ -77,7 +81,10 @@ async fn run_create_tag_round_trip(backend: Backend) {
     let resp = actix_test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
     let tags: Vec<Value> = actix_test::read_body_json(resp).await;
-    assert!(tags.iter().any(|t| t["id"] == id), "created tag must appear in /api/tags");
+    assert!(
+        tags.iter().any(|t| t["id"] == id),
+        "created tag must appear in /api/tags"
+    );
 }
 
 // ==================== T2. Update ====================
@@ -175,7 +182,9 @@ async fn tag_hierarchy_children_query_sqlite() {
 #[actix_web::test]
 async fn tag_hierarchy_children_query_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("tag_hierarchy_children_query_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "tag_hierarchy_children_query_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_tag_hierarchy_children_query(Backend::Postgres).await;
@@ -199,7 +208,12 @@ async fn run_tag_hierarchy_children_query(backend: Backend) {
     assert_eq!(resp.status(), 200);
     let body: Value = actix_test::read_body_json(resp).await;
     let children = body["children"].as_array().expect("children array");
-    assert_eq!(children.len(), 3, "expected 3 children, got {}", children.len());
+    assert_eq!(
+        children.len(),
+        3,
+        "expected 3 children, got {}",
+        children.len()
+    );
 }
 
 // ==================== T5. Autotag-target flag ====================
@@ -212,7 +226,9 @@ async fn autotag_target_flag_persists_sqlite() {
 #[actix_web::test]
 async fn autotag_target_flag_persists_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("autotag_target_flag_persists_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "autotag_target_flag_persists_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_autotag_target_flag_persists(Backend::Postgres).await;
@@ -309,7 +325,9 @@ async fn tag_compaction_merges_pair_sqlite() {
 #[actix_web::test]
 async fn tag_compaction_merges_pair_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("tag_compaction_merges_pair_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "tag_compaction_merges_pair_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_tag_compaction_merges_pair(Backend::Postgres).await;
@@ -403,7 +421,119 @@ async fn run_set_setting_round_trip(backend: Backend) {
     assert_eq!(value, "false", "setting must round-trip; got {value}");
 }
 
-// ==================== S2. Auth ====================
+// ==================== S2. Global settings span databases; task state does not ====================
+
+#[actix_web::test]
+async fn global_setting_spans_databases_sqlite() {
+    run_global_setting_spans_databases(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn global_setting_spans_databases_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "global_setting_spans_databases_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_global_setting_spans_databases(Backend::Postgres).await;
+}
+
+/// Extract a setting's resolved value from `GET /api/settings`, tolerating
+/// both the array-of-entries and map-keyed-by-name layouts (same dual
+/// parsing as the S1 round-trip test).
+fn setting_value(body: &Value, key: &str) -> Option<String> {
+    body.as_array()
+        .and_then(|a| a.iter().find(|s| s["key"] == key))
+        .and_then(|s| s["value"].as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            body.pointer(&format!("/{key}/value"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// The two-tier settings contract through the REST surface: a
+/// deployment-wide key written before a second database exists must be
+/// visible from that database (registry workspace default on SQLite, the
+/// `'_global'` tier on Postgres), while per-DB scheduler state stays
+/// fenced to the database that wrote it.
+async fn run_global_setting_spans_databases(backend: Backend) {
+    use atomic_core::scheduler::state as sched_state;
+
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    // Write a deployment-wide, non-embedding-space key while only the
+    // default database exists.
+    let req = actix_test::TestRequest::put()
+        .uri("/api/settings/chat_model")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "value": "globally/visible-model" }))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert!(resp.status().is_success(), "set chat_model");
+
+    // Second database via the REST surface.
+    let req = actix_test::TestRequest::post()
+        .uri("/api/databases")
+        .insert_header(ctx.auth_header())
+        .set_json(json!({ "name": "settings-beta" }))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 201, "create second database");
+    let body: Value = actix_test::read_body_json(resp).await;
+    let beta_id = body["id"].as_str().expect("database id").to_string();
+
+    // Switch to the new database via the routing header: the global
+    // setting must be inherited there.
+    let req = actix_test::TestRequest::get()
+        .uri("/api/settings")
+        .insert_header(ctx.auth_header())
+        .insert_header(ctx.db_header(&beta_id))
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = actix_test::read_body_json(resp).await;
+    assert_eq!(
+        setting_value(&body, "chat_model").as_deref(),
+        Some("globally/visible-model"),
+        "a global setting written before the second database existed must \
+         be visible from it"
+    );
+
+    // Per-DB scheduler state must NOT span databases: advance `last_run`
+    // on the default database and confirm the new one doesn't see it.
+    let default_core = ctx.state.manager.active_core().await.expect("active core");
+    let beta_core = ctx
+        .state
+        .manager
+        .get_core(&beta_id)
+        .await
+        .expect("beta core");
+    sched_state::set_last_run(&default_core, "e2e_settings_scope", chrono::Utc::now())
+        .await
+        .expect("set last_run on default");
+    assert!(
+        sched_state::get_last_run(&default_core, "e2e_settings_scope")
+            .await
+            .unwrap()
+            .is_some(),
+        "default database sees its own task state"
+    );
+    assert!(
+        sched_state::get_last_run(&beta_core, "e2e_settings_scope")
+            .await
+            .unwrap()
+            .is_none(),
+        "per-DB scheduler state must not leak into the second database"
+    );
+}
+
+// ==================== S3. Auth ====================
 
 #[actix_web::test]
 async fn settings_require_auth_sqlite() {

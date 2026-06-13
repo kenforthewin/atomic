@@ -10,10 +10,21 @@
 //! This file pins the HTTP surface of the wiki module:
 //! `POST /api/wiki/{tag_id}/generate`, `GET /api/wiki/{tag_id}`,
 //! `POST /api/wiki/{tag_id}/update`, `DELETE /api/wiki/{tag_id}`.
+//!
+//! Generation dispatches through the `task_runs` ledger (`task_id =
+//! "wiki.regenerate"`, `subject_id = <tag id>`), so tests 7–9 pin the
+//! durable-dispatch contract: per-tag dedup on the live lease (409 for the
+//! losing request), failure → backed-off pending row that neither the
+//! sweep nor a manual retry re-runs early, and distinct tags regenerating
+//! concurrently. Two mock markers drive the LLM call (the tag name lands
+//! in the generation prompt): `WikiSlow...` delays the response so
+//! concurrent requests genuinely overlap, `WikiFail...` fails it.
 
 mod support;
 
 use actix_web::test as actix_test;
+use atomic_core::wiki::runner::WIKI_REGENERATE_TASK_ID;
+use atomic_core::{AtomicCore, TaskRunState, TaskRunTrigger};
 use serde_json::{json, Value};
 use support::{poll_until_embedding_done, test_app, Backend, TestCtx};
 
@@ -67,6 +78,37 @@ where
     let id = body["id"].as_str().expect("id").to_string();
     poll_until_embedding_done(app, auth, &id).await;
     id
+}
+
+/// POST /api/wiki/{tag_id}/generate without asserting on the status —
+/// returns `(status, body)` so ledger-dispatch tests can branch on the
+/// 200-vs-409 outcome of racing requests.
+async fn generate_wiki_raw<S, B>(
+    app: &S,
+    auth: (&'static str, String),
+    tag_id: &str,
+    tag_name: &str,
+) -> (u16, Value)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    let req = actix_test::TestRequest::post()
+        .uri(&format!("/api/wiki/{tag_id}/generate"))
+        .insert_header(auth)
+        .set_json(json!({ "tag_name": tag_name }))
+        .to_request();
+    let resp = actix_test::call_service(app, req).await;
+    let status = resp.status().as_u16();
+    (status, actix_test::read_body_json(resp).await)
+}
+
+async fn active_core(ctx: &TestCtx) -> AtomicCore {
+    ctx.state.manager.active_core().await.expect("active core")
 }
 
 /// POST /api/wiki/{tag_id}/generate. Returns the parsed
@@ -308,7 +350,11 @@ async fn run_wiki_for_unknown_tag_returns_error(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "GET for unknown tag must return 200 + null");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET for unknown tag must return 200 + null"
+    );
     let body: Value = actix_test::read_body_json(resp).await;
     assert!(
         body.is_null(),
@@ -372,9 +418,16 @@ async fn run_delete_wiki_article(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "deleted-then-GET wiki returns 200 + null");
+    assert_eq!(
+        resp.status(),
+        200,
+        "deleted-then-GET wiki returns 200 + null"
+    );
     let body: Value = actix_test::read_body_json(resp).await;
-    assert!(body.is_null(), "deleted wiki must return null body; got {body}");
+    assert!(
+        body.is_null(),
+        "deleted wiki must return null body; got {body}"
+    );
 }
 
 // ==================== 6. Auth required ====================
@@ -410,4 +463,220 @@ async fn run_wiki_generation_requires_auth(backend: Backend) {
         resp.is_err(),
         "unauthenticated wiki generation must be rejected"
     );
+}
+
+// ==================== 7. Concurrent regen requests for one tag dedup ====================
+
+#[actix_web::test]
+async fn concurrent_generate_requests_for_same_tag_dedup_sqlite() {
+    run_concurrent_generate_requests_for_same_tag_dedup(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn concurrent_generate_requests_for_same_tag_dedup_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "concurrent_generate_requests_for_same_tag_dedup_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_concurrent_generate_requests_for_same_tag_dedup(Backend::Postgres).await;
+}
+
+async fn run_concurrent_generate_requests_for_same_tag_dedup(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    // The slow-mock marker keeps the winning request's LLM call in flight
+    // long enough that the losing request deterministically observes a
+    // live lease on the tag's run.
+    let tag_id = create_tag(&app, ctx.auth_header(), "WikiSlowAlpha").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "concurrent regeneration source material",
+        &[tag_id.as_str()],
+    )
+    .await;
+
+    let (a, b) = tokio::join!(
+        generate_wiki_raw(&app, ctx.auth_header(), &tag_id, "WikiSlowAlpha"),
+        generate_wiki_raw(&app, ctx.auth_header(), &tag_id, "WikiSlowAlpha"),
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [200, 409],
+        "exactly one request regenerates; the other dedups on the live lease \
+         (got {a:?} / {b:?})"
+    );
+    let loser = if a.0 == 409 { &a.1 } else { &b.1 };
+    assert!(
+        loser["error"].as_str().unwrap_or("").contains("already"),
+        "409 body follows the API error convention; got {loser}"
+    );
+
+    // Exactly one ledger row, settled terminally — no double regeneration.
+    let core = active_core(&ctx).await;
+    let history = core
+        .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag_id), 10)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1, "single run row for the racing requests");
+    let run = &history[0];
+    assert_eq!(run.state, TaskRunState::Succeeded);
+    assert_eq!(run.trigger, TaskRunTrigger::Manual);
+    assert_eq!(run.subject_id.as_deref(), Some(tag_id.as_str()));
+    assert_eq!(run.attempts, 1);
+
+    // The winner's article is readable.
+    let req = actix_test::TestRequest::get()
+        .uri(&format!("/api/wiki/{tag_id}"))
+        .insert_header(ctx.auth_header())
+        .to_request();
+    let resp = actix_test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = actix_test::read_body_json(resp).await;
+    assert!(!body.is_null(), "article must exist after the winning run");
+}
+
+// ==================== 8. Failed regen backs off; no early retry ====================
+
+#[actix_web::test]
+async fn failed_generate_backs_off_and_is_not_retried_early_sqlite() {
+    run_failed_generate_backs_off_and_is_not_retried_early(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn failed_generate_backs_off_and_is_not_retried_early_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "failed_generate_backs_off_and_is_not_retried_early_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_failed_generate_backs_off_and_is_not_retried_early(Backend::Postgres).await;
+}
+
+async fn run_failed_generate_backs_off_and_is_not_retried_early(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    // The fail-mock marker 400s the generation call, so the run fails
+    // after the claim and goes pending-with-backoff.
+    let tag_id = create_tag(&app, ctx.auth_header(), "WikiFailTag").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "source material for the failing regeneration",
+        &[tag_id.as_str()],
+    )
+    .await;
+
+    let (status, body) = generate_wiki_raw(&app, ctx.auth_header(), &tag_id, "WikiFailTag").await;
+    assert_eq!(status, 500, "provider failure surfaces as a wiki error");
+    assert!(body["error"].is_string());
+
+    let core = active_core(&ctx).await;
+    let run = &core
+        .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag_id), 10)
+        .await
+        .unwrap()[0];
+    assert_eq!(run.state, TaskRunState::Pending, "retryable, not terminal");
+    assert_eq!(run.attempts, 1);
+    assert!(run.last_error.is_some());
+    assert!(
+        run.next_attempt_at.as_str() > chrono::Utc::now().to_rfc3339().as_str(),
+        "failure pushed next_attempt_at into the future (backoff)"
+    );
+
+    // NOT retried before the window opens: drive the retry sweep the
+    // scheduler tick runs — the backed-off row must not be claimed. (The
+    // after-the-window half needs to rewind `next_attempt_at` and lives in
+    // atomic-core's lib tests, which can reach the raw row.)
+    assert!(core.sweep_due_wiki_regens().await.is_empty());
+
+    // A manual retry inside the window dedups instead of double-running.
+    let (status, _) = generate_wiki_raw(&app, ctx.auth_header(), &tag_id, "WikiFailTag").await;
+    assert_eq!(
+        status, 409,
+        "manual request inside the backoff window conflicts"
+    );
+
+    let history = core
+        .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag_id), 10)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1, "backed-off row reused, not duplicated");
+    assert_eq!(
+        history[0].attempts, 1,
+        "no re-attempt inside the backoff window"
+    );
+}
+
+// ==================== 9. Distinct tags regenerate concurrently ====================
+
+#[actix_web::test]
+async fn distinct_tags_generate_concurrently_sqlite() {
+    run_distinct_tags_generate_concurrently(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn distinct_tags_generate_concurrently_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "distinct_tags_generate_concurrently_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_distinct_tags_generate_concurrently(Backend::Postgres).await;
+}
+
+async fn run_distinct_tags_generate_concurrently(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    // Both tags use the slow marker so their LLM calls genuinely overlap —
+    // subject-keyed dedup must scope to one tag, never across tags.
+    let tag_a = create_tag(&app, ctx.auth_header(), "WikiSlowAlpha").await;
+    let tag_b = create_tag(&app, ctx.auth_header(), "WikiSlowBeta").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "alpha topic source material",
+        &[tag_a.as_str()],
+    )
+    .await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "beta topic source material",
+        &[tag_b.as_str()],
+    )
+    .await;
+
+    let (a, b) = tokio::join!(
+        generate_wiki_raw(&app, ctx.auth_header(), &tag_a, "WikiSlowAlpha"),
+        generate_wiki_raw(&app, ctx.auth_header(), &tag_b, "WikiSlowBeta"),
+    );
+    assert_eq!(a.0, 200, "tag A regenerates despite B in flight: {:?}", a.1);
+    assert_eq!(b.0, 200, "tag B regenerates despite A in flight: {:?}", b.1);
+
+    let core = active_core(&ctx).await;
+    for tag_id in [&tag_a, &tag_b] {
+        let history = core
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(tag_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one run per tag");
+        assert_eq!(history[0].state, TaskRunState::Succeeded);
+        assert_eq!(history[0].subject_id.as_deref(), Some(tag_id.as_str()));
+    }
 }

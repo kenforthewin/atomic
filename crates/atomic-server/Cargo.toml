@@ -80,3 +80,6 @@ actix-http = "3"
 # runtime that the rest of the test harness already runs on.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# The task-runs e2e slice defines stub `ScheduledTask` impls to drive the
+# scheduler tick against both storage backends.
+async-trait = "0.1"

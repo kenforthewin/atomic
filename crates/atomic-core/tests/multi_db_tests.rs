@@ -17,9 +17,10 @@
 //!   4. Overridable keys (e.g. `provider`) routed via `set_setting` with a
 //!      registry attached and N≥2 land in the active DB's per-DB table —
 //!      DB2 keeps seeing the workspace default until it sets its own override.
-//!      Postgres mode currently has no registry, so settings fall through to
-//!      a single shared `settings` table; the SQLite-only assertion below
-//!      pins the per-DB behavior we actually want.
+//!      Postgres mode has no registry, so `set_setting` writes the storage
+//!      layer's global tier (`db_id = '_global'`) — deliberately shared
+//!      across logical databases, with no override layer. The SQLite-only
+//!      assertion below pins the override behavior where it exists.
 
 mod support;
 
@@ -36,10 +37,10 @@ async fn isolation_sqlite() {
 
     // ---------- Overridable settings are per-DB (SQLite + registry only) ----------
     //
-    // Postgres mode has no registry today, so the Postgres `set_setting`
-    // path falls through to the shared storage table — there's no override
-    // layer to test. SQLite always has a registry, so this is the deployment
-    // where the override semantics actually take effect.
+    // Postgres mode has no registry, so the Postgres `set_setting` path
+    // writes the global settings tier — there's no override layer to test.
+    // SQLite always has a registry, so this is the deployment where the
+    // override semantics actually take effect.
     let dbs = manager.list_databases().await.expect("list").0;
     let alpha = dbs
         .iter()

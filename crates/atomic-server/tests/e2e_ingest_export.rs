@@ -182,8 +182,10 @@ async fn run_import_obsidian_vault_creates_atoms(backend: Backend) {
     let vault = tempfile::tempdir().expect("vault tempdir");
     let nested = vault.path().join("Topics").join("Science");
     std::fs::create_dir_all(&nested).unwrap();
-    let note_a = "---\ntags: [imported, physics]\n---\n\n# Note A\n\nQuantum particles and waves.\n";
-    let note_b = "---\ntags: [imported, cooking]\n---\n\n# Note B\n\nSourdough fermentation timing.\n";
+    let note_a =
+        "---\ntags: [imported, physics]\n---\n\n# Note A\n\nQuantum particles and waves.\n";
+    let note_b =
+        "---\ntags: [imported, cooking]\n---\n\n# Note B\n\nSourdough fermentation timing.\n";
     let nested_note = "# Nested\n\nA deep note inside Topics/Science.\n";
     std::fs::write(vault.path().join("note-a.md"), note_a).unwrap();
     std::fs::write(vault.path().join("note-b.md"), note_b).unwrap();
@@ -201,7 +203,10 @@ async fn run_import_obsidian_vault_creates_atoms(backend: Backend) {
     let status = resp.status();
     let body: Value = actix_test::read_body_json(resp).await;
 
-    assert!(status.is_success(), "import must succeed, got {status}: {body}");
+    assert!(
+        status.is_success(),
+        "import must succeed, got {status}: {body}"
+    );
     assert_eq!(body["imported"], 3, "expected 3 imported atoms; got {body}");
     assert!(
         body["tags_created"].as_i64().unwrap_or(0) >= 1,
@@ -235,7 +240,9 @@ async fn markdown_export_job_completes_sqlite() {
 #[actix_web::test]
 async fn markdown_export_job_completes_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("markdown_export_job_completes_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "markdown_export_job_completes_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_markdown_export_job_completes(Backend::Postgres).await;

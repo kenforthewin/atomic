@@ -88,11 +88,7 @@ fn report_payload(name: &str, scope_tag: Option<&str>) -> Value {
     })
 }
 
-async fn create_report<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    payload: Value,
-) -> Value
+async fn create_report<S, B>(app: &S, auth: (&'static str, String), payload: Value) -> Value
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -137,7 +133,12 @@ async fn run_create_report_round_trip(backend: Backend) {
     };
     let app = actix_test::init_service(test_app(&ctx)).await;
 
-    let report = create_report(&app, ctx.auth_header(), report_payload("Weekly Roundup", None)).await;
+    let report = create_report(
+        &app,
+        ctx.auth_header(),
+        report_payload("Weekly Roundup", None),
+    )
+    .await;
     let id = report["id"].as_str().expect("report id").to_string();
     assert_eq!(report["name"], "Weekly Roundup");
     assert_eq!(report["enabled"], true);
@@ -163,7 +164,9 @@ async fn list_reports_returns_created_sqlite() {
 #[actix_web::test]
 async fn list_reports_returns_created_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("list_reports_returns_created_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "list_reports_returns_created_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_list_reports_returns_created(Backend::Postgres).await;
@@ -200,7 +203,9 @@ async fn update_report_changes_fields_sqlite() {
 #[actix_web::test]
 async fn update_report_changes_fields_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("update_report_changes_fields_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "update_report_changes_fields_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_update_report_changes_fields(Backend::Postgres).await;
@@ -287,7 +292,9 @@ async fn manual_run_writes_finding_atom_sqlite() {
 #[actix_web::test]
 async fn manual_run_writes_finding_atom_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("manual_run_writes_finding_atom_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "manual_run_writes_finding_atom_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_manual_run_writes_finding_atom(Backend::Postgres).await;
@@ -361,7 +368,10 @@ async fn run_manual_run_writes_finding_atom(backend: Backend) {
     let finding_row = &findings[0][0];
     let atom_row = &findings[0][1];
     assert_eq!(finding_row["report_id"], id);
-    let atom_id = atom_row["id"].as_str().expect("finding atom id").to_string();
+    let atom_id = atom_row["id"]
+        .as_str()
+        .expect("finding atom id")
+        .to_string();
 
     // Citations should resolve to one of the source atoms (the mock cites
     // marker [1] which the runner maps to the first source citable).
@@ -372,7 +382,10 @@ async fn run_manual_run_writes_finding_atom(backend: Backend) {
     let resp = actix_test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
     let citations: Vec<Value> = actix_test::read_body_json(resp).await;
-    assert!(!citations.is_empty(), "finding must have at least one citation row");
+    assert!(
+        !citations.is_empty(),
+        "finding must have at least one citation row"
+    );
 }
 
 // ==================== R6. Delete ====================
@@ -440,5 +453,8 @@ async fn run_reports_require_auth(backend: Backend) {
         .uri("/api/reports")
         .to_request();
     let resp = actix_test::try_call_service(&app, req).await;
-    assert!(resp.is_err(), "unauthenticated reports list must be rejected");
+    assert!(
+        resp.is_err(),
+        "unauthenticated reports list must be rejected"
+    );
 }

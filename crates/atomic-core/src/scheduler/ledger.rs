@@ -8,9 +8,14 @@
 //! 2. Win the conditional claim, receiving a [`RunHandle`] that owns a tokio
 //!    task heartbeating the lease every [`HEARTBEAT_INTERVAL`].
 //! 3. Call [`RunHandle::complete`] on success, [`RunHandle::fail`] on
-//!    failure. Dropping the handle without either leaves the row in
-//!    `running`; the next scheduler tick reclaims it after the lease
-//!    expires (this is the correct crash-recovery behavior).
+//!    failure. `fail` consults the host's installed
+//!    [`FailureDispositionPolicy`]: environmental failures (provider
+//!    limits/outages) route to [`RunHandle::defer_until`], which re-arms the
+//!    row WITHOUT consuming retry budget — the lease-reclaim precedent
+//!    extended to failures the executor can classify. Dropping the handle
+//!    without settling leaves the row in `running`; the next scheduler tick
+//!    reclaims it after the lease expires (this is the correct
+//!    crash-recovery behavior).
 //!
 //! Phase 1.5 ships this module dormant — reports (phase 2) will be the
 //! first caller. The contract is fully exercised by the unit tests below
@@ -45,6 +50,39 @@ const BACKOFF_BASE: Duration = Duration::from_secs(60);
 /// Hard cap on backoff so a tight cron (e.g. every 15 minutes) doesn't
 /// overshoot the next scheduled fire after a few failures.
 const BACKOFF_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// How a failed execution should settle its ledger row.
+///
+/// The retry budget (`attempts` / `max_attempts`) exists to bound *logic*
+/// failures — a task that keeps failing on its own inputs should stop
+/// burning resources. **Environmental** failures (a provider rate limit, an
+/// exhausted credit allowance, a revoked API key) are different in kind: no
+/// retry succeeds until the environment changes, and counting them against
+/// the budget terminally abandons work that would succeed the moment it
+/// does. This is the same principle the lease-reclaim path already encodes —
+/// `reclaim_expired_task_run` deliberately does NOT bump `attempts`, because
+/// a process crash isn't a logic failure. Deferral extends that precedent to
+/// failures the executor can recognize as environmental.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// A logic failure: consume an attempt — retry with backoff while budget
+    /// remains, abandon when it runs out ([`RunHandle::fail`]'s historical
+    /// behavior, and the default with no policy installed).
+    Fail,
+    /// An environmental failure: release the lease, re-arm the row at the
+    /// given time, and leave the retry budget untouched
+    /// ([`RunHandle::defer_until`]).
+    DeferUntil(DateTime<Utc>),
+}
+
+/// A host-installed classifier mapping a failure message to its
+/// [`FailureDisposition`]. Installed via
+/// [`AtomicCore::set_failure_disposition_policy`](crate::AtomicCore::set_failure_disposition_policy);
+/// consulted by [`RunHandle::fail`] before settling. Hosts that manage
+/// provider environments (pausing/resuming work around provider outages)
+/// use this to keep environmental failures from consuming retry budget;
+/// with no policy installed every failure is [`FailureDisposition::Fail`].
+pub type FailureDispositionPolicy = Arc<dyn Fn(&str) -> FailureDisposition + Send + Sync>;
 
 /// Compute the post-failure backoff for `attempts` completed failures.
 ///
@@ -178,6 +216,33 @@ pub async fn claim_or_create(
         claimed,
         lease_until_str,
     )))
+}
+
+/// Attempt to claim a specific known row — typically one discovered by a
+/// sweep over [`crate::storage::traits::TaskRunStore::list_runnable_task_runs`]
+/// — without the find-or-insert step of [`claim_or_create`].
+///
+/// Never inserts: `Ok(None)` means the row settled or was claimed by a peer
+/// between the caller's scan and this claim, and the caller should move on
+/// rather than fall back to creating fresh work — that's `claim_or_create`'s
+/// job for new firings. The conditional UPDATEs in storage enforce the
+/// pending-state / expired-lease predicates, so a stale snapshot can't
+/// steal a row that has since moved on.
+pub async fn claim_existing(
+    core: &AtomicCore,
+    run: &TaskRun,
+) -> Result<Option<RunHandle>, AtomicCoreError> {
+    let now = Utc::now();
+    let lease_until = now + ChronoDuration::from_std(LEASE_DURATION).unwrap();
+    let lease_until_str = iso(lease_until);
+    match try_claim(core, run, &iso(now), &lease_until_str).await? {
+        ClaimOutcome::Claimed(claimed) => Ok(Some(RunHandle::spawn(
+            core.clone(),
+            claimed,
+            lease_until_str,
+        ))),
+        ClaimOutcome::LostRace => Ok(None),
+    }
 }
 
 /// Whether a non-terminal row is runnable right now: pending rows need
@@ -344,11 +409,18 @@ impl RunHandle {
             .await
     }
 
-    /// Terminal failure. Routes to `fail_task_run_retry` if attempts so
-    /// far is less than `max_attempts`, otherwise `fail_task_run_abandon`.
-    /// The next_attempt_at is computed from [`backoff`]. Same lease fence
-    /// as [`Self::complete`].
+    /// Settle a failure. First consults the core's installed
+    /// [`FailureDispositionPolicy`] (none installed → [`FailureDisposition::Fail`]):
+    /// an environmental classification routes to [`Self::defer_until`], so
+    /// the row re-arms without consuming retry budget. A logic failure
+    /// consumes an attempt — `fail_task_run_retry` while attempts so far is
+    /// less than `max_attempts`, otherwise `fail_task_run_abandon`. The
+    /// retry's next_attempt_at is computed from [`backoff`]. Same lease
+    /// fence as [`Self::complete`].
     pub async fn fail(mut self, error: String) -> Result<bool, AtomicCoreError> {
+        if let FailureDisposition::DeferUntil(until) = self.core.failure_disposition(&error) {
+            return self.defer_until(until, error).await;
+        }
         self.stop_heartbeat();
         let now = Utc::now();
         let now_str = iso(now);
@@ -368,6 +440,28 @@ impl RunHandle {
                 .fail_task_run_abandon_sync(&self.run.id, &lease, &error, &now_str)
                 .await
         }
+    }
+
+    /// Defer the run without consuming retry budget (see
+    /// [`FailureDisposition`] for when this is the right settlement): the
+    /// row returns to `pending` with `next_attempt_at = until`, the lease is
+    /// released, and the attempt the claim charged is refunded — exactly the
+    /// lease-reclaim precedent, where interruption by the environment never
+    /// counts against the budget. `error` is recorded as `last_error` so run
+    /// history shows why the row is waiting. Same lease fence as
+    /// [`Self::complete`]; `Ok(false)` means the row was no longer ours.
+    pub async fn defer_until(
+        mut self,
+        until: DateTime<Utc>,
+        error: String,
+    ) -> Result<bool, AtomicCoreError> {
+        self.stop_heartbeat();
+        let now_str = iso(Utc::now());
+        let lease = self.snapshot_lease();
+        self.core
+            .storage()
+            .defer_task_run_sync(&self.run.id, &lease, &error, &now_str, &iso(until))
+            .await
     }
 
     fn snapshot_lease(&self) -> String {

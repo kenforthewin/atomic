@@ -3,7 +3,8 @@
 use crate::db_extractor::Db;
 use crate::error::{ok_or_error, ApiErrorResponse};
 use crate::event_bridge::embedding_event_callback;
-use crate::state::{AppState, ServerEvent};
+use crate::event_channel::EventChannel;
+use crate::state::ServerEvent;
 use actix_web::{web, HttpResponse};
 use atomic_core::{
     AtomLink, AtomWithTags, BulkCreateResult, PaginatedAtoms, PaginatedTagChildren, SourceInfo,
@@ -330,13 +331,13 @@ pub struct CreateAtomRequest {
     tag = "atoms",
 )]
 pub async fn create_atom(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     body: web::Json<CreateAtomRequest>,
 ) -> HttpResponse {
     let req = body.into_inner();
-    let on_event = embedding_event_callback(state.event_tx.clone());
-    let event_tx = state.event_tx.clone();
+    let on_event = embedding_event_callback(events.0.clone());
+    let event_tx = events.0;
     match db
         .0
         .create_atom(
@@ -371,7 +372,7 @@ pub async fn create_atom(
     tag = "atoms",
 )]
 pub async fn bulk_create_atoms(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     body: web::Json<Vec<CreateAtomRequest>>,
 ) -> HttpResponse {
@@ -386,8 +387,8 @@ pub async fn bulk_create_atoms(
             skip_if_source_exists: r.skip_if_source_exists,
         })
         .collect();
-    let on_event = embedding_event_callback(state.event_tx.clone());
-    let event_tx = state.event_tx.clone();
+    let on_event = embedding_event_callback(events.0.clone());
+    let event_tx = events.0;
     match db.0.create_atoms_bulk(requests, on_event).await {
         Ok(result) => {
             for atom in &result.atoms {
@@ -425,15 +426,15 @@ pub struct UpdateAtomRequest {
     tag = "atoms",
 )]
 pub async fn update_atom(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
     body: web::Json<UpdateAtomRequest>,
 ) -> HttpResponse {
     let id = path.into_inner();
     let req = body.into_inner();
-    let on_event = embedding_event_callback(state.event_tx.clone());
-    let event_tx = state.event_tx.clone();
+    let on_event = embedding_event_callback(events.0.clone());
+    let event_tx = events.0;
     match db
         .0
         .update_atom(
@@ -505,13 +506,13 @@ pub async fn update_atom_content_only(
     tag = "atoms",
 )]
 pub async fn process_atom_pipeline(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
 ) -> HttpResponse {
     let id = path.into_inner();
     tracing::info!(atom_id = %id, "Received explicit atom pipeline request");
-    let on_event = embedding_event_callback(state.event_tx.clone());
+    let on_event = embedding_event_callback(events.0.clone());
     ok_or_error(db.0.process_atom_pipeline(&id, on_event).await)
 }
 

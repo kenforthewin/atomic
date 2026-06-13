@@ -16,10 +16,11 @@
 //! its own dedicated route that walks every inheriting DB and queues
 //! reembeds.
 
-use crate::db_extractor::Db;
+use crate::db_extractor::{request_manager, Db};
 use crate::error::{ok_or_error, ApiErrorResponse};
+use crate::event_channel::EventChannel;
 use crate::state::AppState;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -36,7 +37,7 @@ pub struct SetSettingBody {
 
 #[utoipa::path(put, path = "/api/settings/{key}", params(("key" = String, Path, description = "Setting key")), request_body = SetSettingBody, responses((status = 200, description = "Setting updated"), (status = 400, description = "Invalid setting", body = ApiErrorResponse)), tag = "settings")]
 pub async fn set_setting(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
     body: web::Json<SetSettingBody>,
@@ -46,7 +47,7 @@ pub async fn set_setting(
 
     // Handle embedding-space settings via set_setting_with_reembed (avoids deadlock)
     if atomic_core::settings::is_embedding_space_key(&key) {
-        let on_event = crate::event_bridge::embedding_event_callback(state.event_tx.clone());
+        let on_event = crate::event_bridge::embedding_event_callback(events.0.clone());
         // `set_setting_with_reembed` writes through the resolver's routing:
         // workspace-only → registry, overridable + N≤1 → registry, overridable
         // + N>1 → per-DB override for the active database. It then re-embeds
@@ -71,13 +72,13 @@ pub async fn set_setting(
 
 #[utoipa::path(delete, path = "/api/settings/{key}", params(("key" = String, Path, description = "Setting key")), responses((status = 200, description = "Override cleared"), (status = 400, description = "Key is workspace-only", body = ApiErrorResponse)), tag = "settings")]
 pub async fn clear_setting_override(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
 ) -> HttpResponse {
     let key = path.into_inner();
     if atomic_core::settings::is_embedding_space_key(&key) {
-        let on_event = crate::event_bridge::embedding_event_callback(state.event_tx.clone());
+        let on_event = crate::event_bridge::embedding_event_callback(events.0.clone());
         ok_or_error(db.0.clear_override_with_reembed(&key, on_event).await)
     } else {
         ok_or_error(db.0.clear_override(&key).await)
@@ -93,6 +94,7 @@ pub struct OverrideEntry {
 
 #[utoipa::path(get, path = "/api/settings/{key}/overrides", params(("key" = String, Path, description = "Setting key")), responses((status = 200, description = "List of databases overriding the key", body = Vec<OverrideEntry>)), tag = "settings")]
 pub async fn list_setting_overrides(
+    req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
@@ -104,14 +106,18 @@ pub async fn list_setting_overrides(
         return HttpResponse::Ok().json(Vec::<OverrideEntry>::new());
     }
 
-    let (databases, _active) = match state.manager.list_databases().await {
+    // Cross-database fan-out: iterate the manager governing this request
+    // (honoring a composing layer's RequestDatabaseManager override), not
+    // AppState's unconditionally.
+    let manager = request_manager(&req, &state);
+    let (databases, _active) = match manager.list_databases().await {
         Ok(v) => v,
         Err(e) => return crate::error::error_response(e),
     };
 
     let mut overrides: Vec<OverrideEntry> = Vec::new();
     for info in databases {
-        let core = match state.manager.get_core(&info.id).await {
+        let core = match manager.get_core(&info.id).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(db_id = %info.id, "Failed to load core for override lookup: {}", e);

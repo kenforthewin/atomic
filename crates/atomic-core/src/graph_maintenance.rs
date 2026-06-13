@@ -3,8 +3,14 @@
 //! Embedding writes mark the graph dirty. This task waits for the pipeline to
 //! settle, then recomputes semantic edges and tag centroids in one place so
 //! bulk imports and single-atom edits share the same maintenance path.
+//!
+//! Dispatched through `scheduler::runner`, which owns the `task_runs`
+//! ledger claim, `last_run` advance, and event emission. This task
+//! overrides [`ScheduledTask::is_due`] with its dirty-flag trigger:
+//! it fires when the graph is dirty AND the pipeline is idle (or the
+//! dirt has gone stale enough to force a pass anyway).
 
-use crate::scheduler::{state as task_state, ScheduledTask, TaskContext, TaskError, TaskEvent};
+use crate::scheduler::{state as task_state, ScheduledTask, TaskContext, TaskError};
 use crate::storage::StorageBackend;
 use crate::{AtomicCore, AtomicCoreError};
 use async_trait::async_trait;
@@ -43,59 +49,36 @@ impl ScheduledTask for GraphMaintenanceTask {
         DEFAULT_INTERVAL
     }
 
-    async fn run(&self, core: &AtomicCore, ctx: &TaskContext) -> Result<(), TaskError> {
+    /// Dirty-flag trigger, not an interval: due when enabled, the graph
+    /// has unprocessed dirt, and the embedding pipeline is idle (or the
+    /// dirt has exceeded the staleness budget, forcing a pass even while
+    /// jobs are still flowing). Storage errors read as "not due" — the
+    /// next tick retries the check.
+    async fn is_due(&self, core: &AtomicCore) -> bool {
         if !task_state::is_enabled(core, TASK_ID, DEFAULT_ENABLED).await {
-            return Err(TaskError::Disabled);
+            return false;
         }
-
-        let Some(dirty) = get_dirty_state(core.storage()).await? else {
-            return Err(TaskError::NotDue);
+        let dirty = match get_dirty_state(core.storage()).await {
+            Ok(Some(d)) => d,
+            Ok(None) | Err(_) => return false,
         };
-
-        let active_pipeline_jobs = core.storage().count_pipeline_jobs_sync().await?;
-        let max_staleness = max_staleness(core).await;
+        let active_pipeline_jobs = match core.storage().count_pipeline_jobs_sync().await {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
         let stale = Utc::now().signed_duration_since(dirty.dirty_since)
-            >= ChronoDuration::seconds(max_staleness);
+            >= ChronoDuration::seconds(max_staleness(core).await);
+        active_pipeline_jobs == 0 || stale
+    }
 
-        if active_pipeline_jobs > 0 && !stale {
-            return Err(TaskError::NotDue);
-        }
-
-        let db_id = core
-            .db_path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "default".to_string());
-
-        (ctx.event_cb)(TaskEvent::Started {
-            task_id: TASK_ID.to_string(),
-            db_id: db_id.clone(),
-        });
-
-        let result = run_graph_maintenance(core).await?;
-
-        core.storage()
-            .set_setting_sync(LAST_PROCESSED_KEY, &dirty.last_dirty_at.to_rfc3339())
-            .await?;
-        task_state::set_last_run(core, TASK_ID, Utc::now()).await?;
-
+    async fn run(&self, core: &AtomicCore, _ctx: &TaskContext) -> Result<(), TaskError> {
+        let result = execute(core).await?;
         tracing::info!(
-            db_id = %db_id,
             atoms = result.atoms_processed,
             edges = result.edges_written,
             tags = result.tags_recomputed,
-            stale,
-            active_pipeline_jobs,
-            "[graph_maintenance] scheduler tick complete"
+            "[graph_maintenance] scheduler run complete"
         );
-
-        (ctx.event_cb)(TaskEvent::Completed {
-            task_id: TASK_ID.to_string(),
-            db_id,
-            result_id: None,
-        });
-
         Ok(())
     }
 }
@@ -116,14 +99,24 @@ pub async fn mark_dirty(storage: &StorageBackend) -> Result<(), AtomicCoreError>
 }
 
 pub async fn run_now(core: &AtomicCore) -> Result<(), AtomicCoreError> {
+    execute(core).await?;
+    task_state::set_last_run(core, TASK_ID, Utc::now()).await
+}
+
+/// Shared body of the scheduled and manual paths: snapshot the dirty
+/// watermark, run maintenance, then mark everything up to that watermark
+/// processed. Dirt marked *after* the snapshot stays pending, so a write
+/// landing mid-run is picked up by the next pass rather than silently
+/// swallowed.
+async fn execute(core: &AtomicCore) -> Result<MaintenanceResult, AtomicCoreError> {
     let dirty = get_dirty_state(core.storage()).await?;
-    run_graph_maintenance(core).await?;
+    let result = run_graph_maintenance(core).await?;
     if let Some(dirty) = dirty {
         core.storage()
             .set_setting_sync(LAST_PROCESSED_KEY, &dirty.last_dirty_at.to_rfc3339())
             .await?;
     }
-    task_state::set_last_run(core, TASK_ID, Utc::now()).await
+    Ok(result)
 }
 
 async fn get_dirty_state(storage: &StorageBackend) -> Result<Option<DirtyState>, AtomicCoreError> {

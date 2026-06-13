@@ -6,29 +6,21 @@
 mod config;
 
 use actix_cors::Cors;
-use actix_web::{http::header, middleware, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{http::header, middleware, web, App, HttpServer};
 use atomic_server::{
-    auth, event_bridge,
+    app::configure_app,
+    event_bridge,
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
-    mcp, mcp_auth, routes,
+    mcp,
     state::{AppState, ServerEvent, SetupClaimLimiter, SetupToken},
-    ws, Scalar, Servable,
 };
 use clap::Parser;
 use config::{Cli, Command, TokenAction};
 use std::sync::Arc;
 use std::time::Duration;
-use utoipa::OpenApi;
 
 const SETUP_CLAIMED_AT_KEY: &str = "setup.claimed_at";
-
-async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
-}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -457,7 +449,13 @@ async fn run_server(
         });
     }
 
-    // Spawn feed polling scheduler (ticks every 60 seconds, polls all databases)
+    // Spawn feed polling scheduler (ticks every 60 seconds, polls all
+    // databases). Each due feed's poll is dispatched through the `task_runs`
+    // ledger (`task_id = "feed_poll"`, `subject_id = <feed id>`): the durable
+    // lease dedups overlapping sweeps (and peer processes) per feed, and a
+    // failed poll retries with backoff via `next_attempt_at` instead of
+    // waiting out the feed's full poll_interval. `feeds.last_polled_at`
+    // stays the fast-path cache the hot due-feeds query reads.
     {
         let poll_manager = Arc::clone(&manager);
         let poll_tx = event_tx.clone();
@@ -496,9 +494,12 @@ async fn run_server(
     }
 
     // Spawn scheduled-tasks runner (ticks every 15 seconds across all databases).
-    // Each registered task checks its own due-ness and state; we just hand it
-    // a core + context. A per-(task, db) lock in the registry prevents the
-    // next tick from re-entering a still-running task.
+    // Each due task is dispatched through the `task_runs` ledger
+    // (claim-and-record, same shape as the reports loop below): the durable
+    // lease is the re-entry guard and failed runs back off via
+    // `next_attempt_at` instead of retrying every tick. The registry's
+    // in-memory per-(task, db) lock survives as a fast-path that skips
+    // tasks this process already has in flight without a storage round-trip.
     {
         let task_manager = Arc::clone(&manager);
         let task_tx = event_tx.clone();
@@ -511,46 +512,51 @@ async fn run_server(
             registry.register(Arc::new(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,
             ));
+            // Retention GC for the ledger itself (hourly): dogfoods the same
+            // dispatch path, so GC runs get their own bounded run history.
+            registry.register(Arc::new(atomic_core::scheduler::gc::TaskRunsGcTask));
             let registry = Arc::new(registry);
+            let ctx = atomic_core::scheduler::TaskContext {
+                event_cb: event_bridge::task_event_callback(task_tx.clone()),
+                embedding_event_cb: Arc::new(event_bridge::embedding_event_callback(task_tx)),
+            };
 
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let databases = match task_manager.list_databases().await {
-                    Ok((dbs, _)) => dbs,
-                    Err(_) => continue,
-                };
-                for db_info in &databases {
-                    let db_core = match task_manager.get_core(&db_info.id).await {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    for task in registry.tasks() {
-                        let Some(guard) = registry.try_lock(task.id(), &db_info.id) else {
-                            continue;
+                // Handles are dropped, not awaited: a slow task must not
+                // stall the next tick. The lease + lock keep re-entry safe.
+                let _ = atomic_core::scheduler::runner::tick_all_databases(
+                    &task_manager,
+                    &registry,
+                    &ctx,
+                )
+                .await;
+
+                // Wiki-regen retry sweep. Regeneration is event-triggered
+                // (manual request / tag change), not scheduled — nothing
+                // re-fires a failed run, so each tick also scans the ledger
+                // for runnable `wiki.regenerate` rows (failed runs whose
+                // backoff has elapsed, crashed runs with expired leases)
+                // and re-executes them. Spawned per DB so a slow LLM call
+                // can't stall the tick; overlapping sweeps dedup on the
+                // ledger's conditional claim.
+                if let Ok((dbs, _)) = task_manager.list_databases().await {
+                    for db_info in dbs {
+                        let core = match task_manager.get_core(&db_info.id).await {
+                            Ok(c) => c,
+                            Err(_) => continue,
                         };
-                        let task_clone = Arc::clone(task);
-                        let db_core_clone = db_core.clone();
-                        let tx = task_tx.clone();
-                        let embedding_tx = task_tx.clone();
-                        let db_id = db_info.id.clone();
                         tokio::spawn(async move {
-                            let ctx = atomic_core::scheduler::TaskContext {
-                                event_cb: event_bridge::task_event_callback(tx),
-                                embedding_event_cb: Arc::new(
-                                    event_bridge::embedding_event_callback(embedding_tx),
-                                ),
-                            };
-                            if let Err(e) = task_clone.run(&db_core_clone, &ctx).await {
-                                tracing::debug!(
-                                    task = task_clone.id(),
-                                    db = %db_id,
-                                    error = %e,
-                                    "task run ended"
+                            let regenerated = core.sweep_due_wiki_regens().await;
+                            if !regenerated.is_empty() {
+                                tracing::info!(
+                                    db = %db_info.name,
+                                    tags = regenerated.len(),
+                                    "[wiki.regenerate] retry sweep regenerated articles"
                                 );
                             }
-                            drop(guard);
                         });
                     }
                 }
@@ -659,74 +665,13 @@ async fn run_server(
     HttpServer::new(move || {
         let cors = build_cors(cors_public_url.as_deref());
 
+        // CORS + compression are deployment concerns and stay here; the
+        // route table itself lives in `atomic_server::app::configure_app`
+        // so tests and other embedders compose the identical wiring.
         App::new()
             .wrap(cors)
             .wrap(middleware::Compress::default())
-            .app_data(app_state.clone())
-            // Public routes (no auth)
-            .route("/health", web::get().to(health))
-            .route(
-                "/api/docs/openapi.json",
-                web::get().to(atomic_server::openapi_spec),
-            )
-            .service(Scalar::with_url(
-                "/api/docs",
-                atomic_server::ApiDoc::openapi(),
-            ))
-            .route("/ws", web::get().to(ws::ws_handler))
-            // OAuth discovery (public, no auth)
-            .route(
-                "/.well-known/oauth-authorization-server",
-                web::get().to(routes::oauth::metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource",
-                web::get().to(routes::oauth::resource_metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/mcp",
-                web::get().to(routes::oauth::resource_metadata),
-            )
-            // Instance setup (public, no auth — guarded by zero-token check)
-            .route(
-                "/api/setup/status",
-                web::get().to(routes::setup::setup_status),
-            )
-            .route(
-                "/api/setup/claim",
-                web::post().to(routes::setup::claim_instance),
-            )
-            // OAuth flow (public, no auth)
-            .route("/oauth/register", web::post().to(routes::oauth::register))
-            .route(
-                "/oauth/authorize",
-                web::get().to(routes::oauth::authorize_page),
-            )
-            .route(
-                "/oauth/authorize",
-                web::post().to(routes::oauth::authorize_approve),
-            )
-            .route("/oauth/token", web::post().to(routes::oauth::token))
-            .route(
-                "/api/exports/{id}/download",
-                web::get().to(routes::exports::download_export),
-            )
-            // MCP endpoint with MCP-aware auth
-            .service(
-                web::scope("/mcp")
-                    .wrap(mcp_auth::McpAuth {
-                        state: app_state.clone(),
-                    })
-                    .service(mcp_transport.clone().scope()),
-            )
-            // Authenticated API routes
-            .service(
-                web::scope("/api")
-                    .wrap(auth::BearerAuth {
-                        state: app_state.clone(),
-                    })
-                    .configure(routes::configure_routes),
-            )
+            .configure(configure_app(app_state.clone(), mcp_transport.clone()))
     })
     .workers(4)
     .bind((bind_owned.as_str(), port))?
@@ -812,6 +757,7 @@ fn is_local_origin(origin: &str) -> bool {
 mod tests {
     use super::*;
     use actix_web::test as actix_test;
+    use atomic_server::app::health;
 
     #[actix_web::test]
     async fn cors_allows_mcp_session_headers_from_local_origins() {

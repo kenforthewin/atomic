@@ -9,7 +9,8 @@
 
 use crate::db_extractor::Db;
 use crate::error::{error_response, ApiErrorResponse};
-use crate::state::{AppState, ServerEvent};
+use crate::event_channel::EventChannel;
+use crate::state::ServerEvent;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -58,7 +59,7 @@ pub async fn get_featured_report(db: Db) -> HttpResponse {
 )]
 pub async fn set_featured_report(
     db: Db,
-    state: web::Data<AppState>,
+    events: EventChannel,
     body: web::Json<SetFeaturedReportRequest>,
 ) -> HttpResponse {
     let id = body.report_id.as_deref();
@@ -67,7 +68,7 @@ pub async fn set_featured_report(
     }
     // Broadcast so other clients (and the local BriefingWidget /
     // ReportDetailView star toggle) refetch without polling.
-    let _ = state.event_tx.send(ServerEvent::DashboardFeaturedChanged {
+    let _ = events.0.send(ServerEvent::DashboardFeaturedChanged {
         report_id: body.report_id.clone(),
     });
     HttpResponse::Ok().json(FeaturedReportResponse {

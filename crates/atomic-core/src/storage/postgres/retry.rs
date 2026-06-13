@@ -100,9 +100,7 @@ mod tests {
         fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
             self
         }
-        fn into_error(
-            self: Box<Self>,
-        ) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
             self
         }
         fn kind(&self) -> sqlx::error::ErrorKind {

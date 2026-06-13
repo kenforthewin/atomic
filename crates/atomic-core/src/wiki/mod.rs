@@ -6,6 +6,7 @@
 
 mod agentic;
 pub(crate) mod centroid;
+pub mod runner;
 pub mod section_ops;
 
 pub use section_ops::{apply_section_ops, WikiSectionOp, WikiSectionOpWire};

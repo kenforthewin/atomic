@@ -2,7 +2,8 @@
 
 use crate::db_extractor::Db;
 use crate::event_bridge::embedding_event_callback;
-use crate::state::{AppState, ServerEvent};
+use crate::event_channel::EventChannel;
+use crate::state::ServerEvent;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -17,12 +18,12 @@ pub struct ImportObsidianRequest {
 
 #[utoipa::path(post, path = "/api/import/obsidian", request_body = ImportObsidianRequest, responses((status = 200, description = "Import result")), tag = "import")]
 pub async fn import_obsidian_vault(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     body: web::Json<ImportObsidianRequest>,
 ) -> HttpResponse {
-    let on_event = embedding_event_callback(state.event_tx.clone());
-    let tx = state.event_tx.clone();
+    let on_event = embedding_event_callback(events.0.clone());
+    let tx = events.0.clone();
     let on_progress = move |progress: atomic_core::ImportProgress| {
         let _ = tx.send(ServerEvent::ImportProgress {
             current: progress.current,

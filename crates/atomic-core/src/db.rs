@@ -47,7 +47,12 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 /// Read pool size for server connections (env-overridable, parsed once).
 fn server_read_pool_size() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| env_or("ATOMIC_SERVER_READ_POOL_SIZE", DEFAULT_SERVER_READ_POOL_SIZE))
+    *V.get_or_init(|| {
+        env_or(
+            "ATOMIC_SERVER_READ_POOL_SIZE",
+            DEFAULT_SERVER_READ_POOL_SIZE,
+        )
+    })
 }
 
 /// Page-cache budget in KiB for writer connections (env-overridable, parsed once).

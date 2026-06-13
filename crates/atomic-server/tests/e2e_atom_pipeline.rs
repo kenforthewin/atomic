@@ -61,7 +61,10 @@ async fn run_create_atom_runs_full_pipeline(backend: Backend) {
         final_body["embedding_status"], "complete",
         "embedding should succeed: {final_body}"
     );
-    assert_eq!(final_body["content"], "quantum particles atomic waves momentum");
+    assert_eq!(
+        final_body["content"],
+        "quantum particles atomic waves momentum"
+    );
 
     assert!(
         ctx.mock.embedding_request_count() >= 1,
@@ -178,5 +181,9 @@ async fn run_delete_atom_round_trip(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 404, "deleted atom should 404 on subsequent GET");
+    assert_eq!(
+        resp.status(),
+        404,
+        "deleted atom should 404 on subsequent GET"
+    );
 }

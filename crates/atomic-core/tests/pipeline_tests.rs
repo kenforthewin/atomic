@@ -892,15 +892,13 @@ async fn run_search_threshold_parity(backend: Backend) {
         .expect("test harness setup");
     let core = &handle.core;
 
-    let physics_a =
-        create_and_await(core, "quantum particles atomic waves momentum spin").await;
+    let physics_a = create_and_await(core, "quantum particles atomic waves momentum spin").await;
     let physics_b = create_and_await(
         core,
         "atomic particles quantum waves spin momentum scattering",
     )
     .await;
-    let _biology =
-        create_and_await(core, "biology cells dna evolution organisms genetics").await;
+    let _biology = create_and_await(core, "biology cells dna evolution organisms genetics").await;
 
     let options = SearchOptions {
         query: "quantum particles atomic waves".to_string(),
@@ -917,7 +915,8 @@ async fn run_search_threshold_parity(backend: Backend) {
         [physics_a.clone(), physics_b.clone()].into_iter().collect();
 
     assert_eq!(
-        returned, expected,
+        returned,
+        expected,
         "threshold=0.5 should admit exactly the two physics atoms on both backends; \
          got scores={:?}",
         results
@@ -937,5 +936,83 @@ async fn run_search_threshold_parity(backend: Backend) {
         (0.5..=1.0).contains(&top_score),
         "top similarity {} should land in [0.5, 1.0] for a normalized cosine metric",
         top_score
+    );
+}
+
+// ==================== Deferred pipeline execution ====================
+
+/// With inline pipeline execution switched off (`set_inline_pipeline(false)`
+/// — the knob hosts with a dedicated pipeline worker use), an atom save
+/// still enqueues its durable `atom_pipeline_jobs` row and returns normally,
+/// but nothing in this process claims or executes it: no lease is taken, no
+/// pipeline events fire, and the atom's embedding status stays `pending`.
+/// The parked job is then proven executable — restoring inline mode and
+/// draining the queue completes it — pinning the contract that jobs persist
+/// in the ledger either way and a deferred job is never lost or leased.
+///
+/// The default-on behavior (inline execution byte-identical to before the
+/// knob existed) is pinned by every other test in this suite.
+#[tokio::test]
+async fn deferred_pipeline_leaves_jobs_in_ledger() {
+    let mock = MockAiServer::start().await;
+    let handle = setup_core(Backend::Sqlite, &mock.base_url())
+        .await
+        .expect("test harness setup");
+    let core = &handle.core;
+
+    assert!(core.inline_pipeline(), "inline execution is the default");
+    core.set_inline_pipeline(false);
+
+    let (cb, mut rx) = event_collector();
+    let created = core
+        .create_atom(
+            CreateAtomRequest {
+                content: "quantum mechanics is the study of particles and waves".to_string(),
+                ..Default::default()
+            },
+            cb,
+        )
+        .await
+        .expect("create_atom")
+        .expect("atom was inserted (not skipped)");
+    let atom_id = created.atom.id.clone();
+
+    // The save returned with the job parked in the durable ledger.
+    assert_eq!(
+        support::pending_pipeline_job_count(core).await,
+        1,
+        "deferred save must leave its pipeline job in the ledger"
+    );
+
+    // Nothing processed: status untouched, no events. The settle window
+    // catches a stray spawned task that would otherwise race the asserts.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let fetched = core.get_atom(&atom_id).await.unwrap().expect("persisted");
+    assert_eq!(
+        fetched.atom.embedding_status, "pending",
+        "deferred save must not execute the pipeline"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "deferred save must emit no pipeline events"
+    );
+
+    // The parked job stays claimable: a worker (here: inline mode restored
+    // and the queue drained) runs it to completion.
+    core.set_inline_pipeline(true);
+    let (cb, mut rx) = event_collector();
+    let queued = core
+        .process_queued_pipeline_jobs(cb)
+        .await
+        .expect("drain queue");
+    assert_eq!(queued, 1, "the deferred job must still be claimable");
+    await_pipeline(&mut rx, &atom_id).await;
+
+    let fetched = core.get_atom(&atom_id).await.unwrap().expect("persisted");
+    assert_eq!(fetched.atom.embedding_status, "complete");
+    assert_eq!(
+        support::pending_pipeline_job_count(core).await,
+        0,
+        "executed job must be cleared from the ledger"
     );
 }

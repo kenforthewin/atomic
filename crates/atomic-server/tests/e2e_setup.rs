@@ -18,7 +18,7 @@ mod support;
 
 use serde_json::{json, Value};
 use std::time::Duration;
-use support::{spawn_live_server_with_public_routes, Backend, TestCtx, TestCtxOptions};
+use support::{spawn_live_server, Backend, TestCtx, TestCtxOptions};
 
 async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
     let opts = TestCtxOptions {
@@ -27,7 +27,7 @@ async fn boot(backend: Backend) -> Option<(TestCtx, support::LiveServer)> {
         ..Default::default()
     };
     let ctx = TestCtx::new_with(backend, opts).await?;
-    let server = spawn_live_server_with_public_routes(&ctx).await;
+    let server = spawn_live_server(&ctx).await;
     Some((ctx, server))
 }
 
@@ -76,7 +76,9 @@ async fn claim_succeeds_then_conflicts_sqlite() {
 #[actix_web::test]
 async fn claim_succeeds_then_conflicts_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("claim_succeeds_then_conflicts_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "claim_succeeds_then_conflicts_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_claim_succeeds_then_conflicts(Backend::Postgres).await;
@@ -146,7 +148,9 @@ async fn claim_rate_limited_after_burst_sqlite() {
 #[actix_web::test]
 async fn claim_rate_limited_after_burst_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("claim_rate_limited_after_burst_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "claim_rate_limited_after_burst_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_claim_rate_limited_after_burst(Backend::Postgres).await;

@@ -1,5 +1,68 @@
 # Durable Task Runs
 
+## Status (2026-06-09)
+
+Phase 1 is **landed**: the `task_runs` table exists in both SQLite and
+Postgres storage, and `scheduler::ledger` provides `claim_or_create` with
+durable leases, heartbeating, and crash reclaim (race-tested). Reports
+already dispatch through the ledger (the "phase 1.5" runner in
+`atomic-server/src/main.rs`).
+
+Phase 2 is **landed**: `draft_pipeline` and `graph_maintenance` dispatch
+through the ledger via `scheduler::runner` (claim-and-record, extracted
+from the 15s tick so tests can drive ticks directly). The in-memory
+registry lock is demoted to a fast-path; `last_run` advances only on
+terminal success; failures back off via `next_attempt_at` — the
+retry-storm bug below is fixed. A limitation surfaced by the multi-DB
+e2e — the Postgres backend's `settings` table was global across logical
+databases (no `db_id` scoping), sharing `task.{id}.*` fast-path keys
+between DBs — has since been fixed: Postgres migration 021 scopes
+`settings` by `db_id` with an explicit `'_global'` tier for
+registry-role config.
+
+Phase 3 is **landed**: every feed poll dispatches through the ledger as a
+`task_id = "feed_poll"` run with `subject_id = <feed id>`
+(`ingest::poller`, the sweep body the 60s loop drives; manual polls ride
+the same path with `trigger = manual`). `feeds.last_polled_at` /
+`last_error` are demoted to the fast-path cache: `last_polled_at`
+advances only when a poll settles (success, or abandonment after the
+retry budget — abandonment parks a persistently broken feed until its
+next interval), so retryable failures leave the feed due and the row's
+`next_attempt_at` drives backed-off retries. The hot due-feeds query is
+unchanged.
+
+Phase 4 is **landed**: wiki regeneration dispatches through the ledger as
+`task_id = "wiki.regenerate"` with `subject_id = <tag id>` (`wiki::runner`).
+Subject-keying gives per-tag dedup via the live-lease check — a second
+regen request for a tag with one in flight (or backing off after a
+failure) returns 409 from the route instead of double-running, while
+distinct tags regenerate concurrently. Because the trigger is
+event-driven (no schedule re-fires it), failed runs are retried by a
+**sweeper on the 15s scheduler tick**: `sweep_due_wiki_regens` scans the
+ledger for runnable `wiki.regenerate` rows (pending past
+`next_attempt_at`, or crashed with an expired lease) and re-executes
+them, resolving the tag's *current* name and settling rows whose tag was
+deleted in the meantime. There is no fast-path cache — the article row is
+the artifact and the hot `get_wiki` path never touches `task_runs`.
+
+Phase 5 is **landed**: `task_runs_gc` is a `ScheduledTask` registered
+alongside the others (hourly default), dispatched through the ledger it
+collects — its own run history is bounded by the same policy, and its
+in-flight row is `running` (non-terminal) so it can never delete the row
+recording it. The eligibility policy lives in one SQL statement per
+backend (`TaskRunStore::gc_task_runs`, contract-tested against both);
+`scheduler::gc` owns the `task.task_runs_gc.*` knobs (read at run time
+via `core.storage()` with the defaults below — no seed rows) and the
+batched-delete loop (500 rows per batch, yielding between batches).
+
+All phases are landed; this workstream is complete.
+Note `daily_briefing` no longer exists as a scheduled task — it collapsed
+into a seeded report (see `reports-phase-3-briefing-collapse.md`).
+
+This workstream is a prerequisite for Atomic Cloud's dispatcher, which
+relies on `task_runs` being the single source of pending background work.
+It should land and ride to production in self-hosted first.
+
 ## Context
 
 Atomic has three half-overlapping patterns for background work:
@@ -143,11 +206,27 @@ Retention knobs follow the existing `task.{id}.*` settings convention so server/
 
 Each phase is independently shippable and testable.
 
-1. **Schema + helpers.** V17→V18 migration; `scheduler::runs` module with claim / transition / crash-recovery query. No behavior change yet.
-2. **Retrofit system tasks.** Route `daily_briefing`, `draft_pipeline`, `graph_maintenance` through `task_runs` (claim-and-record). Delivers retry + backoff + history to existing tasks; fixes the retry-storm bug. Keep `last_run` fast-path. In-memory lock demoted to optimization.
-3. **Fold in feed polling.** `feed_poll` runs with `subject_id`; demote `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop claims/records.
-4. **Retention GC.** `task_runs_gc` scheduled task with the policy + batched deletes above.
-5. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
+1. **Schema + helpers.** ✅ Landed (as `scheduler::ledger`; reports dispatch
+   through it).
+2. **Retrofit system tasks.** ✅ Landed (as `scheduler::runner`; see Status).
+   Route `draft_pipeline` and `graph_maintenance` through `task_runs`
+   (claim-and-record). Delivers retry + backoff + history to existing
+   tasks; fixes the retry-storm bug. Keep `last_run` fast-path. In-memory
+   lock demoted to optimization. (`daily_briefing` is gone — it's a seeded
+   report now and already rides the ledger.)
+3. **Fold in feed polling.** ✅ Landed (as `ingest::poller`; see Status).
+   `feed_poll` runs with `subject_id`; demote
+   `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop
+   claims/records.
+4. **Wiki regen.** ✅ Landed (as `wiki::runner`; see Status). Replace
+   fire-and-forget regen on tag change with a `task_runs` row
+   (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).
+   Subject-keying gives natural per-tag dedup via the live-lease check;
+   retry/backoff (driven by a sweep on the scheduler tick) replaces
+   silent loss on LLM failure.
+5. **Retention GC.** ✅ Landed (as `scheduler::gc`; see Status).
+   `task_runs_gc` scheduled task with the policy + batched deletes above.
+6. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
 
 ## Risks & mitigations
 
@@ -156,6 +235,72 @@ Each phase is independently shippable and testable.
 - **Multi-DB regression.** `task_runs`, GC, and the runner are all per-DB. Do not place `task_runs` in `registry.db`; do not introduce a process-global GC timestamp. Reuse the existing `manager.list_databases()` fan-out and per-`(task_id, db_id)` keying (CLAUDE.md multi-DB gotcha).
 - **Migration ordering mistake.** The `LATEST_VERSION` bump + un-pinning the V16→V17 pragma to literal `17` must land together, or the schema version logic breaks. Called out explicitly above.
 - **GC write contention on desktop.** Batched deletes + hourly cadence; never a single large `DELETE` under the write lock.
+
+## Review follow-ups (2026-06-10)
+
+From the post-implementation adversarial review. The claim-query backoff
+gate (a sweeper's stale snapshot could claim a row whose backoff a peer had
+just re-armed) was fixed on the spot; these remain:
+
+Accepted residue from the migration-022 verification (2026-06-10): the
+backfill patterns skip `briefings.migrated_to_findings` / `briefing_prompt`
+— traced safe (the briefings→findings migration re-runs idempotently per DB
+and re-suppresses itself scoped; only a pre-021 deployment with a custom
+legacy prompt that never seeded would fall back to the default prompt, and
+no such deployment exists). Test gap: 021 and 022 are each pinned
+separately but no test drives the full pre-021 → 021 → 022 chain; add one
+if either migration is ever touched again.
+
+- ~~**Postgres settings are global across `db_id`s**~~ — **fixed**
+  (pg-settings-scope branch): migration 021 adds `db_id` to `settings`
+  with PK `(db_id, key)` and an explicit `'_global'` tier for
+  registry-role config; scoped/global accessor split on `SettingsStore`.
+- ~~**021's landing orphaned per-DB-role rows in `'_global'`**~~ —
+  **fixed**: adversarial review disproved the "seeds re-check benignly"
+  claim — invisible `reports.default_briefing_seeded` /
+  `dashboard.featured_report_id` rows made the boot seed create a
+  duplicate Daily Briefing (and resurrect user-deleted seeds), and
+  operator overrides (`task.{id}.enabled`, GC retention) reverted to
+  defaults. Migration 022 backfills the orphans (`task.%`, `reports.%`,
+  the featured-report pointer) into *every* logical database — the
+  faithful reading of the pre-021 shared table — and drops them from
+  `'_global'`. Pinned by
+  `pg_settings_backfill_replicates_orphaned_per_db_keys`.
+- ~~**`purge_database_data` leaks the purged DB's `task_runs`**~~ —
+  **fixed**: the purge now deletes the database's ledger rows too; a
+  deleted DB's GC never runs again, so they'd have leaked forever on a
+  shared cluster. Pinned by `pg_purge_database_data_deletes_task_runs`.
+- **Crash-loop bound.** Reclaim deliberately does *not* consume the retry
+  budget (`ledger_expired_lease_reclaimed_without_bumping_attempts` pins
+  this): desktop restarts mid-task are routine and must not abandon healthy
+  work. The accepted trade-off is that a run that deterministically kills
+  its process retries forever. If that bites, add a separate `reclaims`
+  counter (additive migration) with a generous ceiling (~20) that settles
+  the row abandoned — do not flip the attempts semantics.
+- ~~**Feed deletion strands its non-terminal `feed_poll` row**~~ — **fixed**:
+  `AtomicCore::delete_feed` now settles every non-terminal `feed_poll` row
+  for the feed as a moot *success* via `TaskRunStore::settle_task_runs_moot`
+  (no lease fence, no runnability gate — a backed-off or in-flight row is
+  unclaimable through the normal path and unreachable by any sweep once
+  the definition is gone). Settle-not-delete matches `wiki::runner`'s
+  deleted-tag precedent and preserves history for GC to age out normally.
+- **Settle/cache-write ordering** — a crash between a feed run's ledger
+  settle and the `last_polled_at` cache write loses abandonment parking
+  (the feed re-polls next sweep). Benign-ish; note for the dispatcher port.
+  (Same family: a poll racing a concurrent `delete_feed` past its settle
+  can strand a fresh row — equally benign-rare, same dispatcher-port note.)
+- ~~**`RetentionPolicy::load` fails open**~~ — **fixed**: `load` returns
+  `Result` and `TaskRunsGcTask::run` skips the sweep on a read error
+  (warn + ledger-visible failure with backoff) instead of deleting under
+  possibly tighter-than-configured defaults.
+- ~~**Test gaps**~~ — **closed**: `storage_tests::postgres_tests` now pins
+  cross-`db_id` fencing for `gc_task_runs` and `list_runnable_task_runs`,
+  and crash-reclaim (expired lease through the real
+  `ledger::claim_or_create` path) against Postgres.
+- **Nits**: the `failed` state is unreachable in production flows (runs are
+  only ever `pending`-with-backoff or `abandoned` in practice, so GC's
+  retain-most-recent-failure rule effectively protects `abandoned` rows);
+  `list_task_runs` has no REST surface yet (comes with the run-history UI).
 
 ## Resolved decisions
 

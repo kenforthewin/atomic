@@ -407,6 +407,8 @@ dispatch! {
         => sqlite: get_all_tags_filtered_impl, pg_trait: TagStore, pg_method: get_all_tags_filtered;
     fn get_tag_children_impl(&self, parent_id: &str, min_count: i32, limit: i32, offset: i32) -> Result<PaginatedTagChildren, AtomicCoreError>
         => sqlite: get_tag_children_impl, pg_trait: TagStore, pg_method: get_tag_children;
+    fn get_tag_sync(&self, id: &str) -> Result<Option<Tag>, AtomicCoreError>
+        => sqlite: get_tag_impl, pg_trait: TagStore, pg_method: get_tag;
     fn create_tag_impl(&self, name: &str, parent_id: Option<&str>) -> Result<Tag, AtomicCoreError>
         => sqlite: create_tag_impl, pg_trait: TagStore, pg_method: create_tag;
     fn update_tag_impl(&self, id: &str, name: &str, parent_id: Option<&str>) -> Result<Tag, AtomicCoreError>
@@ -511,6 +513,10 @@ dispatch! {
         => sqlite: clear_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: clear_pipeline_jobs;
     fn count_pipeline_jobs_sync(&self) -> Result<i32, AtomicCoreError>
         => sqlite: count_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_pipeline_jobs;
+    fn count_due_pipeline_jobs_sync(&self, now: &str) -> Result<i32, AtomicCoreError>
+        => sqlite: count_due_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: count_due_pipeline_jobs;
+    fn rearm_pipeline_jobs_sync(&self, reason: &str, now: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: rearm_pipeline_jobs_sync, pg_trait: ChunkStore, pg_method: rearm_pipeline_jobs;
 
     // ---- SearchStore ----
     fn vector_search_sync(&self, query_embedding: &[f32], limit: i32, threshold: f32, tag_id: Option<&str>, created_after: Option<&str>, kinds: &crate::models::KindFilter) -> Result<Vec<SemanticSearchResult>, AtomicCoreError>
@@ -599,6 +605,8 @@ dispatch! {
         => sqlite: get_due_feeds_sync, pg_trait: FeedStore, pg_method: get_due_feeds;
     fn mark_feed_polled_sync(&self, id: &str, error: Option<&str>) -> Result<(), AtomicCoreError>
         => sqlite: mark_feed_polled_sync, pg_trait: FeedStore, pg_method: mark_feed_polled;
+    fn set_feed_error_sync(&self, id: &str, error: &str) -> Result<(), AtomicCoreError>
+        => sqlite: set_feed_error_sync, pg_trait: FeedStore, pg_method: set_feed_error;
     fn claim_feed_item_sync(&self, feed_id: &str, guid: &str) -> Result<bool, AtomicCoreError>
         => sqlite: claim_feed_item_sync, pg_trait: FeedStore, pg_method: claim_feed_item;
     fn complete_feed_item_sync(&self, feed_id: &str, guid: &str, atom_id: &str) -> Result<(), AtomicCoreError>
@@ -617,6 +625,8 @@ dispatch! {
         => sqlite: get_clusters_sync, pg_trait: ClusterStore, pg_method: get_clusters;
 
     // ---- SettingsStore ----
+    // Scoped (per-DB) tier: task.{id}.* scheduler state, seed flags,
+    // per-DB overrides.
     fn get_all_settings_sync(&self) -> Result<HashMap<String, String>, AtomicCoreError>
         => sqlite: get_all_settings_sync, pg_trait: SettingsStore, pg_method: get_all_settings;
     fn get_setting_sync(&self, key: &str) -> Result<Option<String>, AtomicCoreError>
@@ -625,6 +635,19 @@ dispatch! {
         => sqlite: set_setting_sync, pg_trait: SettingsStore, pg_method: set_setting;
     fn delete_setting_sync(&self, key: &str) -> Result<(), AtomicCoreError>
         => sqlite: delete_setting_sync, pg_trait: SettingsStore, pg_method: delete_setting;
+    // Global (registry-role) tier: provider/model config and other
+    // deployment-wide settings. On SQLite a data DB's own table *is* its
+    // only settings table (registry.db handles the global role physically),
+    // so the global accessors map to the same sync helpers; Postgres routes
+    // them to the '_global' sentinel db_id.
+    fn get_global_settings_sync(&self) -> Result<HashMap<String, String>, AtomicCoreError>
+        => sqlite: get_all_settings_sync, pg_trait: SettingsStore, pg_method: get_global_settings;
+    fn get_global_setting_sync(&self, key: &str) -> Result<Option<String>, AtomicCoreError>
+        => sqlite: get_setting_sync, pg_trait: SettingsStore, pg_method: get_global_setting;
+    fn set_global_setting_sync(&self, key: &str, value: &str) -> Result<(), AtomicCoreError>
+        => sqlite: set_setting_sync, pg_trait: SettingsStore, pg_method: set_global_setting;
+    fn delete_global_setting_sync(&self, key: &str) -> Result<(), AtomicCoreError>
+        => sqlite: delete_setting_sync, pg_trait: SettingsStore, pg_method: delete_global_setting;
 
     // ---- TokenStore ----
     fn create_api_token_sync(&self, name: &str) -> Result<(crate::tokens::ApiTokenInfo, String), AtomicCoreError>
@@ -651,6 +674,10 @@ dispatch! {
         => sqlite: get_task_run_sync, pg_trait: TaskRunStore, pg_method: get_task_run;
     fn find_runnable_task_run_sync(&self, task_id: &str, subject_id: Option<&str>, now: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: find_runnable_task_run_sync, pg_trait: TaskRunStore, pg_method: find_runnable_task_run;
+    fn list_runnable_task_runs_sync(&self, task_id: &str, now: &str) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_runnable_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_runnable_task_runs;
+    fn count_active_task_runs_sync(&self) -> Result<i32, AtomicCoreError>
+        => sqlite: count_active_task_runs_sync, pg_trait: TaskRunStore, pg_method: count_active_task_runs;
     fn find_active_task_run_sync(&self, task_id: &str, subject_id: Option<&str>) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: find_active_task_run_sync, pg_trait: TaskRunStore, pg_method: find_active_task_run;
     fn claim_pending_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>
@@ -665,8 +692,18 @@ dispatch! {
         => sqlite: fail_task_run_retry_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_retry;
     fn fail_task_run_abandon_sync(&self, id: &str, expected_lease: &str, last_error: &str, finished_at: &str) -> Result<bool, AtomicCoreError>
         => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
+    fn defer_task_run_sync(&self, id: &str, expected_lease: &str, last_error: &str, now: &str, next_attempt_at: &str) -> Result<bool, AtomicCoreError>
+        => sqlite: defer_task_run_sync, pg_trait: TaskRunStore, pg_method: defer_task_run;
+    fn list_waiting_task_runs_sync(&self, now: &str) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_waiting_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_waiting_task_runs;
+    fn rearm_task_runs_sync(&self, ids: &[String], now: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: rearm_task_runs_sync, pg_trait: TaskRunStore, pg_method: rearm_task_runs;
+    fn settle_task_runs_moot_sync(&self, task_id: &str, subject_id: &str, finished_at: &str) -> Result<u64, AtomicCoreError>
+        => sqlite: settle_task_runs_moot_sync, pg_trait: TaskRunStore, pg_method: settle_task_runs_moot;
     fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: list_recent_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_recent_task_runs;
+    fn gc_task_runs_sync(&self, keep_per_subject: i32, age_cutoff: &str, failed_cutoff: &str, batch_size: i32) -> Result<u64, AtomicCoreError>
+        => sqlite: gc_task_runs_sync, pg_trait: TaskRunStore, pg_method: gc_task_runs;
 
     // ---- ReportStore ----
     fn list_reports_sync(&self) -> Result<Vec<crate::models::Report>, AtomicCoreError>

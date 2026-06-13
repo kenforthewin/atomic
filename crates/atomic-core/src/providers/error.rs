@@ -86,6 +86,64 @@ impl ProviderError {
     }
 }
 
+/// Coarse classification of a provider failure, recovered from an error
+/// *message* — see [`classify_provider_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureClass {
+    /// The provider rate-limited the call (HTTP 429 /
+    /// [`ProviderError::RateLimited`]), with the `Retry-After` hint when the
+    /// provider sent one.
+    RateLimited { retry_after_secs: Option<u64> },
+    /// The provider refused the call for billing reasons (HTTP 402 — e.g.
+    /// an exhausted prepaid balance or per-key credit limit).
+    PaymentRequired,
+    /// The provider rejected the stored credentials (HTTP 401/403 — an
+    /// expired, revoked, or mis-scoped API key). Like billing failures,
+    /// these are environmental: no retry succeeds until the key is fixed.
+    AuthFailed,
+    /// Anything else (including messages this classifier doesn't recognize).
+    Other,
+}
+
+/// Classify a stringly provider failure by recognizing **this module's own
+/// `Display` renderings** of [`ProviderError`].
+///
+/// Most failure paths flatten `ProviderError` into a `String` long before a
+/// scheduler sees it (`EmbedError::message`, embedding-event payloads,
+/// `task_runs.last_error`), usually wrapped in further context
+/// (`"Embedding error: Provider error: Rate limited…"`). Hosts that drive
+/// the durable ledgers need the rate-limit/billing signal back out of those
+/// strings to schedule honest backoff, so the parser lives here — next to
+/// the `Display` impl it must stay in sync with, pinned by the round-trip
+/// tests below — rather than rotting in some caller.
+///
+/// Matching is substring-based and deliberately conservative: rate-limit
+/// first (its rendering never embeds a response body), then the 402 status
+/// marker. A response body that *contains* one of these markers can
+/// misclassify, but only on a call that already failed — the cost is a
+/// gentler retry schedule, never a dropped result.
+pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
+    // `ProviderError::RateLimited` renders as "Rate limited" or
+    // "Rate limited, retry after {N} seconds".
+    if let Some(idx) = message.find("Rate limited") {
+        let tail = &message[idx + "Rate limited".len()..];
+        let retry_after_secs = tail.strip_prefix(", retry after ").and_then(|rest| {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().ok()
+        });
+        return ProviderFailureClass::RateLimited { retry_after_secs };
+    }
+    // `ProviderError::Api { status: 402, .. }` renders as "API error (402): …".
+    if message.contains("API error (402)") {
+        return ProviderFailureClass::PaymentRequired;
+    }
+    // `ProviderError::Api { status: 401 | 403, .. }` — credential rejections.
+    if message.contains("API error (401)") || message.contains("API error (403)") {
+        return ProviderFailureClass::AuthFailed;
+    }
+    ProviderFailureClass::Other
+}
+
 impl From<reqwest::Error> for ProviderError {
     fn from(err: reqwest::Error) -> Self {
         ProviderError::Network(err.to_string())
@@ -102,6 +160,106 @@ impl From<serde_json::Error> for ProviderError {
 impl From<ProviderError> for String {
     fn from(err: ProviderError) -> Self {
         err.to_string()
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    /// The classifier must recover what `Display` rendered — these
+    /// round-trips are the contract that keeps the two in sync. A change to
+    /// the renderings that forgets the parser fails here.
+    #[test]
+    fn classify_round_trips_display_renderings() {
+        let with_hint = ProviderError::RateLimited {
+            retry_after_secs: Some(30),
+        };
+        assert_eq!(
+            classify_provider_failure(&with_hint.to_string()),
+            ProviderFailureClass::RateLimited {
+                retry_after_secs: Some(30)
+            }
+        );
+
+        let without_hint = ProviderError::RateLimited {
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            classify_provider_failure(&without_hint.to_string()),
+            ProviderFailureClass::RateLimited {
+                retry_after_secs: None
+            }
+        );
+
+        let payment = ProviderError::Api {
+            status: 402,
+            message: "Insufficient credits".to_string(),
+        };
+        assert_eq!(
+            classify_provider_failure(&payment.to_string()),
+            ProviderFailureClass::PaymentRequired
+        );
+
+        for status in [401u16, 403] {
+            let auth = ProviderError::Api {
+                status,
+                message: "key revoked".to_string(),
+            };
+            assert_eq!(
+                classify_provider_failure(&auth.to_string()),
+                ProviderFailureClass::AuthFailed,
+                "{status} must classify as an auth failure"
+            );
+        }
+    }
+
+    /// Real failure strings arrive wrapped in caller context; the substring
+    /// match must survive the wrapping.
+    #[test]
+    fn classify_survives_error_wrapping() {
+        assert_eq!(
+            classify_provider_failure(
+                "Embedding error: Provider error: Rate limited, retry after 120 seconds"
+            ),
+            ProviderFailureClass::RateLimited {
+                retry_after_secs: Some(120)
+            }
+        );
+        assert_eq!(
+            classify_provider_failure("Wiki error: API error (402): out of credits"),
+            ProviderFailureClass::PaymentRequired
+        );
+    }
+
+    /// Unrelated failures stay `Other` — the conservative default.
+    #[test]
+    fn classify_leaves_unrelated_errors_alone() {
+        for message in [
+            "API error (500): upstream exploded",
+            "Network error: connection refused",
+            "Parse error: bad JSON",
+            "Model not found: gpt-nonexistent",
+            "",
+        ] {
+            assert_eq!(
+                classify_provider_failure(message),
+                ProviderFailureClass::Other,
+                "{message:?} must classify as Other"
+            );
+        }
+    }
+
+    /// A malformed retry-after tail degrades to "rate limited, no hint",
+    /// never to a parse failure.
+    #[test]
+    fn classify_tolerates_malformed_retry_after() {
+        assert_eq!(
+            classify_provider_failure("Rate limited, retry after soon-ish"),
+            ProviderFailureClass::RateLimited {
+                retry_after_secs: None
+            }
+        );
     }
 }
 

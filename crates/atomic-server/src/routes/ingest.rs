@@ -2,7 +2,7 @@
 
 use crate::db_extractor::Db;
 use crate::event_bridge::{embedding_event_callback, ingestion_event_callback};
-use crate::state::AppState;
+use crate::event_channel::EventChannel;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -28,7 +28,7 @@ pub struct IngestUrlsRequest {
 
 #[utoipa::path(post, path = "/api/ingest/url", request_body = IngestUrlRequest, responses((status = 200, description = "Ingested atom")), tag = "ingestion")]
 pub async fn ingest_url(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     body: web::Json<IngestUrlRequest>,
 ) -> HttpResponse {
@@ -39,8 +39,8 @@ pub async fn ingest_url(
         published_at: body.published_at.clone(),
     };
 
-    let on_ingest = ingestion_event_callback(state.event_tx.clone());
-    let on_embed = embedding_event_callback(state.event_tx.clone());
+    let on_ingest = ingestion_event_callback(events.0.clone());
+    let on_embed = embedding_event_callback(events.0.clone());
 
     match db.0.ingest_url(request, on_ingest, on_embed).await {
         Ok(result) => HttpResponse::Ok().json(result),
@@ -50,7 +50,7 @@ pub async fn ingest_url(
 
 #[utoipa::path(post, path = "/api/ingest/urls", request_body = IngestUrlsRequest, responses((status = 200, description = "Batch ingestion results")), tag = "ingestion")]
 pub async fn ingest_urls(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     body: web::Json<IngestUrlsRequest>,
 ) -> HttpResponse {
@@ -65,8 +65,8 @@ pub async fn ingest_urls(
         })
         .collect();
 
-    let on_ingest = ingestion_event_callback(state.event_tx.clone());
-    let on_embed = embedding_event_callback(state.event_tx.clone());
+    let on_ingest = ingestion_event_callback(events.0.clone());
+    let on_embed = embedding_event_callback(events.0.clone());
 
     let results = db.0.ingest_urls(requests, on_ingest, on_embed).await;
 

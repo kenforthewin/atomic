@@ -136,9 +136,7 @@ async fn run_revoked_bearer_token(backend: Backend) {
         .find(|t| t.name == "e2e-test")
         .expect("seeded e2e-test token")
         .id;
-    core.revoke_api_token(token_id)
-        .await
-        .expect("revoke token");
+    core.revoke_api_token(token_id).await.expect("revoke token");
 
     let app = actix_test::init_service(test_app(&ctx)).await;
 

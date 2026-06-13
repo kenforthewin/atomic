@@ -137,7 +137,10 @@ where
         "POST /api/atoms to db {db_id} should return 201"
     );
     let body: Value = actix_test::read_body_json(resp).await;
-    body["id"].as_str().expect("created atom has id").to_string()
+    body["id"]
+        .as_str()
+        .expect("created atom has id")
+        .to_string()
 }
 
 async fn list_atom_ids<S, B>(app: &S, ctx: &TestCtx, db_id: &str) -> HashSet<String>

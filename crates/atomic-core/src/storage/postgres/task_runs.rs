@@ -212,6 +212,44 @@ impl TaskRunStore for PostgresStorage {
         row.map(|r| row_to_task_run(&r)).transpose()
     }
 
+    async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<TaskRun>> {
+        let sql = format!(
+            "SELECT {COLS}
+             FROM task_runs
+             WHERE db_id = $1
+               AND task_id = $2
+               AND (
+                    (state = 'pending' AND next_attempt_at <= $3)
+                 OR (state = 'running' AND lease_until IS NOT NULL AND lease_until < $3)
+               )
+             ORDER BY next_attempt_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&self.db_id)
+            .bind(task_id)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        rows.iter().map(row_to_task_run).collect()
+    }
+
+    async fn count_active_task_runs(&self) -> StorageResult<i32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_runs
+             WHERE db_id = $1 AND state IN ('pending', 'running')",
+        )
+        .bind(&self.db_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(count as i32)
+    }
+
     async fn find_active_task_run(
         &self,
         task_id: &str,
@@ -258,6 +296,7 @@ impl TaskRunStore for PostgresStorage {
                         attempts    = attempts + 1,
                         updated_at  = $2
                   WHERE id = $1 AND state = 'pending' AND db_id = $4
+                    AND next_attempt_at <= $2
                   RETURNING id",
             )
             .bind(id)
@@ -397,6 +436,88 @@ impl TaskRunStore for PostgresStorage {
         Ok(row.is_some())
     }
 
+    /// Deferral (environmental failure): back to `pending` at the caller's
+    /// horizon with the claim's attempt increment refunded — see
+    /// `TaskRunStore::defer_task_run`. `GREATEST(attempts - 1, 0)` rather
+    /// than a bare decrement so a defensive caller can never drive the
+    /// counter negative.
+    async fn defer_task_run(
+        &self,
+        id: &str,
+        expected_lease: &str,
+        last_error: &str,
+        now: &str,
+        next_attempt_at: &str,
+    ) -> StorageResult<bool> {
+        let row = sqlx::query(
+            "UPDATE task_runs
+                SET state           = 'pending',
+                    attempts        = GREATEST(attempts - 1, 0),
+                    last_error      = $2,
+                    next_attempt_at = $4,
+                    lease_until     = NULL,
+                    started_at      = NULL,
+                    updated_at      = $3
+              WHERE id = $1
+                AND state = 'running'
+                AND lease_until = $5
+                AND db_id = $6
+              RETURNING id",
+        )
+        .bind(id)
+        .bind(last_error)
+        .bind(now)
+        .bind(next_attempt_at)
+        .bind(expected_lease)
+        .bind(&self.db_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    async fn list_waiting_task_runs(&self, now: &str) -> StorageResult<Vec<TaskRun>> {
+        let sql = format!(
+            "SELECT {COLS}
+             FROM task_runs
+             WHERE db_id = $1
+               AND state = 'pending'
+               AND next_attempt_at > $2
+             ORDER BY next_attempt_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&self.db_id)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        rows.iter().map(row_to_task_run).collect()
+    }
+
+    async fn rearm_task_runs(&self, ids: &[String], now: &str) -> StorageResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET next_attempt_at = $2,
+                        updated_at      = $2
+                  WHERE id = ANY($1)
+                    AND state = 'pending'
+                    AND db_id = $3",
+            )
+            .bind(ids)
+            .bind(now)
+            .bind(&self.db_id)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn fail_task_run_abandon(
         &self,
         id: &str,
@@ -426,6 +547,42 @@ impl TaskRunStore for PostgresStorage {
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         Ok(row.is_some())
+    }
+
+    /// Force-settle moot rows for a deleted subject. No lease fence and no
+    /// runnability gate — see `TaskRunStore::settle_task_runs_moot` for why
+    /// both are deliberately skipped. Fenced on `db_id` like every other
+    /// writer here, so deleting a feed in one logical database can't settle
+    /// a sibling's runs.
+    async fn settle_task_runs_moot(
+        &self,
+        task_id: &str,
+        subject_id: &str,
+        finished_at: &str,
+    ) -> StorageResult<u64> {
+        let result = with_retry(|| async {
+            sqlx::query(
+                "UPDATE task_runs
+                    SET state       = 'succeeded',
+                        finished_at = $3,
+                        lease_until = NULL,
+                        last_error  = NULL,
+                        updated_at  = $3
+                  WHERE task_id = $1
+                    AND subject_id = $2
+                    AND db_id = $4
+                    AND state IN ('pending', 'running')",
+            )
+            .bind(task_id)
+            .bind(subject_id)
+            .bind(finished_at)
+            .bind(&self.db_id)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 
     async fn list_recent_task_runs(
@@ -459,5 +616,66 @@ impl TaskRunStore for PostgresStorage {
             .await
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         rows.iter().map(row_to_task_run).collect()
+    }
+
+    /// One bounded retention-GC batch — the same SQL shape as the SQLite
+    /// impl (see `TaskRunStore::gc_task_runs` for the eligibility
+    /// contract) with every table scan fenced on `db_id` so one logical
+    /// database's GC can't rank or delete a sibling's history.
+    async fn gc_task_runs(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64> {
+        let result = with_retry(|| async {
+            sqlx::query(
+                "WITH terminal AS (
+                     SELECT id, created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY task_id, subject_id
+                                ORDER BY created_at DESC, id DESC
+                            ) AS recency_rank
+                       FROM task_runs
+                      WHERE db_id = $1
+                        AND state IN ('succeeded', 'failed', 'abandoned')
+                 ),
+                 protected_failure AS (
+                     SELECT id
+                       FROM (
+                           SELECT id, created_at,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY task_id, subject_id
+                                      ORDER BY created_at DESC, id DESC
+                                  ) AS failure_rank
+                             FROM task_runs
+                            WHERE db_id = $1
+                              AND state IN ('failed', 'abandoned')
+                       ) f
+                      WHERE failure_rank = 1 AND created_at >= $4
+                 )
+                 DELETE FROM task_runs
+                  WHERE db_id = $1
+                    AND id IN (
+                        SELECT t.id
+                          FROM terminal t
+                         WHERE (t.recency_rank > $2 OR t.created_at < $3)
+                           AND t.id NOT IN (SELECT id FROM protected_failure)
+                         ORDER BY t.created_at ASC, t.id ASC
+                         LIMIT $5
+                    )",
+            )
+            .bind(&self.db_id)
+            .bind(keep_per_subject as i64)
+            .bind(age_cutoff)
+            .bind(failed_cutoff)
+            .bind(batch_size as i64)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 }

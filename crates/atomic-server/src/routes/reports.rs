@@ -8,7 +8,8 @@
 
 use crate::db_extractor::Db;
 use crate::error::{error_response, ok_or_error, ApiErrorResponse};
-use crate::state::{AppState, ServerEvent};
+use crate::event_channel::EventChannel;
+use crate::state::ServerEvent;
 use actix_web::{web, HttpResponse};
 use atomic_core::models::{CreateReportRequest, UpdateReportRequest};
 use serde::Deserialize;
@@ -129,11 +130,7 @@ pub async fn set_report_enabled(
     ),
     tag = "reports"
 )]
-pub async fn delete_report(
-    db: Db,
-    path: web::Path<String>,
-    state: web::Data<AppState>,
-) -> HttpResponse {
+pub async fn delete_report(db: Db, path: web::Path<String>, events: EventChannel) -> HttpResponse {
     let id = path.into_inner();
     // Snapshot the featured pointer before deletion so we can detect
     // whether the delete cleared it. `delete_report` clears the pointer
@@ -147,8 +144,8 @@ pub async fn delete_report(
     match db.0.delete_report(&id).await {
         Ok(()) => {
             if previously_featured {
-                let _ = state
-                    .event_tx
+                let _ = events
+                    .0
                     .send(ServerEvent::DashboardFeaturedChanged { report_id: None });
             }
             HttpResponse::NoContent().finish()
@@ -240,11 +237,7 @@ pub struct RunNowResponse {
     ),
     tag = "reports"
 )]
-pub async fn run_report_now(
-    db: Db,
-    path: web::Path<String>,
-    state: web::Data<AppState>,
-) -> HttpResponse {
+pub async fn run_report_now(db: Db, path: web::Path<String>, events: EventChannel) -> HttpResponse {
     let id = path.into_inner();
     // Validate the report exists before reporting 202 — otherwise the
     // 404 would be deferred to the background task and the caller would
@@ -259,7 +252,7 @@ pub async fn run_report_now(
 
     let core = db.0.clone();
     let id_owned = id.clone();
-    let event_tx = state.event_tx.clone();
+    let event_tx = events.0;
     tokio::spawn(async move {
         match core.run_report_now(&id_owned).await {
             Ok(outcome) => {

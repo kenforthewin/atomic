@@ -27,9 +27,7 @@ async fn concurrent_atom_creation_sqlite() {
 #[actix_web::test]
 async fn concurrent_atom_creation_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!(
-            "concurrent_atom_creation_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
-        );
+        eprintln!("concurrent_atom_creation_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
         return;
     }
     run_concurrent_atom_creation(Backend::Postgres).await;
@@ -85,7 +83,10 @@ async fn run_concurrent_atom_creation(backend: Backend) {
     // List endpoint should now report all of them. Read in one shot —
     // the page-size default is large enough for STORM_SIZE atoms.
     let resp = client
-        .get(format!("{}/api/atoms?limit={}", server.base_url, STORM_SIZE))
+        .get(format!(
+            "{}/api/atoms?limit={}",
+            server.base_url, STORM_SIZE
+        ))
         .bearer_auth(&ctx.token)
         .send()
         .await

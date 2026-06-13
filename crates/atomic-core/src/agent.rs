@@ -407,11 +407,12 @@ async fn execute_search_atoms(
             .await;
     }
 
-    // Postgres path: use storage dispatch methods
+    // Postgres path: use storage dispatch methods. Provider config is
+    // deployment-wide, so the fallback reads the global settings tier.
     let settings = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -543,6 +544,7 @@ async fn execute_create_atom(
     storage: &StorageBackend,
     tool_args: &serde_json::Value,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     canvas_cache: Option<&crate::CanvasCache>,
     on_embedding_event: Arc<dyn Fn(EmbeddingEvent) + Send + Sync + 'static>,
 ) -> Result<AtomWithTags, String> {
@@ -574,6 +576,7 @@ async fn execute_create_atom(
         id.clone(),
         "agent_create_atom".to_string(),
         external_settings,
+        inline_pipeline,
         canvas_cache.cloned(),
         on_embedding_event,
     );
@@ -586,6 +589,7 @@ async fn enqueue_and_process_agent_pipeline(
     atom_id: &str,
     reason: &str,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     canvas_cache: Option<&crate::CanvasCache>,
     on_embedding_event: Arc<dyn Fn(EmbeddingEvent) + Send + Sync + 'static>,
 ) -> Result<(), String> {
@@ -601,6 +605,11 @@ async fn enqueue_and_process_agent_pipeline(
         .enqueue_pipeline_jobs_sync(&[job])
         .await
         .map_err(|e| e.to_string())?;
+    if !inline_pipeline {
+        // The job persists in the durable ledger; the host's dedicated
+        // pipeline worker executes it (see AtomicCore::set_inline_pipeline).
+        return Ok(());
+    }
     let callback = {
         let on_embedding_event = Arc::clone(&on_embedding_event);
         move |event| on_embedding_event(event)
@@ -632,6 +641,7 @@ fn enqueue_agent_pipeline_in_background(
     atom_id: String,
     reason: String,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     canvas_cache: Option<crate::CanvasCache>,
     on_embedding_event: Arc<dyn Fn(EmbeddingEvent) + Send + Sync + 'static>,
 ) {
@@ -642,6 +652,7 @@ fn enqueue_agent_pipeline_in_background(
             &atom_id,
             &reason,
             external_settings,
+            inline_pipeline,
             canvas_cache.as_ref(),
             on_embedding_event,
         )
@@ -663,6 +674,7 @@ async fn execute_edit_atom(
     storage: &StorageBackend,
     tool_args: &serde_json::Value,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     canvas_cache: Option<&crate::CanvasCache>,
     on_embedding_event: Arc<dyn Fn(EmbeddingEvent) + Send + Sync + 'static>,
 ) -> Result<Option<AtomWithTags>, String> {
@@ -710,6 +722,7 @@ async fn execute_edit_atom(
         atom_id.to_string(),
         "agent_edit_atom".to_string(),
         external_settings,
+        inline_pipeline,
         canvas_cache.cloned(),
         on_embedding_event,
     );
@@ -900,6 +913,7 @@ struct AgentContext {
     tool_calls_record: Vec<ChatToolCall>,
 }
 
+#[allow(clippy::too_many_arguments)] // Internal loop entry; each argument is a distinct context channel.
 async fn run_agent_loop(
     on_event: ChatEventCallback,
     storage: StorageBackend,
@@ -907,6 +921,7 @@ async fn run_agent_loop(
     model: String,
     mut ctx: AgentContext,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     page_context: Option<&PageContext>,
     canvas_context: Option<&CanvasContext>,
     canvas_cache: Option<&crate::CanvasCache>,
@@ -1128,6 +1143,7 @@ async fn run_agent_loop(
                             &storage,
                             &tool_args,
                             external_settings.clone(),
+                            inline_pipeline,
                             canvas_cache,
                             Arc::clone(&on_embedding_event),
                         )
@@ -1162,6 +1178,7 @@ async fn run_agent_loop(
                             &storage,
                             &tool_args,
                             external_settings.clone(),
+                            inline_pipeline,
                             canvas_cache,
                             Arc::clone(&on_embedding_event),
                         )
@@ -1291,27 +1308,34 @@ pub async fn send_chat_message<F>(
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
 {
-    send_chat_message_with_settings(storage, conversation_id, content, on_event, None).await
+    send_chat_message_with_settings(storage, conversation_id, content, on_event, None, true).await
 }
 
-/// Like `send_chat_message` but with externally-provided settings (from registry).
+/// Like `send_chat_message` but with externally-provided settings (from
+/// registry). `inline_pipeline` controls whether atom mutations made by the
+/// agent's tools execute their embedding/tagging jobs in-process (`true`,
+/// the default behavior) or leave them in the durable ledger for the host's
+/// dedicated pipeline worker (see `AtomicCore::set_inline_pipeline`).
 pub async fn send_chat_message_with_settings<F>(
     storage: StorageBackend,
     conversation_id: &str,
     content: &str,
     on_event: F,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
 ) -> Result<ChatMessageWithContext, String>
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
 {
     let on_event: ChatEventCallback = Arc::new(on_event);
 
-    // Resolve settings (from registry if provided, otherwise from storage)
+    // Resolve settings (from the caller's resolved map if provided,
+    // otherwise the storage layer's global tier — provider config is
+    // deployment-wide)
     let settings_map = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -1402,6 +1426,7 @@ where
         model,
         ctx,
         Some(settings_map),
+        inline_pipeline,
         None,
         None,
         None,
@@ -1446,12 +1471,14 @@ where
 
 /// Like `send_chat_message_with_settings` but with optional UI context for
 /// page-aware and canvas-aware tools.
+#[allow(clippy::too_many_arguments)] // Public chat entry; each argument is a distinct context channel.
 pub async fn send_chat_message_with_canvas<F>(
     storage: StorageBackend,
     conversation_id: &str,
     content: &str,
     on_event: F,
     external_settings: Option<std::collections::HashMap<String, String>>,
+    inline_pipeline: bool,
     canvas_context: Option<CanvasContext>,
     page_context: Option<PageContext>,
     canvas_cache: Option<crate::CanvasCache>,
@@ -1461,11 +1488,13 @@ where
 {
     let on_event: ChatEventCallback = Arc::new(on_event);
 
-    // Resolve settings (from registry if provided, otherwise from storage)
+    // Resolve settings (from the caller's resolved map if provided,
+    // otherwise the storage layer's global tier — provider config is
+    // deployment-wide)
     let settings_map = match external_settings {
         Some(s) => s,
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -1562,6 +1591,7 @@ where
         model,
         ctx,
         Some(settings_map),
+        inline_pipeline,
         page_context.as_ref(),
         canvas_context.as_ref(),
         canvas_cache.as_ref(),

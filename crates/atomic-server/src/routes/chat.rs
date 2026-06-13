@@ -3,7 +3,7 @@
 use crate::db_extractor::Db;
 use crate::error::{ok_or_error, ApiErrorResponse};
 use crate::event_bridge::chat_event_callback;
-use crate::state::AppState;
+use crate::event_channel::EventChannel;
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -146,14 +146,14 @@ pub struct SendMessageBody {
 
 #[utoipa::path(post, path = "/api/conversations/{id}/messages", params(("id" = String, Path, description = "Conversation ID")), request_body = SendMessageBody, responses((status = 200, description = "Assistant response (streaming events via WebSocket)", body = atomic_core::ChatMessageWithContext)), tag = "chat")]
 pub async fn send_chat_message(
-    state: web::Data<AppState>,
+    events: EventChannel,
     db: Db,
     path: web::Path<String>,
     body: web::Json<SendMessageBody>,
 ) -> HttpResponse {
     let conversation_id = path.into_inner();
     let body = body.into_inner();
-    let on_event = chat_event_callback(state.event_tx.clone());
+    let on_event = chat_event_callback(events.0.clone());
 
     let result = if body.canvas_context.is_some() || body.page_context.is_some() {
         db.0.send_chat_message_with_canvas(

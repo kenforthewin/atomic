@@ -16,7 +16,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -41,10 +41,60 @@ pub struct MockAiServer {
     counters: Arc<MockAiCounters>,
 }
 
+/// An injectable failure response, served instead of the normal payload
+/// while set (see [`MockAiServer::set_embedding_failure`] /
+/// [`MockAiServer::set_chat_failure`]). Lets tests exercise providers'
+/// status-code handling — retry/backoff behavior, rate-limit hints,
+/// billing rejections — against the real HTTP clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedFailure {
+    /// HTTP 429, optionally carrying a `Retry-After: <secs>` header.
+    RateLimited { retry_after_secs: Option<u64> },
+    /// HTTP 402 with a provider-style error body.
+    PaymentRequired,
+    /// HTTP 401 with a provider-style error body (expired/revoked API key).
+    Unauthorized,
+}
+
+impl InjectedFailure {
+    fn response(self) -> ResponseTemplate {
+        match self {
+            InjectedFailure::RateLimited { retry_after_secs } => {
+                let mut response = ResponseTemplate::new(429).set_body_json(json!({
+                    "error": { "message": "mock rate limit exceeded" }
+                }));
+                if let Some(secs) = retry_after_secs {
+                    response = response.insert_header("Retry-After", secs.to_string().as_str());
+                }
+                response
+            }
+            InjectedFailure::PaymentRequired => ResponseTemplate::new(402).set_body_json(json!({
+                "error": { "message": "mock insufficient credits" }
+            })),
+            InjectedFailure::Unauthorized => ResponseTemplate::new(401).set_body_json(json!({
+                "error": { "message": "mock invalid api key" }
+            })),
+        }
+    }
+}
+
 #[derive(Default)]
 struct MockAiCounters {
     embedding_requests: AtomicUsize,
     chat_requests: AtomicUsize,
+    /// The `model` field of every `/v1/chat/completions` request body, in
+    /// arrival order — lets tests assert *which* model an operation selected,
+    /// not just that a call happened.
+    chat_models: Mutex<Vec<String>>,
+    /// When set, `/v1/embeddings` serves this failure instead of embeddings.
+    embedding_failure: Mutex<Option<InjectedFailure>>,
+    /// When set, `/v1/chat/completions` serves this failure instead of a
+    /// completion.
+    chat_failure: Mutex<Option<InjectedFailure>>,
+    /// When set, every `/v1/chat/completions` response (success or injected
+    /// failure) is held for this long before being sent — latency injection
+    /// for tests that need requests to genuinely overlap in flight.
+    chat_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl MockAiServer {
@@ -90,9 +140,52 @@ impl MockAiServer {
         self.counters.chat_requests.load(Ordering::Relaxed)
     }
 
+    /// The `model` requested by each chat-completions call so far, in
+    /// arrival order.
+    pub fn chat_request_models(&self) -> Vec<String> {
+        self.counters
+            .chat_models
+            .lock()
+            .expect("chat_models lock")
+            .clone()
+    }
+
+    /// Make `/v1/embeddings` fail with `failure` until cleared with `None`.
+    /// Requests are still counted while failing.
+    pub fn set_embedding_failure(&self, failure: Option<InjectedFailure>) {
+        *self
+            .counters
+            .embedding_failure
+            .lock()
+            .expect("embedding_failure lock") = failure;
+    }
+
+    /// Make `/v1/chat/completions` fail with `failure` until cleared with
+    /// `None`. Requests are still counted while failing.
+    pub fn set_chat_failure(&self, failure: Option<InjectedFailure>) {
+        *self
+            .counters
+            .chat_failure
+            .lock()
+            .expect("chat_failure lock") = failure;
+    }
+
+    /// Hold every `/v1/chat/completions` response for `delay` until cleared
+    /// with `None`. Lets tests keep several chat requests concurrently
+    /// in flight (e.g. concurrency-cap assertions) without racing the
+    /// responder.
+    pub fn set_chat_delay(&self, delay: Option<std::time::Duration>) {
+        *self.counters.chat_delay.lock().expect("chat_delay lock") = delay;
+    }
+
     pub fn reset_counts(&self) {
         self.counters.embedding_requests.store(0, Ordering::Relaxed);
         self.counters.chat_requests.store(0, Ordering::Relaxed);
+        self.counters
+            .chat_models
+            .lock()
+            .expect("chat_models lock")
+            .clear();
     }
 }
 
@@ -171,16 +264,23 @@ fn streaming_chat_response(body: &Value) -> ResponseTemplate {
     } else {
         // First leg: ask the runtime to run `search_atoms`. The query is
         // lifted from the most recent user message so the search hits the
-        // seeded atoms verbatim.
+        // seeded atoms verbatim. The tool-call id must be unique per
+        // response — the runtime persists tool calls by this id, and
+        // concurrent conversations would otherwise collide on it.
         let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
         let arguments = json!({ "query": query, "limit": 5 }).to_string();
+        static TOOL_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let call_id = format!(
+            "call_mock_search_{}",
+            TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let chunks = [
             json!({
                 "choices": [{
                     "delta": {
                         "tool_calls": [{
                             "index": 0,
-                            "id": "call_mock_search",
+                            "id": call_id,
                             "type": "function",
                             "function": {
                                 "name": "search_atoms",
@@ -285,6 +385,14 @@ impl Respond for EmbedResponder {
         self.counters
             .embedding_requests
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(failure) = *self
+            .counters
+            .embedding_failure
+            .lock()
+            .expect("embedding_failure lock")
+        {
+            return failure.response();
+        }
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(_) => return ResponseTemplate::new(400),
@@ -319,10 +427,32 @@ struct ChatResponder {
 impl Respond for ChatResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
+        // Latency injection applies to every chat response uniformly —
+        // success, injected failure, or malformed-request 400.
+        let delay = *self.counters.chat_delay.lock().expect("chat_delay lock");
+        let with_delay = |response: ResponseTemplate| match delay {
+            Some(d) => response.set_delay(d),
+            None => response,
+        };
+        if let Some(failure) = *self
+            .counters
+            .chat_failure
+            .lock()
+            .expect("chat_failure lock")
+        {
+            return with_delay(failure.response());
+        }
         let body: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
-            Err(_) => return ResponseTemplate::new(400),
+            Err(_) => return with_delay(ResponseTemplate::new(400)),
         };
+        if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+            self.counters
+                .chat_models
+                .lock()
+                .expect("chat_models lock")
+                .push(model.to_string());
+        }
 
         // Streaming chat (agent loop). Detected by `stream: true` plus a
         // `tools` array — the chat agent always sends tools, while wiki /
@@ -341,7 +471,7 @@ impl Respond for ChatResponder {
             .map(|t| !t.is_empty())
             .unwrap_or(false);
         if is_streaming && has_tools {
-            return streaming_chat_response(&body);
+            return with_delay(streaming_chat_response(&body));
         }
 
         // Non-streaming chat with tools — used by the reports agentic loop.
@@ -351,7 +481,7 @@ impl Respond for ChatResponder {
         // out of the report e2e tests (search-based tool flow is already
         // covered by slice 3c's chat suite).
         if !is_streaming && has_tools {
-            return ResponseTemplate::new(200).set_body_json(json!({
+            return with_delay(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "mock-cmpl",
                 "object": "chat.completion",
                 "choices": [{
@@ -370,7 +500,7 @@ impl Respond for ChatResponder {
                     },
                     "finish_reason": "tool_calls"
                 }]
-            }));
+            })));
         }
 
         // Inspect the requested schema name so this responder can serve
@@ -402,6 +532,18 @@ impl Respond for ChatResponder {
             // citation extractor parses `\[(\d+)\]` against that source
             // list.
             //
+            // Two marker-driven modes for the ledger e2e tests, keyed on
+            // the tag name (which lands in the prompt as `Write a wiki
+            // article about "{tag_name}"`):
+            //
+            // - `WikiFail...` → 400. Non-retryable at the provider layer
+            //   (`is_retryable` excludes 400), so the failure surfaces
+            //   immediately and the `task_runs` retry/backoff machinery —
+            //   not the provider's internal retry — owns recovery.
+            // - `WikiSlow...` → normal article after a delay, long enough
+            //   that a concurrent regeneration request deterministically
+            //   observes the first one's live lease.
+            //
             // The legacy `update_wiki` path reuses this schema for a full
             // rewrite. Detect the update prompt shape ("NEW SOURCES TO
             // INCORPORATE") and emit a *different* body that pins the new
@@ -409,6 +551,11 @@ impl Respond for ChatResponder {
             // byte-identical to the original generation and tests can't
             // distinguish the two.
             "wiki_generation_result" => {
+                if request_text.contains("wikifail") {
+                    return with_delay(ResponseTemplate::new(400).set_body_json(json!({
+                        "error": { "message": "mock wiki generation failure" }
+                    })));
+                }
                 let n = count_numbered_sources(&body);
                 if let Some(new_index) = first_new_source_index(&body) {
                     // Update path: cite the new source so the test can
@@ -460,13 +607,11 @@ impl Respond for ChatResponder {
             // `Source [N]: ...` blocks; cite the first one and
             // `extract_citations` resolves the marker against the citables
             // table so the finding atom gets a non-empty citation row.
-            "report_generation_result" => {
-                json!({
-                    "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
-                    "citations_used": [1],
-                })
-                .to_string()
-            }
+            "report_generation_result" => json!({
+                "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
+                "citations_used": [1],
+            })
+            .to_string(),
             // Wiki incremental update: emit a single AppendToSection op
             // pinned to the heading the existing article uses, referencing
             // the first new-source index. Tests assert that the update
@@ -494,7 +639,7 @@ impl Respond for ChatResponder {
             _ => "{}".to_string(),
         };
 
-        ResponseTemplate::new(200).set_body_json(json!({
+        let mut response = ResponseTemplate::new(200).set_body_json(json!({
             "id": "mock-cmpl",
             "object": "chat.completion",
             "choices": [
@@ -507,6 +652,12 @@ impl Respond for ChatResponder {
                     "finish_reason": "stop",
                 }
             ],
-        }))
+        }));
+        // Slow-wiki mode: hold the response long enough that overlapping
+        // regeneration requests genuinely race the in-flight one's lease.
+        if schema_name == "wiki_generation_result" && request_text.contains("wikislow") {
+            response = response.set_delay(std::time::Duration::from_millis(1500));
+        }
+        with_delay(response)
     }
 }

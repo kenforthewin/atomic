@@ -8,6 +8,11 @@
 //!   `/article-1` and `/article-2` on the same host.
 //! - HTML articles at `GET /article-N` long enough for `readability` to
 //!   accept them — minimum prose length is empirically ~300 chars.
+//! - Failure-shaped feed variants for the feed-poll ledger tests: a feed
+//!   that parses once then 500s ([`MockUrlServer::flaky_feed_url`]), one
+//!   that always 500s ([`MockUrlServer::broken_feed_url`]), and one that
+//!   responds slowly ([`MockUrlServer::slow_feed_url`]) so tests can
+//!   overlap two poll sweeps deterministically.
 //!
 //! The exact response shapes are tuned to satisfy `feed-rs`'s parser
 //! (Atom requires `<id>`, `<updated>`, and at least one `<entry>`) and
@@ -15,8 +20,15 @@
 //! internal threshold). Tests should treat these as fixed and reuse the
 //! helper instead of building feeds inline.
 
+use std::time::Duration;
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Response delay on [`MockUrlServer::slow_feed_url`] — long enough that a
+/// test driving two poll sweeps concurrently is guaranteed the second
+/// sweep's claim attempt lands while the first poll's lease is live.
+pub const SLOW_FEED_DELAY: Duration = Duration::from_millis(500);
 
 /// Public re-export of the article HTML so callers can sanity-check the
 /// readability heuristic against the same content the mock serves.
@@ -44,14 +56,17 @@ impl MockUrlServer {
         // gate see the right type on the response.
         Mock::given(method("GET"))
             .and(path("/feed.xml"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(atom_feed(&base).into_bytes(), "application/atom+xml"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                atom_feed(&base, "/feed.xml").into_bytes(),
+                "application/atom+xml",
+            ))
             .mount(&server)
             .await;
 
-        for (slug, title) in [("/article-1", "Mock Article One"), ("/article-2", "Mock Article Two")] {
+        for (slug, title) in [
+            ("/article-1", "Mock Article One"),
+            ("/article-2", "Mock Article Two"),
+        ] {
             Mock::given(method("GET"))
                 .and(path(slug))
                 .respond_with(
@@ -65,11 +80,50 @@ impl MockUrlServer {
         // A non-HTML path for the "reject non-HTML" ingest contract test.
         Mock::given(method("GET"))
             .and(path("/plaintext"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "just text, nothing structural here".as_bytes().to_vec(),
+                "text/plain",
+            ))
+            .mount(&server)
+            .await;
+
+        // A feed that parses exactly once (enough for create-time
+        // validation) and 500s on every later fetch — the fixture for poll
+        // retry/backoff tests. Mount order matters: wiremock consumes the
+        // one-shot success first, then the catch-all 500 takes over.
+        Mock::given(method("GET"))
+            .and(path("/flaky-feed.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                atom_feed(&base, "/flaky-feed.xml").into_bytes(),
+                "application/atom+xml",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flaky-feed.xml"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        // A permanently broken feed for tests that seed definitions
+        // directly in storage and don't need create-time validation.
+        Mock::given(method("GET"))
+            .and(path("/broken-feed.xml"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        // A valid feed that responds slowly — see [`SLOW_FEED_DELAY`].
+        Mock::given(method("GET"))
+            .and(path("/slow-feed.xml"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_raw(
-                    "just text, nothing structural here".as_bytes().to_vec(),
-                    "text/plain",
-                ),
+                ResponseTemplate::new(200)
+                    .set_delay(SLOW_FEED_DELAY)
+                    .set_body_raw(
+                        atom_feed(&base, "/slow-feed.xml").into_bytes(),
+                        "application/atom+xml",
+                    ),
             )
             .mount(&server)
             .await;
@@ -92,18 +146,37 @@ impl MockUrlServer {
     pub fn plaintext_url(&self) -> String {
         format!("{}/plaintext", self.server.uri())
     }
+
+    /// Feed that serves a valid document on the first fetch and 500s on
+    /// every fetch after that. Lets a test create the feed through the
+    /// normal validate-on-create path and still observe poll failures.
+    pub fn flaky_feed_url(&self) -> String {
+        format!("{}/flaky-feed.xml", self.server.uri())
+    }
+
+    /// Feed that always responds 500.
+    pub fn broken_feed_url(&self) -> String {
+        format!("{}/broken-feed.xml", self.server.uri())
+    }
+
+    /// Valid feed delayed by [`SLOW_FEED_DELAY`] per response.
+    pub fn slow_feed_url(&self) -> String {
+        format!("{}/slow-feed.xml", self.server.uri())
+    }
 }
 
-fn atom_feed(base: &str) -> String {
+fn atom_feed(base: &str, self_path: &str) -> String {
     // Atom 1.0 — feed-rs accepts both Atom and RSS, but Atom's `<id>`
     // requirement gives the feed entries stable GUIDs without us having
     // to manage RSS `<guid>` semantics. The `<updated>` field is required
     // by spec but ignored by our parser; we set it to a fixed past date
-    // so the test is reproducible.
+    // so the test is reproducible. `self_path` keeps each feed variant's
+    // `<id>` distinct; the entries (and their article links) are shared —
+    // feed-item GUID claims are keyed per feed, so that never collides.
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <id>{base}/feed.xml</id>
+  <id>{base}{self_path}</id>
   <title>Mock Feed</title>
   <updated>2026-01-01T00:00:00Z</updated>
   <link href="{base}"/>

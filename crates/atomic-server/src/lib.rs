@@ -3,10 +3,12 @@
 //! The binary entry point is in `main.rs`. This module re-exports the pieces
 //! needed to spin up a test server.
 
+pub mod app;
 pub mod auth;
-mod db_extractor;
+pub mod db_extractor;
 pub mod error;
 pub mod event_bridge;
+pub mod event_channel;
 pub mod export_jobs;
 pub mod log_buffer;
 pub mod mcp;
@@ -17,7 +19,6 @@ pub mod ws;
 
 use actix_web::{HttpResponse, Responder};
 use utoipa::OpenApi;
-pub use utoipa_scalar::{Scalar, Servable};
 
 #[derive(OpenApi)]
 #[openapi(

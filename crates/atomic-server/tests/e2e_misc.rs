@@ -9,7 +9,7 @@
 //!
 //! The Ollama discovery endpoints are not exercised here because they hit a
 //! real Ollama server. Hooking them up would require a separate mock that
-//! speaks Ollama's `/api/tags` shape; defer until we ship Ollama-on-cloud.
+//! speaks Ollama's `/api/tags` shape; defer until something needs it.
 
 mod support;
 
@@ -20,11 +20,7 @@ use support::{poll_until_embedding_done, test_app, Backend, TestCtx};
 
 // ==================== Helpers ====================
 
-async fn seed_atom<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    content: &str,
-) -> String
+async fn seed_atom<S, B>(app: &S, auth: (&'static str, String), content: &str) -> String
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -56,7 +52,9 @@ async fn canvas_positions_round_trip_sqlite() {
 #[actix_web::test]
 async fn canvas_positions_round_trip_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("canvas_positions_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "canvas_positions_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_canvas_positions_round_trip(Backend::Postgres).await;
@@ -134,7 +132,9 @@ async fn graph_edges_after_pipeline_sqlite() {
 #[actix_web::test]
 async fn graph_edges_after_pipeline_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("graph_edges_after_pipeline_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "graph_edges_after_pipeline_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_graph_edges_after_pipeline(Backend::Postgres).await;
@@ -295,7 +295,9 @@ async fn logs_endpoint_returns_string_sqlite() {
 #[actix_web::test]
 async fn logs_endpoint_returns_string_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("logs_endpoint_returns_string_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "logs_endpoint_returns_string_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_logs_endpoint_returns_string(Backend::Postgres).await;
@@ -327,7 +329,9 @@ async fn create_then_delete_database_sqlite() {
 #[actix_web::test]
 async fn create_then_delete_database_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("create_then_delete_database_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "create_then_delete_database_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_create_then_delete_database(Backend::Postgres).await;
@@ -356,14 +360,21 @@ async fn run_create_then_delete_database(backend: Backend) {
     let resp = actix_test::call_service(&app, req).await;
     let body: Value = actix_test::read_body_json(resp).await;
     let dbs: Vec<Value> = body["databases"].as_array().cloned().unwrap_or_default();
-    assert!(dbs.iter().any(|d| d["id"] == id), "new DB must appear in list");
+    assert!(
+        dbs.iter().any(|d| d["id"] == id),
+        "new DB must appear in list"
+    );
 
     let req = actix_test::TestRequest::delete()
         .uri(&format!("/api/databases/{id}"))
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert!(resp.status().is_success(), "delete must succeed; got {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "delete must succeed; got {}",
+        resp.status()
+    );
 
     let req = actix_test::TestRequest::get()
         .uri("/api/databases")
@@ -386,7 +397,9 @@ async fn rename_database_round_trip_sqlite() {
 #[actix_web::test]
 async fn rename_database_round_trip_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("rename_database_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "rename_database_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_rename_database_round_trip(Backend::Postgres).await;
@@ -450,7 +463,10 @@ async fn run_utils_sqlite_vec_returns_version(backend: Backend) {
         .insert_header(ctx.auth_header())
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert!(resp.status().is_success(), "sqlite-vec must be loaded in tests");
+    assert!(
+        resp.status().is_success(),
+        "sqlite-vec must be loaded in tests"
+    );
     let body: Value = actix_test::read_body_json(resp).await;
     assert!(body["version"].is_string());
 }

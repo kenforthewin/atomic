@@ -153,6 +153,28 @@ impl SqliteStorage {
         Ok(PaginatedTagChildren { children, total })
     }
 
+    pub(crate) fn get_tag_impl(&self, id: &str) -> StorageResult<Option<Tag>> {
+        let conn = self.db.read_conn()?;
+        let tag = conn
+            .query_row(
+                "SELECT id, name, parent_id, created_at, is_autotag_target, autotag_description
+                 FROM tags WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(Tag {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        parent_id: row.get(2)?,
+                        created_at: row.get(3)?,
+                        is_autotag_target: row.get::<_, i32>(4)? != 0,
+                        autotag_description: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(tag)
+    }
+
     pub(crate) fn create_tag_impl(
         &self,
         name: &str,
@@ -669,6 +691,10 @@ impl TagStore for SqliteStorage {
         offset: i32,
     ) -> StorageResult<PaginatedTagChildren> {
         self.get_tag_children_impl(parent_id, min_count, limit, offset)
+    }
+
+    async fn get_tag(&self, id: &str) -> StorageResult<Option<Tag>> {
+        self.get_tag_impl(id)
     }
 
     async fn create_tag(&self, name: &str, parent_id: Option<&str>) -> StorageResult<Tag> {

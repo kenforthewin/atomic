@@ -99,33 +99,24 @@ pub struct AppState {
 impl AppState {
     /// Resolve which database core to use for a request.
     /// Checks X-Atomic-Database header, then ?db= query param, then falls back to active.
+    /// Delegates to [`crate::db_extractor::resolve_core`], which owns the
+    /// per-request selection rules for any manager.
+    ///
+    /// **Warning:** this resolves against `self.manager` only — it never
+    /// consults the
+    /// [`RequestDatabaseManager`](crate::db_extractor::RequestDatabaseManager)
+    /// request extension, so it silently ignores a composing layer's
+    /// per-request manager override. Handler code should use the
+    /// [`Db`](crate::db_extractor::Db) extractor (or
+    /// [`request_manager`](crate::db_extractor::request_manager) +
+    /// `resolve_core`) instead; reach for this method only when you
+    /// explicitly want *this* state's manager regardless of the request's
+    /// composition context.
     pub async fn resolve_core(
         &self,
         req: &actix_web::HttpRequest,
     ) -> Result<AtomicCore, atomic_core::AtomicCoreError> {
-        // Check X-Atomic-Database header
-        if let Some(db_id) = req
-            .headers()
-            .get("X-Atomic-Database")
-            .and_then(|v| v.to_str().ok())
-        {
-            return self.manager.get_core(db_id).await;
-        }
-
-        // Check ?db= query parameter
-        if let Some(db_id) = req.query_string().split('&').find_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            if parts.next()? == "db" {
-                parts.next()
-            } else {
-                None
-            }
-        }) {
-            return self.manager.get_core(db_id).await;
-        }
-
-        // Default to active database
-        self.manager.active_core().await
+        crate::db_extractor::resolve_core(&self.manager, req).await
     }
 }
 

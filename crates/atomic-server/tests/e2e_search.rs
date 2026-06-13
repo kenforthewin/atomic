@@ -55,11 +55,7 @@ where
 }
 
 /// POST /api/search and return the parsed result array.
-async fn run_search<S, B>(
-    app: &S,
-    auth: (&'static str, String),
-    payload: Value,
-) -> Vec<Value>
+async fn run_search<S, B>(app: &S, auth: (&'static str, String), payload: Value) -> Vec<Value>
 where
     S: actix_web::dev::Service<
         actix_http::Request,
@@ -234,7 +230,9 @@ async fn hybrid_search_combines_both_sqlite() {
 #[actix_web::test]
 async fn hybrid_search_combines_both_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("hybrid_search_combines_both_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "hybrid_search_combines_both_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_hybrid_search_combines_both(Backend::Postgres).await;

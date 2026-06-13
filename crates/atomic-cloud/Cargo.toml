@@ -2,45 +2,88 @@
 name = "atomic-cloud"
 version = "0.1.0"
 edition = "2021"
-description = "Management plane for Atomic managed hosting"
+description = "Multi-tenant cloud composition layer for Atomic (Postgres, database-per-account)"
 license = "MIT"
+
+[lib]
+name = "atomic_cloud"
+path = "src/lib.rs"
 
 [[bin]]
 name = "atomic-cloud"
 path = "src/main.rs"
 
 [dependencies]
-# Web framework
+# The crates this one composes. Dependency arrow is strictly one-way:
+# atomic-cloud → atomic-server → atomic-core (see docs/plans/atomic-cloud.md).
+atomic-server = { path = "../atomic-server" }
+atomic-core = { path = "../atomic-core", features = ["postgres"] }
+
+# Web framework — same major as atomic-server so middleware composes.
 actix-web = "4.9"
-actix-cors = "0.7"
-actix-files = "0.6"
+
+# Database — version/features match atomic-core's postgres feature exactly,
+# plus `chrono` for TIMESTAMPTZ decode and `json` for JSONB decode
+# (`provider_credentials.model_config`) on control-plane rows.
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "json"] }
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
-futures = "0.3"
-
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
-
-# HTTP client (Stripe + Fly APIs)
-reqwest = { version = "0.12", features = ["json"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-
-
-# Crypto (Stripe webhook verification)
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Error handling
 thiserror = "1"
+
+# Middleware plumbing — `LocalBoxFuture` for the actix Service impls and
+# JSON denial bodies; versions match atomic-server's usage of both.
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Email delivery (account plane) — `async-trait` for the object-safe
+# EmailSender trait, `reqwest` for the Mailgun REST client; versions match
+# the rest of the workspace.
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Control-plane primitives — versions match the rest of the workspace.
+aes-gcm = "0.10"        # AES-256-GCM provider-credential encryption (keyvault)
+chrono = "0.4"
+data-encoding = "2"     # base32 tenant-database names; hex token hashes
+rand = "0.8"            # OsRng for token/session secrets
+sha2 = "0.10"           # SHA-256 token/session hashing
+url = "2"               # tenant-database URL construction
+uuid = { version = "1", features = ["v4"] }
+
+# Scratch directory backing the inert fallback `AppState` (see
+# `server::FallbackAppState`) — process-lifetime, removed on drop.
+tempfile = "3"
+
+[dev-dependencies]
+# (`futures` above also powers the test-database cleanup guard's
+# `FutureExt::catch_unwind`.)
+# The capturing EmailSender in tests/support implements the async trait and
+# the magic-link tests recompute stored hashes from captured plaintexts.
+async-trait = "0.1"
+data-encoding = "2"
+sha2 = "0.10"
+# Shared mock OpenAI-compat server, so tenant pipelines in the e2e suite
+# never hit real providers.
+atomic-test-support = { path = "../atomic-test-support" }
+# HTTP client for the e2e suite — drives the composed cloud server over a
+# real port with explicit Host headers. Version matches the workspace.
+reqwest = { version = "0.12", features = ["json"] }
+# WebSocket client for the tenant-isolation and eviction-pinning e2e tests.
+# Versions match atomic-server's e2e suite.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+# Mock HTTP server pinning OpenRouterProvisioning's request shape (auth
+# header, body fields, response parsing, error mapping) — NO REAL PROVIDERS.
+# Version matches atomic-test-support.
+wiremock = "0.6"

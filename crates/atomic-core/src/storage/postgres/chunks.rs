@@ -1462,6 +1462,56 @@ impl ChunkStore for PostgresStorage {
                 })?;
         Ok(count as i32)
     }
+
+    /// Count jobs the claim query would return right now. Mirrors the
+    /// claimability predicate in [`Self::claim_pipeline_jobs`] exactly; keep
+    /// the two in sync.
+    async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM atom_pipeline_jobs j
+             INNER JOIN atoms a ON a.id = j.atom_id AND a.db_id = j.db_id
+             WHERE j.db_id = $1
+               AND (
+                 j.state = 'pending'
+                 OR (j.state = 'processing' AND j.lease_until IS NOT NULL AND j.lease_until <= $2)
+               )
+               AND j.not_before <= $2
+               AND (
+                 j.embed_requested
+                 OR (j.tag_requested AND a.embedding_status = 'complete')
+               )",
+        )
+        .bind(&self.db_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Failed to count due pipeline jobs: {}", e))
+        })?;
+        Ok(count as i32)
+    }
+
+    async fn rearm_pipeline_jobs(&self, reason: &str, now: &str) -> StorageResult<u64> {
+        let result = sqlx::query(
+            "UPDATE atom_pipeline_jobs
+                SET not_before = $3,
+                    updated_at = $3
+              WHERE db_id = $1
+                AND state = 'pending'
+                AND reason = $2
+                AND not_before > $3",
+        )
+        .bind(&self.db_id)
+        .bind(reason)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Failed to re-arm pipeline jobs: {}", e))
+        })?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ==================== Pipeline status ====================
@@ -1579,9 +1629,10 @@ impl PostgresStorage {
             tagging_skipped,
             tagging_failed_count,
             tagging_failed,
-            // Postgres backend does not snapshot a per-DB legacy count: the
-            // shared settings table has no per-DB scope. UI gracefully
-            // omits the legacy warning when this is 0.
+            // Postgres backend does not snapshot a per-DB legacy count:
+            // the legacy-tag migration is a SQLite-era concern with no
+            // Postgres deployments behind it. UI gracefully omits the
+            // legacy warning when this is 0.
             legacy_auto_tag_count: 0,
         })
     }

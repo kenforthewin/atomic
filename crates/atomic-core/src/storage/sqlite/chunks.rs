@@ -1012,6 +1012,47 @@ impl SqliteStorage {
         .map_err(AtomicCoreError::from)
     }
 
+    /// Count jobs the claim query would return right now. Mirrors the
+    /// claimability predicate in [`Self::claim_pipeline_jobs_sync`] exactly;
+    /// keep the two in sync.
+    pub(crate) fn count_due_pipeline_jobs_sync(&self, now: &str) -> StorageResult<i32> {
+        let conn = self.db.read_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM atom_pipeline_jobs j
+             INNER JOIN atoms a ON a.id = j.atom_id
+             WHERE (j.state = 'pending'
+                    OR (j.state = 'processing' AND j.lease_until IS NOT NULL AND j.lease_until <= ?1))
+               AND j.not_before <= ?1
+               AND (j.embed_requested = 1
+                    OR (j.tag_requested = 1 AND a.embedding_status = 'complete'))",
+            [now],
+            |row| row.get(0),
+        )
+        .map_err(AtomicCoreError::from)
+    }
+
+    /// See `TaskRunStore`-adjacent `ChunkStore::rearm_pipeline_jobs`: reset
+    /// the `not_before` horizon on pending jobs stamped with `reason` —
+    /// the environment-changed escape hatch for backed-off pipeline work.
+    pub(crate) fn rearm_pipeline_jobs_sync(&self, reason: &str, now: &str) -> StorageResult<u64> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let changed = conn.execute(
+            "UPDATE atom_pipeline_jobs
+                SET not_before = ?2,
+                    updated_at = ?2
+              WHERE state = 'pending'
+                AND reason = ?1
+                AND not_before > ?2",
+            rusqlite::params![reason, now],
+        )?;
+        Ok(changed as u64)
+    }
+
     pub(crate) fn get_embedding_dimension_sync(&self) -> StorageResult<Option<usize>> {
         let conn = self.db.read_conn()?;
         let dim = conn
@@ -1438,6 +1479,14 @@ impl ChunkStore for SqliteStorage {
 
     async fn count_pipeline_jobs(&self) -> StorageResult<i32> {
         self.count_pipeline_jobs_sync()
+    }
+
+    async fn count_due_pipeline_jobs(&self, now: &str) -> StorageResult<i32> {
+        self.count_due_pipeline_jobs_sync(now)
+    }
+
+    async fn rearm_pipeline_jobs(&self, reason: &str, now: &str) -> StorageResult<u64> {
+        self.rearm_pipeline_jobs_sync(reason, now)
     }
 }
 

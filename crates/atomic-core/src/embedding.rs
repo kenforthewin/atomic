@@ -521,11 +521,13 @@ async fn process_embedding_only_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get settings for embeddings (from registry if provided, otherwise from data db)
+    // Get settings for embeddings (from the caller's resolved map if
+    // provided, otherwise the storage layer's global tier — provider config
+    // is deployment-wide, never per-DB)
     let settings_map = match external_settings {
         Some(ref s) => s.clone(),
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -694,11 +696,12 @@ async fn process_tagging_only_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get settings (from registry if provided, otherwise from data db)
+    // Get settings (from the caller's resolved map if provided, otherwise
+    // the global tier — tagging config is deployment-wide)
     let settings_map = match external_settings {
         Some(ref s) => s.clone(),
         None => storage
-            .get_all_settings_sync()
+            .get_global_settings_sync()
             .await
             .map_err(|e| e.to_string())?,
     };
@@ -758,9 +761,10 @@ async fn process_tagging_only_inner(
     // Load model capabilities (uses in-memory + DB cache to avoid redundant fetches)
     let supported_params: Option<Vec<String>> =
         if provider_config.provider_type == ProviderType::OpenRouter {
-            // Try to load capabilities from the settings cache
+            // Try to load capabilities from the settings cache (global
+            // tier — the cache is derived from the global provider config)
             let cached_json = storage
-                .get_setting_sync("model_capabilities_cache")
+                .get_global_setting_sync("model_capabilities_cache")
                 .await
                 .ok()
                 .flatten();
@@ -1172,11 +1176,11 @@ where
         "Starting pipeline for atoms"
     );
 
-    // === Get settings ===
+    // === Get settings (global tier — provider config is deployment-wide) ===
     let provider_config = {
         let settings_map = match external_settings {
             Some(ref s) => s.clone(),
-            None => match storage.get_all_settings_sync().await {
+            None => match storage.get_global_settings_sync().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to get settings");
@@ -1650,7 +1654,7 @@ where
 
     let settings_map = match external_settings.clone() {
         Some(s) => s,
-        None => match storage.get_all_settings_sync().await {
+        None => match storage.get_global_settings_sync().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to get settings for chunk-preserving re-embed");
@@ -2147,6 +2151,76 @@ where
     Ok(total_count as i32)
 }
 
+/// Claim up to `limit` due embedding/tagging jobs from the durable queue and
+/// process them to completion before returning.
+///
+/// The bounded-batch counterpart of [`process_queued_pipeline_jobs`], for
+/// hosts that run pipeline execution in a dedicated worker rather than
+/// spawning it from the save path: one claim, one batch, awaited inline. No
+/// task is spawned and [`crate::executor::EMBEDDING_BATCH_SEMAPHORE`] is not
+/// taken — the caller owns its own concurrency discipline (that semaphore
+/// exists to keep the fire-and-forget spawn path from stampeding a single
+/// process). Emits the same `PipelineQueue*` event family as the spawning
+/// path, scoped to this batch. Returns the number of jobs claimed; `0`
+/// means nothing was due.
+pub async fn run_pipeline_jobs_batch<F>(
+    storage: StorageBackend,
+    limit: i32,
+    on_event: F,
+    external_settings: Option<HashMap<String, String>>,
+    canvas_cache: Option<CanvasCache>,
+) -> Result<i32, String>
+where
+    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
+{
+    let now = chrono::Utc::now();
+    let lease_until = (now + chrono::Duration::minutes(30)).to_rfc3339();
+    let now = now.to_rfc3339();
+    let jobs = storage
+        .claim_pipeline_jobs_sync(limit, &lease_until, &now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let total_jobs = jobs.len();
+    let embedding_total = jobs.iter().filter(|job| job.embed_requested).count();
+    on_event(EmbeddingEvent::PipelineQueueStarted {
+        run_id: run_id.clone(),
+        total_jobs,
+        embedding_total,
+    });
+    if embedding_total > 0 {
+        on_event(EmbeddingEvent::PipelineQueueProgress {
+            run_id: run_id.clone(),
+            stage: "embedding".to_string(),
+            completed: 0,
+            total: embedding_total,
+        });
+    }
+
+    let progress = Arc::new(QueueRunProgress::new(run_id.clone()));
+    process_pipeline_jobs_batch(
+        storage,
+        jobs,
+        on_event.clone(),
+        external_settings,
+        canvas_cache,
+        progress.clone(),
+        embedding_total,
+    )
+    .await;
+
+    on_event(EmbeddingEvent::PipelineQueueCompleted {
+        run_id,
+        total_jobs,
+        failed_jobs: progress.failed_jobs(),
+    });
+    Ok(total_jobs as i32)
+}
+
 /// Convert L2 distance to cosine similarity for normalized vectors
 /// Formula: cosine_similarity = 1 - (L2_distance² / 2)
 /// This derives from: L2² = 2(1 - cos(θ)) for unit vectors
@@ -2315,107 +2389,8 @@ pub fn compute_semantic_edges_for_atom(
     Ok(edges_created)
 }
 
-/// Process all atoms with 'pending' embedding status
-///
-/// Fetches all pending atoms, marks them as 'processing', and processes them in batch.
-/// Returns the number of atoms queued for processing.
-pub async fn process_pending_embeddings<F>(
-    storage: StorageBackend,
-    on_event: F,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    process_pending_embeddings_inner(storage, on_event, None, canvas_cache).await
-}
-
-/// Process pending embeddings with externally-provided settings (from registry).
-pub async fn process_pending_embeddings_with_settings<F>(
-    storage: StorageBackend,
-    on_event: F,
-    settings_map: HashMap<String, String>,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    process_pending_embeddings_inner(storage, on_event, Some(settings_map), canvas_cache).await
-}
-
-/// Process pending embeddings only for atoms last updated at or before
-/// `max_updated_at` (RFC3339).
-pub async fn process_pending_embeddings_due<F>(
-    storage: StorageBackend,
-    on_event: F,
-    max_updated_at: String,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    process_pending_embeddings_due_inner(storage, on_event, max_updated_at, None, canvas_cache)
-        .await
-}
-
-/// Like `process_pending_embeddings_due` but with externally-provided settings.
-pub async fn process_pending_embeddings_due_with_settings<F>(
-    storage: StorageBackend,
-    on_event: F,
-    max_updated_at: String,
-    settings_map: HashMap<String, String>,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    process_pending_embeddings_due_inner(
-        storage,
-        on_event,
-        max_updated_at,
-        Some(settings_map),
-        canvas_cache,
-    )
-    .await
-}
-
 /// Max atoms to process per background embedding batch (limits memory usage).
 const PENDING_BATCH_SIZE: i32 = 100;
-
-async fn process_pending_embeddings_inner<F>(
-    storage: StorageBackend,
-    on_event: F,
-    external_settings: Option<HashMap<String, String>>,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    storage
-        .enqueue_pipeline_jobs_from_statuses_sync(None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    process_queued_pipeline_jobs_inner(storage, on_event, external_settings, canvas_cache).await
-}
-
-async fn process_pending_embeddings_due_inner<F>(
-    storage: StorageBackend,
-    on_event: F,
-    max_updated_at: String,
-    external_settings: Option<HashMap<String, String>>,
-    canvas_cache: Option<CanvasCache>,
-) -> Result<i32, String>
-where
-    F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
-{
-    storage
-        .enqueue_pipeline_jobs_from_statuses_sync(Some(&max_updated_at))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    process_queued_pipeline_jobs_inner(storage, on_event, external_settings, canvas_cache).await
-}
 
 /// Running accumulator for computing a centroid without holding all blobs in memory.
 struct CentroidAccumulator {

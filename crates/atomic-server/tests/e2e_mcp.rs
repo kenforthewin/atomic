@@ -97,7 +97,9 @@ async fn mcp_initialize_round_trip_sqlite() {
 #[actix_web::test]
 async fn mcp_initialize_round_trip_postgres() {
     if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
-        eprintln!("mcp_initialize_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)");
+        eprintln!(
+            "mcp_initialize_round_trip_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
         return;
     }
     run_mcp_initialize_round_trip(Backend::Postgres).await;

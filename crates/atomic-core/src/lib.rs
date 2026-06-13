@@ -66,13 +66,17 @@ pub use embedding::{EmbeddingEvent, EmbeddingStrategy, TaggingStrategy};
 pub use error::AtomicCoreError;
 pub use export::{MarkdownArchiveFormat, MarkdownExportProgress, MarkdownExportResult};
 pub use import::{ImportProgress, ImportResult};
+pub use ingest::poller::PollOutcome;
 pub use ingest::{FeedPollResult, IngestionEvent, IngestionRequest, IngestionResult};
 pub use manager::DatabaseManager;
 pub use models::*;
 pub use providers::{ProviderConfig, ProviderType};
 pub use registry::{DatabaseInfo, OAuthCodeInfo, Registry};
 pub use search::{SearchMode, SearchOptions};
+#[cfg(feature = "postgres")]
+pub use storage::PgPoolConfig;
 pub use tokens::ApiTokenInfo;
+pub use wiki::runner::RegenOutcome;
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -243,6 +247,41 @@ pub struct AtomicCore {
     /// When present, settings and token operations delegate to the shared registry.
     /// When absent (standalone use, tests), uses per-db tables as before.
     registry: Option<Arc<registry::Registry>>,
+    /// Active explicit provider configuration. `None` (the default for every
+    /// constructor without a `_provider` variant) keeps today's behavior:
+    /// provider config is resolved from the settings tables on every
+    /// operation. `Some` makes the held config authoritative — the settings
+    /// tables are never consulted for provider config (keys, base URLs,
+    /// provider selection, or any model selection, the per-task
+    /// `wiki_model`/`chat_model` keys included; see
+    /// `ProviderConfig::apply_to_settings`), only for non-provider AI
+    /// settings (prompts, strategies).
+    ///
+    /// Shared (`Arc`) across every core resolved from the same
+    /// `DatabaseManager`, so a live swap via [`AtomicCore::update_provider_config`]
+    /// takes effect for all logical databases at once. `RwLock` rather than a
+    /// per-operation read of settings keeps explicit mode coherent: operations
+    /// snapshot the config once at their start, so in-flight work finishes on
+    /// the config it started with.
+    provider_config: Arc<std::sync::RwLock<Option<ProviderConfig>>>,
+    /// Whether enqueued embedding/tagging pipeline jobs are also executed
+    /// in this process (`true`, the default for every constructor — today's
+    /// behavior) or left in the durable `atom_pipeline_jobs` ledger for a
+    /// dedicated pipeline worker owned by the composing process (`false`;
+    /// see [`set_inline_pipeline`](Self::set_inline_pipeline)). Shared
+    /// across every core resolved from the same Postgres `DatabaseManager`,
+    /// exactly like `provider_config`, so one composition-time switch
+    /// covers all of a manager's logical databases.
+    inline_pipeline: Arc<std::sync::atomic::AtomicBool>,
+    /// Host-installed classifier deciding whether a failed `task_runs`
+    /// execution consumes retry budget or defers (see
+    /// [`scheduler::ledger::FailureDisposition`]). `None` (every
+    /// constructor's default) keeps the historical behavior: every failure
+    /// counts against `max_attempts`. Shared across every core resolved from
+    /// the same Postgres `DatabaseManager`, exactly like `provider_config`,
+    /// so one composition-time install covers all logical databases.
+    failure_disposition_policy:
+        Arc<std::sync::RwLock<Option<scheduler::ledger::FailureDispositionPolicy>>>,
     /// Per-tag locks to serialize wiki operations (update, propose, accept,
     /// dismiss) against the same article. Prevents background + manual runs
     /// from racing and ensures supersede semantics are consistent. Entries are
@@ -263,6 +302,9 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry: None,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -300,37 +342,124 @@ impl AtomicCore {
     /// Most operations route through the Postgres storage backend. A few operations
     /// (search, wiki generation, chat agent) still require module-level refactoring
     /// and will return `Configuration` errors when used with Postgres.
+    ///
+    /// The connection pool is sized from the `ATOMIC_PG_*` environment
+    /// variables (see [`storage::PgPoolConfig::from_env`]); use
+    /// [`open_postgres_with_pool`](Self::open_postgres_with_pool) to size it
+    /// explicitly.
     #[cfg(feature = "postgres")]
     pub async fn open_postgres(
         database_url: &str,
         db_id: &str,
         registry: Option<Arc<registry::Registry>>,
     ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool(database_url, db_id, registry, PgPoolConfig::from_env()).await
+    }
+
+    /// Like [`open_postgres`](Self::open_postgres), but with an explicit
+    /// pool configuration instead of the `ATOMIC_PG_*` environment defaults.
+    ///
+    /// Callers that hold many independently pooled cores in one process can
+    /// use this to bound each pool so the sum stays within the Postgres
+    /// server's `max_connections`; `open_postgres` keeps the env-derived
+    /// default for the common one-core-per-process deployment.
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_pool(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        pool_config: PgPoolConfig,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool_and_provider(database_url, db_id, registry, pool_config, None)
+            .await
+    }
+
+    /// Like [`open_postgres`](Self::open_postgres), but with an explicit
+    /// provider configuration instead of resolving one from the settings
+    /// tables (see
+    /// [`open_postgres_with_pool_and_provider`](Self::open_postgres_with_pool_and_provider)
+    /// for the semantics).
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_provider(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        provider_config: Option<ProviderConfig>,
+    ) -> Result<Self, AtomicCoreError> {
+        Self::open_postgres_with_pool_and_provider(
+            database_url,
+            db_id,
+            registry,
+            PgPoolConfig::from_env(),
+            provider_config,
+        )
+        .await
+    }
+
+    /// Fully explicit Postgres constructor: pool sizing and provider
+    /// configuration are both injected rather than environment- or
+    /// settings-derived.
+    ///
+    /// `provider_config` semantics:
+    ///
+    /// * `Some(config)` — every AI operation builds its providers from
+    ///   `config`; the settings tables are **never** consulted for provider
+    ///   config (keys, base URLs, provider selection, or model selection —
+    ///   the config's `llm_model` also governs the per-task
+    ///   `wiki_model`/`chat_model` keys, so a settings write cannot route
+    ///   traffic on the configured credential to a model the config didn't
+    ///   choose). Non-provider AI settings (prompts, strategies) still
+    ///   resolve from settings. Composing processes that manage provider
+    ///   credentials outside the settings tables use this; pair with
+    ///   [`update_provider_config`](Self::update_provider_config)
+    ///   for live rotation.
+    /// * `None` — identical to [`open_postgres`](Self::open_postgres):
+    ///   provider config is read from settings on every operation.
+    ///
+    /// The SQLite constructors deliberately have no `_provider` variants —
+    /// no caller needs one today, and explicit mode remains reachable on any
+    /// backend via [`update_provider_config`](Self::update_provider_config).
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres_with_pool_and_provider(
+        database_url: &str,
+        db_id: &str,
+        registry: Option<Arc<registry::Registry>>,
+        pool_config: PgPoolConfig,
+        provider_config: Option<ProviderConfig>,
+    ) -> Result<Self, AtomicCoreError> {
         use storage::PostgresStorage;
 
-        let pg_storage = PostgresStorage::connect(database_url, db_id).await?;
+        let pg_storage =
+            PostgresStorage::connect_with_config(database_url, db_id, pool_config).await?;
         pg_storage.initialize().await?;
 
-        Self::reconcile_pg_vector_index(&pg_storage).await?;
+        Self::reconcile_pg_vector_index(&pg_storage, provider_config.as_ref()).await?;
 
         let storage = storage::StorageBackend::Postgres(pg_storage);
 
-        // Seed default category tags if tags table is empty
+        // Seed default category tags if tags table is empty. The emptiness
+        // check keeps deliberately deleted categories deleted; the upsert
+        // (rather than a plain insert) keeps concurrent opens of the same
+        // logical database from racing each other into a duplicate-key error.
         let all_tags = storage.get_all_tags_impl().await?;
         if all_tags.is_empty() {
             for category in &["Topics", "People", "Locations", "Organizations", "Events"] {
-                storage.create_tag_impl(category, None).await?;
+                storage
+                    .get_or_create_tag_with_parent_id(category, None)
+                    .await?;
             }
             tracing::info!("Seeded default category tags in Postgres");
         }
 
-        // Seed default settings if no registry and settings table is empty.
-        // When a registry exists, settings live there (not in the data DB).
+        // Seed default settings if no registry and the global tier is empty.
+        // When a registry exists, settings live there. Without one, the
+        // global tier plays the registry role — deployment-wide config that
+        // every logical database resolves, never per-DB rows.
         if registry.is_none() {
-            let existing = storage.get_all_settings_sync().await?;
+            let existing = storage.get_global_settings_sync().await?;
             if existing.is_empty() {
                 for (key, value) in settings::DEFAULT_SETTINGS {
-                    storage.set_setting_sync(key, value).await?;
+                    storage.set_global_setting_sync(key, value).await?;
                 }
                 tracing::info!("Seeded default settings in Postgres");
             }
@@ -339,6 +468,9 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry,
+            provider_config: Arc::new(std::sync::RwLock::new(provider_config)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -352,9 +484,13 @@ impl AtomicCore {
     /// `DatabaseManager::new_postgres`. Schema is cluster-wide (not per-db_id),
     /// so this only does real work the first time it sees a dimensionless
     /// column or a missing index.
+    /// `provider_config` carries the explicit config when the caller opened
+    /// with one — the dimension must reflect the config the pipeline will
+    /// actually embed with, not whatever the settings tables hold.
     #[cfg(feature = "postgres")]
     async fn reconcile_pg_vector_index(
         pg: &storage::PostgresStorage,
+        provider_config: Option<&ProviderConfig>,
     ) -> Result<(), AtomicCoreError> {
         use crate::storage::traits::{ChunkStore, SettingsStore};
 
@@ -364,8 +500,13 @@ impl AtomicCore {
             .unwrap_or(0);
         let current_dim = pg.get_embedding_dimension().await?;
 
-        let settings = pg.get_all_settings().await?;
-        let expected_dim = ProviderConfig::from_settings(&settings).embedding_dimension();
+        let expected_dim = match provider_config {
+            Some(config) => config.embedding_dimension(),
+            None => {
+                let settings = pg.get_global_settings().await?;
+                ProviderConfig::from_settings(&settings).embedding_dimension()
+            }
+        };
 
         match current_dim {
             Some(d) if d == expected_dim => {
@@ -415,6 +556,31 @@ impl AtomicCore {
         let core = Self {
             storage: storage::StorageBackend::Postgres(pg),
             registry: None,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
+            wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            canvas_cache: CanvasCache::new(),
+        };
+        core.register_canvas_rebuilder();
+        core
+    }
+
+    /// Create a core for another logical database that shares this core's
+    /// connection pool **and** active provider configuration. Used by
+    /// `DatabaseManager` when lazily resolving additional `db_id`s, so a
+    /// live [`update_provider_config`](Self::update_provider_config) on any
+    /// core takes effect across every logical database of the same manager.
+    /// Wiki locks and the canvas cache stay per-core — they're keyed by
+    /// per-database identifiers.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn sibling_with_storage(&self, pg: storage::PostgresStorage) -> Self {
+        let core = Self {
+            storage: storage::StorageBackend::Postgres(pg),
+            registry: self.registry.clone(),
+            provider_config: Arc::clone(&self.provider_config),
+            inline_pipeline: Arc::clone(&self.inline_pipeline),
+            failure_disposition_policy: Arc::clone(&self.failure_disposition_policy),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -532,6 +698,9 @@ impl AtomicCore {
         let core = Self {
             storage,
             registry,
+            provider_config: Arc::new(std::sync::RwLock::new(None)),
+            inline_pipeline: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            failure_disposition_policy: Arc::new(std::sync::RwLock::new(None)),
             wiki_tag_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             canvas_cache: CanvasCache::new(),
         };
@@ -539,16 +708,157 @@ impl AtomicCore {
         Ok(core)
     }
 
-    /// Resolved settings map for background AI operations (embedding,
-    /// tagging, search, chat, agent). Returns the same merged view as
+    /// Snapshot of the active explicit provider configuration, if one was
+    /// injected at open time or set via
+    /// [`update_provider_config`](Self::update_provider_config). `None`
+    /// means provider config resolves from settings (the default).
+    pub fn active_provider_config(&self) -> Option<ProviderConfig> {
+        self.provider_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Atomically swap the active provider configuration. Subsequent AI
+    /// operations build their providers from `config`; operations already in
+    /// flight finish on the configuration they started with (each operation
+    /// snapshots its config once, at its start).
+    ///
+    /// This is the one live-reconfiguration mechanism for both modes:
+    ///
+    /// * Cores opened with an explicit config (see
+    ///   [`open_postgres_with_pool_and_provider`](Self::open_postgres_with_pool_and_provider))
+    ///   call this to rotate credentials without reopening.
+    /// * Cores in settings mode need no explicit refresh today — provider
+    ///   config is re-read from settings at the start of every operation, so
+    ///   a settings save takes effect on the next operation by construction
+    ///   (the provider cache in [`providers`] is keyed on config equality).
+    ///   Calling this on such a core promotes it to explicit mode: the given
+    ///   config becomes authoritative and settings writes stop affecting
+    ///   provider construction.
+    ///
+    /// The swap is shared with every core resolved from the same
+    /// `DatabaseManager` (see `sibling_with_storage`), so one call covers
+    /// all logical databases.
+    pub fn update_provider_config(&self, config: ProviderConfig) {
+        let mut guard = self
+            .provider_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(config);
+    }
+
+    /// Whether enqueued pipeline jobs are also executed in this process.
+    /// `true` (the default) on every constructor; see
+    /// [`set_inline_pipeline`](Self::set_inline_pipeline).
+    pub fn inline_pipeline(&self) -> bool {
+        self.inline_pipeline
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Choose whether this process executes the embedding/tagging pipeline
+    /// jobs it enqueues.
+    ///
+    /// Hosts that run a **dedicated pipeline worker** can defer execution to
+    /// it: with `inline = false`, every operation that requests pipeline
+    /// work (atom create/update, retries, re-embeds, agent tool mutations)
+    /// still writes its jobs to the durable `atom_pipeline_jobs` ledger and
+    /// returns normally, but no in-process task is spawned to claim and run
+    /// them — the worker claims them via the ledger's lease semantics
+    /// instead. Jobs persist in the ledger either way, so flipping the mode
+    /// never loses work; with no worker attached, deferred jobs simply wait.
+    ///
+    /// The default (`true`) is today's behavior: enqueue, then claim and
+    /// process in-process immediately.
+    ///
+    /// Like [`update_provider_config`](Self::update_provider_config), the
+    /// flag is shared with every core resolved from the same Postgres
+    /// `DatabaseManager` (see `sibling_with_storage`), so one call covers
+    /// all of a manager's logical databases.
+    pub fn set_inline_pipeline(&self, inline: bool) {
+        self.inline_pipeline
+            .store(inline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Install (or clear, with `None`) the failure-disposition policy
+    /// consulted by [`scheduler::ledger::RunHandle::fail`]: a classifier
+    /// that decides, per failure message, whether the failure consumes
+    /// retry budget ([`scheduler::ledger::FailureDisposition::Fail`]) or
+    /// defers the run to a later time without consuming an attempt
+    /// ([`scheduler::ledger::FailureDisposition::DeferUntil`]) — see
+    /// [`scheduler::ledger::FailureDisposition`] for the
+    /// environmental-vs-logical rationale.
+    ///
+    /// Like [`update_provider_config`](Self::update_provider_config), the
+    /// slot is shared with every core resolved from the same Postgres
+    /// `DatabaseManager` (see `sibling_with_storage`), so one install
+    /// covers all of a manager's logical databases.
+    pub fn set_failure_disposition_policy(
+        &self,
+        policy: Option<scheduler::ledger::FailureDispositionPolicy>,
+    ) {
+        let mut guard = self
+            .failure_disposition_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+
+    /// Classify a failure message through the installed policy;
+    /// [`scheduler::ledger::FailureDisposition::Fail`] with no policy.
+    pub(crate) fn failure_disposition(&self, error: &str) -> scheduler::ledger::FailureDisposition {
+        let guard = self
+            .failure_disposition_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(policy) => policy(error),
+            None => scheduler::ledger::FailureDisposition::Fail,
+        }
+    }
+
+    /// Resolved settings map for AI operations (embedding, tagging, search,
+    /// chat, agent, wiki, reports). Returns the same merged view as
     /// `get_settings` — registry workspace defaults + this DB's per-DB
-    /// overrides + builtin fallbacks — so background helpers see exactly
-    /// what the API surfaces. Returning `None` here would make callers fall
-    /// back to reading just the storage layer, which would skip registry
-    /// defaults; we never want that, so we always return `Some` (or `None`
-    /// only on a hard read failure).
+    /// overrides + builtin fallbacks — with one addition: when an explicit
+    /// provider configuration is active, its keys are overlaid so
+    /// `ProviderConfig::from_settings` on the result reproduces it exactly
+    /// and the settings tables are never consulted for provider config.
+    ///
+    /// Every settings map that feeds `ProviderConfig::from_settings` must
+    /// come from here (or `settings_for_background`), never from
+    /// `get_settings` directly — otherwise explicit mode silently leaks back
+    /// to settings-resolved providers.
+    pub(crate) async fn settings_for_ai(&self) -> Result<HashMap<String, String>, AtomicCoreError> {
+        match self.active_provider_config() {
+            Some(config) => {
+                // Explicit mode: a settings read failure degrades to builtin
+                // defaults for the non-provider keys rather than failing the
+                // operation — provider resolution must not depend on the
+                // settings tables in this mode.
+                let mut settings = self.get_settings().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Settings read failed; explicit provider config proceeds with builtin defaults for non-provider settings");
+                    settings::DEFAULT_SETTINGS
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect()
+                });
+                config.apply_to_settings(&mut settings);
+                Ok(settings)
+            }
+            None => self.get_settings().await,
+        }
+    }
+
+    /// `Option`-shaped wrapper around [`settings_for_ai`](Self::settings_for_ai)
+    /// for the background helpers whose module-level fallbacks read the
+    /// storage layer's global tier on `None`. We effectively always return
+    /// `Some` (`None` only on a hard settings read failure in
+    /// settings-resolved mode) so those fallbacks — which would skip registry
+    /// defaults and any explicit provider config — stay unreachable from the
+    /// facade.
     async fn settings_for_background(&self) -> Option<HashMap<String, String>> {
-        self.get_settings().await.ok()
+        self.settings_for_ai().await.ok()
     }
 
     /// Get the storage path (for display purposes).
@@ -562,10 +872,15 @@ impl AtomicCore {
         self.storage.as_sqlite().map(|s| Arc::clone(&s.db))
     }
 
-    /// Get a reference to the underlying storage backend. Used by sibling
-    /// modules (briefing, scheduler helpers) that need to issue storage
-    /// calls directly without going through the full facade surface.
-    pub(crate) fn storage(&self) -> &storage::StorageBackend {
+    /// Get a reference to the underlying storage backend.
+    ///
+    /// Used by sibling modules (briefing, scheduler helpers) that need to
+    /// issue storage calls directly without going through the full facade
+    /// surface. Public because composing layers occasionally need
+    /// backend-specific facilities the facade deliberately doesn't wrap —
+    /// per-database settings via the sync helpers, or inspecting the
+    /// Postgres connection pool.
+    pub fn storage(&self) -> &storage::StorageBackend {
         &self.storage
     }
 
@@ -639,20 +954,26 @@ impl AtomicCore {
             }
         }
 
-        // Layer 3: per-DB. Two cases:
-        //   * Registry attached (the SQLite multi-DB shape): per-DB rows are
-        //     true overrides on top of the registry. Workspace-only rows in
-        //     this layer are legacy data — the registry is the single source
-        //     of truth for those keys, so we ignore them here. The V15
-        //     migration in `db.rs` wipes seeded-default rows so this layer
-        //     only ever contains real overrides.
+        // Layer 3: storage. Two cases:
+        //   * Registry attached (the SQLite multi-DB shape): the scoped
+        //     per-DB rows are true overrides on top of the registry.
+        //     Workspace-only rows in this layer are legacy data — the
+        //     registry is the single source of truth for those keys, so we
+        //     ignore them here. The V15 migration in `db.rs` wipes
+        //     seeded-default rows so this layer only ever contains real
+        //     overrides.
         //   * No registry (Postgres deployments today): the storage layer's
-        //     settings table is the only place anything lives. Treat its
-        //     values like a registry layer would — workspace-only → Workspace,
-        //     overridable → WorkspaceDefault. Without a registry there's no
-        //     "per-DB override" concept to surface.
-        let per_db = self.storage.get_all_settings_sync().await?;
+        //     *global* tier plays the registry role — workspace-only →
+        //     Workspace, overridable → WorkspaceDefault. Reading the global
+        //     tier (rather than the scoped per-DB rows) keeps deployment
+        //     config consistent across logical databases and keeps per-DB
+        //     state (task.{id}.*, seed flags) out of the settings API.
         let has_registry = self.registry.is_some();
+        let per_db = if has_registry {
+            self.storage.get_all_settings_sync().await?
+        } else {
+            self.storage.get_global_settings_sync().await?
+        };
         for (key, value) in per_db {
             let source = if settings::is_workspace_only(&key) {
                 if has_registry {
@@ -677,9 +998,13 @@ impl AtomicCore {
         let registry = match &self.registry {
             Some(r) => r,
             None => {
-                // No registry attached (single-DB embedded use): there's no
-                // workspace layer, so writes always go to the per-DB table.
-                return self.storage.set_setting_sync(key, value).await;
+                // No registry attached (Postgres deployments, single-DB
+                // embedded use): the storage layer's global tier plays the
+                // workspace role, so writes land there. On SQLite the global
+                // accessors resolve to the data DB's only settings table; on
+                // Postgres they hit the '_global' scope shared by every
+                // logical database.
+                return self.storage.set_global_setting_sync(key, value).await;
             }
         };
 
@@ -706,13 +1031,24 @@ impl AtomicCore {
                 key
             )));
         }
-        self.storage.delete_setting_sync(key).await
+        if self.registry.is_some() {
+            // Registry attached: the scoped row is the override layer.
+            self.storage.delete_setting_sync(key).await
+        } else {
+            // No registry: there is no override layer — `set_setting` wrote
+            // the global tier, so "clear" deletes from the same tier and the
+            // key falls back to the builtin default.
+            self.storage.delete_global_setting_sync(key).await
+        }
     }
 
     /// Read the per-DB override row for `key`, if any. Skips the registry
     /// fallback — used by the "overrides across all databases" endpoint that
     /// needs just the override layer for one key, not the merged value.
     /// Returns Ok(None) for workspace-only keys (they cannot have overrides).
+    /// Deliberately stays on the *scoped* tier: with no registry attached
+    /// (Postgres) there is no override layer, and the scoped read correctly
+    /// reports "no override" instead of echoing the global value.
     pub async fn get_setting_override(&self, key: &str) -> Result<Option<String>, AtomicCoreError> {
         if settings::is_workspace_only(key) {
             return Ok(None);
@@ -1386,7 +1722,7 @@ impl AtomicCore {
         }
 
         // Postgres path: use storage dispatch methods directly
-        let settings = self.get_settings().await?;
+        let settings = self.settings_for_ai().await?;
         let config = providers::ProviderConfig::from_settings(&settings);
         let tag_id = options.scope_tag_ids.first().map(|s| s.as_str());
         let cutoff = options.since_days.map(search::since_days_cutoff);
@@ -1522,7 +1858,7 @@ impl AtomicCore {
         tag_name: &str,
     ) -> Result<(wiki::WikiStrategy, wiki::WikiStrategyContext), AtomicCoreError> {
         const MAX_CROSS_LINK_TAGS: usize = 50;
-        let settings_map = self.get_settings().await?;
+        let settings_map = self.settings_for_ai().await?;
         let config = ProviderConfig::from_settings(&settings_map);
         let model = match config.provider_type {
             ProviderType::Ollama => config.llm_model().to_string(),
@@ -1563,7 +1899,10 @@ impl AtomicCore {
         Ok((strategy, ctx))
     }
 
-    /// Generate a wiki article for a tag
+    /// Generate a wiki article for a tag. Pure mechanism: no ledger
+    /// interaction — callers that want durable retry, backoff, and per-tag
+    /// dedup should go through [`Self::regenerate_wiki`], which wraps this
+    /// in a `task_runs` row.
     pub async fn generate_wiki(
         &self,
         tag_id: &str,
@@ -1607,6 +1946,31 @@ impl AtomicCore {
 
         tracing::info!("[wiki] Article saved successfully");
         Ok(result)
+    }
+
+    /// Regenerate a tag's wiki article through the `task_runs` ledger: one
+    /// run per regeneration with `task_id = "wiki.regenerate"` and
+    /// `subject_id = <tag id>`. Returns [`RegenOutcome::Skipped`] when
+    /// another worker already holds the tag's run, or a failed regeneration
+    /// is still inside its backoff window. The tag name is resolved from
+    /// storage (a nonexistent tag is `NotFound`); see [`wiki::runner`] for
+    /// the full lifecycle.
+    pub async fn regenerate_wiki(
+        &self,
+        tag_id: &str,
+        trigger: TaskRunTrigger,
+    ) -> Result<RegenOutcome, AtomicCoreError> {
+        wiki::runner::run_wiki_regenerate(self, tag_id, trigger).await
+    }
+
+    /// Re-execute every runnable `wiki.regenerate` row (failed runs whose
+    /// backoff has elapsed, crashed runs with expired leases), returning the
+    /// tag ids whose articles were regenerated. Regeneration is
+    /// event-triggered — nothing on a schedule re-fires it — so the server's
+    /// scheduler tick drives this sweep; see
+    /// [`wiki::runner::sweep_due_wiki_regens`].
+    pub async fn sweep_due_wiki_regens(&self) -> Vec<String> {
+        wiki::runner::sweep_due_wiki_regens(self).await
     }
 
     /// Acquire the per-tag wiki lock. Serializes propose/accept/dismiss/update
@@ -2111,30 +2475,25 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let on_event = self.wrap_event_for_cache(on_event);
-        let canvas_cache = Some(self.canvas_cache.clone());
-        match self.settings_for_background().await {
-            Some(s) => embedding::process_pending_embeddings_with_settings(
-                self.storage.clone(),
-                on_event,
-                s,
-                canvas_cache,
-            )
-            .await
-            .map_err(|e| AtomicCoreError::Embedding(e)),
-            None => {
-                embedding::process_pending_embeddings(self.storage.clone(), on_event, canvas_cache)
-                    .await
-                    .map_err(|e| AtomicCoreError::Embedding(e))
-            }
-        }
+        self.storage
+            .enqueue_pipeline_jobs_from_statuses_sync(None)
+            .await?;
+        self.process_queued_pipeline_jobs(on_event).await
     }
 
     /// Process due jobs from the unified embedding/tagging queue.
+    ///
+    /// With inline pipeline execution off (see
+    /// [`set_inline_pipeline`](Self::set_inline_pipeline)), this is a no-op
+    /// returning 0: enqueued jobs stay unclaimed in the durable ledger for
+    /// the host's dedicated pipeline worker.
     pub async fn process_queued_pipeline_jobs<F>(&self, on_event: F) -> Result<i32, AtomicCoreError>
     where
         F: Fn(EmbeddingEvent) + Send + Sync + 'static,
     {
+        if !self.inline_pipeline() {
+            return Ok(0);
+        }
         let on_event = self.wrap_event_for_cache(on_event);
         let canvas_cache = Some(self.canvas_cache.clone());
         match self.settings_for_background().await {
@@ -2156,6 +2515,166 @@ impl AtomicCore {
         }
     }
 
+    /// Claim up to `limit` due jobs from the durable pipeline ledger and
+    /// process them to completion before returning.
+    ///
+    /// The execution entry point for hosts that turned inline pipeline
+    /// execution off ([`set_inline_pipeline`](Self::set_inline_pipeline))
+    /// and drive the ledger from a dedicated worker instead: unlike
+    /// [`process_queued_pipeline_jobs`](Self::process_queued_pipeline_jobs)
+    /// it neither consults the inline flag nor spawns — the worker claims a
+    /// bounded batch when it has capacity and awaits it, owning its own
+    /// concurrency and backpressure. Events flow through `on_event` exactly
+    /// as on the inline path. Returns the number of jobs claimed (`0` =
+    /// nothing due).
+    pub async fn run_pipeline_jobs_batch<F>(
+        &self,
+        limit: i32,
+        on_event: F,
+    ) -> Result<i32, AtomicCoreError>
+    where
+        F: Fn(EmbeddingEvent) + Send + Sync + 'static,
+    {
+        let on_event = self.wrap_event_for_cache(on_event);
+        let canvas_cache = Some(self.canvas_cache.clone());
+        let settings = self.settings_for_background().await;
+        embedding::run_pipeline_jobs_batch(
+            self.storage.clone(),
+            limit,
+            on_event,
+            settings,
+            canvas_cache,
+        )
+        .await
+        .map_err(AtomicCoreError::Embedding)
+    }
+
+    /// Enqueue pipeline-ledger rows without executing anything — the
+    /// companion write primitive to
+    /// [`run_pipeline_jobs_batch`](Self::run_pipeline_jobs_batch) for hosts
+    /// that drive the ledger from a dedicated worker. Unlike the save-path
+    /// enqueues, the caller controls every field of each
+    /// [`AtomPipelineJobRequest`](models::AtomPipelineJobRequest) —
+    /// including `not_before`, which is how a worker reschedules
+    /// transiently-failed work (e.g. honoring a provider's retry hint)
+    /// instead of leaving it terminally failed. Coalesces with any existing
+    /// row per the ledger's upsert semantics (flags OR together,
+    /// `not_before` takes the earliest). Returns the number of rows
+    /// written. Inert with respect to execution: with inline pipeline
+    /// execution on, the next save/startup pass picks the rows up; with it
+    /// off, the host's worker does.
+    pub async fn enqueue_pipeline_jobs(
+        &self,
+        jobs: &[models::AtomPipelineJobRequest],
+    ) -> Result<i32, AtomicCoreError> {
+        self.storage.enqueue_pipeline_jobs_sync(jobs).await
+    }
+
+    // ==================== Ledger scanning ====================
+    //
+    // Read-only visibility into the two durable work ledgers
+    // (`atom_pipeline_jobs`, `task_runs`). Hosts that run background
+    // execution in dedicated workers (see `set_inline_pipeline` /
+    // `run_pipeline_jobs_batch`) poll these to learn whether a database has
+    // outstanding work without claiming anything; they're equally useful
+    // for ops tooling and tests.
+
+    /// Number of pipeline jobs claimable right now — pending (or
+    /// expired-lease) rows whose `not_before` has passed and whose
+    /// requested stage is executable. The sizing input for
+    /// [`run_pipeline_jobs_batch`](Self::run_pipeline_jobs_batch).
+    pub async fn count_due_pipeline_jobs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage
+            .count_due_pipeline_jobs_sync(&chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Total pipeline-job rows, regardless of state or timing — in-flight
+    /// leases and backed-off retries included. `0` means the pipeline
+    /// ledger is fully drained.
+    pub async fn count_pipeline_jobs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage.count_pipeline_jobs_sync().await
+    }
+
+    /// Non-terminal `task_runs` rows (pending or running) across all tasks
+    /// and subjects. `0` means the run ledger holds only history.
+    pub async fn count_active_task_runs(&self) -> Result<i32, AtomicCoreError> {
+        self.storage.count_active_task_runs_sync().await
+    }
+
+    /// Runnable `task_runs` rows for `task_id` as of now: pending rows past
+    /// their `next_attempt_at` plus crashed rows with expired leases. The
+    /// sweep input for event-triggered tasks (see
+    /// [`wiki::runner::run_runnable_wiki_regen`]).
+    pub async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskRun>, AtomicCoreError> {
+        self.storage
+            .list_runnable_task_runs_sync(task_id, &chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Feeds due for polling right now — the same due-ness the poll sweep
+    /// uses ([`ingest::poller::poll_due_feeds`]), exposed so hosts can
+    /// schedule per-feed polls themselves.
+    pub async fn list_due_feeds(&self) -> Result<Vec<Feed>, AtomicCoreError> {
+        self.storage.get_due_feeds_sync().await
+    }
+
+    // ==================== Ledger re-arming ====================
+    //
+    // When the *environment* a backoff was scheduled around changes — the
+    // canonical case being a provider configuration change after provider
+    // failures pushed work out — the stored horizons describe a world that
+    // no longer exists. These helpers reset them to "now" so the next
+    // scheduling pass redispatches immediately instead of waiting out a
+    // horizon computed for the old configuration. Both are precise about
+    // which rows they touch: only rows whose recorded cause matches.
+
+    /// Reset the `not_before` horizon to now on every pending pipeline job
+    /// whose `reason` equals `reason` — the marker a host's re-enqueue path
+    /// stamps when it backs work off (e.g. around a provider's
+    /// `Retry-After`). Rows enqueued for other reasons, in-flight leases,
+    /// and already-due rows are untouched. Returns the number of rows
+    /// re-armed.
+    pub async fn rearm_pipeline_jobs(&self, reason: &str) -> Result<u64, AtomicCoreError> {
+        self.storage
+            .rearm_pipeline_jobs_sync(reason, &chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
+    /// Reset `next_attempt_at` to now on every pending `task_runs` row that
+    /// is (a) waiting on a future horizon and (b) waiting *because of a
+    /// provider failure* — its recorded `last_error` classifies as a
+    /// rate-limit, billing, or credential rejection
+    /// ([`providers::classify_provider_failure`]). This covers both
+    /// deferred rows ([`scheduler::ledger::RunHandle::defer_until`]) and
+    /// backed-off retries whose failure was provider-classified. Rows
+    /// waiting out logic-failure backoff are untouched — a provider change
+    /// doesn't make a broken task less broken. Returns the number of rows
+    /// re-armed.
+    pub async fn rearm_provider_blocked_task_runs(&self) -> Result<u64, AtomicCoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let waiting = self.storage.list_waiting_task_runs_sync(&now).await?;
+        let ids: Vec<String> = waiting
+            .into_iter()
+            .filter(|run| {
+                run.last_error.as_deref().is_some_and(|error| {
+                    !matches!(
+                        providers::classify_provider_failure(error),
+                        providers::ProviderFailureClass::Other
+                    )
+                })
+            })
+            .map(|run| run.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.storage.rearm_task_runs_sync(&ids, &now).await
+    }
+
     /// Process pending embeddings only for atoms last updated at or before
     /// `cutoff`. Used by the draft-pipeline scheduler so active edits can
     /// settle before background AI work begins.
@@ -2168,30 +2687,10 @@ impl AtomicCore {
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
         let cutoff_rfc3339 = cutoff.to_rfc3339();
-        let on_event = self.wrap_event_for_cache(on_event);
-        let canvas_cache = Some(self.canvas_cache.clone());
-        let count = match self.settings_for_background().await {
-            Some(s) => {
-                embedding::process_pending_embeddings_due_with_settings(
-                    self.storage.clone(),
-                    on_event,
-                    cutoff_rfc3339.clone(),
-                    s,
-                    canvas_cache,
-                )
-                .await
-            }
-            None => {
-                embedding::process_pending_embeddings_due(
-                    self.storage.clone(),
-                    on_event,
-                    cutoff_rfc3339.clone(),
-                    canvas_cache,
-                )
-                .await
-            }
-        }
-        .map_err(|e| AtomicCoreError::Embedding(e))?;
+        self.storage
+            .enqueue_pipeline_jobs_from_statuses_sync(Some(&cutoff_rfc3339))
+            .await?;
+        let count = self.process_queued_pipeline_jobs(on_event).await?;
         if count > 0 {
             tracing::info!(cutoff = %cutoff_rfc3339, count, "Queued pending embeddings due for processing");
         }
@@ -2213,6 +2712,21 @@ impl AtomicCore {
     /// normal server path runs the same work from `GraphMaintenanceTask`.
     pub async fn process_graph_maintenance(&self) -> Result<(), AtomicCoreError> {
         graph_maintenance::run_now(self).await
+    }
+
+    /// Recent execution history for a task from the `task_runs` ledger,
+    /// newest first. `subject_id = None` returns runs for every subject of
+    /// the task (the read shape history UIs want); pass `Some` to narrow to
+    /// one subject (e.g. a single feed).
+    pub async fn list_task_runs(
+        &self,
+        task_id: &str,
+        subject_id: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<TaskRun>, AtomicCoreError> {
+        self.storage
+            .list_recent_task_runs_sync(task_id, subject_id, limit)
+            .await
     }
 
     /// Reset atoms stuck in 'processing' state back to 'pending'
@@ -2380,7 +2894,9 @@ impl AtomicCore {
 
         let mut bg_settings = match self.settings_for_background().await {
             Some(settings) => settings,
-            None => self.storage.get_all_settings_sync().await?,
+            // Hard read failure in the resolver — fall back to the raw
+            // global tier (provider/model config), never the per-DB rows.
+            None => self.storage.get_global_settings_sync().await?,
         };
         bg_settings.insert("auto_tagging_enabled".to_string(), "true".to_string());
         let on_event = self.wrap_event_for_cache(on_event);
@@ -2393,14 +2909,19 @@ impl AtomicCore {
             replace_existing: false,
         };
         self.storage.enqueue_pipeline_jobs_sync(&[job]).await?;
-        embedding::process_queued_pipeline_jobs_with_settings(
-            self.storage.clone(),
-            on_event,
-            bg_settings,
-            Some(self.canvas_cache.clone()),
-        )
-        .await
-        .map_err(AtomicCoreError::Embedding)?;
+        // Direct module call (not `process_queued_pipeline_jobs`) because the
+        // retry forces `auto_tagging_enabled` into the settings map above —
+        // so the inline-execution gate is applied here explicitly.
+        if self.inline_pipeline() {
+            embedding::process_queued_pipeline_jobs_with_settings(
+                self.storage.clone(),
+                on_event,
+                bg_settings,
+                Some(self.canvas_cache.clone()),
+            )
+            .await
+            .map_err(AtomicCoreError::Embedding)?;
+        }
 
         Ok(())
     }
@@ -2575,6 +3096,7 @@ impl AtomicCore {
             content,
             on_event,
             self.settings_for_background().await,
+            self.inline_pipeline(),
         )
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e))
@@ -2598,6 +3120,7 @@ impl AtomicCore {
             content,
             on_event,
             self.settings_for_background().await,
+            self.inline_pipeline(),
             canvas_context,
             page_context,
             Some(self.canvas_cache.clone()),
@@ -3022,6 +3545,19 @@ impl AtomicCore {
     /// vector space. Existing chunk rows are preserved by the embed-only queue.
     /// Failed atoms are auto-retried for non-space provider config changes
     /// such as API keys or base URLs.
+    ///
+    /// Both the current and the post-write settings maps are resolved through
+    /// [`settings_for_ai`](Self::settings_for_ai) — the invariant documented
+    /// there: every map that feeds `ProviderConfig::from_settings` must carry
+    /// the explicit-config overlay. In explicit provider-config mode the
+    /// overlay pins every provider/embedding key in *both* maps, so an
+    /// embedding-space settings write is **inert**: the value is stored, but
+    /// the resolved vector space cannot change — no index recreation, no
+    /// re-embed queue, no failed-atom retry. Computing the change decision
+    /// from raw `get_settings` instead would recreate the vector index at a
+    /// dimension the active config never produces, destroying every stored
+    /// vector. In settings-resolved mode the overlay arm is a no-op and
+    /// behavior is unchanged.
     pub async fn set_setting_with_reembed<F>(
         &self,
         key: &str,
@@ -3031,8 +3567,16 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let current_settings = self.get_settings().await?;
-        let value_changed = current_settings.get(key).map(|s| s.as_str()) != Some(value);
+        let current_settings = self.settings_for_ai().await?;
+        // The map the write produces, as AI operations will resolve it:
+        // the new value overlaid with the explicit config (if any), exactly
+        // like `settings_for_ai` will report it after the write.
+        let mut new_settings = current_settings.clone();
+        new_settings.insert(key.to_string(), value.to_string());
+        if let Some(config) = self.active_provider_config() {
+            config.apply_to_settings(&mut new_settings);
+        }
+        let value_changed = current_settings.get(key) != new_settings.get(key);
 
         let mut embedding_space_changed = false;
         let mut dimension_changed = false;
@@ -3044,8 +3588,6 @@ impl AtomicCore {
             let current_config = ProviderConfig::from_settings(&current_settings);
             old_dim = current_config.embedding_dimension();
 
-            let mut new_settings = current_settings.clone();
-            new_settings.insert(key.to_string(), value.to_string());
             let new_config = ProviderConfig::from_settings(&new_settings);
             new_dim = new_config.embedding_dimension();
 
@@ -3137,6 +3679,13 @@ impl AtomicCore {
     /// recreate the active DB's vector index before queueing pending atoms;
     /// same-dimension space changes re-embed all atoms so stale vectors are
     /// not left behind.
+    ///
+    /// As with [`set_setting_with_reembed`](Self::set_setting_with_reembed),
+    /// both settings maps come from [`settings_for_ai`](Self::settings_for_ai):
+    /// in explicit provider-config mode the overlay pins the embedding-space
+    /// keys on both sides of the clear, so the override row is removed but the
+    /// resolved vector space never changes — no recreation, no re-embedding.
+    /// Settings-resolved mode is unchanged.
     pub async fn clear_override_with_reembed<F>(
         &self,
         key: &str,
@@ -3145,13 +3694,13 @@ impl AtomicCore {
     where
         F: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let current_settings = self.get_settings().await?;
+        let current_settings = self.settings_for_ai().await?;
         let current_config = ProviderConfig::from_settings(&current_settings);
         let current_value = current_settings.get(key).cloned();
 
         self.clear_override(key).await?;
 
-        let new_settings = self.get_settings().await?;
+        let new_settings = self.settings_for_ai().await?;
         let new_config = ProviderConfig::from_settings(&new_settings);
         let new_value = new_settings.get(key).cloned();
         let value_changed = current_value != new_value;
@@ -3211,7 +3760,7 @@ impl AtomicCore {
 
     /// Verify that the current provider is properly configured
     pub async fn verify_provider_configured(&self) -> Result<bool, AtomicCoreError> {
-        let settings_map = self.get_settings().await?;
+        let settings_map = self.settings_for_ai().await?;
         let config = ProviderConfig::from_settings(&settings_map);
 
         match config.provider_type {
@@ -3229,13 +3778,15 @@ impl AtomicCore {
         self.storage.get_all_wiki_articles_sync().await
     }
 
-    /// Get cached model capabilities from the settings table.
+    /// Get cached model capabilities from the settings table. The cache is
+    /// derived from the (global) provider config, so it lives in the global
+    /// tier — shared across logical databases on Postgres.
     pub async fn get_cached_capabilities(
         &self,
     ) -> Result<Option<providers::models::ModelCapabilitiesCache>, AtomicCoreError> {
         let json = self
             .storage
-            .get_setting_sync("model_capabilities_cache")
+            .get_global_setting_sync("model_capabilities_cache")
             .await?;
         match json {
             Some(j) => {
@@ -3261,7 +3812,7 @@ impl AtomicCore {
             AtomicCoreError::Configuration(format!("Failed to serialize capabilities cache: {}", e))
         })?;
         self.storage
-            .set_setting_sync("model_capabilities_cache", &json)
+            .set_global_setting_sync("model_capabilities_cache", &json)
             .await
     }
 
@@ -3422,9 +3973,7 @@ impl AtomicCore {
                 let parent_id: Option<String> = if htag.parent_path.is_empty() {
                     None
                 } else {
-                    folder_tag_ids
-                        .get(htag.parent_path.len() - 1)
-                        .cloned()
+                    folder_tag_ids.get(htag.parent_path.len() - 1).cloned()
                 };
 
                 let cache_key = (htag.name.to_lowercase(), parent_id.clone());
@@ -3453,7 +4002,11 @@ impl AtomicCore {
                 folder_tag_ids.push(tag_id.clone());
                 if let Err(e) = self
                     .storage
-                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .link_tags_to_atom_with_source(
+                        &atom_id,
+                        std::slice::from_ref(&tag_id),
+                        "manual",
+                    )
                     .await
                 {
                     tracing::error!(tag_name = %htag.name, error = %e, "Error linking folder tag to atom");
@@ -3489,7 +4042,11 @@ impl AtomicCore {
 
                 if let Err(e) = self
                     .storage
-                    .link_tags_to_atom_with_source(&atom_id, std::slice::from_ref(&tag_id), "manual")
+                    .link_tags_to_atom_with_source(
+                        &atom_id,
+                        std::slice::from_ref(&tag_id),
+                        "manual",
+                    )
                     .await
                 {
                     tracing::error!(tag_name = %tag_name, error = %e, "Error linking frontmatter tag to atom");
@@ -3679,11 +4236,14 @@ impl AtomicCore {
             )
             .await?;
 
-        // Poll immediately after creation
+        // Poll immediately after creation — through the ledger like any
+        // other poll, so the kickoff run shows up in `feed_poll` history.
         let core = self.clone();
         let feed_id = feed.id.clone();
         executor::spawn(async move {
-            let _ = core.poll_feed(&feed_id, on_ingest, on_embed).await;
+            let _ = core
+                .poll_feed(&feed_id, TaskRunTrigger::Manual, on_ingest, on_embed)
+                .await;
         });
 
         Ok(feed)
@@ -3717,12 +4277,60 @@ impl AtomicCore {
     }
 
     /// Delete a feed. Does NOT delete atoms created from this feed.
+    ///
+    /// Also settles any non-terminal `feed_poll` ledger rows for the feed
+    /// as moot successes — the same terminal shape `wiki::runner` gives a
+    /// pending regen whose tag was deleted. Without this, a backed-off
+    /// retry (or a crashed run) for the deleted feed would sit in the
+    /// ledger forever: the poll sweep only visits feeds that still have a
+    /// definition row, and GC never deletes non-terminal rows. Settling
+    /// after the definition delete keeps the window for a racing poll to
+    /// insert a fresh row as small as possible; a poll already in flight
+    /// loses its terminal write on the state predicate and exits quietly.
     pub async fn delete_feed(&self, id: &str) -> Result<(), AtomicCoreError> {
-        self.storage.delete_feed_sync(id).await
+        self.storage.delete_feed_sync(id).await?;
+        let settled = self
+            .storage
+            .settle_task_runs_moot_sync(
+                ingest::poller::FEED_POLL_TASK_ID,
+                id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await?;
+        if settled > 0 {
+            tracing::info!(
+                feed_id = %id,
+                settled,
+                "[feed_poll] feed deleted; settled its non-terminal ledger rows"
+            );
+        }
+        Ok(())
     }
 
-    /// Poll a single feed: fetch XML, parse, dedup via feed_items, ingest new articles.
+    /// Poll a single feed through the `task_runs` ledger: one run per poll
+    /// with `task_id = "feed_poll"` and `subject_id = <feed id>`. Returns
+    /// [`PollOutcome::Skipped`] when another worker already holds the
+    /// feed's run, or a failed poll is still inside its backoff window.
+    /// See [`ingest::poller`] for the full lifecycle.
     pub async fn poll_feed<F, G>(
+        &self,
+        feed_id: &str,
+        trigger: TaskRunTrigger,
+        on_ingest: F,
+        on_embed: G,
+    ) -> Result<PollOutcome, AtomicCoreError>
+    where
+        F: Fn(ingest::IngestionEvent) + Send + Sync + Clone + 'static,
+        G: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
+    {
+        ingest::poller::run_feed_poll(self, feed_id, trigger, on_ingest, on_embed).await
+    }
+
+    /// Fetch a feed's XML, parse it, dedup via `feed_items`, and ingest new
+    /// articles. Pure mechanism: no ledger interaction and no writes to the
+    /// `feeds` fast-path cache (`last_polled_at` / `last_error`) —
+    /// [`ingest::poller`] owns both.
+    pub(crate) async fn fetch_and_ingest_feed<F, G>(
         &self,
         feed_id: &str,
         on_ingest: F,
@@ -3739,7 +4347,6 @@ impl AtomicCore {
             Ok(bytes) => bytes,
             Err(e) => {
                 let err = format!("Cannot fetch feed: {}", e);
-                self.update_feed_error(feed_id, &err).await;
                 on_ingest(ingest::IngestionEvent::FeedPollFailed {
                     feed_id: feed_id.to_string(),
                     error: err.clone(),
@@ -3751,7 +4358,6 @@ impl AtomicCore {
         let parsed = match ingest::rss::parse_feed(&feed_data) {
             Ok(p) => p,
             Err(e) => {
-                self.update_feed_error(feed_id, &e).await;
                 on_ingest(ingest::IngestionEvent::FeedPollFailed {
                     feed_id: feed_id.to_string(),
                     error: e.clone(),
@@ -3825,8 +4431,6 @@ impl AtomicCore {
             }
         }
 
-        // Update feed metadata
-        self.storage.mark_feed_polled_sync(feed_id, None).await?;
         // Backfill title/site_url from feed data if not already set
         if parsed.title.is_some() || parsed.site_url.is_some() {
             self.storage
@@ -3855,7 +4459,9 @@ impl AtomicCore {
         Ok(result)
     }
 
-    /// Poll all feeds that are due (not paused, enough time elapsed).
+    /// Poll all feeds that are due (not paused, enough time elapsed), each
+    /// through its own `task_runs` row. This is the sweep body the server's
+    /// 60s loop drives; see [`ingest::poller::poll_due_feeds`].
     pub async fn poll_due_feeds<F, G>(
         &self,
         on_ingest: F,
@@ -3865,24 +4471,7 @@ impl AtomicCore {
         F: Fn(ingest::IngestionEvent) + Send + Sync + Clone + 'static,
         G: Fn(EmbeddingEvent) + Send + Sync + Clone + 'static,
     {
-        let due_feed_ids: Vec<String> = match self.storage.get_due_feeds_sync().await {
-            Ok(feeds) => feeds.into_iter().map(|f| f.id).collect(),
-            Err(_) => return vec![],
-        };
-
-        let mut results = Vec::new();
-        for feed_id in due_feed_ids {
-            match self
-                .poll_feed(&feed_id, on_ingest.clone(), on_embed.clone())
-                .await
-            {
-                Ok(r) => results.push(r),
-                Err(e) => {
-                    tracing::error!(feed_id = %feed_id, error = %e, "Feed poll failed");
-                }
-            }
-        }
-        results
+        ingest::poller::poll_due_feeds(self, on_ingest, on_embed).await
     }
 
     /// Atomically claim a feed item GUID. Returns true if this call claimed it,
@@ -3913,14 +4502,6 @@ impl AtomicCore {
         self.storage
             .mark_feed_item_skipped_sync(feed_id, guid, reason)
             .await
-    }
-
-    /// Helper: update a feed's last_error field.
-    async fn update_feed_error(&self, feed_id: &str, error: &str) {
-        let _ = self
-            .storage
-            .mark_feed_polled_sync(feed_id, Some(error))
-            .await;
     }
 
     /// Get suggested wiki articles (tags without articles, ranked by demand)
@@ -4945,6 +5526,124 @@ mod tests {
         assert!(!result.dimension_changed);
         assert_eq!(result.old_dim, 1536);
         assert_eq!(result.new_dim, 1536);
+    }
+
+    /// Settings-mode regression: an embedding-model change through
+    /// `set_setting_with_reembed` still marks the space changed (and would
+    /// re-embed) when no explicit provider config is active. The explicit-mode
+    /// tests below depend on this staying true — inertness must come from the
+    /// overlay, not from the change detection going blind.
+    #[tokio::test]
+    async fn test_settings_mode_model_change_marks_space_changed() {
+        let (_registry, cores, _dir) = make_workspace(0);
+
+        let result = cores[0]
+            .set_setting_with_reembed("embedding_model", "custom/other-space", |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            result.embedding_space_changed,
+            "settings mode must still treat a model change as a space change"
+        );
+        assert!(!result.dimension_changed, "same dimension, no recreation");
+    }
+
+    /// Explicit provider-config mode: embedding-space settings writes are
+    /// inert. The values land in the settings tables, but the resolved vector
+    /// space is pinned by the active config — no index recreation, no re-embed
+    /// queue, no failed-atom retry.
+    #[tokio::test]
+    async fn test_explicit_mode_embedding_space_writes_are_inert() {
+        let (_registry, cores, _dir) = make_workspace(0);
+        // Promote to explicit mode with the default config (OpenRouter,
+        // 1536-dim embedding model).
+        cores[0].update_provider_config(ProviderConfig::from_settings(
+            &std::collections::HashMap::new(),
+        ));
+
+        // Writes that, in settings mode, would flip the provider to a
+        // 3072-dim openai_compat space (recreating the vector index) or
+        // change the embedding model (queueing a full re-embed).
+        for (key, value) in [
+            ("openai_compat_embedding_dimension", "3072"),
+            ("provider", "openai_compat"),
+            ("embedding_model", "frontier/other-space"),
+        ] {
+            let result = cores[0]
+                .set_setting_with_reembed(key, value, |_| {})
+                .await
+                .unwrap();
+            assert!(!result.embedding_space_changed, "{key} must be inert");
+            assert!(!result.dimension_changed, "{key} must not recreate");
+            assert_eq!(result.total_atom_count, 0, "{key} must queue nothing");
+            assert_eq!(result.retried_failed_count, 0, "{key} must retry nothing");
+        }
+
+        // The vector index was never touched: still at the 1536 dimension the
+        // explicit config produces, not the 3072 the settings rows now claim.
+        assert_vec_chunks_dimension(&cores[0], 1536);
+
+        // The writes themselves landed — explicit mode stores values, it only
+        // keeps them from steering the embedding space.
+        let stored = cores[0].get_settings().await.unwrap();
+        assert_eq!(
+            stored
+                .get("openai_compat_embedding_dimension")
+                .map(String::as_str),
+            Some("3072")
+        );
+        assert_eq!(
+            stored.get("provider").map(String::as_str),
+            Some("openai_compat")
+        );
+    }
+
+    /// Explicit-mode twin of
+    /// `test_clear_embedding_dimension_override_recreates_vector_index`:
+    /// clearing an embedding-space override under an active explicit config
+    /// removes the override row but recreates nothing — the overlay pins both
+    /// sides of the comparison.
+    #[tokio::test]
+    async fn test_explicit_mode_clear_override_is_inert() {
+        let (registry, cores, _dir) = make_workspace(1);
+        registry.set_setting("provider", "openai_compat").unwrap();
+        registry
+            .set_setting("openai_compat_embedding_dimension", "1536")
+            .unwrap();
+
+        // Settings mode writes a 768-dim override (recreates — existing
+        // behavior, pinned elsewhere).
+        cores[0]
+            .set_setting_with_reembed("openai_compat_embedding_dimension", "768", |_| {})
+            .await
+            .unwrap();
+        assert_vec_chunks_dimension(&cores[0], 768);
+
+        // Explicit mode on: clearing the override flips the settings-resolved
+        // dimension 768 → 1536, but the explicit config owns the space, so
+        // nothing may be recreated or re-embedded.
+        cores[0].update_provider_config(ProviderConfig::from_settings(
+            &std::collections::HashMap::new(),
+        ));
+        let result = cores[0]
+            .clear_override_with_reembed("openai_compat_embedding_dimension", |_| {})
+            .await
+            .unwrap();
+
+        assert!(!result.embedding_space_changed);
+        assert!(!result.dimension_changed);
+        assert_eq!(result.total_atom_count, 0, "no re-embed queued");
+        assert_vec_chunks_dimension(&cores[0], 768);
+
+        // The override row is genuinely gone — the clear itself worked.
+        let s = cores[0].get_settings().await.unwrap();
+        assert_eq!(
+            s.get("openai_compat_embedding_dimension")
+                .map(String::as_str),
+            Some("1536"),
+            "override cleared back to the workspace default"
+        );
     }
 
     #[tokio::test]
@@ -6532,6 +7231,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_claim_refuses_pending_row_inside_backoff_window() {
+        // A claim must gate on next_attempt_at: a sweeper working from a
+        // stale runnable snapshot must not steal a row whose backoff was
+        // re-armed (by a peer's failure) after the snapshot was taken.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let row = insert_pending_run(&db, "task-A", now + chrono::Duration::seconds(60), 3).await;
+        let lease = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        assert!(
+            !db.storage
+                .claim_pending_task_run_sync(&row.id, &now.to_rfc3339(), &lease)
+                .await
+                .unwrap(),
+            "claim inside the backoff window must lose"
+        );
+        let later = (now + chrono::Duration::seconds(120)).to_rfc3339();
+        assert!(
+            db.storage
+                .claim_pending_task_run_sync(&row.id, &later, &lease)
+                .await
+                .unwrap(),
+            "claim after the window opens must win"
+        );
+    }
+
+    #[tokio::test]
     async fn ledger_claim_or_create_inserts_then_claims_when_no_row_exists() {
         // High-level happy path: no existing row → fresh pending inserted,
         // claim wins, RunHandle returned, complete succeeds.
@@ -6828,6 +7553,1066 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // ==================== Scheduler runner dispatch (phase 2) ====================
+    //
+    // System tasks ride the ledger through `scheduler::runner::run_task`.
+    // These tests pin the dispatch semantics the plan's Risks section calls
+    // out: backoff actually throttles a failing task, a crashed run (row
+    // left `running` with an expired lease) is reclaimed, and the
+    // `last_run` fast-path advances only on terminal success.
+
+    use crate::scheduler::runner::{self, DispatchOutcome};
+    use crate::scheduler::{state as sched_state, ScheduledTask, TaskContext, TaskError};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Test double: a task whose due-ness is the trait default (interval
+    /// elapsed since last success) and whose run outcome is toggled by a
+    /// shared flag. Counts invocations so tests can assert "did not run".
+    struct StubTask {
+        id: &'static str,
+        fail: Arc<AtomicBool>,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl StubTask {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                fail: Arc::new(AtomicBool::new(false)),
+                runs: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn failing(id: &'static str) -> Self {
+            let stub = Self::new(id);
+            stub.fail.store(true, Ordering::SeqCst);
+            stub
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScheduledTask for StubTask {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Stub task"
+        }
+        fn default_interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        async fn run(&self, _core: &AtomicCore, _ctx: &TaskContext) -> Result<(), TaskError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(TaskError::Other("stub failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn noop_ctx() -> TaskContext {
+        TaskContext {
+            event_cb: Arc::new(|_| {}),
+            embedding_event_cb: Arc::new(|_| {}),
+        }
+    }
+
+    /// Force a pending row's `next_attempt_at` into the past so a test can
+    /// step through retries without waiting out the real backoff window.
+    async fn force_retry_due(db: &AtomicCore, task_id: &str) {
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE task_runs SET next_attempt_at = ?1 WHERE task_id = ?2 AND state = 'pending'",
+            rusqlite::params![past, task_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_failing_task_backs_off_instead_of_retrying_every_tick() {
+        // The retry-storm fix: after a failure the row goes pending with
+        // `next_attempt_at` in the future, and subsequent dispatches skip
+        // it until the window passes — they must not re-run the task.
+        let (db, _temp) = create_test_db().await;
+        let task = StubTask::failing("stub_backoff");
+        let ctx = noop_ctx();
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+
+        let row = &db.list_task_runs("stub_backoff", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.last_error.as_deref(), Some("stub failure"));
+        assert!(
+            row.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        // Simulate the next few 15s ticks: still due (no last_run), but the
+        // backoff window gates the claim. No re-run.
+        for _ in 0..3 {
+            let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+            assert!(matches!(outcome, DispatchOutcome::Skipped));
+        }
+        assert_eq!(
+            task.runs.load(Ordering::SeqCst),
+            1,
+            "no re-attempt inside the backoff window"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_failing_task_abandons_after_max_attempts() {
+        // Step through the full retry budget by forcing each backoff window
+        // open, then confirm the row settles `abandoned` (terminal) and a
+        // later dispatch starts a fresh row rather than touching it.
+        let (db, _temp) = create_test_db().await;
+        let task = StubTask::failing("stub_abandon");
+        let ctx = noop_ctx();
+
+        for attempt in 1..=runner::DEFAULT_MAX_ATTEMPTS as usize {
+            let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+            assert!(
+                matches!(outcome, DispatchOutcome::Failed { .. }),
+                "attempt {attempt} should run and fail"
+            );
+            force_retry_due(&db, "stub_abandon").await;
+        }
+        assert_eq!(
+            task.runs.load(Ordering::SeqCst),
+            runner::DEFAULT_MAX_ATTEMPTS as usize
+        );
+
+        let row = &db.list_task_runs("stub_abandon", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Abandoned);
+        assert_eq!(row.attempts, runner::DEFAULT_MAX_ATTEMPTS);
+
+        // The abandoned row is terminal — the next dispatch opens a new one.
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        let history = db.list_task_runs("stub_abandon", None, 10).await.unwrap();
+        assert_eq!(history.len(), 2, "fresh row after abandonment");
+    }
+
+    #[tokio::test]
+    async fn dispatch_success_advances_last_run_failure_does_not() {
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+
+        let ok_task = StubTask::new("stub_ok");
+        let outcome = runner::run_task(&db, "test-db", &ok_task, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        assert!(
+            sched_state::get_last_run(&db, "stub_ok")
+                .await
+                .unwrap()
+                .is_some(),
+            "success advances the last_run fast-path"
+        );
+        let row = &db.list_task_runs("stub_ok", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Succeeded);
+
+        let bad_task = StubTask::failing("stub_bad");
+        let outcome = runner::run_task(&db, "test-db", &bad_task, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Failed { .. }));
+        assert!(
+            sched_state::get_last_run(&db, "stub_bad")
+                .await
+                .unwrap()
+                .is_none(),
+            "failure must not advance last_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_not_due_creates_no_ledger_rows() {
+        // The hot is_due gate runs before any ledger work: a just-succeeded
+        // task (within its interval) leaves task_runs completely untouched
+        // on subsequent ticks.
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+        let task = StubTask::new("stub_not_due");
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+        let history = db.list_task_runs("stub_not_due", None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "no new row for a not-due tick");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reclaims_running_row_with_expired_lease() {
+        // Simulated crash: a previous process claimed the row and died —
+        // the row is stuck `running` with a lease in the past. The next
+        // dispatch must reclaim it (same row, no attempt bump) and run.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        let crashed = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: "stub_crash".to_string(),
+            subject_id: None,
+            state: TaskRunState::Running,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: Some((now - chrono::Duration::minutes(5)).to_rfc3339()),
+            next_attempt_at: now.to_rfc3339(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: Some((now - chrono::Duration::minutes(20)).to_rfc3339()),
+            finished_at: None,
+            created_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+            updated_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+        };
+        let crashed_id = crashed.id.clone();
+        db.storage.insert_task_run_sync(&crashed).await.unwrap();
+
+        let task = StubTask::new("stub_crash");
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 1);
+
+        let history = db.list_task_runs("stub_crash", None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "reclaimed the crashed row, no new row");
+        let row = db
+            .storage
+            .get_task_run_sync(&crashed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, TaskRunState::Succeeded);
+        assert_eq!(row.attempts, 1, "reclaim does not bump attempts");
+    }
+
+    #[tokio::test]
+    async fn provider_classified_failure_defers_without_consuming_attempts() {
+        // The environmental-failure sibling of the reclaim rule above: with
+        // a host policy installed, `RunHandle::fail` on a provider-classified
+        // error routes to `defer_until` — pending at the policy's horizon,
+        // the claim's attempt refunded, lease released — while a logic
+        // failure through the same policy keeps consuming retry budget.
+        let (db, _temp) = create_test_db().await;
+        db.set_failure_disposition_policy(Some(Arc::new(|error: &str| {
+            match crate::providers::classify_provider_failure(error) {
+                crate::providers::ProviderFailureClass::Other => ledger::FailureDisposition::Fail,
+                _ => {
+                    ledger::FailureDisposition::DeferUntil(Utc::now() + chrono::Duration::hours(1))
+                }
+            }
+        })));
+
+        let handle = ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("fresh claim");
+        assert_eq!(handle.run().attempts, 1, "the claim charges an attempt");
+        assert!(handle
+            .fail("Embedding error: API error (402): out of credits".to_string())
+            .await
+            .unwrap());
+
+        let row = &db.list_task_runs("stub_defer", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "deferred, not failed");
+        assert_eq!(
+            row.attempts, 0,
+            "deferral refunds the claim's attempt — environmental failures \
+             never consume retry budget"
+        );
+        assert!(row.lease_until.is_none(), "the deferral released the lease");
+        assert!(
+            row.next_attempt_at.as_str()
+                > (Utc::now() + chrono::Duration::minutes(55))
+                    .to_rfc3339()
+                    .as_str(),
+            "re-armed at the policy's horizon, not the ledger's backoff"
+        );
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("Embedding error: API error (402): out of credits")
+        );
+
+        // The deferred row gates re-claims exactly like a backoff window…
+        assert!(
+            ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+                .await
+                .unwrap()
+                .is_none(),
+            "a deferred row is owned work — no duplicate claim"
+        );
+
+        // …and once due again, a LOGIC failure through the same policy
+        // still consumes budget (the historical retry/abandon path).
+        force_retry_due(&db, "stub_defer").await;
+        let handle = ledger::claim_or_create(&db, "stub_defer", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("re-claim after deferral");
+        assert!(handle
+            .fail("Parse error: bad JSON".to_string())
+            .await
+            .unwrap());
+        let row = &db.list_task_runs("stub_defer", None, 10).await.unwrap()[0];
+        assert_eq!(row.state, TaskRunState::Pending, "retry scheduled");
+        assert_eq!(row.attempts, 1, "logic failures keep consuming the budget");
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_when_peer_holds_live_lease() {
+        // The durable lease — not the in-memory registry lock — is the
+        // re-entry guard. A row claimed by a "peer" (live lease) makes a
+        // fresh dispatch skip without running the task.
+        let (db, _temp) = create_test_db().await;
+        let peer = ledger::claim_or_create(&db, "stub_lease", None, TaskRunTrigger::Schedule, 3)
+            .await
+            .unwrap()
+            .expect("peer claims");
+
+        let task = StubTask::new("stub_lease");
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Skipped));
+        assert_eq!(task.runs.load(Ordering::SeqCst), 0, "task must not run");
+
+        let _ = peer.complete(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graph_maintenance_is_due_tracks_dirty_flag() {
+        // GraphMaintenanceTask overrides the default interval gate with a
+        // dirty-flag trigger: clean graph → never due; marked dirty (with
+        // an idle pipeline) → due; processed → clean again.
+        let (db, _temp) = create_test_db().await;
+        let task = graph_maintenance::GraphMaintenanceTask;
+
+        assert!(!task.is_due(&db).await, "clean graph is never due");
+
+        graph_maintenance::mark_dirty(&db.storage).await.unwrap();
+        assert!(
+            task.is_due(&db).await,
+            "dirty graph with idle pipeline is due"
+        );
+
+        graph_maintenance::run_now(&db).await.unwrap();
+        assert!(!task.is_due(&db).await, "processed dirt clears due-ness");
+    }
+
+    // ==================== task_runs retention GC (phase 5) ====================
+    //
+    // The per-rule eligibility SQL is contract-tested against both backends
+    // in tests/storage_tests.rs; these tests pin the task layer: policy
+    // knobs resolve from per-DB settings with the plan's defaults, the
+    // sweep loop drains a backlog in bounded batches, and the task itself
+    // dispatches through the same ledger it collects (dogfooding).
+
+    use crate::scheduler::gc::{self as task_gc, GcOutcome, RetentionPolicy, TaskRunsGcTask};
+
+    /// Seed a terminal ledger row dated `created_at` — GC test fixture.
+    async fn seed_terminal_run(
+        db: &AtomicCore,
+        task_id: &str,
+        state: TaskRunState,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let ts = created_at.to_rfc3339();
+        let row = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: task_id.to_string(),
+            subject_id: None,
+            state,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: ts.clone(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: None,
+            finished_at: Some(ts.clone()),
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        db.storage.insert_task_run_sync(&row).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_policy_loads_defaults_and_overrides() {
+        // Fresh DB: empty per-DB settings table (the load-bearing
+        // invariant — no migration seeds these keys) yields the plan's
+        // defaults.
+        let (db, _temp) = create_test_db().await;
+        assert_eq!(
+            RetentionPolicy::load(&db).await.unwrap(),
+            RetentionPolicy::default()
+        );
+
+        // Valid overrides are honored. Written via storage directly —
+        // the same per-DB path the loader reads.
+        for (key, value) in [
+            ("task.task_runs_gc.keep_per_subject", "5"),
+            ("task.task_runs_gc.retain_days", "7"),
+            ("task.task_runs_gc.retain_failed_days", "14"),
+        ] {
+            db.storage.set_setting_sync(key, value).await.unwrap();
+        }
+        assert_eq!(
+            RetentionPolicy::load(&db).await.unwrap(),
+            RetentionPolicy {
+                keep_per_subject: 5,
+                retain_days: 7,
+                retain_failed_days: 14,
+            }
+        );
+
+        // Garbage falls back per-knob: zero, negative, and unparseable
+        // values must not become "delete everything immediately".
+        for (key, value) in [
+            ("task.task_runs_gc.keep_per_subject", "0"),
+            ("task.task_runs_gc.retain_days", "-3"),
+            ("task.task_runs_gc.retain_failed_days", "ninety"),
+        ] {
+            db.storage.set_setting_sync(key, value).await.unwrap();
+        }
+        assert_eq!(
+            RetentionPolicy::load(&db).await.unwrap(),
+            RetentionPolicy::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_skips_sweep_when_policy_load_fails() {
+        // Fail closed: a settings read error must skip the sweep — the
+        // defaults may be tighter than the operator's overrides, so falling
+        // back to them could delete history that was configured to be kept.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        // A row the default policy would collect (terminal, past the age cap).
+        seed_terminal_run(
+            &db,
+            "stub_gc_fail_closed",
+            TaskRunState::Succeeded,
+            now - chrono::Duration::days(40),
+        )
+        .await;
+
+        // Break the per-DB settings table to force a real read error on the
+        // exact path RetentionPolicy::load uses.
+        {
+            let sqlite = db.storage.as_sqlite().unwrap();
+            let conn = sqlite.db.conn.lock().unwrap();
+            conn.execute("ALTER TABLE settings RENAME TO settings_broken", [])
+                .unwrap();
+        }
+
+        assert!(
+            RetentionPolicy::load(&db).await.is_err(),
+            "load must surface the read error, not default"
+        );
+        let ctx = noop_ctx();
+        assert!(
+            TaskRunsGcTask.run(&db, &ctx).await.is_err(),
+            "the run fails (skipping the sweep) instead of deleting under defaults"
+        );
+        assert_eq!(
+            db.list_task_runs("stub_gc_fail_closed", None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nothing was deleted while the policy was unreadable"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_drains_backlog_in_bounded_batches() {
+        // 7 collectible rows with batch size 3 → exactly 3 storage
+        // round-trips (3 + 3 + 1), everything gone. The short final batch
+        // doubles as the loop's termination signal.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        for i in 0..7 {
+            seed_terminal_run(
+                &db,
+                "stub_gc_batch",
+                TaskRunState::Succeeded,
+                now - chrono::Duration::days(40) - chrono::Duration::minutes(i),
+            )
+            .await;
+        }
+
+        let outcome = task_gc::sweep(&db, &RetentionPolicy::default(), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GcOutcome {
+                deleted: 7,
+                batches: 3
+            }
+        );
+        assert!(db
+            .list_task_runs("stub_gc_batch", None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_task_dispatches_through_ledger_and_prunes_history() {
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+        let task = TaskRunsGcTask;
+
+        // A keep-window override the run must pick up, plus a 5-row
+        // history (recent, so only the K rule can prune it).
+        db.storage
+            .set_setting_sync("task.task_runs_gc.keep_per_subject", "2")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        for i in 1..=5 {
+            seed_terminal_run(
+                &db,
+                "stub_gc_history",
+                TaskRunState::Succeeded,
+                now - chrono::Duration::minutes(i),
+            )
+            .await;
+        }
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+
+        let history = db
+            .list_task_runs("stub_gc_history", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "pruned to the overridden keep window");
+
+        // Dogfooding: the sweep itself settled a succeeded ledger row and
+        // advanced the last_run fast-path...
+        let own = db.list_task_runs(task_gc::TASK_ID, None, 10).await.unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].state, TaskRunState::Succeeded);
+        assert!(sched_state::get_last_run(&db, task_gc::TASK_ID)
+            .await
+            .unwrap()
+            .is_some());
+
+        // ...so the hourly default interval gates the next tick.
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+
+        // An interval_minutes override re-opens the gate once last_run
+        // falls outside the shorter window.
+        db.storage
+            .set_setting_sync("task.task_runs_gc.interval_minutes", "1")
+            .await
+            .unwrap();
+        sched_state::set_last_run(
+            &db,
+            task_gc::TASK_ID,
+            Utc::now() - chrono::Duration::minutes(2),
+        )
+        .await
+        .unwrap();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        let own = db.list_task_runs(task_gc::TASK_ID, None, 10).await.unwrap();
+        assert_eq!(own.len(), 2, "second sweep recorded its own run");
+    }
+
+    #[tokio::test]
+    async fn gc_disabled_via_setting_is_not_due() {
+        let (db, _temp) = create_test_db().await;
+        db.storage
+            .set_setting_sync("task.task_runs_gc.enabled", "false")
+            .await
+            .unwrap();
+
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &TaskRunsGcTask, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+        assert!(
+            db.list_task_runs(task_gc::TASK_ID, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a disabled GC never touches the ledger"
+        );
+    }
+
+    // ==================== Feed polling via the ledger (phase 3) ====================
+    //
+    // Feed polls ride the same `task_runs` ledger as system tasks, keyed
+    // per feed via `subject_id`. These tests drive
+    // `ingest::poller::poll_due_feeds` — the sweep body the server's 60s
+    // loop runs — and pin the phase-3 contract: one run row per poll with
+    // the feed id as subject, retryable failures back off without touching
+    // `last_polled_at` (the feed stays due; the ledger throttles),
+    // abandonment parks the feed until its next interval, and overlapping
+    // sweeps dedup on the live lease.
+
+    use crate::ingest::poller::{self, PollOutcome, FEED_POLL_TASK_ID};
+    use atomic_test_support::MockUrlServer;
+
+    /// One poll sweep with noop event callbacks — the deterministic
+    /// stand-in for the server's 60s timer tick.
+    async fn poll_sweep(db: &AtomicCore) -> Vec<ingest::FeedPollResult> {
+        poller::poll_due_feeds(db, |_| {}, |_| {}).await
+    }
+
+    /// Seed a feed definition directly in storage — no create-time fetch or
+    /// kickoff poll, so tests own every poll explicitly. `poll_interval` is
+    /// minutes; 0 means due on every sweep.
+    async fn seed_feed(db: &AtomicCore, url: &str, poll_interval: i32) -> Feed {
+        db.storage
+            .create_feed_sync(url, Some("Test feed"), None, poll_interval, &[])
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn feed_poll_sweep_records_run_per_feed_with_subject() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        // Same mock document under two distinct URL strings — the `feeds`
+        // table has a uniqueness check on `url`.
+        let feed_a = seed_feed(&db, &mock.feed_url(), 0).await;
+        let feed_b = seed_feed(&db, &format!("{}?b", mock.feed_url()), 0).await;
+
+        let results = poll_sweep(&db).await;
+        assert_eq!(results.len(), 2, "both due feeds polled");
+
+        for feed in [&feed_a, &feed_b] {
+            let history = db
+                .list_task_runs(FEED_POLL_TASK_ID, Some(&feed.id), 10)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1, "one ledger row per poll");
+            let run = &history[0];
+            assert_eq!(run.subject_id.as_deref(), Some(feed.id.as_str()));
+            assert_eq!(run.state, TaskRunState::Succeeded);
+            assert_eq!(run.trigger, TaskRunTrigger::Schedule);
+            assert!(run.finished_at.is_some());
+
+            let refreshed = db.get_feed(&feed.id).await.unwrap();
+            assert!(
+                refreshed.last_polled_at.is_some(),
+                "success advances the fast-path"
+            );
+            assert!(refreshed.last_error.is_none());
+        }
+
+        // Subject scoping: listing without a subject spans both feeds.
+        let all = db
+            .list_task_runs(FEED_POLL_TASK_ID, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn feed_poll_failure_backs_off_while_healthy_feed_keeps_polling() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let healthy = seed_feed(&db, &mock.feed_url(), 0).await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 0).await;
+
+        let results = poll_sweep(&db).await;
+        assert_eq!(results.len(), 1, "only the healthy poll completes");
+
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(run.attempts, 1);
+        assert!(run.last_error.is_some());
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        let broken_feed = db.get_feed(&broken.id).await.unwrap();
+        assert!(
+            broken_feed.last_polled_at.is_none(),
+            "retryable failure must not advance the fast-path — the feed stays due"
+        );
+        assert!(broken_feed.last_error.is_some());
+
+        // Subsequent sweeps: the broken feed is still due but inside its
+        // backoff window — no re-attempt, no new rows. The healthy feed
+        // (interval 0) keeps polling, untouched by its broken sibling.
+        for _ in 0..2 {
+            poll_sweep(&db).await;
+        }
+        let broken_history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            broken_history.len(),
+            1,
+            "backed-off row is reused, not duplicated"
+        );
+        assert_eq!(
+            broken_history[0].attempts, 1,
+            "no re-attempt inside the backoff window"
+        );
+        let healthy_history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&healthy.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy_history.len(),
+            3,
+            "healthy feed polled on every sweep"
+        );
+        assert!(healthy_history
+            .iter()
+            .all(|r| r.state == TaskRunState::Succeeded));
+
+        // Manual polls respect the same backoff gate as the sweep.
+        let outcome = db
+            .poll_feed(&broken.id, TaskRunTrigger::Manual, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PollOutcome::Skipped));
+    }
+
+    #[tokio::test]
+    async fn feed_poll_abandonment_parks_feed_until_next_interval() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 60).await;
+
+        // Exhaust the retry budget, forcing each backoff window open the
+        // same way the scheduler dispatch tests do. A never-polled feed
+        // stays due throughout (last_polled_at never advances on a
+        // retryable failure), so each sweep reaches the claim.
+        for attempt in 1..=poller::MAX_ATTEMPTS {
+            let results = poll_sweep(&db).await;
+            assert!(results.is_empty(), "failed polls return no results");
+            let run = &db
+                .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+                .await
+                .unwrap()[0];
+            assert_eq!(run.attempts, attempt, "one attempt per opened window");
+            force_retry_due(&db, FEED_POLL_TASK_ID).await;
+        }
+
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Abandoned);
+        assert_eq!(run.attempts, poller::MAX_ATTEMPTS);
+
+        // Abandonment settles the sweep: `last_polled_at` advances, so the
+        // feed is parked until poll_interval elapses instead of opening a
+        // fresh retry cycle on the very next sweep.
+        let feed = db.get_feed(&broken.id).await.unwrap();
+        assert!(feed.last_polled_at.is_some());
+        assert!(feed.last_error.is_some());
+
+        poll_sweep(&db).await;
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "parked feed is not due — no new row");
+    }
+
+    #[tokio::test]
+    async fn feed_poll_concurrent_sweeps_poll_each_due_feed_once() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let feed = seed_feed(&db, &mock.slow_feed_url(), 0).await;
+
+        // Two sweeps in flight at once (two server processes sharing one
+        // database, or overlapping ticks). The slow fixture keeps the
+        // winner's poll running long enough that the loser's claim
+        // deterministically sees a live lease.
+        let (a, b) = tokio::join!(poll_sweep(&db), poll_sweep(&db));
+        assert_eq!(a.len() + b.len(), 1, "exactly one sweep polled the feed");
+
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&feed.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "single run row — no double poll");
+        assert_eq!(history[0].state, TaskRunState::Succeeded);
+        assert_eq!(history[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_feed_settles_nonterminal_ledger_rows() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockUrlServer::start().await;
+        let broken = seed_feed(&db, &mock.broken_feed_url(), 0).await;
+
+        // One failed poll leaves a pending row backed off into the future —
+        // exactly the row no sweep can ever reach once the feed definition
+        // is gone (the sweep only visits feeds that still exist, and GC
+        // never deletes non-terminal rows).
+        poll_sweep(&db).await;
+        let run = &db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending);
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "test premise: the row is inside its backoff window"
+        );
+
+        db.delete_feed(&broken.id).await.unwrap();
+
+        assert!(
+            db.storage
+                .find_active_task_run_sync(FEED_POLL_TASK_ID, Some(&broken.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "no non-terminal rows survive feed deletion"
+        );
+        let history = db
+            .list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "history is preserved, not deleted");
+        assert_eq!(
+            history[0].state,
+            TaskRunState::Succeeded,
+            "settled as moot success — same shape as wiki's deleted-tag path"
+        );
+        assert!(history[0].finished_at.is_some());
+
+        // A later sweep neither errors nor resurrects work for the feed.
+        assert!(poll_sweep(&db).await.is_empty());
+        assert_eq!(
+            db.list_task_runs(FEED_POLL_TASK_ID, Some(&broken.id), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the deleted feed never re-enters the ledger"
+        );
+    }
+
+    // ==================== Wiki regen via the ledger (phase 4) ====================
+    //
+    // Wiki regeneration rides `task_runs` with `task_id = "wiki.regenerate"`
+    // and the tag id as subject. Unlike system tasks and feed polls it is
+    // event-triggered — no schedule re-fires it — so on top of the shared
+    // claim semantics these tests pin the retry sweeper: a failed run's
+    // pending row is ignored while its backoff window is closed, picked up
+    // by `sweep_due_wiki_regens` once it opens (`force_retry_due` stands in
+    // for the elapsed wall clock), and settled quietly when its tag was
+    // deleted in the meantime. The HTTP-surface contract (409 on concurrent
+    // requests, distinct tags in parallel) lives in
+    // `atomic-server/tests/e2e_wiki.rs` across both backends.
+
+    use crate::wiki::runner::{RegenOutcome, WIKI_REGENERATE_TASK_ID};
+    use atomic_test_support::MockAiServer;
+
+    /// Point the per-DB provider settings at a mock OpenAI-compat server so
+    /// wiki generation drives the real provider client against
+    /// deterministic responses.
+    async fn seed_mock_provider(db: &AtomicCore, mock: &MockAiServer) {
+        for (k, v) in [
+            ("provider", "openai_compat"),
+            ("openai_compat_base_url", mock.base_url().as_str()),
+            ("openai_compat_api_key", "test-key"),
+            ("openai_compat_llm_model", "mock-llm"),
+        ] {
+            db.set_setting(k, v).await.unwrap();
+        }
+    }
+
+    /// Seed a tag with one atom and the chunk row the embedding pipeline
+    /// would have produced, so the wiki source query has content without
+    /// running the async pipeline.
+    async fn seed_wiki_tag(db: &AtomicCore, tag_name: &str) -> Tag {
+        let tag = db.create_tag(tag_name, None).await.unwrap();
+        let atom_id = uuid::Uuid::new_v4().to_string();
+        let request = CreateAtomRequest {
+            content: "wiki source content".to_string(),
+            tag_ids: vec![tag.id.clone()],
+            ..Default::default()
+        };
+        db.storage
+            .insert_atom_impl(&atom_id, &request, &Utc::now().to_rfc3339())
+            .await
+            .unwrap();
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO atom_chunks (id, atom_id, chunk_index, content) VALUES (?1, ?2, 0, ?3)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                atom_id,
+                "wiki source content"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        tag
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_records_ledger_run_with_tag_subject() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        let tag = seed_wiki_tag(&db, "Physics").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        let RegenOutcome::Generated(article) = outcome else {
+            panic!("expected Generated, got {outcome:?}");
+        };
+
+        let history = db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one ledger row per regeneration");
+        let run = &history[0];
+        assert_eq!(run.subject_id.as_deref(), Some(tag.id.as_str()));
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert_eq!(run.trigger, TaskRunTrigger::Manual);
+        assert_eq!(
+            run.result_id.as_deref(),
+            Some(article.article.id.as_str()),
+            "result_id points at the produced article"
+        );
+        assert!(db.get_wiki(&tag.id).await.unwrap().is_some());
+
+        // A nonexistent tag is a caller error surfaced before any ledger
+        // row is created.
+        let err = db
+            .regenerate_wiki("missing-tag", TaskRunTrigger::Manual)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AtomicCoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_failure_backs_off_and_sweeper_retries_when_window_opens() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        // "WikiFail" in the tag name lands in the generation prompt and
+        // makes the mock provider 400 the call.
+        let tag = seed_wiki_tag(&db, "WikiFailPhysics").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Failed { .. }));
+
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(run.attempts, 1);
+        assert!(run.last_error.is_some());
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        // NOT before the window opens: sweeps are no-ops and a manual
+        // request dedups against the backed-off row instead of double-running.
+        assert!(db.sweep_due_wiki_regens().await.is_empty());
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Skipped));
+        let history = db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "backed-off row reused, not duplicated");
+        assert_eq!(
+            history[0].attempts, 1,
+            "no re-attempt inside the backoff window"
+        );
+
+        // Open the window and clear the failure mode (rename the tag) — the
+        // sweep claims the row and the retry synthesizes against the tag's
+        // *current* name, not the one captured at enqueue time.
+        force_retry_due(&db, WIKI_REGENERATE_TASK_ID).await;
+        db.update_tag(&tag.id, "RecoveredPhysics", None)
+            .await
+            .unwrap();
+        let regenerated = db.sweep_due_wiki_regens().await;
+        assert_eq!(regenerated, vec![tag.id.clone()]);
+
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert_eq!(
+            run.attempts, 2,
+            "retry consumed a second attempt on the same row"
+        );
+        assert!(run.result_id.is_some());
+        assert!(db.get_wiki(&tag.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_sweep_settles_run_for_deleted_tag() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        let tag = seed_wiki_tag(&db, "WikiFailDoomed").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Failed { .. }));
+
+        // The tag disappears while its retry waits out the backoff. The
+        // sweep must settle the row (the work is moot, not failed) instead
+        // of leaving it runnable forever or recording a spurious abandon.
+        force_retry_due(&db, WIKI_REGENERATE_TASK_ID).await;
+        db.delete_tag(&tag.id, false).await.unwrap();
+
+        assert!(db.sweep_due_wiki_regens().await.is_empty());
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert!(run.result_id.is_none(), "no artifact for moot work");
     }
 
     // ==================== Reports primitive (V20) ====================

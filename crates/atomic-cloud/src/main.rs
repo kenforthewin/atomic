@@ -1,189 +1,1303 @@
-//! Atomic Cloud — management plane for Atomic managed hosting
+//! Atomic Cloud — binary entry point.
+//!
+//! Subcommands:
+//!
+//! - `serve` — run the composed multi-tenant server (see [`atomic_cloud::server`]),
+//!   applying pending control-plane migrations on boot.
+//! - `migrate` — apply pending control-plane migrations and exit.
+//! - `account create` / `account delete` — operator-side provisioning, the
+//!   manual path until the signup slice lands the HTTP flow.
+//! - `token create` — mint a control-plane API token for an account.
+//!
+//! Every command takes `--control-url` (or `ATOMIC_CLOUD_CONTROL_URL`) before
+//! the subcommand and runs migrations first, so any command works against a
+//! fresh cluster.
+//!
+//! # Master key
+//!
+//! `serve` additionally requires the provider-credential master key (env
+//! var named by `--master-key-env`, default `ATOMIC_CLOUD_MASTER_KEY`) and
+//! refuses to boot without a valid one — provider features are integral to
+//! serving (managed keys are provisioned at signup; BYOK settings routes
+//! decrypt stored keys), so a missing/malformed key is a deployment error
+//! best surfaced at boot, not on the first signup. The other subcommands
+//! (`migrate`, `account`, `token`) deliberately never load the vault — or
+//! the OpenRouter provisioning key — so operator tooling stays runnable
+//! from hosts that hold neither production secret. The trade-off is that
+//! `account create` provisions keyless accounts and `account delete` cannot
+//! delete a managed runtime key (it logs the residue loudly with the
+//! `external_key_id`; the master OpenRouter account's key listing is the
+//! cleanup path). The HTTP routes, which run inside `serve`, do both
+//! properly — prefer them.
 
-mod auth;
-mod clients;
-mod config;
-mod db;
-mod error;
-mod jobs;
-mod models;
-mod routes;
-mod state;
-
-use actix_cors::Cors;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use clap::Parser;
-use config::{Cli, Command};
 use std::sync::Arc;
 
-async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "service": "atomic-cloud",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
+use actix_web::{App, HttpServer};
+use atomic_cloud::{
+    abandoned_run_threshold, advance_deploy, configure_cloud_app, delete_account,
+    finalize_abandoned_runs, issue_token, latest_deploy_run, list_failed_migrations,
+    list_unmigrated, provision_account, run_fleet_gate, tenant_schema_target, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, ChatStreamLimiter,
+    CloudAuth, ClusterConfig, ControlPlane, DeployPolicy, Dispatcher, DispatcherConfig,
+    EmailSender, EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender,
+    MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PoolCaps,
+    RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
+};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Parser)]
+#[command(name = "atomic-cloud", about = "Atomic Cloud multi-tenant server")]
+struct Cli {
+    /// Postgres URL of the control-plane database. When the URL omits a
+    /// database name, `atomic_cloud_control` is used.
+    #[arg(long, env = "ATOMIC_CLOUD_CONTROL_URL")]
+    control_url: String,
+
+    #[command(subcommand)]
+    command: Command,
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let cli = Cli::parse();
+/// Where tenant databases live. Shared by every subcommand that touches a
+/// tenant database (`serve`, `account create`, `account delete`).
+#[derive(Args)]
+struct ClusterArgs {
+    /// Postgres URL of the shared tenant cluster. The database path
+    /// component is replaced per tenant; the user must be able to
+    /// CREATE/DROP DATABASE.
+    #[arg(long, env = "ATOMIC_CLOUD_CLUSTER_URL")]
+    cluster_url: String,
 
-    match cli.command {
-        Some(Command::Serve {
-            port,
-            bind,
-            database_url,
-            stripe_secret_key,
-            stripe_webhook_secret,
-            stripe_price_id,
-            fly_api_token,
-            fly_org,
-            fly_region,
-            atomic_image,
-            base_domain,
-            mailgun_api_key,
-            mailgun_domain,
-            mailgun_from,
-            admin_api_key,
-            public_url,
-            frontend_dir,
-        }) => {
-            run_server(
-                port,
-                &bind,
-                &database_url,
-                stripe_secret_key,
-                stripe_webhook_secret,
-                stripe_price_id,
-                fly_api_token,
-                fly_org,
-                fly_region,
-                atomic_image,
-                base_domain,
-                mailgun_api_key,
-                mailgun_domain,
-                mailgun_from,
-                admin_api_key,
-                public_url,
-                frontend_dir,
-            )
-            .await
-        }
-        None => {
-            eprintln!("Usage: atomic-cloud serve [OPTIONS]");
-            eprintln!("Run `atomic-cloud serve --help` for details.");
-            std::process::exit(1);
+    /// Identifier recorded on account_databases rows, for the future
+    /// shard split. v1 runs a single cluster.
+    #[arg(long, env = "ATOMIC_CLOUD_CLUSTER_ID", default_value = "primary")]
+    cluster_id: String,
+}
+
+impl ClusterArgs {
+    fn into_config(self) -> ClusterConfig {
+        ClusterConfig {
+            cluster_id: self.cluster_id,
+            cluster_url: self.cluster_url,
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_server(
-    port: u16,
-    bind: &str,
-    database_url: &str,
-    stripe_secret_key: String,
-    stripe_webhook_secret: String,
-    stripe_price_id: String,
-    fly_api_token: String,
-    fly_org: String,
-    fly_region: String,
-    atomic_image: String,
-    base_domain: String,
-    mailgun_api_key: String,
-    mailgun_domain: String,
-    mailgun_from: String,
-    admin_api_key: String,
-    public_url: String,
-    frontend_dir: String,
-) -> std::io::Result<()> {
-    // Connect to PostgreSQL
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(database_url)
-        .await
-        .expect("Failed to connect to PostgreSQL");
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // One Command exists per process; Serve is just every serve knob.
+enum Command {
+    /// Start the multi-tenant HTTP server.
+    Serve {
+        #[command(flatten)]
+        cluster: ClusterArgs,
 
-    // Run migrations
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run database migrations");
+        /// Base domain accounts are hosted under: requests to
+        /// `<subdomain>.<base-domain>` route to the matching account.
+        #[arg(long, env = "ATOMIC_CLOUD_BASE_DOMAIN")]
+        base_domain: String,
 
-    eprintln!("Atomic Cloud starting...");
-    eprintln!("  Listening: http://{}:{}", bind, port);
-    eprintln!("  Public URL: {}", public_url);
-    eprintln!("  Fly org: {}", fly_org);
-    eprintln!("  Base domain: {}", base_domain);
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
 
-    let fly_client = Arc::new(clients::fly::FlyClient::new(fly_api_token));
+        /// Address to bind to.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
 
-    // Spawn background cleanup job
-    jobs::spawn_cleanup_job(pool.clone(), Arc::clone(&fly_client));
+        /// Max connections in each cached tenant's Postgres pool. Every
+        /// active account holds its own pool, so keep this small (the plan
+        /// budgets ~5 per tenant behind pgbouncer).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_TENANT_POOL_MAX_CONNECTIONS",
+            default_value_t = 5
+        )]
+        tenant_pool_max_connections: u32,
 
-    let mailgun_client =
-        clients::mailgun::MailgunClient::new(mailgun_api_key, mailgun_domain, mailgun_from);
+        /// Close a tenant pool's connections after this many seconds idle,
+        /// so quiet-but-cached accounts release connections back to the
+        /// cluster before their cache entry is evicted.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_TENANT_POOL_IDLE_TIMEOUT_SECS",
+            default_value_t = 300
+        )]
+        tenant_pool_idle_timeout_secs: u64,
 
-    let app_state = web::Data::new(state::CloudState {
-        db: pool,
-        stripe: clients::stripe::StripeClient::new(stripe_secret_key),
-        fly: fly_client,
-        mailgun: mailgun_client,
-        config: state::CloudConfig {
-            stripe_price_id,
-            stripe_webhook_secret,
-            base_domain,
-            atomic_image,
-            fly_org,
-            fly_region,
-            admin_api_key,
-            public_url,
-        },
-    });
+        /// How often the periodic idle sweep of the account cache runs, in
+        /// seconds. Defaults to a quarter of the cache idle TTL.
+        #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
+        cache_sweep_interval_secs: Option<u64>,
 
-    let bind_owned = bind.to_string();
-    let frontend_dir_owned = frontend_dir.clone();
+        /// How often the failure-recovery reaper runs, in seconds (plan:
+        /// "Failure recovery & the reaper"). Each pass resumes or rolls
+        /// back stuck provisions, reclaims orphaned tenant databases,
+        /// clears self-reservations, and purges expired links/sessions/
+        /// reservations. Per-account advisory locks make concurrent passes
+        /// across pods safe.
+        #[arg(long, env = "ATOMIC_CLOUD_REAPER_INTERVAL_SECS", default_value_t = 60)]
+        reaper_interval_secs: u64,
 
-    HttpServer::new(move || {
-        let cors = Cors::permissive();
+        #[command(flatten)]
+        email: EmailArgs,
 
-        let mut app = App::new()
-            .wrap(cors)
-            .app_data(app_state.clone())
-            // Health check (public)
-            .route("/health", web::get().to(health))
-            // Public routes (no auth)
-            .configure(routes::configure_public_routes)
-            // Instance management routes (management token auth)
-            .service(
-                web::scope("/api/instance")
-                    .wrap(auth::InstanceAuth)
-                    .configure(routes::configure_instance_routes),
-            )
-            // Admin routes (admin API key auth)
-            .service(
-                web::scope("/api/admin")
-                    .wrap(auth::AdminAuth)
-                    .configure(routes::configure_admin_routes),
-            );
+        /// Name of the environment variable holding the master key that
+        /// encrypts provider credentials at rest (32 bytes, hex or
+        /// base64). The key VALUE is only ever read from the environment —
+        /// argv leaks into process listings. serve fails at boot without a
+        /// valid key; see atomic_cloud::keyvault for the custody runbook
+        /// (loss of this key = unrecoverable credentials).
+        #[arg(long, default_value = atomic_cloud::MASTER_KEY_ENV)]
+        master_key_env: String,
 
-        // Serve frontend static files if the directory exists
-        let frontend_path = std::path::Path::new(&frontend_dir_owned);
-        if frontend_path.exists() {
-            app = app.service(
-                actix_files::Files::new("/", &frontend_dir_owned)
-                    .index_file("index.html")
-                    .default_handler(
-                        actix_files::NamedFile::open(frontend_path.join("index.html"))
-                            .expect("Frontend index.html not found"),
-                    ),
-            );
+        /// Derive the client IP for rate limiting from `X-Forwarded-For`
+        /// (rightmost entry — the one appended by your proxy) instead of
+        /// the connection peer address. Enable when, and ONLY when, a
+        /// trusted reverse proxy fronts this process: without one, clients
+        /// can spoof the header and sidestep per-IP limits; with one but
+        /// this flag off, every client shares the proxy's bucket.
+        #[arg(long, env = "ATOMIC_CLOUD_TRUST_PROXY_HEADER")]
+        trust_proxy_header: bool,
+
+        /// Public origin used when building emailed magic links, e.g.
+        /// `https://app.atomic.cloud`. Defaults to `https://app.<base-domain>`;
+        /// override for local/dev deployments with ports or plain http.
+        /// Post-signup/login redirects to tenant subdomains reuse its
+        /// scheme and port.
+        #[arg(long, env = "ATOMIC_CLOUD_APP_PUBLIC_URL")]
+        app_public_url: Option<String>,
+
+        /// Max signups provisioning concurrently in this process; further
+        /// signup completions get a 503 + Retry-After without consuming
+        /// their link (the plan budgets 4-8).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_MAX_CONCURRENT_PROVISIONS",
+            default_value_t = atomic_cloud::DEFAULT_MAX_CONCURRENT_PROVISIONS
+        )]
+        max_concurrent_provisions: usize,
+
+        #[command(flatten)]
+        provisioning: ProvisioningArgs,
+
+        #[command(flatten)]
+        dispatcher: DispatcherArgs,
+
+        #[command(flatten)]
+        fleet: FleetArgs,
+
+        /// Max concurrent streaming-chat requests per account in this
+        /// process (plan: streaming chat is not pooled — a per-tenant
+        /// semaphore at the route caps it). Over-cap chat sends get a
+        /// structured 429 with a Retry-After hint. Independent of
+        /// --dispatcher: the cap guards the interactive route either way.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_CHAT_STREAMS_PER_ACCOUNT",
+            default_value_t = atomic_cloud::DEFAULT_CHAT_STREAMS_PER_ACCOUNT
+        )]
+        chat_streams_per_account: usize,
+    },
+
+    /// Connect to the control plane (creating the database if it doesn't
+    /// exist) and apply pending migrations.
+    Migrate,
+
+    /// Manage accounts.
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+
+    /// Manage control-plane API tokens.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+
+    /// Inspect and acknowledge boot-time fleet migrations (deploy gating).
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
+    },
+}
+
+/// How magic-link emails leave the process.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EmailMode {
+    /// Write the link to the server log at info level instead of sending
+    /// anything (dev mode — the log is the delivery channel).
+    Log,
+    /// Send real email via the Mailgun REST API; links are never logged.
+    Mailgun,
+}
+
+/// Email delivery selection for `serve`. Mailgun mode requires all three
+/// credentials; the API key is env-only by convention (it's a secret).
+#[derive(Args)]
+struct EmailArgs {
+    /// Email delivery mode for magic links.
+    #[arg(long, env = "ATOMIC_CLOUD_EMAIL_MODE", default_value = "log")]
+    email_mode: EmailMode,
+
+    /// Mailgun API key (required with --email-mode mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_API_KEY", hide_env_values = true)]
+    mailgun_api_key: Option<String>,
+
+    /// Mailgun sending domain, e.g. `mg.atomic.cloud` (required with
+    /// --email-mode mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_DOMAIN")]
+    mailgun_domain: Option<String>,
+
+    /// From address for magic-link email, e.g.
+    /// `Atomic <no-reply@mg.atomic.cloud>` (required with --email-mode
+    /// mailgun).
+    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_FROM")]
+    mailgun_from: Option<String>,
+}
+
+/// How managed provider keys are provisioned at signup (plan: "Provider
+/// management" → "Managed key lifecycle").
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProvisioningMode {
+    /// No managed keys (dev default): signup skips the key step entirely
+    /// and accounts run keyless until a provider is configured. Account
+    /// deletion logs loudly if it encounters managed-key residue it cannot
+    /// delete.
+    Disabled,
+    /// Mint a per-account OpenRouter runtime key at signup, with the
+    /// configured monthly allowance and native monthly reset. Requires the
+    /// provisioning key in the environment.
+    Openrouter,
+}
+
+/// Managed-key provisioning selection for `serve`. The provisioning key is
+/// env-only by convention — it can mint runtime keys against the master
+/// OpenRouter account's balance (crown-jewel custody; see
+/// `atomic_cloud::provisioning_api`), and argv leaks into process listings.
+#[derive(Args)]
+struct ProvisioningArgs {
+    /// Managed provider-key provisioning mode.
+    #[arg(
+        long = "provisioning-mode",
+        env = "ATOMIC_CLOUD_PROVISIONING_MODE",
+        default_value = "disabled"
+    )]
+    provisioning_mode: ProvisioningMode,
+
+    /// Name of the environment variable holding the OpenRouter provisioning
+    /// key (required with --provisioning-mode openrouter). The key VALUE is
+    /// only ever read from the environment.
+    #[arg(long, default_value = atomic_cloud::PROVISIONING_KEY_ENV)]
+    openrouter_provisioning_key_env: String,
+
+    /// Base URL of the OpenRouter provisioning API. Override for proxies or
+    /// test servers speaking the same API.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_OPENROUTER_PROVISIONING_URL",
+        default_value = atomic_cloud::DEFAULT_OPENROUTER_PROVISIONING_URL
+    )]
+    openrouter_provisioning_url: String,
+
+    /// Monthly credit allowance per managed key, in cents, enforced
+    /// provider-side with native monthly reset (the plan's free-tier
+    /// placeholder is 50 = $0.50/mo; the billing slice derives this from
+    /// the account's plan instead).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MANAGED_KEY_ALLOWANCE_CENTS",
+        default_value_t = atomic_cloud::DEFAULT_MONTHLY_ALLOWANCE_CENTS
+    )]
+    managed_key_allowance_cents: u32,
+}
+
+impl ProvisioningArgs {
+    /// Build the managed-key handle, erroring (at boot, never on the first
+    /// signup) when openrouter mode is missing its provisioning key. Takes
+    /// the boot-validated vault; `Disabled` drops it — the boot contract
+    /// ("stored credentials are decryptable") holds either way.
+    fn into_managed_keys(
+        self,
+        vault: Arc<dyn KeyVault>,
+    ) -> Result<ManagedKeys, Box<dyn std::error::Error>> {
+        match self.provisioning_mode {
+            ProvisioningMode::Disabled => {
+                tracing::warn!(
+                    "managed-key provisioning is disabled: new accounts are \
+                     created without AI provider credentials"
+                );
+                Ok(ManagedKeys::Disabled)
+            }
+            ProvisioningMode::Openrouter => {
+                let api = OpenRouterProvisioning::from_env(
+                    &self.openrouter_provisioning_url,
+                    &self.openrouter_provisioning_key_env,
+                )?;
+                Ok(ManagedKeys::Enabled {
+                    api: Arc::new(api),
+                    vault,
+                    config: ManagedKeyConfig {
+                        monthly_allowance_cents: self.managed_key_allowance_cents,
+                        ..ManagedKeyConfig::default()
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// The per-pod background dispatcher (plan: "Worker fairness & job queue").
+/// On by default for `serve`: tenant saves enqueue durable
+/// `atom_pipeline_jobs` rows only, and this pod's dispatcher executes them
+/// (plus scheduled tasks, feed polls, wiki-regen retries, and reports)
+/// through four bounded worker pools with per-tenant round-robin fairness.
+/// Disabling it (`--dispatcher=false`) restores inline pipeline execution
+/// in the serving process and runs NO background work — only sensible for
+/// debugging a single pod while another pod's dispatcher covers the fleet.
+#[derive(Args)]
+struct DispatcherArgs {
+    /// Run the background dispatcher in this process. On by default:
+    /// tenant saves enqueue durable ledger rows and this pod's worker
+    /// pools execute them (plus scheduled tasks, feed polls, wiki-regen
+    /// retries, and reports). --dispatcher=false restores inline pipeline
+    /// execution and runs NO background work — self-hosted parity mode,
+    /// only sensible for debugging while another pod covers the fleet.
+    #[arg(
+        long = "dispatcher",
+        env = "ATOMIC_CLOUD_DISPATCHER",
+        default_value_t = true,
+        action = ArgAction::Set,
+        num_args = 1
+    )]
+    dispatcher: bool,
+
+    /// Milliseconds between dispatcher ticks. Each pod offsets its first
+    /// tick by a random fraction of this so a fleet doesn't synchronize.
+    #[arg(long, env = "ATOMIC_CLOUD_DISPATCHER_TICK_MS", default_value_t = 2_000)]
+    dispatcher_tick_ms: u64,
+
+    /// Seconds between slow-path full scans of ALL active accounts (the
+    /// recovery bound for lost dispatch hints and for time-driven work on
+    /// otherwise-idle tenants). The first tick after boot always full-scans.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_SLOW_SCAN_SECS",
+        default_value_t = 300
+    )]
+    dispatcher_slow_scan_secs: u64,
+
+    /// Pipeline jobs claimed per embedding-pool batch.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_PIPELINE_BATCH",
+        default_value_t = 8
+    )]
+    dispatcher_pipeline_batch: i32,
+
+    /// Embedding pool: total in-flight batches per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_EMBEDDING_POOL_TOTAL", default_value_t = 32)]
+    embedding_pool_total: usize,
+
+    /// Embedding pool: in-flight batches per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_EMBEDDING_POOL_PER_TENANT",
+        default_value_t = 4
+    )]
+    embedding_pool_per_tenant: usize,
+
+    /// LLM pool (wiki regeneration, reports): total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_LLM_POOL_TOTAL", default_value_t = 16)]
+    llm_pool_total: usize,
+
+    /// LLM pool: in-flight per tenant.
+    #[arg(long, env = "ATOMIC_CLOUD_LLM_POOL_PER_TENANT", default_value_t = 2)]
+    llm_pool_per_tenant: usize,
+
+    /// Ingestion pool (feed polls): total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_INGESTION_POOL_TOTAL", default_value_t = 16)]
+    ingestion_pool_total: usize,
+
+    /// Ingestion pool: in-flight per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_INGESTION_POOL_PER_TENANT",
+        default_value_t = 4
+    )]
+    ingestion_pool_per_tenant: usize,
+
+    /// Maintenance pool (draft pipeline, graph maintenance, ledger GC):
+    /// total in-flight per pod.
+    #[arg(long, env = "ATOMIC_CLOUD_MAINTENANCE_POOL_TOTAL", default_value_t = 8)]
+    maintenance_pool_total: usize,
+
+    /// Maintenance pool: in-flight per tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MAINTENANCE_POOL_PER_TENANT",
+        default_value_t = 1
+    )]
+    maintenance_pool_per_tenant: usize,
+
+    /// Per-tenant in-flight cap for report runs (a work-type carve-out
+    /// inside the LLM pool; the plan serializes reports per tenant).
+    #[arg(long, env = "ATOMIC_CLOUD_REPORTS_PER_TENANT_CAP", default_value_t = 1)]
+    reports_per_tenant_cap: usize,
+
+    /// Ceiling in seconds on one tenant's ledger poll inside a dispatcher
+    /// tick: a wedged or unreachable tenant database is skipped for the
+    /// tick (and retried next tick) instead of head-of-line-blocking every
+    /// other tenant.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DISPATCHER_TENANT_POLL_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    dispatcher_tenant_poll_timeout_secs: u64,
+
+    /// Ceiling in seconds on a provider-supplied Retry-After hint when
+    /// scheduling backoff — a hostile or buggy provider must not strand a
+    /// tenant's jobs behind an arbitrary horizon.
+    #[arg(long, env = "ATOMIC_CLOUD_RETRY_AFTER_CAP_SECS", default_value_t = 900)]
+    retry_after_cap_secs: u64,
+
+    /// Circuit breaker: sliding detection window in seconds for
+    /// rate-limit-classified provider failures.
+    #[arg(long, env = "ATOMIC_CLOUD_BREAKER_WINDOW_SECS", default_value_t = 60)]
+    breaker_window_secs: u64,
+
+    /// Circuit breaker: rate-limit failures within the window that trip a
+    /// tenant pause.
+    #[arg(long, env = "ATOMIC_CLOUD_BREAKER_THRESHOLD", default_value_t = 3)]
+    breaker_threshold: usize,
+
+    /// Circuit breaker: first trip's cooldown in seconds (doubles per
+    /// consecutive trip).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_BASE_COOLDOWN_SECS",
+        default_value_t = 60
+    )]
+    breaker_base_cooldown_secs: u64,
+
+    /// Circuit breaker: cooldown ceiling in seconds.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_MAX_COOLDOWN_SECS",
+        default_value_t = 3600
+    )]
+    breaker_max_cooldown_secs: u64,
+
+    /// Circuit breaker: credits/auth pause horizon in seconds when the
+    /// provider exposes no reset time — how long until dispatch re-probes.
+    /// Also the deferral horizon for credits/auth-classified task runs.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BREAKER_CREDITS_RECHECK_SECS",
+        default_value_t = 3600
+    )]
+    breaker_credits_recheck_secs: u64,
+}
+
+impl DispatcherArgs {
+    /// `Some(config)` when the dispatcher is enabled, `None` otherwise.
+    fn into_config(self) -> Option<DispatcherConfig> {
+        if !self.dispatcher {
+            return None;
+        }
+        Some(DispatcherConfig {
+            // tokio::time::interval panics on a zero period; clamp.
+            tick_interval: std::time::Duration::from_millis(self.dispatcher_tick_ms.max(1)),
+            slow_scan_interval: std::time::Duration::from_secs(
+                self.dispatcher_slow_scan_secs.max(1),
+            ),
+            tenant_poll_timeout: std::time::Duration::from_secs(
+                self.dispatcher_tenant_poll_timeout_secs.max(1),
+            ),
+            pipeline_batch_size: self.dispatcher_pipeline_batch.max(1),
+            reports_per_tenant_cap: self.reports_per_tenant_cap.max(1),
+            retry_after_cap: std::time::Duration::from_secs(self.retry_after_cap_secs.max(1)),
+            pools: WorkerPoolsConfig {
+                embedding: PoolCaps {
+                    total: self.embedding_pool_total,
+                    per_tenant: self.embedding_pool_per_tenant,
+                },
+                llm: PoolCaps {
+                    total: self.llm_pool_total,
+                    per_tenant: self.llm_pool_per_tenant,
+                },
+                ingestion: PoolCaps {
+                    total: self.ingestion_pool_total,
+                    per_tenant: self.ingestion_pool_per_tenant,
+                },
+                maintenance: PoolCaps {
+                    total: self.maintenance_pool_total,
+                    per_tenant: self.maintenance_pool_per_tenant,
+                },
+            },
+            breaker: atomic_cloud::BreakerConfig {
+                window: std::time::Duration::from_secs(self.breaker_window_secs.max(1)),
+                threshold: self.breaker_threshold.max(1),
+                base_cooldown: std::time::Duration::from_secs(
+                    self.breaker_base_cooldown_secs.max(1),
+                ),
+                max_cooldown: std::time::Duration::from_secs(self.breaker_max_cooldown_secs.max(1)),
+                credits_recheck: std::time::Duration::from_secs(
+                    self.breaker_credits_recheck_secs.max(1),
+                ),
+            },
+        })
+    }
+}
+
+/// Boot-time fleet migration + deploy gating (plan: "Schema migration on
+/// deploy"). The new binary boots in migrating mode: `/health` (liveness) is
+/// up immediately, `/ready` answers 503 until every lagging tenant database
+/// has been brought to the compiled schema target and the failure-rate
+/// policy admits. See `atomic_cloud::deploy` for the policy table and
+/// `atomic-cloud deploy status` / `deploy advance` for the operator surface.
+/// The per-tenant fields (connect timeout, retry backoff) are shared with
+/// the reaper's failed-migrations retry arm, so a reaper retry and a boot
+/// attempt run and record identically.
+#[derive(Args)]
+struct FleetArgs {
+    /// Tenant databases migrating concurrently during the boot fleet run
+    /// (the plan starts at 16; tune from production).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_MIGRATION_CONCURRENCY",
+        default_value_t = 16
+    )]
+    fleet_migration_concurrency: usize,
+
+    /// Wall-clock limit in seconds on the boot fleet migration; past it the
+    /// run is abandoned and the pod holds not-ready with
+    /// deploy_status='migration_timeout' (plan: 30 minutes).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_MIGRATION_TIMEOUT_SECS",
+        default_value_t = 1800
+    )]
+    fleet_migration_timeout_secs: u64,
+
+    /// Ceiling in seconds on establishing one tenant's migration connection
+    /// — an unreachable tenant database fails fast and recorded instead of
+    /// holding a fan-out slot.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_FLEET_CONNECT_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    fleet_connect_timeout_secs: u64,
+
+    /// Base in seconds of the exponential backoff horizon recorded on a
+    /// failed tenant migration (`base * 2^retry_count`, capped below); the
+    /// always-running reaper retries the row once the horizon passes. One
+    /// flag feeds both writers of `migration_retry_after` — the boot fleet
+    /// runner and the reaper's retry arm — so they can never disagree on
+    /// backoff arithmetic.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MIGRATION_RETRY_BACKOFF_BASE_SECS",
+        default_value_t = 60
+    )]
+    migration_retry_backoff_base_secs: u64,
+
+    /// Ceiling in seconds on that backoff horizon. The reaper keeps
+    /// retrying at the cap; a row past 5 retries is escalated to an
+    /// error-level alert (plan: "alerts when retry_count > 5").
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_MIGRATION_RETRY_BACKOFF_CAP_SECS",
+        default_value_t = 1800
+    )]
+    migration_retry_backoff_cap_secs: u64,
+
+    /// Failure-rate threshold below which the deploy proceeds without
+    /// operator action (plan: 1%). Sub-threshold failures are stragglers:
+    /// CloudAuth 503s them per request and the reaper retries them.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DEPLOY_READY_FAILURE_RATE",
+        default_value_t = 0.01
+    )]
+    deploy_ready_failure_rate: f64,
+
+    /// Failure-rate threshold below which (and at/above the ready
+    /// threshold) the pod holds with deploy_status='awaiting_review' for an
+    /// operator's `deploy advance`; at/above it, 'rollback_required' — no
+    /// override short of redeploying the old binary (plan: 10%).
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_DEPLOY_REVIEW_FAILURE_RATE",
+        default_value_t = 0.10
+    )]
+    deploy_review_failure_rate: f64,
+}
+
+impl FleetArgs {
+    fn into_configs(self) -> (FleetMigrationConfig, DeployPolicy) {
+        (
+            FleetMigrationConfig {
+                concurrency: self.fleet_migration_concurrency.max(1),
+                tenant_connect_timeout: std::time::Duration::from_secs(
+                    self.fleet_connect_timeout_secs.max(1),
+                ),
+                wall_clock_limit: std::time::Duration::from_secs(
+                    self.fleet_migration_timeout_secs.max(1),
+                ),
+                // Zero base is legal ("retry on the very next reaper pass");
+                // only the cap needs a floor for the doubling to terminate.
+                retry_backoff_base: std::time::Duration::from_secs(
+                    self.migration_retry_backoff_base_secs,
+                ),
+                retry_backoff_cap: std::time::Duration::from_secs(
+                    self.migration_retry_backoff_cap_secs.max(1),
+                ),
+            },
+            DeployPolicy {
+                ready_failure_rate: self.deploy_ready_failure_rate,
+                review_failure_rate: self.deploy_review_failure_rate,
+            },
+        )
+    }
+}
+
+impl EmailArgs {
+    /// Build the configured sender, erroring when mailgun mode is missing
+    /// credentials — fail at boot, not on the first signup.
+    fn into_sender(self) -> Result<Arc<dyn EmailSender>, Box<dyn std::error::Error>> {
+        match self.email_mode {
+            EmailMode::Log => {
+                tracing::warn!(
+                    "email mode is 'log': magic links are written to this log, not emailed"
+                );
+                Ok(Arc::new(LogSender))
+            }
+            EmailMode::Mailgun => {
+                let missing = |flag: &str| {
+                    format!("--email-mode mailgun requires {flag} (or its environment variable)")
+                };
+                let api_key = self
+                    .mailgun_api_key
+                    .ok_or_else(|| missing("--mailgun-api-key"))?;
+                let domain = self
+                    .mailgun_domain
+                    .ok_or_else(|| missing("--mailgun-domain"))?;
+                let from = self.mailgun_from.ok_or_else(|| missing("--mailgun-from"))?;
+                Ok(Arc::new(MailgunSender::new(api_key, domain, from)))
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum AccountAction {
+    /// Provision a new account: claim the subdomain, create + migrate the
+    /// tenant database, and print a fresh account-scope API token.
+    Create {
+        #[command(flatten)]
+        cluster: ClusterArgs,
+
+        /// Account owner's email address.
+        #[arg(long)]
+        email: String,
+
+        /// Subdomain the account is served under (3-32 chars of [a-z0-9-]).
+        #[arg(long)]
+        subdomain: String,
+    },
+
+    /// Hard-delete an account: revoke its credentials, drop its tenant
+    /// database, and reserve the freed subdomain for 90 days.
+    ///
+    /// The preferred path is the authenticated HTTP route (`DELETE
+    /// /api/account` on the account's subdomain), which also evicts the
+    /// serve process's AccountCache entry and severs the account's live
+    /// WebSocket sessions. This CLI command runs process-separate, so it
+    /// can't reach that cache; a running serve process's stale entry is
+    /// harmless and self-heals (requests 404 at auth, the idle TTL reclaims
+    /// the entry). Use the CLI for operator cleanup, the route for
+    /// everything else.
+    Delete {
+        #[command(flatten)]
+        cluster: ClusterArgs,
+
+        /// Subdomain of the account to delete.
+        #[arg(long)]
+        subdomain: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployAction {
+    /// Print the latest deploy run (counts, verdict) plus every tenant
+    /// whose migration is currently failed.
+    Status,
+
+    /// Acknowledge an awaiting-review deploy: flips every awaiting_review
+    /// run at the latest target version to 'advanced' in the control plane,
+    /// so EVERY pod holding on that review (each boots its own run row)
+    /// observes the acknowledgment on its next readiness probe and goes
+    /// ready. rollback_required deliberately has no override — the
+    /// migration itself is broken; redeploy the old binary (see
+    /// atomic_cloud::deploy).
+    Advance,
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Mint a new API token for an account and print its plaintext (shown
+    /// exactly once; only a hash is stored).
+    Create {
+        /// Subdomain of the account the token belongs to.
+        #[arg(long)]
+        subdomain: String,
+
+        /// Token scope: "account" (full access), "database" (one knowledge
+        /// base; requires --db), or "mcp".
+        #[arg(long, default_value = "account")]
+        scope: String,
+
+        /// Knowledge-base id the token is pinned to (required for
+        /// --scope database; optional for --scope mcp).
+        #[arg(long)]
+        db: Option<String>,
+
+        /// Human-readable label for the token.
+        #[arg(long, default_value = "cli")]
+        name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "atomic_cloud=info,warn".parse().unwrap());
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    let cli = Cli::parse();
+    match run(cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Connect to the control plane and bring its schema current — the shared
+/// preamble of every subcommand, so each one works against a fresh cluster.
+async fn connect_control(control_url: &str) -> Result<ControlPlane, Box<dyn std::error::Error>> {
+    let control = ControlPlane::connect(control_url).await?;
+    let applied = control.initialize().await?;
+    if applied > 0 {
+        tracing::info!(applied, "applied control-plane migrations");
+    }
+    Ok(control)
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let control = connect_control(&cli.control_url).await?;
+
+    match cli.command {
+        Command::Migrate => {
+            tracing::info!("control-plane schema is current");
+            Ok(())
         }
 
-        app
+        Command::Serve {
+            cluster,
+            base_domain,
+            port,
+            bind,
+            tenant_pool_max_connections,
+            tenant_pool_idle_timeout_secs,
+            cache_sweep_interval_secs,
+            reaper_interval_secs,
+            email,
+            master_key_env,
+            trust_proxy_header,
+            app_public_url,
+            max_concurrent_provisions,
+            provisioning,
+            dispatcher,
+            fleet,
+            chat_streams_per_account,
+        } => {
+            // Boot-time master-key check (plan: "Encryption at rest").
+            // Constructing the vault validates the key, so a deployment
+            // with a missing or malformed master key dies here with a
+            // message naming the variable — never on the first signup.
+            // The boot contract: serve does not start unless stored
+            // provider credentials are decryptable.
+            let vault: Arc<dyn KeyVault> = Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+            let managed = provisioning.into_managed_keys(Arc::clone(&vault))?;
+            let dispatcher_config = dispatcher.into_config();
+            let (fleet_config, deploy_policy) = fleet.into_configs();
+
+            let cache_config = AccountCacheConfig {
+                tenant_pool_max_connections,
+                tenant_pool_idle_timeout: std::time::Duration::from_secs(
+                    tenant_pool_idle_timeout_secs,
+                ),
+                // With a dispatcher attached, tenant saves are enqueue-only
+                // (durable `atom_pipeline_jobs` rows) and the dispatcher's
+                // embedding pool owns execution. Never flip this off
+                // without a dispatcher: enqueued work would sit unexecuted.
+                inline_pipeline: dispatcher_config.is_none(),
+                // And under the dispatcher composition, provider-classified
+                // task-run failures defer instead of consuming retry budget
+                // (plan: jobs sit in the ledger, never fail). Derived from
+                // the breaker config so the deferral horizons match the
+                // pauses that gate dispatch.
+                failure_disposition_policy: dispatcher_config.as_ref().map(|config| {
+                    atomic_cloud::provider_failure_policy(
+                        config.breaker.credits_recheck,
+                        config.retry_after_cap,
+                    )
+                }),
+                ..AccountCacheConfig::default()
+            };
+            let plane_config = AccountPlaneConfig {
+                app_public_url,
+                trust_proxy_header,
+                rate_limits: RateLimits::default(),
+                max_concurrent_provisions,
+                ..AccountPlaneConfig::new(base_domain.clone())
+            };
+            serve(
+                control,
+                cluster.into_config(),
+                managed,
+                vault,
+                base_domain,
+                bind,
+                port,
+                cache_config,
+                cache_sweep_interval_secs.map(std::time::Duration::from_secs),
+                // tokio::time::interval panics on a zero period; clamp.
+                std::time::Duration::from_secs(reaper_interval_secs.max(1)),
+                email.into_sender()?,
+                plane_config,
+                dispatcher_config,
+                fleet_config,
+                deploy_policy,
+                ChatStreamLimiter::new(chat_streams_per_account),
+            )
+            .await
+        }
+
+        Command::Account { action } => match action {
+            AccountAction::Create {
+                cluster,
+                email,
+                subdomain,
+            } => {
+                // Operator-side creation never provisions a managed key:
+                // this command runs from hosts that hold neither the
+                // master key nor the provisioning key (see the module
+                // docs), so the account starts keyless — same state as
+                // provisioning-mode 'disabled'.
+                let account = provision_account(
+                    &control,
+                    &cluster.into_config(),
+                    &ManagedKeys::Disabled,
+                    NewAccount { email, subdomain },
+                )
+                .await?;
+                let token = issue_token(
+                    &control,
+                    &account.account_id,
+                    TokenScope::Account,
+                    None,
+                    "initial",
+                )
+                .await?;
+                println!("account_id: {}", account.account_id);
+                println!("subdomain:  {}", account.subdomain);
+                println!("tenant_db:  {}", account.db_name);
+                println!("token:      {token}");
+                println!("(the token is shown once; only its hash is stored)");
+                Ok(())
+            }
+
+            AccountAction::Delete { cluster, subdomain } => {
+                let account_id = control
+                    .account_id_by_subdomain(&subdomain)
+                    .await?
+                    .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
+                // Disabled here too: this host has no provisioning key, so
+                // a managed runtime key (if the account has one) cannot be
+                // deleted from the CLI — delete_account logs the residue
+                // loudly with the external id; clean it up via the master
+                // OpenRouter account's key listing. The HTTP deletion route
+                // (the preferred path) deletes the key properly.
+                delete_account(
+                    &control,
+                    &cluster.into_config(),
+                    &ManagedKeys::Disabled,
+                    &account_id,
+                )
+                .await?;
+                println!("deleted account {account_id} ({subdomain})");
+                Ok(())
+            }
+        },
+
+        Command::Token { action } => match action {
+            TokenAction::Create {
+                subdomain,
+                scope,
+                db,
+                name,
+            } => {
+                let scope: TokenScope = scope.parse()?;
+                match scope {
+                    TokenScope::Account if db.is_some() => {
+                        return Err("--db only applies to database/mcp scopes".into());
+                    }
+                    TokenScope::Database if db.is_none() => {
+                        return Err("--scope database requires --db".into());
+                    }
+                    _ => {}
+                }
+                let account_id = control
+                    .account_id_by_subdomain(&subdomain)
+                    .await?
+                    .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
+                let token = issue_token(&control, &account_id, scope, db.as_deref(), &name).await?;
+                println!("{token}");
+                Ok(())
+            }
+        },
+
+        Command::Deploy { action } => match action {
+            DeployAction::Status => {
+                finalize_stale_runs(&control).await;
+                print_deploy_status(&control).await?;
+                Ok(())
+            }
+            DeployAction::Advance => {
+                finalize_stale_runs(&control).await;
+                match advance_deploy(&control).await? {
+                    AdvanceOutcome::Advanced {
+                        target_version,
+                        runs,
+                    } => {
+                        println!(
+                            "advanced {runs} awaiting_review deploy run(s) at target \
+                         version {target_version}"
+                        );
+                        println!("every pod holding on that review goes ready on its next probe");
+                        Ok(())
+                    }
+                    AdvanceOutcome::RefusedRollbackRequired => Err(
+                        "refusing to advance: the latest deploy run is rollback_required \
+                     (failure rate ≥ the rollback threshold). The migration itself is \
+                     broken; there is deliberately no override — redeploy the previous \
+                     binary (additive-only migrations make that safe), fix the \
+                     migration, and deploy again."
+                            .into(),
+                    ),
+                    AdvanceOutcome::NothingToAdvance { status } => {
+                        println!("nothing awaiting review (latest deploy run is '{status}')");
+                        Ok(())
+                    }
+                    AdvanceOutcome::NoRuns => {
+                        println!("no deploy runs recorded yet");
+                        Ok(())
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Finalize stale `migrating` deploy runs before any operator command reads
+/// them — a dead pod's row must not shadow `deploy advance` (see
+/// `atomic_cloud::deploy::finalize_abandoned_runs`). The CLI doesn't know
+/// the fleet's `--fleet-migration-timeout-secs`, so the threshold derives
+/// from the default config (conservative: a custom shorter timeout only
+/// delays finalization, never mislabels a live run). Best-effort — a
+/// failure is reported and the command proceeds on the unfinalized rows.
+async fn finalize_stale_runs(control: &ControlPlane) {
+    let threshold = abandoned_run_threshold(&FleetMigrationConfig::default());
+    match finalize_abandoned_runs(control, threshold).await {
+        Ok(0) => {}
+        Ok(n) => println!("finalized {n} stale 'migrating' deploy run(s) as 'abandoned'"),
+        Err(e) => eprintln!("warning: finalizing stale deploy runs failed: {e}"),
+    }
+}
+
+/// `deploy status`: the latest run, the compiled target plus how many
+/// tenants still lag it, and the currently-failed tenant migrations.
+async fn print_deploy_status(control: &ControlPlane) -> Result<(), Box<dyn std::error::Error>> {
+    let target = tenant_schema_target();
+    println!("compiled tenant schema target: {target}");
+    let lagging = list_unmigrated(control, target).await?;
+    println!("tenants below target: {}", lagging.len());
+
+    match latest_deploy_run(control).await? {
+        None => println!("no deploy runs recorded yet"),
+        Some(run) => {
+            println!("latest deploy run: {}", run.id);
+            println!("  status:         {}", run.deploy_status);
+            println!("  target version: {}", run.target_version);
+            println!("  started:        {}", run.started_at.to_rfc3339());
+            match run.finished_at {
+                Some(finished) => println!("  finished:       {}", finished.to_rfc3339()),
+                None => println!("  finished:       (still running, or the pod died mid-run)"),
+            }
+            if let (Some(total), Some(migrated), Some(failed)) =
+                (run.total, run.migrated, run.failed)
+            {
+                let rate = if total > 0 {
+                    failed as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "  tenants:        {total} enumerated, {migrated} migrated, \
+                     {failed} failed ({rate:.2}% failure rate), {} unattempted",
+                    total - migrated - failed
+                );
+            }
+            if let Some(advanced_at) = run.advanced_at {
+                println!("  advanced:       {}", advanced_at.to_rfc3339());
+            }
+        }
+    }
+
+    let failures = list_failed_migrations(control).await?;
+    if failures.is_empty() {
+        println!("failed tenant migrations: none");
+    } else {
+        println!("failed tenant migrations: {}", failures.len());
+        for f in failures {
+            println!(
+                "  {} ({}) at v{}, {} retr{}, failed {}, next retry {}: {}",
+                f.account_id,
+                f.db_name,
+                f.last_migrated_version,
+                f.migration_retry_count,
+                if f.migration_retry_count == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                f.migration_failed_at.to_rfc3339(),
+                f.migration_retry_after
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(unset)".to_string()),
+                f.last_migration_error
+                    .as_deref()
+                    .unwrap_or("(no error recorded)"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run the composed multi-tenant server until interrupted. See
+/// [`atomic_cloud::server`] for what the composition serves (and what it
+/// deliberately doesn't until later slices).
+///
+/// `sweep_interval` controls the periodic account-cache sweep; `None` means
+/// a quarter of the cache's idle TTL. `reaper_interval` paces the
+/// failure-recovery reaper. `dispatcher_config` (`Some` by default —
+/// `--dispatcher=false` to disable) runs the per-pod background dispatcher;
+/// the caller must have built `cache_config` with `inline_pipeline` set to
+/// the matching value (off exactly when a dispatcher runs).
+/// `fleet_config` + `deploy_policy` drive the boot fleet migration gate:
+/// the process starts serving immediately (liveness up) but `/ready` holds
+/// 503 until the gate's policy admits (see `atomic_cloud::deploy`).
+/// `chat_streams` is the process-wide streaming-chat semaphore, cloned into
+/// every HTTP worker.
+#[allow(clippy::too_many_arguments)] // CLI assembly; every argument is a distinct serve knob.
+async fn serve(
+    control: ControlPlane,
+    cluster: ClusterConfig,
+    managed: ManagedKeys,
+    vault: Arc<dyn KeyVault>,
+    base_domain: String,
+    bind: String,
+    port: u16,
+    cache_config: AccountCacheConfig,
+    sweep_interval: Option<std::time::Duration>,
+    reaper_interval: std::time::Duration,
+    email: Arc<dyn EmailSender>,
+    plane_config: AccountPlaneConfig,
+    dispatcher_config: Option<DispatcherConfig>,
+    fleet_config: FleetMigrationConfig,
+    deploy_policy: DeployPolicy,
+    chat_streams: ChatStreamLimiter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sweep_interval = sweep_interval
+        .unwrap_or(cache_config.idle_ttl / 4)
+        .max(std::time::Duration::from_secs(1));
+    let cache = Arc::new(AccountCache::new(
+        control.clone(),
+        cluster.clone(),
+        Arc::clone(&vault),
+        cache_config,
+    ));
+    let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
+    let tenant_plane = TenantPlane::new(
+        control.clone(),
+        cluster.clone(),
+        managed.clone(),
+        vault,
+        Arc::clone(&cache),
+    );
+
+    // The reaper loop runs concurrently with the server below via select!,
+    // not tokio::spawn: spawn's Send bound trips rustc's
+    // "implementation is not general enough" higher-ranked lifetime false
+    // positive on provision_account's sqlx futures (the same one
+    // tests/provisioning.rs works around with join!), and select! on the
+    // main task needs no Send while also tying the reaper's lifetime to
+    // serve's.
+    let reaper_loop = run_reaper_loop(
+        control.clone(),
+        cluster.clone(),
+        managed.clone(),
+        reaper_interval,
+        fleet_config.clone(),
+    );
+
+    // Deploy gate (plan: "Schema migration on deploy"): boot in migrating
+    // mode and run the fleet migration concurrently with serving, so
+    // liveness is up from the first request while `/ready` holds 503 until
+    // every lagging tenant is migrated and the failure-rate policy admits.
+    // The dispatcher below is safe to start immediately — its tick skips
+    // tenants whose schema still lags the compiled target, exactly as
+    // CloudAuth 503s their requests.
+    let readiness = Readiness::new(control.clone());
+    tokio::spawn(run_fleet_gate(
+        control.clone(),
+        cluster.clone(),
+        fleet_config,
+        deploy_policy,
+        readiness.clone(),
+    ));
+
+    let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
+
+    // Periodic idle sweep. The cache also sweeps inline when a load inserts
+    // a new entry, but a stable working set produces no inserts — without
+    // this task, idle entries would hold their tenant pools forever. The
+    // sweep semantics themselves (TTL, live-WebSocket pinning) are pinned by
+    // tests/account_cache.rs, which drives `sweep()` with no insert traffic;
+    // this loop is interval glue around that tested method.
+    tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move {
+            let mut ticker = tokio::time::interval(sweep_interval);
+            // The first tick fires immediately; nothing can be idle yet.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                cache.sweep().await;
+            }
+        }
+    });
+
+    // Per-pod background dispatcher (plan: "Worker fairness & job queue").
+    // Spawned over the SAME AccountCache the request path uses, so worker
+    // events land on the channels live WebSocket clients subscribe to.
+    // No leader election: ledger claims are the cross-pod exclusion, and
+    // run_loop jitters its first tick.
+    match dispatcher_config {
+        Some(config) => {
+            tracing::info!(
+                tick_ms = config.tick_interval.as_millis() as u64,
+                slow_scan_secs = config.slow_scan_interval.as_secs(),
+                "dispatcher enabled; tenant pipeline execution runs in worker pools"
+            );
+            let dispatcher = Arc::new(Dispatcher::new(control.clone(), Arc::clone(&cache), config));
+            tokio::spawn(dispatcher.run_loop());
+        }
+        None => {
+            tracing::warn!(
+                "dispatcher disabled: background work (feeds, reports, scheduled tasks) \
+                 will not run in this process; tenant pipelines execute inline"
+            );
+        }
+    }
+
+    // Must outlive the server: it owns the scratch directory backing the
+    // inert fallback AppState (see server.rs module docs).
+    let fallback = FallbackAppState::build()?;
+    let state = fallback.data();
+
+    tracing::info!("Atomic Cloud starting...");
+    tracing::info!(base_domain, "accounts served under *.{base_domain}");
+    tracing::info!(
+        base_domain,
+        "account plane (signup/login) on {base_domain} and app.{base_domain}"
+    );
+    tracing::info!(bind, port, "listening on http://{bind}:{port}");
+    tracing::info!(bind, port, "health: http://{bind}:{port}/health");
+
+    let server = HttpServer::new(move || {
+        App::new().configure(configure_cloud_app(
+            state.clone(),
+            auth.clone(),
+            account_plane.clone(),
+            tenant_plane.clone(),
+            control.clone(),
+            chat_streams.clone(),
+            readiness.clone(),
+        ))
     })
     .workers(4)
-    .bind((bind_owned.as_str(), port))?
-    .run()
-    .await
+    .bind((bind.as_str(), port))?
+    .run();
+
+    tokio::select! {
+        result = server => result?,
+        _ = reaper_loop => unreachable!("the reaper loop never returns"),
+    }
+
+    Ok(())
+}
+
+/// Failure-recovery reaper loop (plan: "Failure recovery & the reaper").
+/// The pass semantics — per-account advisory locks, resume-then-rollback,
+/// orphan reclaim, hygiene purges — live in (and are tested through)
+/// [`atomic_cloud::reaper::run_reaper_pass`]; this is interval glue around
+/// it. The jittered start keeps a fleet of pods booted together from
+/// synchronizing their passes (they'd be safe anyway — contended rows skip
+/// via the advisory locks — just wasteful). Never returns; the caller
+/// select!s it against the server so it lives exactly as long as serving.
+async fn run_reaper_loop(
+    control: ControlPlane,
+    cluster: ClusterConfig,
+    managed: ManagedKeys,
+    reaper_interval: std::time::Duration,
+    fleet_config: FleetMigrationConfig,
+) {
+    // The failed-migrations arm retries through the boot fleet runner's
+    // per-tenant step; handing it the serve-level `--fleet-*` config keeps
+    // the two writers of migration_retry_after on one backoff schedule.
+    let policy = atomic_cloud::ReaperPolicy {
+        migration_retry: fleet_config,
+        ..atomic_cloud::ReaperPolicy::default()
+    };
+    let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
+        &mut rand::thread_rng(),
+        0..=reaper_interval.as_millis() as u64,
+    ));
+    tokio::time::sleep(jitter).await;
+    let mut ticker = tokio::time::interval(reaper_interval);
+    loop {
+        ticker.tick().await;
+        let summary = atomic_cloud::run_reaper_pass(&control, &cluster, &managed, &policy).await;
+        if summary.is_quiet() {
+            tracing::debug!("reaper pass: nothing to do");
+        } else {
+            tracing::info!(?summary, "reaper pass");
+        }
+    }
 }
