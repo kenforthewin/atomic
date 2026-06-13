@@ -42,6 +42,7 @@ pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod oauth_store;
 pub mod plans;
 pub mod pools;
 pub mod provider_config;
@@ -119,6 +120,11 @@ pub use magic_links::{
 };
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
+};
+pub use oauth_store::{
+    consume_oauth_code, create_oauth_client, get_oauth_client, insert_oauth_code,
+    purge_expired_oauth_codes, record_oauth_code_token, NewOAuthCode, OAuthClient, OAuthCode,
+    OAUTH_CLIENT_PREFIX, OAUTH_CODE_PREFIX, OAUTH_CODE_TTL,
 };
 pub use plans::{Plan, PlanRegistry, DEFAULT_PLAN_ID};
 pub use pools::{PoolCaps, PoolPermit, WorkClass, WorkTypeCap, WorkerPools, WorkerPoolsConfig};

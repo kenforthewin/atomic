@@ -31,6 +31,9 @@ const CONTROL_TABLES: &[&str] = &[
     "plan_transitions",
     // Migration 011 — Stripe webhook idempotency ledger.
     "processed_webhook_events",
+    // Migration 014 — per-account OAuth (DCR clients + authorization codes).
+    "oauth_clients",
+    "oauth_codes",
 ];
 
 /// The migration-tracking columns 008 adds to `account_databases` (plan:
