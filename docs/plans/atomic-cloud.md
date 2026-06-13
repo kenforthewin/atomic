@@ -1307,6 +1307,30 @@ the same hourly sweep auto-downgrades expired trials to `free` —
 data retained, never deleted), `active` otherwise (`advance_expired_trials`,
 the over-limit decision read live from the tenant DB via the account cache).
 
+**Period rollover & storage enforcement** ([`quota_usage.rs`](../../crates/atomic-cloud/src/quota_usage.rs),
+migration 013): an hourly `serve` loop rolls `quota_usage` period rows
+forward (idempotent, cross-pod safe) — AI allowances reset natively at
+OpenRouter so they need no rollover — and recomputes per-tenant storage
+bytes into a warn→restrict ladder (`storage_state`), restricting writes via
+the same path as `read_only`, never deleting data.
+
+**Review-driven hardening (the atom-ceiling was the slice's sharpest gap):**
+The quota guard is an HTTP middleware, so it only sees request-path atom
+creation. The adversarial review found three evasions of the account-wide
+atom ceiling it therefore missed, all now closed: (1) **background** atom
+creation — feed polls and report-finding writes go through the dispatcher,
+which now defers atom-creating work for an at-ceiling tenant (the
+"blocks, sits in the ledger" pattern, sharing the data plane's
+`PlanRegistry`); (2) the request-time gate counted only the targeted KB
+while the limit is **account-wide** — it now sums across all the tenant's
+KBs, matching the downgrade sweep; (3) the **manual-trigger** routes
+(`POST /api/import/obsidian`, `/api/reports/{id}/run`, `/api/feeds/{id}/poll`)
+were ungated aliases of the atom-create surface — now in `quota_target`.
+Also: the Stripe webhook's claim-and-apply run in **one transaction**, so a
+crash between claiming an event id and applying it rolls the claim back
+(Stripe's redelivery reprocesses rather than being dedup'd into a no-op);
+the signature is still verified before the transaction opens.
+
 **Deviations from this plan (deliberate):**
 
 - **`accounts.billing_state` is a new column, orthogonal to `status`.** The
@@ -1330,11 +1354,10 @@ the over-limit decision read live from the tenant DB via the account cache).
   rollups) and the advisory AI counter.
 
 **Deferred:** observability metrics/tracing; the user-facing `account_events`
-log (rides with the frontend slice); the `quota_usage` writer + 1-hour
-period-rollover job (the table exists; nothing writes it yet);
-plan-change → PATCH managed-key credit limit (the managed-keys seam exists);
-the signup/billing **frontend** (API + redirects only); paid-tier pricing
-(the `pro` numbers are documented placeholders).
+log (rides with the frontend slice); plan-change → PATCH managed-key credit
+limit (the managed-keys seam exists); the signup/billing **frontend** (API +
+redirects only); paid-tier pricing (the `pro` numbers are documented
+placeholders).
 
 ## Open questions (carried across sections)
 
@@ -1595,3 +1618,19 @@ and link the discussion if it lives in a memory file.
   compiled target. Supersedes the boot-runner/reaper ownership split,
   which left mid-deploy signups and lost record-writes permanently
   stragglered.
+- **2026-06-13** — Slice 6 landed (see Implementation log): plans + quota
+  enforcement, full Stripe billing, the dunning state machine, period
+  rollover + storage enforcement. Billing is optional (no Stripe key →
+  routes 503, dunning no-ops) so dev/self-hosted clusters are unaffected.
+- **2026-06-13** — Dunning lives in `accounts.billing_state`, orthogonal to
+  `status`: a delinquent account stays `status='active'`. Never auto-delete
+  on downgrade/suspend/storage-restrict — writes block, data is retained.
+- **2026-06-13** — The atom ceiling is account-wide and enforced on every
+  creation surface, not just `POST /api/atoms`: the request-time guard sums
+  across KBs; background atom-creating work (feeds, reports) defers in the
+  dispatcher when at-ceiling; manual-trigger routes (import, run, poll) are
+  gated. It is a soft ceiling (live count, no reservation) — bounded TOCTOU
+  overshoot accepted; never affects money or managed-key credits.
+- **2026-06-13** — Stripe webhook: signature verified before any effect;
+  claim + apply in one transaction so a crash reprocesses on redelivery
+  rather than dedup'ing into a no-op; constant-time MAC comparison.
