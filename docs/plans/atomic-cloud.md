@@ -1410,6 +1410,25 @@ carrying an `allowed_db_id` mints an `mcp`-scoped token pinned to that KB, and
 the slice-1 `allowed_db_id` chokepoint enforces it (e2e-pinned: a pinned token
 can't reach another KB via `X-Atomic-Database`).
 
+**Review-driven hardening (security-sensitive, post-e2e):** the adversarial
+review found two real holes, both closed: (1) the server-rendered OAuth
+**consent page** had no anti-framing header — an attacker who self-registers a
+client could iframe a victim tenant's `/oauth/authorize` and clickjack consent
+into minting a token (the `SameSite=Lax` cookie doesn't defend a same-origin
+submit inside a cross-origin frame). Every OAuth HTML response now carries
+`X-Frame-Options: DENY` + `Content-Security-Policy: frame-ancestors 'none'`
+via a single hardened-response helper. (2) The db-pin chokepoint was enforced
+only for an *explicit* different-KB selection — on the **default no-selection**
+path the MCP transport read only `?db=` (never the `X-Atomic-Database` header
+CloudAuth injects for a pinned request), so a KB-pinned MCP token fell through
+to the tenant's *active* KB (a within-account isolation hole). The MCP
+transport now resolves its target DB with the same `header → ?db= → active`
+precedence as the `Db` extractor, so an injected pin is honored — pinned by a
+positive two-KB test (token pinned to the non-active KB resolves to the pinned
+one). Also: OAuth redirects are now RFC-correct for `redirect_uri`s carrying a
+pre-existing query string, and the MCP `WWW-Authenticate` challenge covers the
+trailing-slash path.
+
 **Deviations from this plan (deliberate):**
 
 - **OAuth routes are individual exact-path resources, not a `web::scope("")`.**
@@ -1710,3 +1729,16 @@ and link the discussion if it lives in a memory file.
 - **2026-06-13** — Stripe webhook: signature verified before any effect;
   claim + apply in one transaction so a crash reprocesses on redelivery
   rather than dedup'ing into a no-op; constant-time MAC comparison.
+- **2026-06-13** — Slice 7 landed (see Implementation log): cloud's own
+  per-account OAuth 2.0 flow (DCR + auth code + PKCE, account resolved from
+  Host, consent gated by the session cookie) and a per-tenant MCP endpoint.
+  Resolves the open MCP-token-default-scope question: account scope by
+  default, db-pin supported and chokepoint-enforced.
+- **2026-06-13** — The one atomic-server change is cloud-unaware: the MCP
+  transport resolves its DatabaseManager per request (a RequestManager
+  extension mirroring the Db extractor), self-hosted byte-identical;
+  routes/oauth.rs untouched, atomic-core untouched.
+- **2026-06-13** — OAuth consent is clickjacking-hardened (X-Frame-Options +
+  CSP frame-ancestors on every OAuth HTML path), and the db-pin chokepoint is
+  enforced on the MCP default no-selection path (transport reads the injected
+  X-Atomic-Database header, header → ?db= → active, matching the Db extractor).
