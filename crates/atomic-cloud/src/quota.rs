@@ -15,7 +15,14 @@
 //! |-----------------------------------------|-------------|-------------------------------------|
 //! | `POST /api/atoms`                       | `atom_limit`| `AtomicCore::count_atoms()` (live)  |
 //! | `POST /api/atoms/bulk`                  | `atom_limit`| live count + the request's batch    |
+//! | `POST /api/ingest/url`                  | `atom_limit`| live count + 1                      |
+//! | `POST /api/ingest/urls`                 | `atom_limit`| live count + the request's batch    |
 //! | `POST /api/databases`                   | `kb_limit`  | `DatabaseManager::list_databases()` |
+//!
+//! URL ingestion creates atoms exactly like the `/api/atoms` routes, so it
+//! counts against `atom_limit` too — an account at its ceiling can't slip
+//! past the gate by ingesting instead of creating (the plan's enforcement
+//! table lists "Atom create" generically; both surfaces grow the atom count).
 //!
 //! Both counts are read **live** from the tenant database at enforcement
 //! time — cheap, single-statement, strongly consistent. There is no stored
@@ -23,6 +30,20 @@
 //! can't be counted cheaply live; see [`crate::plans`]). A `NULL` limit
 //! means unlimited and the guard passes the request straight through —
 //! the count is never even read.
+//!
+//! # The live-count gate is a soft ceiling, not a reservation
+//!
+//! The check reads the live count and admits if `current + delta <= limit`
+//! with no row lock or pre-reservation — a deliberate trade (deviation log
+//! below) for a cheap, drift-free counter over a contended `quota_usage`
+//! UPSERT. The residual is a TOCTOU: two concurrent creates at
+//! `current = limit - 1` can both observe the pre-write count and both admit,
+//! landing the tenant one over the ceiling. This is acceptable for a soft
+//! resource limit (the overshoot is bounded by concurrency, self-heals as
+//! the count is re-read on the next write, and never affects money or
+//! managed-key credits — those ride the AI ledger, not this gate). If a hard
+//! cap is ever required, this is the seam to swap in a `SELECT … FOR UPDATE`
+//! reservation against a stored counter.
 //!
 //! # The bulk batch delta
 //!
@@ -70,10 +91,14 @@ use crate::plans::{Plan, PlanRegistry};
 /// check is denominated in. `None` for routes the guard ignores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuotaTarget {
-    /// `POST /api/atoms` — one atom.
+    /// `POST /api/atoms` or `POST /api/ingest/url` — one atom.
     Atom,
-    /// `POST /api/atoms/bulk` — N atoms; the batch size is read from the body.
+    /// `POST /api/atoms/bulk` — N atoms; the batch size is the top-level JSON
+    /// array's length.
     AtomBulk,
+    /// `POST /api/ingest/urls` — N atoms; the batch size is the length of the
+    /// request body's `urls` array.
+    IngestUrls,
     /// `POST /api/databases` — one knowledge base.
     Kb,
 }
@@ -81,14 +106,16 @@ enum QuotaTarget {
 /// Classify a `(method, path)` into the resource it consumes, or `None` if
 /// the guard doesn't enforce it. Exact-path matches: only the collection
 /// `POST`s create resources (`/api/atoms/{id}` is an update, `/api/databases/{id}`
-/// a rename — neither grows the count).
+/// a rename — neither grows the count). The ingestion routes create atoms too,
+/// so they count against `atom_limit` alongside the `/api/atoms` routes.
 fn quota_target(method: &Method, path: &str) -> Option<QuotaTarget> {
     if *method != Method::POST {
         return None;
     }
     match path {
-        "/api/atoms" => Some(QuotaTarget::Atom),
+        "/api/atoms" | "/api/ingest/url" => Some(QuotaTarget::Atom),
         "/api/atoms/bulk" => Some(QuotaTarget::AtomBulk),
+        "/api/ingest/urls" => Some(QuotaTarget::IngestUrls),
         "/api/databases" => Some(QuotaTarget::Kb),
         _ => None,
     }
@@ -139,11 +166,18 @@ pub async fn quota_guard(
     let mut req = req;
     let delta: i64 = match target {
         QuotaTarget::Atom | QuotaTarget::Kb => 1,
-        QuotaTarget::AtomBulk => match peek_and_replay_json_array_len(&mut req).await {
+        // The batch size is read from the body and the bytes are replayed so
+        // the handler reads an untouched payload. `/api/atoms/bulk` is a
+        // top-level array; `/api/ingest/urls` wraps its batch in a `urls`
+        // field. An unreadable/wrong-shaped body isn't ours to reject — let
+        // the handler return its own deserialization 400. A zero-length batch
+        // creates nothing, so it can never exceed a limit.
+        QuotaTarget::AtomBulk => match peek_and_replay_batch_len(&mut req, None).await {
             Ok(n) => n as i64,
-            // An unreadable/non-array body isn't ours to reject — let the
-            // handler return its own deserialization 400. A zero-length
-            // batch creates nothing, so it can never exceed a limit.
+            Err(()) => 0,
+        },
+        QuotaTarget::IngestUrls => match peek_and_replay_batch_len(&mut req, Some("urls")).await {
+            Ok(n) => n as i64,
             Err(()) => 0,
         },
     };
@@ -168,7 +202,9 @@ async fn check_resource(
     delta: i64,
 ) -> Result<Option<HttpResponse>, atomic_core::AtomicCoreError> {
     let (metric, limit) = match target {
-        QuotaTarget::Atom | QuotaTarget::AtomBulk => ("atoms", plan.atom_limit),
+        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls => {
+            ("atoms", plan.atom_limit)
+        }
         QuotaTarget::Kb => ("knowledge_bases", plan.kb_limit),
     };
     // NULL limit = unlimited: never read the count, never block.
@@ -178,7 +214,7 @@ async fn check_resource(
     let limit = i64::from(limit);
 
     let current: i64 = match target {
-        QuotaTarget::Atom | QuotaTarget::AtomBulk => {
+        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls => {
             // Count atoms in the SAME knowledge base the create will target,
             // resolved exactly as atomic-server's handler will resolve it.
             let core = resolve_core(manager, req).await?;
@@ -225,12 +261,19 @@ async fn resolve_core(
     manager.active_core().await
 }
 
-/// Buffer the request body, count the top-level JSON array's elements, and
-/// **re-inject the exact bytes** so the downstream handler reads an
-/// untouched payload. `Err(())` for a body that isn't a JSON array (or can't
-/// be read) — the caller treats that as a zero delta and lets the handler
-/// surface its own deserialization error.
-async fn peek_and_replay_json_array_len(req: &mut ServiceRequest) -> Result<usize, ()> {
+/// Buffer the request body, count the batch's elements, and **re-inject the
+/// exact bytes** so the downstream handler reads an untouched payload.
+///
+/// `field = None` counts a top-level JSON array (`/api/atoms/bulk`);
+/// `field = Some("urls")` counts the named array field inside a top-level JSON
+/// object (`/api/ingest/urls`). `Err(())` for a body that doesn't match the
+/// expected shape (or can't be read) — the caller treats that as a zero delta
+/// and lets the handler surface its own deserialization error. The bytes are
+/// always replayed first, including on the error path.
+async fn peek_and_replay_batch_len(
+    req: &mut ServiceRequest,
+    field: Option<&str>,
+) -> Result<usize, ()> {
     // `web::Bytes::from_request` drains the payload into memory. Clone the
     // (cheap, Arc-backed) HttpRequest so the immutable `request()` borrow
     // doesn't overlap the mutable `take_payload()` borrow.
@@ -238,18 +281,32 @@ async fn peek_and_replay_json_array_len(req: &mut ServiceRequest) -> Result<usiz
     let bytes = Bytes::from_request(&http_req, &mut req.take_payload())
         .await
         .map_err(|_| ())?;
-    // Count without fully materializing every element into owned values.
-    let len = match serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(&bytes) {
-        Ok(items) => items.len(),
-        Err(_) => {
-            // Not a JSON array — still replay the bytes so the handler can
-            // produce its own 400, then report "not ours".
-            req.set_payload(Payload::from(bytes));
-            return Err(());
-        }
-    };
+    // Always replay the exact bytes before returning so the handler reads an
+    // untouched payload regardless of the count outcome.
+    let len = batch_len(&bytes, field);
     req.set_payload(Payload::from(bytes));
-    Ok(len)
+    len
+}
+
+/// Count the batch length in `bytes`: a top-level array when `field` is
+/// `None`, or the named array field of a top-level object otherwise. Returns
+/// `Err(())` for any other shape. Counts without materializing element values.
+fn batch_len(bytes: &[u8], field: Option<&str>) -> Result<usize, ()> {
+    match field {
+        None => serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(bytes)
+            .map(|items| items.len())
+            .map_err(|_| ()),
+        Some(name) => {
+            // The array can be large, so avoid counting it twice: deserialize
+            // the whole object once, then read the named field's length.
+            let obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(bytes).map_err(|_| ())?;
+            match obj.get(name) {
+                Some(serde_json::Value::Array(items)) => Ok(items.len()),
+                _ => Err(()),
+            }
+        }
+    }
 }
 
 /// Placeholder upgrade link, derived from the request host
@@ -297,6 +354,15 @@ mod tests {
             quota_target(&post, "/api/atoms/bulk"),
             Some(QuotaTarget::AtomBulk)
         );
+        // URL ingestion creates atoms too — counts against atom_limit.
+        assert_eq!(
+            quota_target(&post, "/api/ingest/url"),
+            Some(QuotaTarget::Atom)
+        );
+        assert_eq!(
+            quota_target(&post, "/api/ingest/urls"),
+            Some(QuotaTarget::IngestUrls)
+        );
         assert_eq!(quota_target(&post, "/api/databases"), Some(QuotaTarget::Kb));
         // Updates, reads, and nested paths are not resource creates.
         for ignored in [
@@ -311,5 +377,36 @@ mod tests {
         // Reads on the create paths are not creates.
         assert_eq!(quota_target(&Method::GET, "/api/atoms"), None);
         assert_eq!(quota_target(&Method::PUT, "/api/atoms"), None);
+        assert_eq!(quota_target(&Method::GET, "/api/ingest/urls"), None);
+    }
+
+    #[test]
+    fn batch_len_counts_top_level_array() {
+        assert_eq!(batch_len(b"[]", None), Ok(0));
+        assert_eq!(
+            batch_len(br#"[{"content":"a"},{"content":"b"}]"#, None),
+            Ok(2)
+        );
+        // Non-array bodies are not ours to count.
+        assert_eq!(batch_len(br#"{"content":"a"}"#, None), Err(()));
+        assert_eq!(batch_len(b"not json", None), Err(()));
+    }
+
+    #[test]
+    fn batch_len_counts_named_object_field() {
+        assert_eq!(batch_len(br#"{"urls":[]}"#, Some("urls")), Ok(0));
+        assert_eq!(
+            batch_len(
+                br#"{"urls":[{"url":"a"},{"url":"b"},{"url":"c"}]}"#,
+                Some("urls")
+            ),
+            Ok(3)
+        );
+        // A top-level array is the wrong shape for the field form.
+        assert_eq!(batch_len(br#"[{"url":"a"}]"#, Some("urls")), Err(()));
+        // Missing or non-array field is not ours to count.
+        assert_eq!(batch_len(br#"{"other":[]}"#, Some("urls")), Err(()));
+        assert_eq!(batch_len(br#"{"urls":"x"}"#, Some("urls")), Err(()));
+        assert_eq!(batch_len(b"not json", Some("urls")), Err(()));
     }
 }

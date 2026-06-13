@@ -146,6 +146,51 @@ async fn record_transition(
     }
 }
 
+/// Claim a Stripe webhook event id for one-time processing. Inserts the id
+/// into `processed_webhook_events`; returns `true` when THIS call won the
+/// insert (a first delivery, so the caller should apply the event) and
+/// `false` when the id was already present (a redelivery — Stripe retries
+/// until it sees a 2xx and does not guarantee at-most-once delivery, so the
+/// caller acks without re-running the side effects).
+///
+/// This is the idempotency boundary: claiming before applying collapses every
+/// redelivery of the same event to a no-op, including the unconditional
+/// `checkout`-arm audit row that would otherwise duplicate in
+/// `plan_transitions` (plan: "The webhook is the source of truth").
+pub async fn claim_webhook_event(
+    control: &ControlPlane,
+    event_id: &str,
+    event_type: &str,
+) -> Result<bool, CloudError> {
+    let inserted = sqlx::query(
+        "INSERT INTO processed_webhook_events (event_id, event_type) \
+         VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(event_id)
+    .bind(event_type)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("claiming webhook event"))?
+    .rows_affected();
+    Ok(inserted > 0)
+}
+
+/// Release a previously-[`claim_webhook_event`]ed id, deleting its row. Called
+/// only when applying the event FAILED, so Stripe's retry re-processes it
+/// instead of being deduped into a permanent no-op (the side effects never
+/// landed). Idempotent — a missing row is success.
+pub async fn release_webhook_event(
+    control: &ControlPlane,
+    event_id: &str,
+) -> Result<(), CloudError> {
+    sqlx::query("DELETE FROM processed_webhook_events WHERE event_id = $1")
+        .bind(event_id)
+        .execute(control.pool())
+        .await
+        .map_err(CloudError::db("releasing webhook event"))?;
+    Ok(())
+}
+
 /// Resolve the account id a webhook event pertains to, via its Stripe
 /// customer id. `None` when no `stripe_customers` row maps it (an event for
 /// an account we don't know — e.g. a customer created out-of-band).
@@ -197,6 +242,19 @@ pub async fn link_stripe_customer(
 ///
 /// `deleted` is signaled by `state.status == "canceled"` or the dedicated
 /// [`apply_subscription_deleted`]; this handles the create/update arm.
+///
+/// # Ordering
+///
+/// [`claim_webhook_event`] makes every *redelivery* of one event a no-op, so
+/// a verbatim replay can't re-apply a plan/state change or duplicate the
+/// audit row. Stripe does not, however, guarantee *ordering* between distinct
+/// events: a stale `subscription.updated` (its own event id) delivered after a
+/// `subscription.deleted` would transiently re-widen the plan. This is
+/// accepted (the plan's webhook is the source of truth and the next
+/// authoritative event self-heals it; billing money rides Stripe-side credits,
+/// not this projection). A strict newer-wins guard would need the event's
+/// `created` timestamp persisted and compared here — deferred until reorder is
+/// observed in practice.
 pub async fn apply_subscription_event(
     control: &ControlPlane,
     account_id: &str,

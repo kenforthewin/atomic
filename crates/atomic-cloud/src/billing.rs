@@ -70,6 +70,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// leaked-but-stale signed payload.
 pub const WEBHOOK_TOLERANCE_SECS: i64 = 300;
 
+/// Default name of the environment variable holding the Stripe secret key
+/// (`sk_…`). Like [`crate::MASTER_KEY_ENV`] and
+/// [`crate::PROVISIONING_KEY_ENV`], the secret VALUE is only ever read from
+/// the environment — `serve` takes the variable NAME on argv, never the key
+/// itself, so it can't leak into process listings (`ps`, `/proc/<pid>/cmdline`).
+pub const STRIPE_SECRET_KEY_ENV: &str = "ATOMIC_CLOUD_STRIPE_SECRET_KEY";
+
+/// Default name of the environment variable holding the Stripe webhook signing
+/// secret (`whsec_…`). Read from the environment by NAME for the same custody
+/// reason as [`STRIPE_SECRET_KEY_ENV`].
+pub const STRIPE_WEBHOOK_SECRET_ENV: &str = "ATOMIC_CLOUD_STRIPE_WEBHOOK_SECRET";
+
 /// A Stripe Checkout / Customer-Portal session: just the redirect URL cloud
 /// 302s the browser to.
 #[derive(Debug, Clone)]

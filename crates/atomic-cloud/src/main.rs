@@ -353,26 +353,29 @@ impl ProvisioningArgs {
 }
 
 /// Stripe billing selection for `serve` (plan: "Billing"). Billing is
-/// OPTIONAL: with no `--stripe-secret-key`, the billing routes degrade to a
-/// structured 503 and the dunning sweep simply never has past_due accounts
-/// to advance — fine for dev clusters and self-hosted-style deployments. The
-/// secret key and webhook signing secret are env-only by convention (they're
-/// secrets; argv leaks into process listings).
+/// OPTIONAL: with the secret-key env var unset, the billing routes degrade to
+/// a structured 503 and the dunning sweep simply never has past_due accounts
+/// to advance — fine for dev clusters and self-hosted-style deployments.
+///
+/// The secret key and webhook signing secret follow the same custody rule as
+/// the master key and the OpenRouter provisioning key: `serve` takes only the
+/// environment-variable NAME on argv and reads the VALUE from the environment
+/// (`into_config`). The secret itself never appears in argv, so it can't leak
+/// into process listings (`ps`, `/proc/<pid>/cmdline`).
 #[derive(Args)]
 struct BillingArgs {
-    /// Stripe secret key (`sk_…`). Enables billing when set; env-only.
-    #[arg(long, env = "ATOMIC_CLOUD_STRIPE_SECRET_KEY", hide_env_values = true)]
-    stripe_secret_key: Option<String>,
+    /// Name of the environment variable holding the Stripe secret key
+    /// (`sk_…`). Billing is enabled when that variable is set; the key VALUE
+    /// is only ever read from the environment, never taken on argv.
+    #[arg(long, default_value = atomic_cloud::STRIPE_SECRET_KEY_ENV)]
+    stripe_secret_key_env: String,
 
-    /// Stripe webhook signing secret (`whsec_…`), used to verify the
-    /// `app.<base>/billing/webhook` signature. Required for the webhook to
-    /// accept anything; env-only.
-    #[arg(
-        long,
-        env = "ATOMIC_CLOUD_STRIPE_WEBHOOK_SECRET",
-        hide_env_values = true
-    )]
-    stripe_webhook_secret: Option<String>,
+    /// Name of the environment variable holding the Stripe webhook signing
+    /// secret (`whsec_…`), used to verify the `app.<base>/billing/webhook`
+    /// signature. Required for the webhook to accept anything; the secret
+    /// VALUE is only ever read from the environment, never taken on argv.
+    #[arg(long, default_value = atomic_cloud::STRIPE_WEBHOOK_SECRET_ENV)]
+    stripe_webhook_secret_env: String,
 
     /// Plan→price mapping as repeatable `plan_id=stripe_price_id` pairs, e.g.
     /// `--stripe-price pro=price_123`. The reverse map drives webhook
@@ -384,6 +387,16 @@ struct BillingArgs {
         value_delimiter = ','
     )]
     stripe_prices: Vec<String>,
+}
+
+/// Read a secret VALUE from the named environment variable, treating an unset
+/// OR empty variable as "absent" (`None`). Used for the optional Stripe
+/// credentials: the variable NAME comes from argv, the secret never does, so
+/// it can't surface in process listings. An empty value is deliberately
+/// folded into `None` so that exporting `VAR=` reads as "billing disabled"
+/// rather than enabling billing with an empty key.
+fn read_secret_env(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.is_empty())
 }
 
 impl BillingArgs {
@@ -406,8 +419,8 @@ impl BillingArgs {
     ) -> Result<BillingConfig, Box<dyn std::error::Error>> {
         let plan_prices = self.plan_prices()?;
         Ok(BillingConfig {
-            stripe_secret_key: self.stripe_secret_key,
-            webhook_secret: self.stripe_webhook_secret,
+            stripe_secret_key: read_secret_env(&self.stripe_secret_key_env),
+            webhook_secret: read_secret_env(&self.stripe_webhook_secret_env),
             plan_prices,
             app_public_url,
             base_domain,

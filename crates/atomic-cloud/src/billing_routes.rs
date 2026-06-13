@@ -312,8 +312,43 @@ async fn webhook(
         }
     };
 
+    // Idempotency: claim the event id before applying any side effect. Stripe
+    // redelivers until it sees a 2xx and does not guarantee at-most-once
+    // delivery, so a verbatim replay must collapse to an ack with no repeated
+    // money/quota/audit work (plan: "The webhook is the source of truth").
+    // Only events with a real id participate; a malformed-but-verified event
+    // (no `evt_…` id) falls through to apply, which is itself convergent.
+    let event_id = event["id"].as_str().unwrap_or_default();
+    let event_type = event["type"].as_str().unwrap_or_default();
+    if !event_id.is_empty() {
+        match dunning::claim_webhook_event(&state.control, event_id, event_type).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    event_id,
+                    event_type,
+                    "duplicate Stripe webhook; acking no-op"
+                );
+                return HttpResponse::Ok().json(serde_json::json!({ "received": true }));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "claiming Stripe webhook event failed");
+                return internal_error();
+            }
+        }
+    }
+
     if let Err(e) = apply(&state, parsed).await {
         tracing::error!(error = %e, "applying Stripe webhook failed");
+        // Release the claim so Stripe's retry re-processes this event rather
+        // than being deduped into a permanent no-op — the apply failed, so
+        // the side effects did NOT land. A failed release is logged but can't
+        // change the 500 we owe Stripe (it will retry regardless).
+        if !event_id.is_empty() {
+            if let Err(e) = dunning::release_webhook_event(&state.control, event_id).await {
+                tracing::error!(error = %e, event_id, "releasing failed webhook claim failed");
+            }
+        }
         return internal_error();
     }
     HttpResponse::Ok().json(serde_json::json!({ "received": true }))

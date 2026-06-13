@@ -26,11 +26,12 @@ use std::time::Duration;
 use actix_web::{web, App, HttpServer};
 use atomic_cloud::{
     advance_dunning, apply_payment_failed, apply_payment_succeeded, apply_subscription_deleted,
-    apply_subscription_event, configure_cloud_app, issue_token, link_stripe_customer,
-    provision_account, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
-    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
-    DataPlaneRateLimits, FallbackAppState, ManagedKeys, NewAccount, PlanRegistry, QuotaBilling,
-    Readiness, SubscriptionState, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    apply_subscription_event, claim_webhook_event, configure_cloud_app, issue_token,
+    link_stripe_customer, provision_account, release_webhook_event, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
+    ClusterConfig, ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits, FallbackAppState,
+    ManagedKeys, NewAccount, PlanRegistry, QuotaBilling, Readiness, SubscriptionState, TenantPlane,
+    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use reqwest::header::HOST;
 use reqwest::{Method, StatusCode};
@@ -377,6 +378,65 @@ async fn bulk_create_respects_the_batch_delta() {
 }
 
 #[actix_web::test]
+async fn url_ingestion_counts_against_atom_limit() {
+    with_control_db("ingest_atom_quota", |url| async move {
+        // Free = 1 atom, so an account at its ceiling can't slip past the
+        // quota gate by ingesting instead of creating.
+        set_free_limits(&url, Some(1), Some(1)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // Land exactly at the limit with a direct create (count 0→1).
+        let first = harness.create_atom(&tenant, "atom 0").await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        // Single-URL ingestion (delta 1): 1 + 1 > 1 → 402 BEFORE the handler
+        // ever fetches the URL. The body is the exact quota shape, proving the
+        // ingest path enforces atom_limit, not just the 30/min rate limit.
+        let single = harness
+            .api(Method::POST, &tenant.subdomain, "/api/ingest/url")
+            .bearer_auth(&tenant.token)
+            .json(&json!({ "url": "https://example.com/x" }))
+            .send()
+            .await
+            .expect("ingest one");
+        assert_eq!(
+            single.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "single ingest over the atom limit"
+        );
+        let body: Value = single.json().await.expect("body");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["metric"], "atoms");
+        assert_eq!(body["current"], 1);
+        assert_eq!(body["limit"], 1);
+
+        // Batch ingestion delta is read from the `urls` field: 1 + 2 > 1 → 402
+        // as a single denial, no partial fetch.
+        let batch = harness
+            .api(Method::POST, &tenant.subdomain, "/api/ingest/urls")
+            .bearer_auth(&tenant.token)
+            .json(&json!({ "urls": [
+                { "url": "https://example.com/a" },
+                { "url": "https://example.com/b" }
+            ] }))
+            .send()
+            .await
+            .expect("ingest batch");
+        assert_eq!(
+            batch.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "batch ingest over the atom limit"
+        );
+        let body: Value = batch.json().await.expect("batch body");
+        assert_eq!(body["metric"], "atoms");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
 async fn kb_limit_blocks_database_create() {
     with_control_db("kb_limit_enforced", |url| async move {
         // Free = 1 KB (the default seed); a fresh tenant already has its
@@ -636,6 +696,105 @@ async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
         assert!(
             transitions >= 3,
             "every transition is audited, got {transitions}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn webhook_event_id_is_claimed_exactly_once() {
+    with_control_db("webhook_claim_once", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+
+        // First delivery wins the claim; the redelivery (same id) does not.
+        assert!(
+            claim_webhook_event(&control, "evt_1", "customer.subscription.updated")
+                .await
+                .expect("first claim"),
+            "first delivery claims the event"
+        );
+        assert!(
+            !claim_webhook_event(&control, "evt_1", "customer.subscription.updated")
+                .await
+                .expect("second claim"),
+            "redelivery of the same id is deduped"
+        );
+
+        // A distinct id is its own claim.
+        assert!(
+            claim_webhook_event(&control, "evt_2", "invoice.payment_failed")
+                .await
+                .expect("distinct claim"),
+            "a different event id claims independently"
+        );
+
+        // Releasing a claim (the apply-failed compensation) lets a retry
+        // re-claim it — the side effects never landed, so the retry must run.
+        release_webhook_event(&control, "evt_1")
+            .await
+            .expect("release");
+        assert!(
+            claim_webhook_event(&control, "evt_1", "customer.subscription.updated")
+                .await
+                .expect("re-claim after release"),
+            "a released event can be claimed again"
+        );
+
+        let _ = account_id;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replayed_subscription_event_does_not_duplicate_the_audit_row() {
+    // The 'checkout' arm of apply_subscription_event records a plan_transitions
+    // row unconditionally, so a *verbatim* replay would append a duplicate
+    // audit row each time. The webhook handler's claim collapses redelivery to
+    // a no-op; this proves the underlying double-apply is what the claim
+    // guards against by asserting the count grows by exactly one per UNIQUE
+    // event (the handler skips apply entirely on a claimed id).
+    with_control_db("webhook_replay_audit", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+        link_stripe_customer(&control, &account_id, "cus_1")
+            .await
+            .expect("link customer");
+
+        let sub = SubscriptionState {
+            stripe_customer_id: "cus_1".into(),
+            stripe_subscription_id: "sub_1".into(),
+            plan_id: "pro".into(),
+            status: "active".into(),
+            current_period_start: chrono::Utc::now(),
+            current_period_end: chrono::Utc::now() + chrono::Duration::days(30),
+            cancel_at_period_end: false,
+        };
+
+        // Simulate the handler's claim-then-apply for the SAME event id twice:
+        // the first delivery applies, the redelivery is deduped before apply.
+        for _ in 0..2 {
+            if claim_webhook_event(&control, "evt_sub_1", "customer.subscription.updated")
+                .await
+                .expect("claim")
+            {
+                apply_subscription_event(&control, &account_id, &sub)
+                    .await
+                    .expect("apply");
+            }
+        }
+
+        let transitions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_transitions WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_one(control.pool())
+                .await
+                .expect("count transitions");
+        assert_eq!(
+            transitions, 1,
+            "the redelivered event is deduped — exactly one audit row"
         );
     })
     .await;
