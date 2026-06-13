@@ -32,6 +32,7 @@ use crate::auth::ResolvedTenant;
 use crate::billing::dunning;
 use crate::billing::{self, BillingProvider, WebhookEvent};
 use crate::control_plane::ControlPlane;
+use crate::tokens::TokenScope;
 
 /// Everything the billing routes need. `None` provider means Stripe isn't
 /// configured — every route degrades to a structured 503.
@@ -154,10 +155,15 @@ impl Billing {
     /// Register the authenticated tenant-plane billing routes (portal,
     /// checkout). Behind the same `CloudAuth` as the rest of `/api/*`; the
     /// caller wires the auth wrap.
+    ///
+    /// These are configured INTO `atomic_server::app::api_scope()`, which is
+    /// `web::scope("/api")` — so the paths registered here are relative to
+    /// that scope (no `/api` prefix), yielding the public URLs
+    /// `/api/billing/portal` and `/api/billing/checkout`.
     pub(crate) fn configure_tenant(&self, cfg: &mut web::ServiceConfig) {
         cfg.app_data(self.state.clone())
-            .route("/api/billing/portal", web::get().to(portal))
-            .route("/api/billing/checkout", web::get().to(checkout));
+            .route("/billing/portal", web::get().to(portal))
+            .route("/billing/checkout", web::get().to(checkout));
     }
 
     /// Register the unauthenticated webhook on the app host (guarded so it
@@ -182,8 +188,13 @@ async fn portal(state: web::Data<BillingState>, req: HttpRequest) -> HttpRespons
     let Some(provider) = state.provider.as_ref() else {
         return billing_not_configured();
     };
-    let Some(account_id) = account_id(&req) else {
-        return unauthorized();
+    // Billing actions touch the whole account, not a single KB — only an
+    // account-scope credential (or a web session) may start them, exactly
+    // like `DELETE /api/account` (tenant_plane). A database- or MCP-scoped
+    // token is pinned to a KB and gets 403.
+    let account_id = match require_account_scope(&req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
 
     let customer: Result<Option<String>, _> =
@@ -226,8 +237,9 @@ async fn checkout(
     let Some(provider) = state.provider.as_ref() else {
         return billing_not_configured();
     };
-    let Some(account_id) = account_id(&req) else {
-        return unauthorized();
+    let account_id = match require_account_scope(&req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     let Some(price_id) = state.plan_to_price.get(&query.plan) else {
         return HttpResponse::BadRequest().json(serde_json::json!({
@@ -479,10 +491,32 @@ where
     }
 }
 
-fn account_id(req: &HttpRequest) -> Option<String> {
-    req.extensions()
-        .get::<ResolvedTenant>()
-        .map(|t| t.principal.account_id.clone())
+/// Resolve the request's account id, requiring an **account-scope** credential
+/// — the billing routes' authorization prologue, mirroring
+/// [`crate::tenant_plane`]'s `require_account_scope`. CloudAuth installs the
+/// extension on every request it passes; its absence is a composition bug and
+/// fails closed (500) rather than guessing an identity. A real-but-KB-pinned
+/// credential (database/MCP scope) gets a structured 403.
+fn require_account_scope(req: &HttpRequest) -> Result<String, HttpResponse> {
+    let extensions = req.extensions();
+    let Some(tenant) = extensions.get::<ResolvedTenant>() else {
+        tracing::error!(
+            path = req.path(),
+            "billing route reached without a resolved tenant"
+        );
+        return Err(internal_error());
+    };
+    if tenant.principal.scope != TokenScope::Account {
+        return Err(account_scope_required());
+    }
+    Ok(tenant.principal.account_id.clone())
+}
+
+fn account_scope_required() -> HttpResponse {
+    HttpResponse::Forbidden().json(serde_json::json!({
+        "error": "account_scope_required",
+        "message": "This action requires an account-scope token or a web session.",
+    }))
 }
 
 fn redirect(url: &str) -> HttpResponse {

@@ -999,12 +999,390 @@ async fn suspended_account_is_blocked_at_auth_read_only_blocks_writes() {
     .await;
 }
 
+/// The checkout route, driven against a scripted provider, returns a 302 to
+/// the session URL — and is account-scope-gated exactly like
+/// `DELETE /api/account`: a database-scoped token (KB-pinned) gets 403
+/// `account_scope_required`, never a redirect or a Stripe call.
+#[actix_web::test]
+async fn checkout_route_redirects_and_is_account_scope_gated() {
+    with_control_db("billing_checkout_route", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            Some(Arc::new(RecordingBilling::new(
+                "https://checkout.stripe.test/cs_route",
+                "https://portal.stripe.test/ps_route",
+            ))),
+            "whsec_route",
+            HashMap::from([("pro".to_string(), "price_pro".to_string())]),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        let harness =
+            Harness::spawn_with_billing(control.clone(), DataPlaneRateLimits::default(), billing)
+                .await;
+        let tenant = harness.provision("alpha").await;
+
+        // The recording provider's session URL is on a non-resolvable host, so
+        // a client that FOLLOWS the 302 would fail at connect. Use a no-redirect
+        // client and assert on the 302 + Location header directly.
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("no-redirect client");
+
+        // Account-scope token → 302 into Stripe Checkout, no plan state written.
+        let resp = no_redirect
+            .get(format!(
+                "{}/api/billing/checkout?plan=pro",
+                harness.base_url
+            ))
+            .header(HOST, format!("{}.{BASE_DOMAIN}", tenant.subdomain))
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("checkout");
+        assert_eq!(resp.status(), StatusCode::FOUND, "checkout 302s");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("https://checkout.stripe.test/cs_route"),
+            "redirects to the Stripe Checkout session URL"
+        );
+
+        // Unknown plan → 400 unknown_plan (still account-scope, reached the route).
+        let resp = harness
+            .api(
+                Method::GET,
+                &tenant.subdomain,
+                "/api/billing/checkout?plan=nope",
+            )
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("checkout bad plan");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["error"], "unknown_plan");
+
+        // A database-scoped token is KB-pinned → 403, never a redirect.
+        let db_token = issue_token(
+            &harness.control,
+            &tenant.account_id,
+            TokenScope::Database,
+            Some("default"),
+            "kb-pinned",
+        )
+        .await
+        .expect("issue db token");
+        let resp = harness
+            .api(
+                Method::GET,
+                &tenant.subdomain,
+                "/api/billing/checkout?plan=pro",
+            )
+            .bearer_auth(&db_token)
+            .send()
+            .await
+            .expect("db-scoped checkout");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "db-scoped 403s");
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["error"], "account_scope_required");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// The portal route 409s when the account has no Stripe customer yet, 302s
+/// into the portal once linked, and is account-scope-gated (db-scoped → 403).
+#[actix_web::test]
+async fn portal_route_conflicts_redirects_and_is_account_scope_gated() {
+    with_control_db("billing_portal_route", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            Some(Arc::new(RecordingBilling::new(
+                "https://checkout.stripe.test/cs_route",
+                "https://portal.stripe.test/ps_route",
+            ))),
+            "whsec_route",
+            HashMap::from([("pro".to_string(), "price_pro".to_string())]),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        let harness =
+            Harness::spawn_with_billing(control.clone(), DataPlaneRateLimits::default(), billing)
+                .await;
+        let tenant = harness.provision("alpha").await;
+
+        // No Stripe customer yet → 409 no_billing_customer (must check out first).
+        let resp = harness
+            .api(Method::GET, &tenant.subdomain, "/api/billing/portal")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("portal pre-link");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["error"], "no_billing_customer");
+
+        // Link a customer, then the portal 302s into Stripe. Use a no-redirect
+        // client (the session URL host doesn't resolve) and assert the 302.
+        link_stripe_customer(&harness.control, &tenant.account_id, "cus_portal")
+            .await
+            .expect("link customer");
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("no-redirect client");
+        let resp = no_redirect
+            .get(format!("{}/api/billing/portal", harness.base_url))
+            .header(HOST, format!("{}.{BASE_DOMAIN}", tenant.subdomain))
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("portal post-link");
+        assert_eq!(resp.status(), StatusCode::FOUND, "portal 302s");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("https://portal.stripe.test/ps_route"),
+            "redirects to the Stripe Customer Portal session URL"
+        );
+
+        // A database-scoped token → 403, never a redirect.
+        let db_token = issue_token(
+            &harness.control,
+            &tenant.account_id,
+            TokenScope::Database,
+            Some("default"),
+            "kb-pinned",
+        )
+        .await
+        .expect("issue db token");
+        let resp = harness
+            .api(Method::GET, &tenant.subdomain, "/api/billing/portal")
+            .bearer_auth(&db_token)
+            .send()
+            .await
+            .expect("db-scoped portal");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(body["error"], "account_scope_required");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// The webhook rejects a bad/missing signature with 400 BEFORE any parsing or
+/// lookup (only a forger ever sees it), and applies no state.
+#[actix_web::test]
+async fn webhook_rejects_a_bad_signature_with_400() {
+    with_control_db("billing_webhook_badsig", |url| async move {
+        const SECRET: &str = "whsec_badsig";
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+        link_stripe_customer(&control, &account_id, "cus_sig")
+            .await
+            .expect("link customer");
+
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            Some(Arc::new(RecordingBilling::new("u", "u"))),
+            SECRET,
+            HashMap::new(),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        let harness =
+            Harness::spawn_with_billing(control.clone(), DataPlaneRateLimits::default(), billing)
+                .await;
+
+        // A payload that, if it were applied, would move this account to
+        // past_due — proving the 400 short-circuited before any effect.
+        let payload = serde_json::to_vec(&json!({
+            "id": "evt_badsig",
+            "type": "invoice.payment_failed",
+            "data": { "object": { "customer": "cus_sig" } }
+        }))
+        .expect("serialize");
+
+        let now = chrono::Utc::now().timestamp();
+        let cases: Vec<(&str, Option<String>)> = vec![
+            // No signature header at all.
+            ("missing", None),
+            // A header that doesn't parse as Stripe's `t=,v1=` scheme.
+            ("garbage", Some("not-a-signature".to_string())),
+            // A correctly-shaped, correctly-timed signature — under the WRONG
+            // secret, so the HMAC can't match.
+            (
+                "wrong-secret",
+                Some(sign_webhook("whsec_other", &payload, now)),
+            ),
+            // A correctly-signed header but a stale timestamp (replay defense).
+            ("stale", Some(sign_webhook(SECRET, &payload, now - 10_000))),
+        ];
+        for (label, header) in cases {
+            let mut req = harness
+                .client
+                .post(format!("{}/billing/webhook", harness.base_url))
+                .header(HOST, format!("app.{BASE_DOMAIN}"))
+                .header("content-type", "application/json")
+                .body(payload.clone());
+            if let Some(h) = header {
+                req = req.header("stripe-signature", h);
+            }
+            let resp = req.send().await.expect("post webhook");
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{label} signature rejected with 400"
+            );
+            let body: Value = resp.json().await.expect("body");
+            assert_eq!(body["error"], "invalid_signature", "{label}");
+        }
+
+        // No state changed: the account is still active, no dedup row written.
+        assert_eq!(billing_state(&control, &account_id).await, "active");
+        let claimed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM processed_webhook_events WHERE event_id = 'evt_badsig'",
+        )
+        .fetch_one(control.pool())
+        .await
+        .expect("count claims");
+        assert_eq!(claimed, 0, "a rejected signature claims no event id");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// A genuinely-signed event for a Stripe customer mapped to NO account is
+/// acked 200 (so Stripe stops retrying a permanently-orphaned event) with no
+/// state change — Stripe best practice for an event we cannot correlate.
+#[actix_web::test]
+async fn webhook_orphaned_customer_is_acked_200_with_no_effect() {
+    with_control_db("billing_webhook_orphan", |url| async move {
+        const SECRET: &str = "whsec_orphan";
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            Some(Arc::new(RecordingBilling::new("u", "u"))),
+            SECRET,
+            HashMap::new(),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        let harness =
+            Harness::spawn_with_billing(control.clone(), DataPlaneRateLimits::default(), billing)
+                .await;
+
+        // payment_failed for a customer that maps to no account at all.
+        let now = chrono::Utc::now().timestamp();
+        let payload = serde_json::to_vec(&json!({
+            "id": "evt_orphan",
+            "type": "invoice.payment_failed",
+            "data": { "object": { "customer": "cus_nobody" } }
+        }))
+        .expect("serialize");
+        let signature = sign_webhook(SECRET, &payload, now);
+
+        let resp = harness
+            .client
+            .post(format!("{}/billing/webhook", harness.base_url))
+            .header(HOST, format!("app.{BASE_DOMAIN}"))
+            .header("stripe-signature", signature)
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await
+            .expect("post webhook");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "orphaned event is acked so Stripe stops retrying"
+        );
+
+        // The event was claimed (so a redelivery is a fast no-op) but no
+        // account state was touched — there was no account to touch.
+        let claimed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM processed_webhook_events WHERE event_id = 'evt_orphan'",
+        )
+        .fetch_one(control.pool())
+        .await
+        .expect("count claims");
+        assert_eq!(claimed, 1, "the orphaned event id is claimed");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
 // --- helpers -----------------------------------------------------------------
+
+/// A `BillingProvider` test double: returns scripted session URLs and records
+/// the calls it received. Drives the checkout/portal route tests without a
+/// Stripe account (the trait is the seam; the wiremock test in
+/// `tests/stripe_client.rs` pins the real client's request shape).
+struct RecordingBilling {
+    checkout_url: String,
+    portal_url: String,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingBilling {
+    fn new(checkout_url: impl Into<String>, portal_url: impl Into<String>) -> Self {
+        Self {
+            checkout_url: checkout_url.into(),
+            portal_url: portal_url.into(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl atomic_cloud::BillingProvider for RecordingBilling {
+    async fn create_checkout_session(
+        &self,
+        price_id: &str,
+        _customer_email: &str,
+        subdomain: &str,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> Result<atomic_cloud::StripeSession, atomic_cloud::CloudError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("checkout:{price_id}:{subdomain}"));
+        Ok(atomic_cloud::StripeSession {
+            url: self.checkout_url.clone(),
+        })
+    }
+
+    async fn create_portal_session(
+        &self,
+        stripe_customer_id: &str,
+        _return_url: &str,
+    ) -> Result<atomic_cloud::StripeSession, atomic_cloud::CloudError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("portal:{stripe_customer_id}"));
+        Ok(atomic_cloud::StripeSession {
+            url: self.portal_url.clone(),
+        })
+    }
+}
 
 /// A `BillingProvider` whose presence alone enables the webhook route. The
 /// webhook handler never calls these (it only verifies + projects + applies);
-/// the checkout/portal redirect routes aren't exercised by the webhook test,
-/// so the methods just need to exist.
+/// the auto-link webhook test doesn't start a checkout/portal session, so the
+/// methods just need to exist.
 struct StubBillingProvider;
 
 #[async_trait::async_trait]

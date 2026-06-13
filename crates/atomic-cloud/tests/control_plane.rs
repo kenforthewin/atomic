@@ -29,6 +29,8 @@ const CONTROL_TABLES: &[&str] = &[
     "stripe_customers",
     "stripe_subscriptions",
     "plan_transitions",
+    // Migration 011 — Stripe webhook idempotency ledger.
+    "processed_webhook_events",
 ];
 
 /// The migration-tracking columns 008 adds to `account_databases` (plan:
