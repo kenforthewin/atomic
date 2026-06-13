@@ -359,14 +359,36 @@ async fn webhook(
 async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::error::CloudError> {
     match event {
         WebhookEvent::SubscriptionUpserted(sub) => {
-            match dunning::account_for_customer(&state.control, &sub.stripe_customer_id).await? {
+            // Resolve (and, on the very first subscription, ESTABLISH) the
+            // account↔customer linkage. A real Stripe checkout's
+            // `customer.subscription.created` is the first time cloud learns
+            // the `cus_…` id — the redirect path deliberately writes no state
+            // (the webhook is the source of truth), so no `stripe_customers`
+            // row exists yet. The subscription carries the account's subdomain
+            // in its metadata (stamped at checkout via
+            // `subscription_data[metadata][subdomain]`); we map it to the
+            // account and link the customer before applying. Without this, a
+            // genuine first subscription would resolve to no account and be
+            // silently dropped — the happy path would never complete. (Plan:
+            // "Key events: customer.subscription.{created,updated,deleted}" —
+            // we link off the subscription itself rather than handling a
+            // separate `checkout.session.completed`, keeping the handled-event
+            // set exactly as the plan specifies.)
+            let account_id =
+                match dunning::account_for_customer(&state.control, &sub.stripe_customer_id).await?
+                {
+                    Some(account_id) => Some(account_id),
+                    None => link_from_subdomain(state, &sub).await?,
+                };
+            match account_id {
                 Some(account_id) => {
                     dunning::apply_subscription_event(&state.control, &account_id, &sub).await
                 }
                 None => {
                     tracing::warn!(
                         customer = sub.stripe_customer_id,
-                        "subscription event for an unknown Stripe customer; ignoring"
+                        "subscription event for an unknown Stripe customer with no \
+                         resolvable subdomain metadata; ignoring"
                     );
                     Ok(())
                 }
@@ -395,6 +417,39 @@ async fn apply(state: &BillingState, event: WebhookEvent) -> Result<(), crate::e
             Ok(())
         }
     }
+}
+
+/// Establish the `stripe_customers` linkage for a brand-new subscription by
+/// resolving its `metadata.subdomain` to an account, then return that account
+/// id. `None` when the subscription carries no subdomain (out-of-band) or the
+/// subdomain matches no account (a stale/forged subdomain — the verified
+/// signature guarantees the event is from Stripe, but the metadata is
+/// caller-supplied at checkout, so a mismatch is logged and ignored rather
+/// than trusted). Linking is idempotent ([`dunning::link_stripe_customer`]
+/// upserts), so a retry after a transient apply failure re-links harmlessly.
+async fn link_from_subdomain(
+    state: &BillingState,
+    sub: &billing::SubscriptionState,
+) -> Result<Option<String>, crate::error::CloudError> {
+    let Some(subdomain) = sub.subdomain.as_deref() else {
+        return Ok(None);
+    };
+    let Some(account_id) = state.control.account_id_by_subdomain(subdomain).await? else {
+        tracing::warn!(
+            customer = sub.stripe_customer_id,
+            subdomain,
+            "subscription metadata.subdomain matches no account; ignoring"
+        );
+        return Ok(None);
+    };
+    dunning::link_stripe_customer(&state.control, &account_id, &sub.stripe_customer_id).await?;
+    tracing::info!(
+        customer = sub.stripe_customer_id,
+        account_id,
+        subdomain,
+        "linked Stripe customer to account from checkout subscription metadata"
+    );
+    Ok(Some(account_id))
 }
 
 /// Resolve the account for a Stripe customer and run `f` against it; a no-op

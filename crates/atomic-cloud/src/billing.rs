@@ -105,6 +105,16 @@ pub struct SubscriptionState {
     pub current_period_start: chrono::DateTime<chrono::Utc>,
     pub current_period_end: chrono::DateTime<chrono::Utc>,
     pub cancel_at_period_end: bool,
+    /// The account subdomain carried in the subscription's
+    /// `metadata.subdomain` — stamped by [`BillingProvider::create_checkout_session`]
+    /// via `subscription_data[metadata][subdomain]`. This is how the webhook
+    /// auto-links a brand-new Stripe customer to its account on the very first
+    /// `customer.subscription.created`, *before* any `stripe_customers` row
+    /// exists (the redirect path never writes one — the webhook is the source
+    /// of truth). `None` for subscriptions created out-of-band (Stripe
+    /// dashboard, API) with no subdomain metadata, in which case the customer
+    /// must already be linked or the event is logged-and-ignored.
+    pub subdomain: Option<String>,
 }
 
 /// The Stripe operations cloud needs, behind a trait so the billing routes
@@ -453,6 +463,13 @@ fn parse_subscription(
             err("could not resolve a plan from the subscription's price (no metadata.plan_id and no price→plan mapping)")
         })?;
 
+    // The account subdomain stamped into the subscription at checkout, used to
+    // auto-link a fresh Stripe customer to its account (see the field doc).
+    let subdomain = sub["metadata"]["subdomain"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     Ok(SubscriptionState {
         stripe_customer_id,
         stripe_subscription_id,
@@ -461,6 +478,7 @@ fn parse_subscription(
         current_period_start,
         current_period_end,
         cancel_at_period_end,
+        subdomain,
     })
 }
 
@@ -587,6 +605,7 @@ mod tests {
                 "cancel_at_period_end": false,
                 "current_period_start": 1_700_000_000_i64,
                 "current_period_end": 1_702_592_000_i64,
+                "metadata": { "subdomain": "alpha" },
                 "items": { "data": [ { "price": {
                     "id": "price_pro",
                     "metadata": { "plan_id": "pro" }
@@ -598,6 +617,9 @@ mod tests {
                 assert_eq!(s.plan_id, "pro");
                 assert_eq!(s.status, "active");
                 assert_eq!(s.stripe_customer_id, "cus_1");
+                // The checkout-stamped subdomain rides through so the webhook
+                // can auto-link a fresh customer to its account.
+                assert_eq!(s.subdomain.as_deref(), Some("alpha"));
             }
             other => panic!("expected upsert, got {other:?}"),
         }

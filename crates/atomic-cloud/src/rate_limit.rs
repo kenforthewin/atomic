@@ -208,6 +208,17 @@ impl DataPlaneRateLimiter {
     /// and — like the signup limiters — only **admitted** requests are
     /// recorded, so a client hammering its own 429 doesn't push its reset
     /// further out.
+    ///
+    /// One consequence of broad-first: a request that *passes* the broad
+    /// limit but then trips a narrow limit (e.g. atom-create #61 with the
+    /// request window still open) has already recorded an admission on the
+    /// broad window. The broad counter therefore slightly over-counts on
+    /// narrow-limit rejections — it can only ever over-count, never
+    /// under-count, so it stays fail-safe (an account is never granted more
+    /// than its broad allowance). Given per-pod approximate consistency this
+    /// is immaterial; exact broad accounting would require checking the
+    /// narrow limit first (or a non-recording peek), which would in turn let
+    /// the broad limit under-count — the wrong trade for an anti-abuse cap.
     pub fn check(
         &self,
         account_id: &str,

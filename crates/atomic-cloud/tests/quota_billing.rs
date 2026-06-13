@@ -60,11 +60,32 @@ struct Harness {
 }
 
 impl Harness {
+    /// Spawn with billing disabled (no Stripe provider) — the default for the
+    /// quota/rate-limit tests, which never exercise the webhook route.
     async fn spawn(control_url: &str, rate_limits: DataPlaneRateLimits) -> Self {
         let control = ControlPlane::connect(control_url)
             .await
             .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            None,
+            "",
+            HashMap::new(),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        Self::spawn_with_billing(control, rate_limits, billing).await
+    }
+
+    /// Spawn with a fully-configured [`atomic_cloud::Billing`] (a scriptable
+    /// provider + a real webhook secret), so the webhook route can verify a
+    /// signed payload and drive the subscription lifecycle end-to-end.
+    async fn spawn_with_billing(
+        control: ControlPlane,
+        rate_limits: DataPlaneRateLimits,
+        billing: atomic_cloud::Billing,
+    ) -> Self {
         let cluster = ClusterConfig {
             cluster_id: "test-cluster-1".to_string(),
             cluster_url: std::env::var("ATOMIC_TEST_DATABASE_URL")
@@ -112,14 +133,7 @@ impl Harness {
         let quota_billing = QuotaBilling {
             plan_registry,
             rate_limiter: DataPlaneRateLimiter::new(rate_limits),
-            billing: atomic_cloud::Billing::with_provider(
-                control.clone(),
-                None,
-                "",
-                HashMap::new(),
-                format!("https://app.{BASE_DOMAIN}"),
-                BASE_DOMAIN,
-            ),
+            billing,
         };
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
@@ -657,6 +671,7 @@ async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
             current_period_start: chrono::Utc::now(),
             current_period_end: chrono::Utc::now() + chrono::Duration::days(30),
             cancel_at_period_end: false,
+            subdomain: Some("alpha".into()),
         };
         apply_subscription_event(&control, &account_id, &sub)
             .await
@@ -697,6 +712,99 @@ async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
             transitions >= 3,
             "every transition is audited, got {transitions}"
         );
+    })
+    .await;
+}
+
+/// The production billing happy path, end-to-end through the real webhook
+/// route: a brand-new Stripe customer whose `stripe_customers` row does NOT
+/// yet exist (the redirect path never writes one — the webhook is the source
+/// of truth). The `customer.subscription.created` event carries the account's
+/// subdomain in its metadata (stamped at checkout), and the handler must use
+/// it to ESTABLISH the linkage before applying — otherwise the plan never
+/// widens and the subscription is silently dropped. This is the regression
+/// test for the auto-link wiring; the other lifecycle tests pre-seed the link
+/// directly and so never exercise this seam.
+#[actix_web::test]
+async fn webhook_auto_links_a_fresh_customer_and_widens_the_plan() {
+    with_control_db("webhook_auto_link", |url| async move {
+        const WEBHOOK_SECRET: &str = "whsec_e2e_secret";
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+
+        // A real account, provisioned the normal way (plan_id starts 'free').
+        let account_id = seed_account(&control, "alpha").await;
+
+        // Billing wired with a present provider (so the webhook route is
+        // enabled) and a real signing secret — but NO stripe_customers row.
+        let billing = atomic_cloud::Billing::with_provider(
+            control.clone(),
+            Some(Arc::new(StubBillingProvider)),
+            WEBHOOK_SECRET,
+            HashMap::from([("pro".to_string(), "price_pro".to_string())]),
+            format!("https://app.{BASE_DOMAIN}"),
+            BASE_DOMAIN,
+        );
+        let harness =
+            Harness::spawn_with_billing(control.clone(), DataPlaneRateLimits::default(), billing)
+                .await;
+
+        // A genuine first `customer.subscription.created` for a customer we've
+        // never seen, carrying the subdomain Stripe echoes back from checkout.
+        let now = chrono::Utc::now().timestamp();
+        let payload = json!({
+            "id": "evt_sub_created",
+            "type": "customer.subscription.created",
+            "data": { "object": {
+                "id": "sub_new",
+                "customer": "cus_brand_new",
+                "status": "active",
+                "cancel_at_period_end": false,
+                "current_period_start": now,
+                "current_period_end": now + 2_592_000,
+                "metadata": { "subdomain": "alpha" },
+                "items": { "data": [ { "price": {
+                    "id": "price_pro",
+                    "metadata": { "plan_id": "pro" }
+                } } ] }
+            }}
+        });
+        let body = serde_json::to_vec(&payload).expect("serialize");
+        let signature = sign_webhook(WEBHOOK_SECRET, &body, now);
+
+        let resp = harness
+            .client
+            .post(format!("{}/billing/webhook", harness.base_url))
+            // The webhook lives on the app host, not a tenant subdomain.
+            .header(HOST, format!("app.{BASE_DOMAIN}"))
+            .header("stripe-signature", signature)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("post webhook");
+        assert_eq!(resp.status(), StatusCode::OK, "webhook accepted");
+
+        // The plan widened end-to-end…
+        assert_eq!(
+            plan_id(&control, &account_id).await.as_deref(),
+            Some("pro"),
+            "checkout subscription widened the plan via auto-link"
+        );
+        // …and the linkage now exists, so subsequent events (portal, dunning)
+        // resolve by customer id without the subdomain.
+        let linked: Option<String> = sqlx::query_scalar(
+            "SELECT account_id FROM stripe_customers WHERE stripe_customer_id = 'cus_brand_new'",
+        )
+        .fetch_optional(control.pool())
+        .await
+        .expect("query linkage");
+        assert_eq!(
+            linked.as_deref(),
+            Some(account_id.as_str()),
+            "the customer is now linked to its account"
+        );
+        harness.stop().await;
     })
     .await;
 }
@@ -771,6 +879,7 @@ async fn replayed_subscription_event_does_not_duplicate_the_audit_row() {
             current_period_start: chrono::Utc::now(),
             current_period_end: chrono::Utc::now() + chrono::Duration::days(30),
             cancel_at_period_end: false,
+            subdomain: Some("alpha".into()),
         };
 
         // Simulate the handler's claim-then-apply for the SAME event id twice:
@@ -891,6 +1000,49 @@ async fn suspended_account_is_blocked_at_auth_read_only_blocks_writes() {
 }
 
 // --- helpers -----------------------------------------------------------------
+
+/// A `BillingProvider` whose presence alone enables the webhook route. The
+/// webhook handler never calls these (it only verifies + projects + applies);
+/// the checkout/portal redirect routes aren't exercised by the webhook test,
+/// so the methods just need to exist.
+struct StubBillingProvider;
+
+#[async_trait::async_trait]
+impl atomic_cloud::BillingProvider for StubBillingProvider {
+    async fn create_checkout_session(
+        &self,
+        _price_id: &str,
+        _customer_email: &str,
+        _subdomain: &str,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> Result<atomic_cloud::StripeSession, atomic_cloud::CloudError> {
+        unreachable!("the webhook test does not start a checkout session")
+    }
+
+    async fn create_portal_session(
+        &self,
+        _stripe_customer_id: &str,
+        _return_url: &str,
+    ) -> Result<atomic_cloud::StripeSession, atomic_cloud::CloudError> {
+        unreachable!("the webhook test does not start a portal session")
+    }
+}
+
+/// Build a valid `Stripe-Signature` header for `payload` at time `t` under
+/// `secret` — the exact HMAC-SHA256-over-`"{t}.{body}"` scheme
+/// `verify_webhook` checks, so the e2e test posts a genuinely signed body.
+fn sign_webhook(secret: &str, payload: &[u8], t: i64) -> String {
+    use hmac::{Hmac, Mac};
+    let mut signed = Vec::new();
+    signed.extend_from_slice(t.to_string().as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(payload);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+    mac.update(&signed);
+    let hex = data_encoding::HEXLOWER.encode(&mac.finalize().into_bytes());
+    format!("t={t},v1={hex}")
+}
 
 /// Seed a bare active account directly (the dunning/lifecycle tests don't
 /// need a tenant database — they exercise control-plane state only).

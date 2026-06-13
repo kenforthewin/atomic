@@ -74,6 +74,10 @@ tempfile = "3"
 async-trait = "0.1"
 data-encoding = "2"
 sha2 = "0.10"
+# Sign Stripe webhook fixtures in the billing e2e test (the same HMAC-SHA256
+# scheme `verify_webhook` checks) so the auto-link path runs through the real
+# webhook route without a Stripe account.
+hmac = "0.12"
 # Shared mock OpenAI-compat server, so tenant pipelines in the e2e suite
 # never hit real providers.
 atomic-test-support = { path = "../atomic-test-support" }
