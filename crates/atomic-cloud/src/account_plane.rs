@@ -165,6 +165,7 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::auth::SESSION_COOKIE;
+use crate::billing::dunning::{start_trial, DEFAULT_TRIAL_DAYS};
 use crate::control_plane::ControlPlane;
 use crate::email::EmailSender;
 use crate::error::CloudError;
@@ -247,6 +248,56 @@ pub struct AccountPlaneConfig {
     /// Web-session lifetime and cookie `Max-Age`. Production callers use
     /// the [`SESSION_TTL`] default; tests shrink it.
     pub session_ttl: std::time::Duration,
+    /// Free-trial policy applied at signup completion (plan: "Trials"). The
+    /// default grants the paid tier for [`DEFAULT_TRIAL_DAYS`] days with no
+    /// card; [`TrialPolicy::disabled`] opts a deployment out (new accounts go
+    /// straight to free).
+    pub trial: TrialPolicy,
+}
+
+/// What free trial a freshly-provisioned account receives (plan: "Trials: 14
+/// days of paid tier on signup, no card required").
+#[derive(Debug, Clone)]
+pub struct TrialPolicy {
+    /// `false` disables trials: signup leaves the account on the free plan,
+    /// `billing_state = 'active'`, no trial. (Provisioning already defaults a
+    /// new account to free/active, so a disabled trial is a no-op at
+    /// completion.)
+    pub enabled: bool,
+    /// The paid plan id the trial grants for its duration. Must name a row in
+    /// the `plans` table; a misconfigured id is a fail-closed no-op (the
+    /// trial UPDATE in [`start_trial`](crate::billing::dunning::start_trial)
+    /// would set an unknown `plan_id`, so the FK on `accounts.plan_id`
+    /// rejects it and the account stays free — the conservative default).
+    pub plan_id: String,
+    /// Trial length. The default is [`DEFAULT_TRIAL_DAYS`].
+    pub duration: chrono::Duration,
+}
+
+impl TrialPolicy {
+    /// The plan's default: 14 days of the `pro` tier, no card.
+    pub fn default_enabled() -> Self {
+        Self {
+            enabled: true,
+            plan_id: "pro".to_string(),
+            duration: chrono::Duration::days(DEFAULT_TRIAL_DAYS),
+        }
+    }
+
+    /// Trials off — every new account goes straight to free.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            plan_id: "pro".to_string(),
+            duration: chrono::Duration::days(DEFAULT_TRIAL_DAYS),
+        }
+    }
+}
+
+impl Default for TrialPolicy {
+    fn default() -> Self {
+        Self::default_enabled()
+    }
 }
 
 impl AccountPlaneConfig {
@@ -259,6 +310,7 @@ impl AccountPlaneConfig {
             rate_limits: RateLimits::default(),
             max_concurrent_provisions: DEFAULT_MAX_CONCURRENT_PROVISIONS,
             session_ttl: SESSION_TTL,
+            trial: TrialPolicy::default_enabled(),
         }
     }
 }
@@ -292,6 +344,9 @@ struct PlaneState {
     /// consumed; never waited on — a saturated process answers 503.
     provision_permits: Arc<Semaphore>,
     session_ttl: std::time::Duration,
+    /// Free-trial policy applied right after a first-time provision in
+    /// `/signup/complete` (plan: "Trials").
+    trial: TrialPolicy,
 }
 
 /// The account plane as a registrable unit: construct once, hand a clone to
@@ -347,6 +402,7 @@ impl AccountPlane {
                     config.max_concurrent_provisions.max(1),
                 )),
                 session_ttl: config.session_ttl,
+                trial: config.trial,
             }),
         })
     }
@@ -736,6 +792,30 @@ async fn signup_complete(
     .await;
     match provisioned {
         Ok(account) => {
+            // Start the free trial (plan: "Trials: 14 days of paid tier on
+            // signup, no card required"). First-time-only and idempotent
+            // (see `start_trial`), so a resume of an already-trialing signup
+            // re-runs harmlessly; disabled deployments skip it and leave the
+            // account on free. A trial-start failure must NOT fail signup —
+            // the account is fully provisioned and serving; the worst case is
+            // it sits on free instead of the paid trial, which the user can
+            // remedy by upgrading. Log and continue.
+            if state.trial.enabled {
+                if let Err(e) = start_trial(
+                    &state.control,
+                    &account.account_id,
+                    &state.trial.plan_id,
+                    state.trial.duration,
+                )
+                .await
+                {
+                    tracing::error!(
+                        account_id = account.account_id,
+                        error = %e,
+                        "starting free trial failed; account remains on free"
+                    );
+                }
+            }
             tracing::info!(
                 account_id = account.account_id,
                 subdomain = account.subdomain,

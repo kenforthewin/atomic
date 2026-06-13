@@ -100,7 +100,7 @@ bind atomic-server's process-global state and have no per-tenant story yet —
 - [`plans.rs`](src/plans.rs) — the seeded plan catalogue + in-memory `PlanRegistry`
 - [`quota.rs`](src/quota.rs) — the data-plane resource-limit guard (atom/KB creates → 402 `quota_exceeded`)
 - [`billing.rs`](src/billing.rs) — `BillingProvider` trait + `StripeClient`, webhook signature verification + event projection
-- [`billing/dunning.rs`](src/billing/dunning.rs) — `BillingState`, subscription/payment transitions, the time-driven `advance_dunning` sweep
+- [`billing/dunning.rs`](src/billing/dunning.rs) — `BillingState` (incl. `trialing`), subscription/payment transitions, the time-driven `advance_dunning` + `advance_expired_trials` sweeps, and `start_trial` (signup grants the 14-day paid trial)
 - [`billing_routes.rs`](src/billing_routes.rs) — portal/checkout redirects (tenant) + the signed webhook (app host)
 - [`billing_guard.rs`](src/billing_guard.rs) — the `read_only` write-guard (suspended is gated in `CloudAuth`)
 
@@ -210,7 +210,7 @@ process listings.
 
 ## Migrations
 
-Control-plane migrations live in [`migrations/`](migrations) (`001`–`009`) and
+Control-plane migrations live in [`migrations/`](migrations) (`001`–`012`) and
 run through the hardened runner in `control_plane.rs` (schema-version table,
 advisory lock on a detached connection, errors propagated). Tenant databases run
 atomic-core's own migrations via `initialize()`.

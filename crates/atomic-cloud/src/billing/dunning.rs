@@ -52,6 +52,13 @@ pub const SUSPENDED_AFTER_DAYS: i64 = 14;
 pub enum BillingState {
     /// Normal — no restriction.
     Active,
+    /// A free trial is running (14 days of the paid tier on signup, no card
+    /// — plan: "Trials"). Serving-wise identical to [`Active`](Self::Active):
+    /// full read+write access. Distinct only so the trial auto-downgrade can
+    /// find these accounts and the frontend can show a trial banner. The
+    /// [`crate::billing::dunning::advance_dunning`] sweep ends it once
+    /// `trial_ends_at` passes.
+    Trialing,
     /// A payment failed; full access continues during the grace window.
     PastDue,
     /// 3 days past_due: reads and exports allowed, writes blocked.
@@ -65,6 +72,7 @@ impl BillingState {
     pub fn as_str(self) -> &'static str {
         match self {
             BillingState::Active => "active",
+            BillingState::Trialing => "trialing",
             BillingState::PastDue => "past_due",
             BillingState::ReadOnly => "read_only",
             BillingState::Suspended => "suspended",
@@ -91,6 +99,7 @@ impl FromStr for BillingState {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "active" => Ok(BillingState::Active),
+            "trialing" => Ok(BillingState::Trialing),
             "past_due" => Ok(BillingState::PastDue),
             "read_only" => Ok(BillingState::ReadOnly),
             "suspended" => Ok(BillingState::Suspended),
@@ -535,6 +544,210 @@ impl DunningAdvance {
     }
 }
 
+/// Default trial length: 14 days of the paid tier on signup, no card (plan:
+/// "Trials"). Exposed so the wiring (and the trial-start config) share one
+/// constant; the actual duration is configurable on the account plane.
+pub const DEFAULT_TRIAL_DAYS: i64 = 14;
+
+/// Start a free trial for an account — the plan's "14 days of paid tier on
+/// signup, no card required" made executable (plan: "Trials"). Sets
+/// `billing_state = 'trialing'`, `trial_ends_at = now + duration`, and
+/// `plan_id = trial_plan_id` (the paid tier the trial grants).
+///
+/// **First-time only, and idempotent.** The UPDATE is guarded to fire only
+/// for a pristine account — one still `billing_state = 'active'`, on the free
+/// plan, that has never started a trial (`trial_ends_at IS NULL`). That makes
+/// it safe to call unconditionally from signup completion, which can re-run
+/// on resume (`crate::provision::provision_account` is idempotent, and so is
+/// this): a second call after the trial is running, converted, or expired
+/// matches zero rows and changes nothing. It also means an account that
+/// already paid (a subscription webhook moved it off `free`) is never
+/// silently reset into a trial. Returns whether a trial was actually started.
+///
+/// Trial start lives at **signup completion** (`crate::account_plane`), not in
+/// `provision_account`: a trial is a product/onboarding decision (it can be
+/// turned off, its length tuned), while provisioning is the low-level tenant
+/// bring-up that the reaper also re-runs. Keeping the trial out of
+/// `provision_account` leaves every resume/recovery path free of trial side
+/// effects. Auto-downgrade is the time-driven [`advance_expired_trials`] arm.
+pub async fn start_trial(
+    control: &ControlPlane,
+    account_id: &str,
+    trial_plan_id: &str,
+    duration: chrono::Duration,
+) -> Result<bool, CloudError> {
+    let from_plan = current_plan(control, account_id).await?;
+    let started = sqlx::query(
+        "UPDATE accounts \
+            SET billing_state = 'trialing', \
+                trial_ends_at = NOW() + $2, \
+                plan_id = $3 \
+          WHERE id = $1 \
+            AND billing_state = 'active' \
+            AND plan_id = $4 \
+            AND trial_ends_at IS NULL",
+    )
+    .bind(account_id)
+    .bind(duration)
+    .bind(trial_plan_id)
+    .bind(DEFAULT_PLAN_ID)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("starting trial"))?
+    .rows_affected();
+    if started > 0 {
+        record_transition(
+            control,
+            account_id,
+            from_plan.as_deref(),
+            Some(trial_plan_id),
+            "trial_started",
+            None,
+        )
+        .await?;
+    }
+    Ok(started > 0)
+}
+
+/// Every account whose trial has expired at `now`: still `trialing`, with a
+/// `trial_ends_at` in the past. Returned for the sweep to resolve each one's
+/// over-limit status against its tenant database before downgrading
+/// ([`finish_expired_trial`]) — the control plane alone can't read the atom/KB
+/// count, so the tenant-aware decision is made by the caller and fed back in.
+pub async fn expired_trials(
+    control: &ControlPlane,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, CloudError> {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts \
+          WHERE billing_state = 'trialing' \
+            AND trial_ends_at IS NOT NULL \
+            AND trial_ends_at <= $1",
+    )
+    .bind(now)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing expired trials"))
+}
+
+/// Finish one expired trial: drop to the free plan and clear the trialing
+/// state (plan: "Auto-downgrade to free after"). The post-trial serving state
+/// depends on whether the now-free account is over the free plan's limits:
+///
+/// - **under limits** → `billing_state = 'active'`: full access on free.
+/// - **over limits** → `billing_state = 'read_only'`: writes blocked until the
+///   user deletes data or upgrades, exactly the subscription-deleted
+///   over-limit rule (plan: "Plan transitions" → "Drops to free plan; if over
+///   free limits, read-only until under"). The over-limit data is **retained**
+///   — never deleted (the cardinal rule).
+///
+/// `over_free_limits` is computed by the caller from the tenant database (the
+/// live atom/KB count vs the free plan's limits). Guarded to only act on a
+/// row still `trialing` (so a converted/already-finished trial is a no-op),
+/// which keeps it idempotent under a concurrent sweep on another pod.
+pub async fn finish_expired_trial(
+    control: &ControlPlane,
+    account_id: &str,
+    over_free_limits: bool,
+) -> Result<bool, CloudError> {
+    let target_state = if over_free_limits {
+        BillingState::ReadOnly
+    } else {
+        BillingState::Active
+    };
+    let from_plan = current_plan(control, account_id).await?;
+    let downgraded = sqlx::query(
+        "UPDATE accounts \
+            SET plan_id = $2, \
+                billing_state = $3, \
+                trial_ends_at = NULL \
+          WHERE id = $1 AND billing_state = 'trialing'",
+    )
+    .bind(account_id)
+    .bind(DEFAULT_PLAN_ID)
+    .bind(target_state.as_str())
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("finishing expired trial"))?
+    .rows_affected();
+    if downgraded > 0 {
+        record_transition(
+            control,
+            account_id,
+            from_plan.as_deref(),
+            Some(DEFAULT_PLAN_ID),
+            "trial_expired",
+            Some(target_state.as_str()),
+        )
+        .await?;
+    }
+    Ok(downgraded > 0)
+}
+
+/// One pass of trial auto-downgrade at `now`: find every expired trial and
+/// downgrade each to the free plan, going `read_only` when the now-free
+/// account is over the free limits (plan: "Auto-downgrade to free after";
+/// "Drops to free plan; if over free limits, read-only until under"). Data is
+/// **never deleted**.
+///
+/// `over_free_limits` is an async predicate the caller supplies — it reads the
+/// account's tenant database (live atom/KB count) against the free plan, work
+/// the control plane can't do alone. Threading it as a closure keeps this
+/// function's control-plane logic unit-testable ([`finish_expired_trial`] is
+/// driven directly with an explicit `over_free_limits` in tests) while the
+/// `serve` wiring supplies the real tenant-aware check. A predicate error for
+/// one account is logged and that account is left `trialing` for the next
+/// sweep — better than fail-open (downgrading without knowing the limit) or
+/// fail-closed (read_only-ing a possibly-under-limit account).
+pub async fn advance_expired_trials<F, Fut>(
+    control: &ControlPlane,
+    now: DateTime<Utc>,
+    mut over_free_limits: F,
+) -> Result<TrialAdvance, CloudError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, CloudError>>,
+{
+    let mut advance = TrialAdvance::default();
+    for account_id in expired_trials(control, now).await? {
+        let over = match over_free_limits(account_id.clone()).await {
+            Ok(over) => over,
+            Err(e) => {
+                tracing::error!(account_id, error = %e, "trial over-limit check failed; deferring downgrade");
+                continue;
+            }
+        };
+        if finish_expired_trial(control, &account_id, over).await? {
+            if over {
+                advance.downgraded_to_read_only += 1;
+            } else {
+                advance.downgraded_to_active += 1;
+            }
+        }
+    }
+    if !advance.is_quiet() {
+        tracing::info!(?advance, "trial auto-downgrade");
+    }
+    Ok(advance)
+}
+
+/// What one [`advance_expired_trials`] pass changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrialAdvance {
+    /// Expired trials dropped to free, under the free limits (full access).
+    pub downgraded_to_active: u64,
+    /// Expired trials dropped to free but over the free limits (writes
+    /// blocked until under; data retained).
+    pub downgraded_to_read_only: u64,
+}
+
+impl TrialAdvance {
+    /// Whether the pass changed anything (for quiet logging).
+    pub fn is_quiet(self) -> bool {
+        self.downgraded_to_active == 0 && self.downgraded_to_read_only == 0
+    }
+}
+
 /// Default cadence for the dunning sweep loop in `serve` — hourly is ample
 /// for day-granularity thresholds. Exposed so the wiring (and any future CLI
 /// knob) shares one constant.
@@ -548,6 +761,7 @@ mod tests {
     fn billing_state_round_trips_and_gates() {
         for state in [
             BillingState::Active,
+            BillingState::Trialing,
             BillingState::PastDue,
             BillingState::ReadOnly,
             BillingState::Suspended,
@@ -556,10 +770,13 @@ mod tests {
         }
         assert!(BillingState::Suspended.blocks_serving());
         assert!(!BillingState::ReadOnly.blocks_serving());
+        assert!(!BillingState::Trialing.blocks_serving());
         assert!(BillingState::ReadOnly.blocks_writes());
         assert!(!BillingState::Suspended.blocks_writes()); // serving-blocked instead
         assert!(!BillingState::PastDue.blocks_writes());
         assert!(!BillingState::Active.blocks_writes());
+        // A trial is full access — neither serving nor writes are blocked.
+        assert!(!BillingState::Trialing.blocks_writes());
 
         // Unknown column degrades to active (never block over corruption).
         assert_eq!(billing_state_from_column("garbage"), BillingState::Active);

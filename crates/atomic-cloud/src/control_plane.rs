@@ -62,6 +62,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         11,
         include_str!("../migrations/011_webhook_idempotency.sql"),
     ),
+    (12, include_str!("../migrations/012_trials.sql")),
 ];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks

@@ -41,9 +41,10 @@ use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 
 /// The default plan stamped on a new account when nothing else applies
-/// (plan: free-tier default; trials land a paid plan, but trial handling is
-/// the billing state-machine's job — provision defaults to `free` and leaves
-/// a doc pointer there).
+/// (plan: free-tier default). Provisioning always stamps `free`; signup
+/// completion then promotes the account to the paid trial tier via
+/// [`start_trial`](crate::billing::dunning::start_trial), and the trial
+/// auto-downgrade returns it here when the 14 days lapse.
 pub const DEFAULT_PLAN_ID: &str = "free";
 
 /// One plan-tier row. `atom_limit` / `kb_limit` / `storage_bytes_limit` are

@@ -192,6 +192,55 @@ pub async fn quota_guard(
     }
 }
 
+/// Whether an account is currently over `plan`'s resource limits, reading the
+/// live atom and KB counts straight from the tenant `manager` — the same
+/// strongly-consistent live reads the request-time guard uses, just summed
+/// across the whole tenant rather than the one KB a request targets.
+///
+/// Used by the trial auto-downgrade and the subscription-deleted path (plan:
+/// "Drops to free plan; if over free limits, read-only until under"): a
+/// shrinking plan can't reject already-stored data (it is **retained, never
+/// deleted**), so the account goes `read_only` until the user brings it back
+/// under. A `NULL` limit on an axis is unlimited and never contributes to
+/// over-limit. The atom count is summed over **every** knowledge base in the
+/// tenant (the limit is an account-wide ceiling, not per-KB); the KB count is
+/// the number of knowledge bases.
+pub async fn account_over_plan_limits(
+    plan: &Plan,
+    manager: &DatabaseManager,
+) -> Result<bool, atomic_core::AtomicCoreError> {
+    if let Some(kb_limit) = plan.kb_limit {
+        let kbs = manager.list_databases().await?.0;
+        if kbs.len() as i64 > i64::from(kb_limit) {
+            return Ok(true);
+        }
+        if let Some(atom_limit) = plan.atom_limit {
+            let mut total: i64 = 0;
+            for db in kbs {
+                let core = manager.get_core(&db.id).await?;
+                total += i64::from(core.count_atoms().await?);
+                if total > i64::from(atom_limit) {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
+    }
+    // No KB limit: still enforce the atom ceiling account-wide.
+    if let Some(atom_limit) = plan.atom_limit {
+        let kbs = manager.list_databases().await?.0;
+        let mut total: i64 = 0;
+        for db in kbs {
+            let core = manager.get_core(&db.id).await?;
+            total += i64::from(core.count_atoms().await?);
+            if total > i64::from(atom_limit) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Run the resource check for `target`. `Ok(None)` admits; `Ok(Some(resp))`
 /// is the 402 to return; `Err` is an operational fault reading the count.
 async fn check_resource(

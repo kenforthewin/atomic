@@ -33,17 +33,18 @@
 use std::sync::Arc;
 
 use actix_web::{web, App, HttpServer};
+use atomic_cloud::account_over_plan_limits;
 use atomic_cloud::{
-    abandoned_run_threshold, advance_deploy, advance_dunning, configure_cloud_app, delete_account,
-    finalize_abandoned_runs, issue_token, latest_deploy_run, list_failed_migrations,
-    list_unmigrated, provision_account, run_fleet_gate, tenant_schema_target, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig,
-    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
-    DataPlaneRateLimits, DeployPolicy, Dispatcher, DispatcherConfig, EmailSender,
-    EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender, MailgunSender,
-    ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PlanRegistry, PoolCaps,
-    QuotaBilling, RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
-    DEFAULT_DUNNING_SWEEP_INTERVAL,
+    abandoned_run_threshold, advance_deploy, advance_dunning, advance_expired_trials,
+    configure_cloud_app, delete_account, finalize_abandoned_runs, issue_token, latest_deploy_run,
+    list_failed_migrations, list_unmigrated, provision_account, run_fleet_gate,
+    tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane, AccountPlaneConfig,
+    AdvanceOutcome, Billing, BillingConfig, ChatStreamLimiter, CloudAuth, ClusterConfig,
+    ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits, DeployPolicy, Dispatcher,
+    DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig,
+    KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys, NewAccount,
+    OpenRouterProvisioning, PlanRegistry, PoolCaps, QuotaBilling, RateLimits, Readiness,
+    TenantPlane, TokenScope, WorkerPoolsConfig, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_PLAN_ID,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
@@ -1306,27 +1307,67 @@ async fn serve(
         }
     });
 
-    // Dunning sweep (plan: "Billing" → dunning): advance past_due → read_only
-    // (3 days) → suspended (14 days), data always retained. Hourly is ample
-    // for day-granularity thresholds; the transition logic takes an explicit
-    // `now`, so this is interval glue around a tested function. Cross-pod
-    // safe: each transition is an idempotent conditional UPDATE (the first
-    // pod to advance an account wins; later pods match zero rows). Cheap
-    // when billing is disabled — no account is ever past_due, so every sweep
+    // Dunning + trial sweep (plan: "Billing" → dunning, "Trials"): advance
+    // past_due → read_only (3 days) → suspended (14 days), and downgrade
+    // expired trials to free (read_only if over the free limits). Data is
+    // always retained. Hourly is ample for day-granularity thresholds; the
+    // transition logic takes an explicit `now`, so this is interval glue
+    // around tested functions. Cross-pod safe: every dunning transition is an
+    // idempotent conditional UPDATE (the first pod to advance an account
+    // wins; later pods match zero rows), and the trial downgrade is guarded
+    // on `billing_state = 'trialing'` so only one pod's UPDATE takes. Cheap
+    // when billing/trials are inactive — no account matches, so every sweep
     // is a no-op set of UPDATEs.
+    //
+    // The trial downgrade's over-limit decision reads the tenant database (the
+    // live atom/KB count vs the free plan), via the same `AccountCache` the
+    // request path uses; the free plan comes from the loaded registry.
+    let trial_registry = quota_billing.plan_registry.clone();
     tokio::spawn({
         let control = control.clone();
+        let cache = Arc::clone(&cache);
         async move {
             let mut ticker = tokio::time::interval(DEFAULT_DUNNING_SWEEP_INTERVAL);
             ticker.tick().await; // first tick fires immediately
             loop {
                 ticker.tick().await;
-                match advance_dunning(&control, chrono::Utc::now()).await {
+                let now = chrono::Utc::now();
+                match advance_dunning(&control, now).await {
                     Ok(advance) if !advance.is_quiet() => {
                         tracing::info!(?advance, "dunning sweep")
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "dunning sweep failed"),
+                }
+
+                // Trial auto-downgrade. The free plan must be in the registry
+                // (migration 010 seeds it); if it somehow isn't, skip the
+                // arm rather than guess a limit.
+                let Some(free_plan) = trial_registry.get(DEFAULT_PLAN_ID) else {
+                    tracing::error!("free plan absent from registry; skipping trial sweep");
+                    continue;
+                };
+                let cache = Arc::clone(&cache);
+                let over_free_limits = |account_id: String| {
+                    let cache = Arc::clone(&cache);
+                    let free_plan = free_plan.clone();
+                    async move {
+                        let handle = cache.get_or_load(&account_id).await?;
+                        account_over_plan_limits(&free_plan, &handle.manager)
+                            .await
+                            .map_err(|e| {
+                                atomic_cloud::CloudError::Invariant(format!(
+                                    "reading tenant resource count for trial downgrade: {e}"
+                                ))
+                            })
+                    }
+                };
+                match advance_expired_trials(&control, now, over_free_limits).await {
+                    Ok(advance) if !advance.is_quiet() => {
+                        tracing::info!(?advance, "trial sweep")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "trial sweep failed"),
                 }
             }
         }

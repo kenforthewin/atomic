@@ -58,7 +58,8 @@ pub mod tokens;
 
 pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
 pub use account_plane::{
-    AccountPlane, AccountPlaneConfig, RateLimits, DEFAULT_MAX_CONCURRENT_PROVISIONS, SESSION_TTL,
+    AccountPlane, AccountPlaneConfig, RateLimits, TrialPolicy, DEFAULT_MAX_CONCURRENT_PROVISIONS,
+    SESSION_TTL,
 };
 pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSION_COOKIE};
 pub use backpressure::{
@@ -66,10 +67,11 @@ pub use backpressure::{
     ProviderBreaker, ProviderPause, DEFAULT_RETRY_AFTER_CAP,
 };
 pub use billing::dunning::{
-    advance_dunning, apply_payment_failed, apply_payment_succeeded, apply_subscription_deleted,
-    apply_subscription_event, billing_state_from_column, claim_webhook_event, link_stripe_customer,
-    release_webhook_event, BillingState, DunningAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL,
-    READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
+    advance_dunning, advance_expired_trials, apply_payment_failed, apply_payment_succeeded,
+    apply_subscription_deleted, apply_subscription_event, billing_state_from_column,
+    claim_webhook_event, expired_trials, finish_expired_trial, link_stripe_customer,
+    release_webhook_event, start_trial, BillingState, DunningAdvance, TrialAdvance,
+    DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS, READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
 };
 pub use billing::{
     now_unix, parse_event, verify_webhook, BillingProvider, StripeClient, StripeSession,
@@ -134,7 +136,7 @@ pub use provisioning_api::{
     CreatedRuntimeKey, OpenRouterProvisioning, ProvisioningApi, RuntimeKeyUsage,
     DEFAULT_OPENROUTER_PROVISIONING_URL, PROVISIONING_KEY_ENV,
 };
-pub use quota::quota_guard;
+pub use quota::{account_over_plan_limits, quota_guard};
 pub use rate_limit::{
     data_plane_rate_limit_guard, DataPlaneLimit, DataPlaneRateLimiter, DataPlaneRateLimits,
 };

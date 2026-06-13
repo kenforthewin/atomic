@@ -248,11 +248,12 @@ pub async fn provision_account(
     // email's in-flight claim) reports taken.
     // Stamp both the legacy bare `plan` column (still read by old binaries
     // mid-rolling-deploy) and the new `plan_id` FK (read by quota
-    // enforcement) to 'free' (plan: free-tier default; migration 010). A
-    // trial would land a paid plan here, but trials are the billing
-    // state-machine's job (plan: "Trials: 14 days of paid tier on signup");
-    // until that wires in, every new account defaults to 'free' — see
-    // crate::plans::DEFAULT_PLAN_ID.
+    // enforcement) to 'free' (plan: free-tier default; migration 010).
+    // Provisioning always lands 'free'/'active'; the 14-day paid trial (plan:
+    // "Trials") is started by signup completion, not here, via
+    // `crate::billing::dunning::start_trial` — keeping the reaper's resume
+    // path and every other `provision_account` caller free of trial side
+    // effects. See crate::plans::DEFAULT_PLAN_ID.
     let account_id = Uuid::new_v4();
     let claim = sqlx::query(
         "INSERT INTO accounts (id, subdomain, email, status, plan, plan_id) \

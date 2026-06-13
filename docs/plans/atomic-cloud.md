@@ -1298,7 +1298,14 @@ subscription/payment event projection. The dunning state machine
 ([`billing/dunning.rs`](../../crates/atomic-cloud/src/billing/dunning.rs)):
 `past_due → read_only` (3d) `→ suspended` (14d), data always retained —
 suspended gated in `CloudAuth`, read_only by a write-guard, advanced by an
-injectable-clock `advance_dunning` sweep (hourly loop in `serve`).
+injectable-clock `advance_dunning` sweep (hourly loop in `serve`). **Trials**
+(migration 012, `accounts.trial_ends_at` + the `trialing` `billing_state`):
+signup completion grants the 14-day paid tier with no card (`start_trial`,
+first-time-only/idempotent), `CloudAuth` serves a trial as full access, and
+the same hourly sweep auto-downgrades expired trials to `free` —
+`read_only` when the now-free account is over the free limits (over-limit
+data retained, never deleted), `active` otherwise (`advance_expired_trials`,
+the over-limit decision read live from the tenant DB via the account cache).
 
 **Deviations from this plan (deliberate):**
 
@@ -1324,8 +1331,7 @@ injectable-clock `advance_dunning` sweep (hourly loop in `serve`).
 
 **Deferred:** observability metrics/tracing; the user-facing `account_events`
 log (rides with the frontend slice); the `quota_usage` writer + 1-hour
-period-rollover job (the table exists; nothing writes it yet); trials (14-day
-paid tier on signup — `provision` defaults to `free` with a doc pointer);
+period-rollover job (the table exists; nothing writes it yet);
 plan-change → PATCH managed-key credit limit (the managed-keys seam exists);
 the signup/billing **frontend** (API + redirects only); paid-tier pricing
 (the `pro` numbers are documented placeholders).

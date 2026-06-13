@@ -961,6 +961,33 @@ async fn signup_complete_end_to_end() {
                 .expect("count mappings");
         assert_eq!(mappings, 1, "exactly one tenant database is recorded");
 
+        // Signup starts the free trial (plan: "Trials: 14 days of paid tier
+        // on signup, no card required"): the account lands on the paid tier
+        // in the `trialing` state with a deadline ~14 days out — full access,
+        // auto-downgraded by the dunning/trial sweep when it expires.
+        let (billing_state, plan_id, trial_ends_at): (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT billing_state, plan_id, trial_ends_at FROM accounts WHERE id = $1",
+        )
+        .bind(&account_id)
+        .fetch_one(h.control.pool())
+        .await
+        .expect("billing columns");
+        assert_eq!(billing_state, "trialing", "signup starts a trial");
+        assert_eq!(
+            plan_id.as_deref(),
+            Some("pro"),
+            "trial grants the paid tier"
+        );
+        let in_days = (trial_ends_at.expect("trial deadline") - chrono::Utc::now()).num_days();
+        assert!(
+            (12..=14).contains(&in_days),
+            "trial deadline ~14 days out, got {in_days}"
+        );
+
         // Hash-only, end to end: neither the session secret in the cookie
         // nor any link plaintext was ever persisted.
         assert!(

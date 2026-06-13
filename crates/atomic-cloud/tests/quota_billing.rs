@@ -25,13 +25,14 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use atomic_cloud::{
-    advance_dunning, apply_payment_failed, apply_payment_succeeded, apply_subscription_deleted,
-    apply_subscription_event, claim_webhook_event, configure_cloud_app, issue_token,
-    link_stripe_customer, provision_account, release_webhook_event, AccountCache,
-    AccountCacheConfig, AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth,
-    ClusterConfig, ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits, FallbackAppState,
-    ManagedKeys, NewAccount, PlanRegistry, QuotaBilling, Readiness, SubscriptionState, TenantPlane,
-    TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    advance_dunning, advance_expired_trials, apply_payment_failed, apply_payment_succeeded,
+    apply_subscription_deleted, apply_subscription_event, claim_webhook_event, configure_cloud_app,
+    expired_trials, finish_expired_trial, issue_token, link_stripe_customer, provision_account,
+    release_webhook_event, start_trial, AccountCache, AccountCacheConfig, AccountPlane,
+    AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
+    DataPlaneRateLimiter, DataPlaneRateLimits, FallbackAppState, ManagedKeys, NewAccount,
+    PlanRegistry, QuotaBilling, Readiness, SubscriptionState, TenantPlane, TokenScope,
+    DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use reqwest::header::HOST;
 use reqwest::{Method, StatusCode};
@@ -950,6 +951,343 @@ async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
     .await;
 }
 
+/// `start_trial` puts a pristine account on the paid tier in the `trialing`
+/// state with a future `trial_ends_at`, is first-time-only and idempotent, and
+/// never resets an account that already moved off free (a converted trial).
+#[tokio::test]
+async fn start_trial_is_first_time_only_and_idempotent() {
+    with_control_db("trial_start", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+        let account_id = seed_account(&control, "alpha").await;
+
+        // First call starts the trial: trialing, on 'pro', deadline in ~14d.
+        let started = start_trial(&control, &account_id, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start trial");
+        assert!(started, "a pristine account starts a trial");
+        assert_eq!(billing_state(&control, &account_id).await, "trialing");
+        assert_eq!(plan_id(&control, &account_id).await.as_deref(), Some("pro"));
+        let ends = trial_ends_at(&control, &account_id)
+            .await
+            .expect("deadline set");
+        let in_days = (ends - chrono::Utc::now()).num_days();
+        assert!(
+            (12..=14).contains(&in_days),
+            "deadline ~14 days out, got {in_days}"
+        );
+
+        // A second call is a no-op — the trial is already running.
+        let again = start_trial(&control, &account_id, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start trial again");
+        assert!(!again, "an already-trialing account is not re-trialed");
+
+        // An account that has already moved off free (e.g. a paid checkout)
+        // is never silently reset into a trial.
+        set_billing_state(&control, &account_id, "active").await;
+        sqlx::query("UPDATE accounts SET plan_id = 'pro', trial_ends_at = NULL WHERE id = $1")
+            .bind(&account_id)
+            .execute(control.pool())
+            .await
+            .expect("simulate paid");
+        let on_paid = start_trial(&control, &account_id, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start trial on paid");
+        assert!(!on_paid, "a paid account is never reset into a trial");
+        assert_eq!(billing_state(&control, &account_id).await, "active");
+        assert!(
+            trial_ends_at(&control, &account_id).await.is_none(),
+            "no trial deadline stamped on a paid account"
+        );
+    })
+    .await;
+}
+
+/// An expired trial auto-downgrades to the free plan: `active` when the
+/// account is under the free limits, `read_only` when over (over-limit data
+/// retained, never deleted) — the control-plane half driven directly, the
+/// over-limit decision injected exactly as the sweep would feed it.
+#[tokio::test]
+async fn expired_trial_downgrades_to_free_active_or_read_only() {
+    with_control_db("trial_downgrade", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+
+        // Under-limit account: trial expires → free + active.
+        let under = seed_account(&control, "under").await;
+        start_trial(&control, &under, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start trial");
+        expire_trial(&control, &under, 1).await;
+        let downgraded = finish_expired_trial(&control, &under, false)
+            .await
+            .expect("finish under-limit trial");
+        assert!(downgraded);
+        assert_eq!(plan_id(&control, &under).await.as_deref(), Some("free"));
+        assert_eq!(billing_state(&control, &under).await, "active");
+        assert!(
+            trial_ends_at(&control, &under).await.is_none(),
+            "trial deadline cleared on downgrade"
+        );
+
+        // Over-limit account: trial expires → free + read_only.
+        let over = seed_account(&control, "over").await;
+        start_trial(&control, &over, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start trial");
+        expire_trial(&control, &over, 1).await;
+        let downgraded = finish_expired_trial(&control, &over, true)
+            .await
+            .expect("finish over-limit trial");
+        assert!(downgraded);
+        assert_eq!(plan_id(&control, &over).await.as_deref(), Some("free"));
+        assert_eq!(billing_state(&control, &over).await, "read_only");
+
+        // Finishing again is a no-op (state is no longer trialing).
+        let again = finish_expired_trial(&control, &over, true)
+            .await
+            .expect("finish again");
+        assert!(!again, "a finished trial is not re-downgraded");
+    })
+    .await;
+}
+
+/// The sweep finds only *expired* trials and feeds each through the over-limit
+/// predicate. A still-running trial is left alone; an expired one downgrades.
+/// NEVER-DELETE invariant: the downgraded account's row is retained.
+#[tokio::test]
+async fn trial_sweep_downgrades_only_expired_and_never_deletes() {
+    with_control_db("trial_sweep", |url| async move {
+        let control = ControlPlane::connect(&url).await.expect("connect");
+        control.initialize().await.expect("migrate");
+
+        let running = seed_account(&control, "running").await;
+        let expired = seed_account(&control, "expired").await;
+        for id in [&running, &expired] {
+            start_trial(&control, id, "pro", chrono::Duration::days(14))
+                .await
+                .expect("start trial");
+        }
+        // Only `expired` is past its deadline.
+        expire_trial(&control, &expired, 1).await;
+
+        // `expired_trials` returns exactly the past-deadline account.
+        let due = expired_trials(&control, chrono::Utc::now())
+            .await
+            .expect("expired trials");
+        assert_eq!(due, vec![expired.clone()]);
+
+        // Drive the sweep with an over-limit predicate (so the downgrade lands
+        // read_only) and assert it only touched the expired account.
+        let advance = advance_expired_trials(&control, chrono::Utc::now(), |_id| async {
+            Ok::<bool, atomic_cloud::CloudError>(true)
+        })
+        .await
+        .expect("advance trials");
+        assert_eq!(advance.downgraded_to_read_only, 1);
+        assert_eq!(advance.downgraded_to_active, 0);
+
+        // The expired account downgraded; the running one is untouched.
+        assert_eq!(plan_id(&control, &expired).await.as_deref(), Some("free"));
+        assert_eq!(billing_state(&control, &expired).await, "read_only");
+        assert_eq!(plan_id(&control, &running).await.as_deref(), Some("pro"));
+        assert_eq!(billing_state(&control, &running).await, "trialing");
+
+        // NEVER-DELETE: both rows still exist after the sweep.
+        for id in [&running, &expired] {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(control.pool())
+                    .await
+                    .expect("exists");
+            assert!(exists, "downgraded/trialing accounts are retained");
+        }
+    })
+    .await;
+}
+
+/// A trialing account serves reads AND writes (a trial is full access); an
+/// expired trial swept to `read_only` (over-limit) then blocks writes while
+/// reads still pass — end-to-end through the composed server, with the
+/// over-limit decision read from the real tenant database against a shrunk
+/// free plan.
+#[actix_web::test]
+async fn trialing_account_has_full_access_then_sweep_downgrades_to_read_only() {
+    with_control_db("trial_e2e", |url| async move {
+        // Shrink the free plan so a single atom puts the account over the
+        // free limit once it downgrades (the trial grants 'pro', unlimited).
+        set_free_limits(&url, Some(0), None).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // Put the account on a trial (signup-completion does this in
+        // production; here we drive it directly to keep the test on the
+        // control-plane seam without exercising the magic-link flow).
+        start_trial(
+            &harness.control,
+            &tenant.account_id,
+            "pro",
+            chrono::Duration::days(14),
+        )
+        .await
+        .expect("start trial");
+        assert_eq!(
+            billing_state(&harness.control, &tenant.account_id).await,
+            "trialing"
+        );
+
+        // Trial = full access: a write succeeds (the 'pro' plan is unlimited,
+        // so the quota guard never blocks it).
+        let write = harness.create_atom(&tenant, "during trial").await;
+        assert_eq!(
+            write.status(),
+            StatusCode::CREATED,
+            "a trial serves writes (full access)"
+        );
+
+        // Expire the trial and run the sweep with the real tenant-aware
+        // over-limit check: the account now holds 1 atom against a free
+        // atom_limit of 0, so it downgrades to read_only.
+        expire_trial(&harness.control, &tenant.account_id, 1).await;
+        let plan_registry = PlanRegistry::load(harness.control.clone())
+            .await
+            .expect("load plans");
+        let free_plan = plan_registry.get("free").expect("free plan");
+        let cache = Arc::new(AccountCache::new(
+            harness.control.clone(),
+            harness.cluster.clone(),
+            support::test_vault(),
+            AccountCacheConfig::default(),
+        ));
+        let advance = advance_expired_trials(&harness.control, chrono::Utc::now(), |account_id| {
+            let cache = Arc::clone(&cache);
+            let free_plan = free_plan.clone();
+            async move {
+                let handle = cache.get_or_load(&account_id).await?;
+                atomic_cloud::account_over_plan_limits(&free_plan, &handle.manager)
+                    .await
+                    .map_err(|e| atomic_cloud::CloudError::Invariant(e.to_string()))
+            }
+        })
+        .await
+        .expect("advance trials");
+        assert_eq!(advance.downgraded_to_read_only, 1);
+        assert_eq!(
+            billing_state(&harness.control, &tenant.account_id).await,
+            "read_only"
+        );
+
+        // read_only: reads pass, writes 402 (data retained, never deleted).
+        let read = harness
+            .api(Method::GET, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("read");
+        assert_eq!(
+            read.status(),
+            StatusCode::OK,
+            "downgraded account still reads"
+        );
+        let blocked = harness.create_atom(&tenant, "after downgrade").await;
+        assert_eq!(
+            blocked.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "read_only blocks writes after trial downgrade"
+        );
+        let body: Value = blocked.json().await.expect("body");
+        assert_eq!(body["error"], "account_read_only");
+
+        // The atom created during the trial is retained (never deleted).
+        let list = harness
+            .api(Method::GET, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("list");
+        let atoms: Value = list.json().await.expect("atoms");
+        assert!(
+            atoms.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+                || atoms["atoms"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
+            "the trial-era atom survives the downgrade"
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// Recovery: a `read_only` account whose payment succeeds returns to `active`
+/// and can write again — the dunning recovery path, end-to-end.
+#[actix_web::test]
+async fn payment_succeeded_lifts_read_only_and_restores_writes() {
+    with_control_db("billing_recovery", |url| async move {
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        // Drive into read_only and prove a write is blocked.
+        set_billing_state(&harness.control, &tenant.account_id, "read_only").await;
+        let blocked = harness.create_atom(&tenant, "blocked").await;
+        assert_eq!(blocked.status(), StatusCode::PAYMENT_REQUIRED);
+
+        // Payment succeeds → billing_state clears to active.
+        apply_payment_succeeded(&harness.control, &tenant.account_id)
+            .await
+            .expect("payment succeeded");
+        assert_eq!(
+            billing_state(&harness.control, &tenant.account_id).await,
+            "active"
+        );
+
+        // Writes work again.
+        let ok = harness.create_atom(&tenant, "recovered").await;
+        assert_eq!(
+            ok.status(),
+            StatusCode::CREATED,
+            "a recovered account can write again"
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// Gate ordering: a `suspended` account that is ALSO credits-paused gets the
+/// `account_suspended` response, not `out_of_ai_credits`. Suspended is the
+/// more terminal state and is gated first in CloudAuth, before the request
+/// ever reaches the downstream out-of-credits guard.
+#[actix_web::test]
+async fn suspended_wins_over_credits_pause() {
+    with_control_db("billing_gate_order", |url| async move {
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+
+        set_billing_state(&harness.control, &tenant.account_id, "suspended").await;
+        set_credits_paused(&harness.control, &tenant.account_id).await;
+
+        let resp = harness
+            .api(Method::GET, &tenant.subdomain, "/api/atoms")
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body: Value = resp.json().await.expect("body");
+        assert_eq!(
+            body["error"], "account_suspended",
+            "suspended is gated before the credits pause"
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}
+
 #[actix_web::test]
 async fn suspended_account_is_blocked_at_auth_read_only_blocks_writes() {
     with_control_db("billing_serving_gate", |url| async move {
@@ -1476,4 +1814,46 @@ async fn backdate_past_due(control: &ControlPlane, account_id: &str, days: i64) 
     .execute(control.pool())
     .await
     .expect("backdate past_due_since");
+}
+
+/// Move a trialing account's `trial_ends_at` to `days` in the past so a sweep
+/// at the real `now` sees it as expired — the no-real-waits idiom (the trial
+/// analogue of `backdate_past_due`).
+async fn expire_trial(control: &ControlPlane, account_id: &str, days_ago: i64) {
+    sqlx::query(
+        "UPDATE accounts SET trial_ends_at = NOW() - make_interval(days => $2) WHERE id = $1",
+    )
+    .bind(account_id)
+    .bind(days_ago as i32)
+    .execute(control.pool())
+    .await
+    .expect("expire trial_ends_at");
+}
+
+/// Read `trial_ends_at` (NULL once the trial ends or never started).
+async fn trial_ends_at(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT trial_ends_at FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(control.pool())
+        .await
+        .expect("trial_ends_at")
+}
+
+/// Force a credits pause active for `account_id` (the `out_of_ai_credits`
+/// surface), so the gate-ordering test can prove `suspended` wins over a
+/// credits pause. Mirrors the column shape backpressure.rs writes.
+async fn set_credits_paused(control: &ControlPlane, account_id: &str) {
+    sqlx::query(
+        "UPDATE accounts \
+            SET provider_paused_until = NOW() + interval '1 hour', \
+                provider_pause_kind = 'credits', provider_pause_streak = 1 \
+          WHERE id = $1",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .expect("set credits pause");
 }
