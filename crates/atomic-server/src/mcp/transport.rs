@@ -140,14 +140,32 @@ fn request_session_id(req: &HttpRequest) -> Option<Arc<str>> {
         .map(|s| Arc::<str>::from(s.to_owned()))
 }
 
+/// Resolve which database this request selects, with the *same* precedence as
+/// the data plane's [`resolve_core`](crate::db_extractor::resolve_core): the
+/// `X-Atomic-Database` header first, then the `?db=` query parameter (and, on
+/// the server side, the manager's active database when neither is present).
+///
+/// Honoring the header — not just `?db=` — is what keeps the MCP path in step
+/// with the `Db` extractor: a composing layer that pre-resolves the manager
+/// per request can pin a selection by injecting `X-Atomic-Database`, and that
+/// pin is honored identically here and on the data plane. The standalone
+/// server injects no such header, so behavior is unchanged unless something
+/// installs it (the same contract the `Db` extractor exposes).
 fn db_selection(req: &HttpRequest) -> DbSelection {
-    let db_id = req.query_string().split('&').find_map(|pair| {
-        let mut parts = pair.splitn(2, '=');
-        if parts.next()? == "db" {
-            parts.next().map(String::from)
-        } else {
-            None
-        }
+    let header_db = req
+        .headers()
+        .get("X-Atomic-Database")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let db_id = header_db.or_else(|| {
+        req.query_string().split('&').find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next()? == "db" {
+                parts.next().map(String::from)
+            } else {
+                None
+            }
+        })
     });
     DbSelection(db_id)
 }
@@ -755,8 +773,8 @@ mod tests {
     use std::task::{Context, Poll};
 
     /// Minimal middleware that installs a `RequestDatabaseManager` on every
-    /// request — standing in for the composition layer (e.g. atomic-cloud's
-    /// `CloudAuth`) that resolves a per-request manager.
+    /// request — standing in for a composing layer's middleware that
+    /// pre-resolves the manager per request.
     #[derive(Clone)]
     struct InjectManager(Arc<DatabaseManager>);
 
@@ -926,6 +944,112 @@ mod tests {
         assert!(
             text.contains("Atom not found"),
             "without an override the baked-in manager is used: {text}"
+        );
+    }
+
+    /// Build a manager with two databases: the ACTIVE (default) one holds
+    /// `active-kb-atom-body`, a SECOND non-active one holds
+    /// `second-kb-atom-body`. Returns the manager, the second db's id, and the
+    /// two atom ids `(active_atom, second_atom)`.
+    async fn manager_with_two_kbs() -> (
+        Arc<DatabaseManager>,
+        tempfile::TempDir,
+        String,
+        String,
+        String,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(DatabaseManager::new(temp.path()).unwrap());
+
+        let create = |core: atomic_core::AtomicCore, body: &'static str| async move {
+            core.create_atom(
+                atomic_core::CreateAtomRequest {
+                    content: body.to_string(),
+                    source_url: None,
+                    published_at: None,
+                    tag_ids: vec![],
+                    skip_if_source_exists: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .atom
+            .id
+        };
+
+        let active_core = manager.active_core().await.unwrap();
+        let active_atom = create(active_core, "active-kb-atom-body").await;
+
+        let second = manager.create_database("Second KB").await.unwrap();
+        let second_core = manager.get_core(&second.id).await.unwrap();
+        let second_atom = create(second_core, "second-kb-atom-body").await;
+
+        (manager, temp, second.id, active_atom, second_atom)
+    }
+
+    #[actix_web::test]
+    async fn tool_call_db_selection_honors_x_atomic_database_header_over_active() {
+        // The transport selects the request's database with the SAME precedence
+        // as the `Db` extractor: `X-Atomic-Database` header first, then `?db=`,
+        // then the manager's active db. Here the active db is a *different* KB
+        // than the one the header names, so a tool call carrying only the header
+        // (no `?db=`) must resolve against the header's KB — not the active one.
+        let (transport, _baked) = test_transport();
+        let (mgr, _temp, second_db, active_atom, second_atom) = manager_with_two_kbs().await;
+
+        let app = actix_test::init_service(
+            App::new().service(
+                web::scope("/mcp")
+                    .service(transport.scope())
+                    .wrap(InjectManager(mgr)),
+            ),
+        )
+        .await;
+        let session_id = initialize_session!(app);
+        send_initialized!(app, session_id);
+
+        // read_atom on the SECOND KB's atom, selecting that KB via the header
+        // only — resolves there, returning its body.
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id.clone()))
+            .insert_header(("X-Atomic-Database", second_db.clone()))
+            .set_payload(read_atom_request(2, &second_atom).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("second-kb-atom-body"),
+            "the header selects the second KB: {text}"
+        );
+
+        // The ACTIVE KB's atom is NOT reachable through the header-selected KB —
+        // proving the header won over the active-db fallback (not the reverse).
+        let req = actix_test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((
+                header::ACCEPT,
+                format!("{JSON_MIME_TYPE}, {EVENT_STREAM_MIME_TYPE}"),
+            ))
+            .insert_header((header::CONTENT_TYPE, JSON_MIME_TYPE))
+            .insert_header((HEADER_SESSION_ID, session_id))
+            .insert_header(("X-Atomic-Database", second_db))
+            .set_payload(read_atom_request(3, &active_atom).to_string())
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_tool_text(resp).await;
+        assert!(
+            text.contains("Atom not found"),
+            "header selection does not fall through to the active KB: {text}"
         );
     }
 }

@@ -240,6 +240,49 @@ impl OAuthHarness {
             .to_string()
     }
 
+    /// Create a second knowledge base on `subdomain` over the account token,
+    /// returning its `db_id`. Used to give a tenant two KBs so a db-pinned MCP
+    /// token can be exercised against the non-active one.
+    async fn create_kb(&self, subdomain: &str, token: &str, name: &str) -> String {
+        let resp = self
+            .req(Method::POST, subdomain, "/api/databases")
+            .bearer_auth(token)
+            .json(&json!({ "name": name }))
+            .send()
+            .await
+            .expect("send create database");
+        assert_eq!(resp.status(), StatusCode::CREATED, "create KB");
+        let body: Value = resp.json().await.expect("database json");
+        body["id"].as_str().expect("db id").to_string()
+    }
+
+    /// Seed an atom into a SPECIFIC KB (`db_id`) on `subdomain`, selecting the
+    /// KB with the `X-Atomic-Database` header exactly as the data plane does.
+    /// Returns the new atom's id.
+    async fn seed_atom_in_db(
+        &self,
+        subdomain: &str,
+        token: &str,
+        db_id: &str,
+        content: &str,
+    ) -> String {
+        let resp = self
+            .req(Method::POST, subdomain, "/api/atoms")
+            .bearer_auth(token)
+            .header("X-Atomic-Database", db_id)
+            .json(&json!({ "content": content }))
+            .send()
+            .await
+            .expect("send create atom in db");
+        assert_eq!(resp.status(), StatusCode::CREATED, "seed atom in db");
+        let body: Value = resp.json().await.expect("atom json");
+        body["id"]
+            .as_str()
+            .or_else(|| body["atom"]["id"].as_str())
+            .expect("atom id in create response")
+            .to_string()
+    }
+
     /// Drive the MCP Streamable-HTTP handshake against `subdomain`'s `/mcp`
     /// with `token`, then issue a single `tools/call`. Returns the tool
     /// result's first text content.
@@ -523,6 +566,28 @@ async fn full_flow_session_to_mcp_scoped_token_that_cloudauth_accepts() {
                 .await
                 .expect("send authorize get");
             assert_eq!(consent.status(), StatusCode::OK, "consent page renders");
+            // The consent page lives on the tenant origin and its approval POST
+            // rides the SameSite=Lax session cookie, so it MUST deny all
+            // framing — otherwise an attacker who completed their own DCR could
+            // clickjack the logged-in user into minting them a token. Both the
+            // legacy X-Frame-Options and the modern CSP frame-ancestors are
+            // asserted (the consent GET is the only OAuth HTML response).
+            assert_eq!(
+                consent
+                    .headers()
+                    .get("X-Frame-Options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("DENY"),
+                "consent page denies framing (X-Frame-Options)"
+            );
+            assert_eq!(
+                consent
+                    .headers()
+                    .get("Content-Security-Policy")
+                    .and_then(|v| v.to_str().ok()),
+                Some("frame-ancestors 'none'"),
+                "consent page denies framing (CSP frame-ancestors)"
+            );
             let consent_body = consent.text().await.expect("consent body");
             assert!(consent_body.contains("Approve"), "consent has approve");
             assert!(
@@ -613,6 +678,88 @@ async fn full_flow_session_to_mcp_scoped_token_that_cloudauth_accepts() {
                 mcp.headers().contains_key("mcp-session-id"),
                 "mcp session established"
             );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn approve_appends_code_with_ampersand_when_redirect_uri_has_query() {
+    // RFC 6749 §3.1.2/§4.1.2: a registered redirect_uri MAY carry its own
+    // query string; the authorization response must then append `code`/`state`
+    // with `&`, not a second `?` (which would corrupt the redirect).
+    with_control_db(
+        "approve_appends_code_with_ampersand_when_redirect_uri_has_query",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let account = h.provision("alpha").await;
+
+            // A redirect_uri that already has a `?tenant=acme` query.
+            let redirect_uri = "https://claude.ai/api/mcp/auth_callback?tenant=acme";
+
+            let reg = h
+                .req(Method::POST, "alpha", "/oauth/register")
+                .json(&json!({
+                    "client_name": "Claude Desktop",
+                    "redirect_uris": [redirect_uri],
+                }))
+                .send()
+                .await
+                .expect("send register");
+            assert_eq!(reg.status(), StatusCode::CREATED, "DCR succeeds");
+            let reg_body: Value = reg.json().await.expect("register json");
+            let client_id = reg_body["client_id"].as_str().expect("client_id");
+
+            let session = h.session(&account.account_id).await;
+            let resp = h
+                .req(Method::POST, "alpha", "/oauth/authorize")
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .form(&[
+                    ("client_id", client_id),
+                    ("redirect_uri", redirect_uri),
+                    ("code_challenge", RFC7636_CHALLENGE),
+                    ("code_challenge_method", "S256"),
+                    ("state", "xyz"),
+                    ("action", "approve"),
+                ])
+                .send()
+                .await
+                .expect("send approve");
+            assert_eq!(resp.status(), StatusCode::FOUND, "approve redirects");
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .expect("Location")
+                .to_str()
+                .expect("location str")
+                .to_string();
+
+            // The existing `?tenant=acme` is preserved, and code/state are
+            // appended with `&` — never a second `?`.
+            assert!(
+                location.starts_with("https://claude.ai/api/mcp/auth_callback?tenant=acme"),
+                "existing query preserved: {location}"
+            );
+            assert!(
+                location.contains("&code="),
+                "code appended with `&`: {location}"
+            );
+            assert!(
+                location.contains("&state=xyz"),
+                "state appended with `&`: {location}"
+            );
+            assert_eq!(
+                location.matches('?').count(),
+                1,
+                "exactly one `?` in the redirect: {location}"
+            );
+
+            // And the code is still a valid, exchangeable grant (the `&`
+            // separator didn't mangle it).
+            let code = code_from_location(&location);
+            assert!(!code.is_empty(), "code parsed from the redirect");
 
             h.stop().await;
         },
@@ -1254,11 +1401,14 @@ async fn db_pinned_mcp_token_cannot_reach_another_kb_via_mcp() {
             .expect("issue db-pinned mcp token");
 
             // Trying to reach a DIFFERENT KB on /mcp via the X-Atomic-Database
-            // header → 403 at the CloudAuth chokepoint, before the request ever
-            // reaches the MCP transport's manager resolution. This proves the
-            // MCP path is governed by the SAME allowed_db_id chokepoint the
-            // data plane uses — a db-pinned MCP token can't read another KB
-            // through the MCP context's db selection.
+            // header → 403 at the CloudAuth chokepoint. Note this 403 is raised
+            // by CloudAuth *before* the request reaches the MCP transport, so
+            // this case exercises the explicit-different-db rejection only — NOT
+            // the transport's own db resolution on the default (no-selection)
+            // path. The positive pin (a no-selection request landing on the
+            // pinned KB, which depends on the transport honoring the injected
+            // X-Atomic-Database header) is proven by
+            // `db_pinned_mcp_token_resolves_to_pinned_kb_not_active`.
             let resp = h
                 .req(Method::POST, "alpha", "/mcp")
                 .bearer_auth(&pinned)
@@ -1285,6 +1435,81 @@ async fn db_pinned_mcp_token_cannot_reach_another_kb_via_mcp() {
                 resp.status(),
                 StatusCode::FORBIDDEN,
                 "db-pinned mcp token can't select another KB on /mcp"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn db_pinned_mcp_token_resolves_to_pinned_kb_not_active() {
+    // The positive db-pin case Issue 2 fixes: a tenant with two KBs, the
+    // ACTIVE one (KB-A, the provisioned default) different from the pinned one
+    // (KB-B). An MCP token pinned to KB-B, with NO `?db=` and NO header on the
+    // request, must operate on KB-B — the pin CloudAuth injects as
+    // `X-Atomic-Database` — and NOT fall through to the tenant's active KB-A.
+    //
+    // Before the fix the MCP transport read only `?db=` and ignored the
+    // injected header, so a no-selection request resolved to KB-A (the active),
+    // silently crossing the pin within the account.
+    with_control_db(
+        "db_pinned_mcp_token_resolves_to_pinned_kb_not_active",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let account = h.provision("alpha").await;
+
+            // KB-A is the provisioned default and stays the ACTIVE KB. Create
+            // KB-B as a second KB (creation does not change the active KB).
+            let kb_b = h
+                .create_kb("alpha", &account.account_token, "Second KB")
+                .await;
+
+            // Seed a distinct, identifiable atom in each KB.
+            let atom_a = h
+                .seed_atom("alpha", &account.account_token, "ACTIVE-KB-A-ATOM-BODY")
+                .await;
+            let atom_b = h
+                .seed_atom_in_db(
+                    "alpha",
+                    &account.account_token,
+                    &kb_b,
+                    "PINNED-KB-B-ATOM-BODY",
+                )
+                .await;
+
+            // An MCP token PINNED to the non-active KB-B.
+            let pinned = issue_token(
+                &h.control,
+                &account.account_id,
+                TokenScope::Mcp,
+                Some(&kb_b),
+                "mcp-oauth: pinned to KB-B",
+            )
+            .await
+            .expect("issue KB-B-pinned mcp token");
+
+            // read_atom on KB-B's atom with NO ?db= and NO header: the only way
+            // this resolves is if the transport honors the X-Atomic-Database pin
+            // CloudAuth injected for the unselective request → operates on KB-B.
+            let text_b = h
+                .mcp_tools_call("alpha", &pinned, "read_atom", json!({ "atom_id": atom_b }))
+                .await;
+            assert!(
+                text_b.contains("PINNED-KB-B-ATOM-BODY"),
+                "no-selection request on a KB-B-pinned token resolves to KB-B: {text_b}"
+            );
+
+            // The active KB-A's atom is NOT visible through the pinned token —
+            // proving the request landed on KB-B (the pin), not KB-A (the
+            // active fallback the pre-fix transport would have chosen).
+            let text_a = h
+                .mcp_tools_call("alpha", &pinned, "read_atom", json!({ "atom_id": atom_a }))
+                .await;
+            assert!(
+                text_a.contains("Atom not found"),
+                "the pin keeps KB-A's atom out of reach (not the active fallback): {text_a}"
             );
 
             h.stop().await;
@@ -1357,6 +1582,31 @@ async fn unauthenticated_mcp_returns_401_pointing_at_tenant_discovery() {
                 .await
                 .expect("discovery json");
             assert_eq!(meta["resource"], "http://alpha.cloudtest.local/mcp");
+
+            // A trailing-slash `/mcp/` (which some clients send before path
+            // normalization) gets the SAME challenge — the decoration matches
+            // the bare path and anything beneath it, so a trailing-slash client
+            // still discovers the OAuth flow rather than seeing a bare 401.
+            let slash = h
+                .req(Method::POST, "alpha", "/mcp/")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .body(
+                    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })
+                        .to_string(),
+                )
+                .send()
+                .await
+                .expect("send unauthenticated mcp trailing slash");
+            assert_eq!(slash.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                slash
+                    .headers()
+                    .get(WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|c| c.starts_with("Bearer ") && c.contains("resource_metadata=")),
+                "/mcp/ 401 carries the WWW-Authenticate challenge"
+            );
 
             // The /api data plane, by contrast, gets a plain 401 — no MCP
             // discovery noise leaks onto it.

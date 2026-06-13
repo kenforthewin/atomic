@@ -424,9 +424,7 @@ async fn authorize_page(
         &q.code_challenge_method,
         q.state.as_deref().unwrap_or(""),
     );
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(html)
+    html_ok(html)
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,9 +510,10 @@ async fn authorize_approve(
         }
     };
 
-    let mut location = format!("{}?code={}", f.redirect_uri, code);
+    let mut location = f.redirect_uri.clone();
+    append_query_param(&mut location, "code", &code);
     if let Some(s) = &f.state {
-        location.push_str(&format!("&state={}", urlencode(s)));
+        append_query_param(&mut location, "state", s);
     }
     HttpResponse::Found()
         .insert_header((header::LOCATION, location))
@@ -716,13 +715,26 @@ fn login_redirect(state: &PlaneState, issuer: &str, req: &HttpRequest) -> HttpRe
 
 /// Redirect an OAuth error back to the (validated) `redirect_uri`.
 fn redirect_with_error(redirect_uri: &str, error: &str, state: Option<&str>) -> HttpResponse {
-    let mut url = format!("{redirect_uri}?error={error}");
+    let mut url = redirect_uri.to_string();
+    append_query_param(&mut url, "error", error);
     if let Some(s) = state {
-        url.push_str(&format!("&state={}", urlencode(s)));
+        append_query_param(&mut url, "state", s);
     }
     HttpResponse::Found()
         .insert_header((header::LOCATION, url))
         .finish()
+}
+
+/// Append `key=value` (value percent-encoded) to `url`, choosing the right
+/// separator. Per RFC 6749 §3.1.2 / §4.1.2 a registered `redirect_uri` MAY
+/// already carry a query string, so the first appended parameter uses `?`
+/// only when the URL has none yet, and `&` otherwise — appending a bare `?`
+/// to a URL that already has one would corrupt the redirect.
+fn append_query_param(url: &mut String, key: &str, value: &str) {
+    url.push(if url.contains('?') { '&' } else { '?' });
+    url.push_str(key);
+    url.push('=');
+    url.push_str(&urlencode(value));
 }
 
 /// Minimal application/x-www-form-urlencoded component encoding for the bits
@@ -777,6 +789,26 @@ fn server_error() -> HttpResponse {
         "error": "server_error",
         "error_description": "Something went wrong; try again.",
     }))
+}
+
+/// Build a `200 OK` HTML response hardened against clickjacking.
+///
+/// Every server-rendered OAuth page MUST route through this helper. The
+/// consent/approve form lives on the **tenant origin** and its approval POST
+/// rides the user's `SameSite=Lax` session cookie, so if the page could be
+/// framed an attacker who completed their own Dynamic Client Registration
+/// (with an attacker-controlled `redirect_uri`) could iframe
+/// `https://<victim>.<base>/oauth/authorize?...` and clickjack the victim into
+/// minting them an account-scoped MCP token. Both `X-Frame-Options: DENY` and
+/// `Content-Security-Policy: frame-ancestors 'none'` deny all framing (the CSP
+/// directive covers modern browsers; the legacy header covers the rest).
+/// Centralizing the construction here means no OAuth HTML path can forget it.
+fn html_ok(body: String) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .insert_header((header::X_FRAME_OPTIONS, "DENY"))
+        .insert_header((header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"))
+        .body(body)
 }
 
 /// The minimal server-rendered consent page (plan: "the OAuth consent/login

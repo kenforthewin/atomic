@@ -451,10 +451,20 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
 }
 
 /// The MCP Streamable HTTP endpoint path, mounted by the cloud composition
-/// at `/mcp` (see [`crate::server::configure_cloud_app`]). Trailing-slash
-/// variants are normalized away by the transport's `NormalizePath`, but the
-/// challenge is attached before that runs, so accept the bare path only.
+/// at `/mcp` (see [`crate::server::configure_cloud_app`]). The transport's
+/// `NormalizePath` collapses trailing-slash variants, but the challenge is
+/// attached in CloudAuth *before* that runs — so a client that connects to
+/// `/mcp/` (or any sub-path the MCP scope serves) must still receive the
+/// challenge. [`is_mcp_path`] matches the bare path and anything beneath it.
 const MCP_PATH: &str = "/mcp";
+
+/// Whether `path` addresses the MCP scope: the bare [`MCP_PATH`] or anything
+/// under it (`/mcp/`, `/mcp/<sub>`). `NormalizePath` runs inside the transport
+/// scope, after CloudAuth, so the challenge decoration can't rely on the path
+/// already being canonical — it must recognize the trailing-slash form itself.
+fn is_mcp_path(path: &str) -> bool {
+    path == MCP_PATH || path.starts_with("/mcp/")
+}
 
 /// Add the MCP-compliant `WWW-Authenticate` challenge to a 401 on the `/mcp`
 /// path, so an MCP client (Claude Desktop, the MCP Inspector) that hits the
@@ -479,7 +489,7 @@ fn decorate_mcp_unauthorized(
     req: &ServiceRequest,
     denial: HttpResponse,
 ) -> HttpResponse {
-    if denial.status() != actix_web::http::StatusCode::UNAUTHORIZED || req.path() != MCP_PATH {
+    if denial.status() != actix_web::http::StatusCode::UNAUTHORIZED || !is_mcp_path(req.path()) {
         return denial;
     }
     let Some(host) = request_host(req) else {
