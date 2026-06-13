@@ -432,7 +432,13 @@ fn request_host(req: &ServiceRequest) -> Option<&str> {
 
 /// Extract the subdomain from `host`, given the normalized base domain.
 /// Exactly one label below the base is accepted; ports are ignored.
-fn subdomain_from_host(host: &str, base_domain: &str) -> Option<String> {
+///
+/// `pub(crate)` so the OAuth plane ([`crate::oauth_routes`]) resolves the
+/// tenant from `Host` with exactly the same rules CloudAuth uses — its
+/// discovery/register/token endpoints are public (no credential to verify)
+/// but still account-scoped by host, so they can't route through CloudAuth
+/// itself (which 401s an un-credentialed request).
+pub(crate) fn subdomain_from_host(host: &str, base_domain: &str) -> Option<String> {
     // Strip any port. IPv6 literals contain colons too, but they can never
     // match `<label>.<base_domain>`, so mangling them is harmless.
     let host = host.split(':').next()?.to_ascii_lowercase();

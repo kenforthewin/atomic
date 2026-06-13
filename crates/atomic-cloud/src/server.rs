@@ -34,6 +34,19 @@
 //!   identity plane cloud replaces — so cloud routes its own handler straight
 //!   to [`ws::start_event_session`], streaming the per-account event channel
 //!   the middleware injected.
+//! - **Cloud OAuth** ([`crate::oauth_routes`]) — the per-account discovery /
+//!   DCR / authorize / token endpoints. PUBLIC (no [`CloudAuth`]): an MCP
+//!   client bootstraps before any token exists, so each handler resolves the
+//!   account from `Host` itself and is account-scoped through the control
+//!   plane. The authorize-approve step verifies the session cookie. On the
+//!   app host they resolve no subdomain and 404, like every tenant route.
+//! - `/mcp` — atomic-server's MCP Streamable HTTP transport
+//!   ([`mcp_scope`](atomic_server::app::mcp_scope)) under [`CloudAuth`] +
+//!   [`cloud_plane_guard`]. The bearer MCP token the OAuth flow mints
+//!   authenticates the request; CloudAuth injects the tenant's
+//!   [`RequestDatabaseManager`], which the transport resolves per request
+//!   (its cloud-unaware `RequestManager` override), so every tenant's `/mcp`
+//!   call hits its own knowledge base — never the inert baked-in manager.
 //! - `/api/*` — atomic-server's full route table
 //!   ([`api_scope`](atomic_server::app::api_scope)) wrapped in [`CloudAuth`]
 //!   (in place of self-hosted's `BearerAuth`) plus [`cloud_plane_guard`].
@@ -41,13 +54,10 @@
 //! Deliberately **not** registered, with their replacements landing in later
 //! slices (plan: `docs/plans/atomic-cloud.md`):
 //!
-//! - `configure_public_routes` — its OAuth discovery/flow, instance setup,
-//!   self-hosted `/ws`, API docs, and export download all assume the
-//!   single-tenant identity model. Cloud OAuth is per-account and lives in
-//!   atomic-cloud when the OAuth/MCP slice arrives.
-//! - `mcp_scope` — the MCP transport binds one `DatabaseManager` and one
-//!   event channel at construction, which cannot express per-request tenant
-//!   resolution. Cloud MCP arrives with the OAuth/MCP slice.
+//! - `configure_public_routes` — its instance setup, self-hosted `/ws`, API
+//!   docs, and export download all assume the single-tenant identity model.
+//!   (Cloud OAuth, formerly listed here, now ships as the per-account
+//!   [`crate::oauth_routes`] plane above.)
 //! - `/api/auth/*` (inside `api_scope`) is the self-hosted token plane; it
 //!   operates on the composition-time [`AppState`] manager rather than the
 //!   request's tenant. Cloud tokens live in the control plane
@@ -101,13 +111,15 @@ use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::{from_fn, Next};
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use atomic_core::DatabaseManager;
-use atomic_server::app::{api_scope, health};
+use atomic_server::app::{api_scope, health, mcp_scope};
 use atomic_server::db_extractor::RequestDatabaseManager;
 use atomic_server::event_channel::EventChannel;
 use atomic_server::export_jobs::ExportJobManager;
 use atomic_server::log_buffer::LogBuffer;
+use atomic_server::mcp::AtomicMcpTransport;
 use atomic_server::state::{AppState, SetupClaimLimiter};
 use atomic_server::ws;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::account_plane::AccountPlane;
@@ -120,6 +132,7 @@ use crate::control_plane::ControlPlane;
 use crate::deploy::Readiness;
 use crate::dispatch_hints::{mark_hint_on_mutation, DispatchHintWriter};
 use crate::error::CloudError;
+use crate::oauth_routes::OAuthPlane;
 use crate::plans::PlanRegistry;
 use crate::quota::quota_guard;
 use crate::rate_limit::{data_plane_rate_limit_guard, DataPlaneRateLimiter};
@@ -176,7 +189,38 @@ impl FallbackAppState {
     pub fn data(&self) -> web::Data<AppState> {
         self.data.clone()
     }
+
+    /// Build the MCP Streamable HTTP transport for the cloud `/mcp` route.
+    ///
+    /// The transport bakes in *this fallback's* inert manager and a fresh
+    /// event channel — the same type-level-placeholder rationale as the
+    /// fallback [`AppState`] itself (module docs): [`CloudAuth`] injects the
+    /// real per-request [`RequestDatabaseManager`] on every authenticated
+    /// `/mcp` request, and atomic-server's transport resolves *that* manager
+    /// per request (its `RequestManager` override), so the baked-in one is
+    /// never reached. [`cloud_plane_guard`] makes that an invariant: a `/mcp`
+    /// request without the tenant extension fails closed rather than serving
+    /// from the inert manager.
+    ///
+    /// Build it **once per process** and clone it into each worker's
+    /// `configure_cloud_app` call, so every actix worker shares one MCP
+    /// session manager (the transport is cheap to clone — it's `Arc`-backed).
+    /// `sse_keep_alive` is the interval between SSE `:ping` frames on a live
+    /// stream.
+    ///
+    /// Worker-event scope: MCP tool calls that create atoms broadcast onto the
+    /// transport's baked-in channel, not the per-account one a WS client
+    /// subscribes to. That matches the existing v1 limitation (MCP tool events
+    /// aren't relayed to WS subscribers); durable state is always correct.
+    pub fn mcp_transport(&self, sse_keep_alive: Duration) -> AtomicMcpTransport {
+        let (event_tx, _) = broadcast::channel(16);
+        AtomicMcpTransport::new(Arc::clone(&self.data.manager), event_tx, sse_keep_alive)
+    }
 }
+
+/// Default interval between SSE `:ping` keep-alive frames on a live MCP
+/// stream (matches atomic-server's standalone default).
+pub const DEFAULT_MCP_SSE_KEEP_ALIVE: Duration = Duration::from_secs(30);
 
 /// Whether `path` belongs to a route family whose handlers operate on
 /// composition-time [`AppState`] fields — under cloud, the single inert
@@ -358,6 +402,8 @@ pub fn configure_cloud_app(
     auth: CloudAuth,
     account_plane: AccountPlane,
     tenant_plane: TenantPlane,
+    oauth_plane: OAuthPlane,
+    mcp_transport: AtomicMcpTransport,
     control: ControlPlane,
     chat_streams: ChatStreamLimiter,
     readiness: Readiness,
@@ -381,9 +427,29 @@ pub fn configure_cloud_app(
         // signature is the auth; guarded to the app host like the account
         // plane). Registered with the app plane, never on tenant subdomains.
         billing.configure_app(cfg);
+        // Cloud's per-account OAuth flow (plan: "OAuth"). PUBLIC — no
+        // CloudAuth — because the discovery/register/token endpoints are how
+        // an MCP client bootstraps before any token exists; each handler
+        // resolves the account from Host itself and is account-scoped through
+        // the control-plane store. On the app host they resolve no subdomain
+        // and 404, like every tenant route. The authorize-approve step
+        // verifies the session cookie. See `crate::oauth_routes`.
+        oauth_plane.configure(cfg);
         // Before api_scope: its exact-path /api/account resource must win
         // the route match over the /api scope.
         tenant_plane.configure(cfg, auth.clone());
+        // Per-tenant MCP Streamable HTTP (plan: "MCP token UX"). Behind
+        // CloudAuth: the bearer MCP token this flow mints authenticates the
+        // request and CloudAuth injects the tenant's `RequestDatabaseManager`,
+        // which atomic-server's MCP transport resolves per-request (the
+        // cloud-unaware `RequestManager` override) — so every tenant's `/mcp`
+        // call hits its own knowledge base, never the inert baked-in manager.
+        // The plane guard fails closed if the extension is somehow absent.
+        cfg.service(
+            mcp_scope(mcp_transport)
+                .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth.clone()),
+        );
         cfg.service(
             web::resource("/ws")
                 .route(web::get().to(cloud_ws))

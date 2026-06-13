@@ -42,6 +42,7 @@ pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod oauth_routes;
 pub mod oauth_store;
 pub mod plans;
 pub mod pools;
@@ -121,6 +122,7 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
+pub use oauth_routes::OAuthPlane;
 pub use oauth_store::{
     consume_oauth_code, create_oauth_client, get_oauth_client, insert_oauth_code,
     purge_expired_oauth_codes, record_oauth_code_token, NewOAuthCode, OAuthClient, OAuthCode,
@@ -156,7 +158,10 @@ pub use rate_limit::{
     data_plane_rate_limit_guard, DataPlaneLimit, DataPlaneRateLimiter, DataPlaneRateLimits,
 };
 pub use reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
-pub use server::{cloud_plane_guard, configure_cloud_app, FallbackAppState, QuotaBilling};
+pub use server::{
+    cloud_plane_guard, configure_cloud_app, FallbackAppState, QuotaBilling,
+    DEFAULT_MCP_SSE_KEEP_ALIVE,
+};
 pub use tenant_plane::TenantPlane;
 pub use tokens::{
     create_session, issue_token, verify_session, verify_token, SessionRecord, TokenRecord,

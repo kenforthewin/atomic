@@ -18,6 +18,28 @@ use tokio::sync::broadcast;
 #[derive(Clone, Debug)]
 pub struct DbSelection(pub Option<String>);
 
+/// Per-request override for the [`DatabaseManager`] the MCP tools resolve
+/// against, carried in the rmcp request extensions.
+///
+/// The transport mirrors the data plane's [`RequestDatabaseManager`]
+/// extension (`crate::db_extractor`): a caller composing the MCP scope under
+/// its own middleware can install a [`RequestDatabaseManager`] on the actix
+/// request, and the transport copies the manager into this extension so the
+/// tool call resolves against it instead of the manager baked in at
+/// [`AtomicMcpServer::new`]. When absent — the standalone server installs no
+/// such middleware — [`AtomicMcpServer::resolve_core`] falls back to the
+/// baked-in manager, so self-hosted behavior is unchanged.
+///
+/// It carries the *manager* rather than a pre-resolved [`AtomicCore`] so the
+/// per-request database selection ([`DbSelection`] / the `?db=` parameter)
+/// stays applied in exactly one place ([`AtomicMcpServer::resolve_core`]),
+/// regardless of where the manager came from — the same discipline as the
+/// data plane's [`resolve_core`](crate::db_extractor::resolve_core).
+///
+/// [`RequestDatabaseManager`]: crate::db_extractor::RequestDatabaseManager
+#[derive(Clone)]
+pub struct RequestManager(pub Arc<DatabaseManager>);
+
 /// MCP Server for Atomic knowledge base
 #[derive(Clone)]
 pub struct AtomicMcpServer {
@@ -35,23 +57,34 @@ impl AtomicMcpServer {
         }
     }
 
-    /// Resolve the correct AtomicCore from the request context's DbSelection extension.
+    /// Resolve the correct AtomicCore for the request.
+    ///
+    /// The manager is the per-request [`RequestManager`] override when a
+    /// composing layer installed one, otherwise the manager baked in at
+    /// [`Self::new`] — the same fallback shape as the data plane's
+    /// [`request_manager`](crate::db_extractor::request_manager). The database
+    /// *within* that manager is then selected from the [`DbSelection`]
+    /// extension (the `?db=` parameter), so selection lives in one place
+    /// regardless of where the manager came from.
     async fn resolve_core(
         &self,
         context: &RequestContext<RoleServer>,
     ) -> Result<AtomicCore, ErrorData> {
+        let manager = context
+            .extensions
+            .get::<RequestManager>()
+            .map(|m| &m.0)
+            .unwrap_or(&self.manager);
         let db_id = context
             .extensions
             .get::<DbSelection>()
             .and_then(|s| s.0.clone());
         match db_id {
-            Some(id) => {
-                self.manager.get_core(&id).await.map_err(|e| {
-                    ErrorData::internal_error(format!("Database not found: {}", e), None)
-                })
-            }
-            None => self
-                .manager
+            Some(id) => manager
+                .get_core(&id)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("Database not found: {}", e), None)),
+            None => manager
                 .active_core()
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None)),

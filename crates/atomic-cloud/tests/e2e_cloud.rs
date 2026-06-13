@@ -127,12 +127,21 @@ impl CloudHarness {
         let quota_billing = QuotaBilling::for_tests(control.clone(), BASE_DOMAIN)
             .await
             .expect("plans");
+        let oauth_plane = atomic_cloud::OAuthPlane::new(
+            control.clone(),
+            BASE_DOMAIN,
+            "http",
+            format!("http://app.{BASE_DOMAIN}"),
+        );
+        let mcp_transport = fallback.mcp_transport(atomic_cloud::DEFAULT_MCP_SSE_KEEP_ALIVE);
         let server = HttpServer::new(move || {
             App::new().configure(configure_cloud_app(
                 state.clone(),
                 auth.clone(),
                 account_plane.clone(),
                 tenant_plane.clone(),
+                oauth_plane.clone(),
+                mcp_transport.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
                 readiness.clone(),

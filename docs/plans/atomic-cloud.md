@@ -1359,6 +1359,62 @@ limit (the managed-keys seam exists); the signup/billing **frontend** (API +
 redirects only); paid-tier pricing (the `pro` numbers are documented
 placeholders).
 
+### Slice 7 — cloud OAuth flow & per-tenant MCP (2026-06-13, branch `cloud-oauth`)
+
+Landed: cloud's **own** per-account OAuth 2.0 flow
+([`oauth_routes.rs`](../../crates/atomic-cloud/src/oauth_routes.rs)) on the
+tenant subdomain — Dynamic Client Registration + Authorization Code + PKCE
+(S256-only, `client_secret_post`) — backed by the slice-prepped control-plane
+store ([`oauth_store.rs`](../../crates/atomic-cloud/src/oauth_store.rs),
+migration 014, every row `account_id`-scoped). The discovery / register /
+token endpoints are **public** (an MCP client bootstraps before any token
+exists), each resolving the account from `Host` itself with CloudAuth's exact
+subdomain rules; the authorize-**approve** step authenticates the **session
+cookie** (the logged-in user on their own subdomain), not a pasted token —
+the structural difference from atomic-server's self-hosted flow, which is left
+**untouched** (it stores in atomic-core's registry, which cloud's Postgres
+mode lacks). A logged-out authorize bounces to `app.<base>/login?return_to=…`.
+The minted token lands in `cloud_tokens` (`scope='mcp'`) and CloudAuth then
+accepts it on `/api/*` and `/mcp` (full flow e2e-pinned).
+
+Per-tenant **MCP**: atomic-server's `mcp_scope` now mounts under CloudAuth +
+`cloud_plane_guard` ([`server.rs`](../../crates/atomic-cloud/src/server.rs)),
+so the tenant's injected `RequestDatabaseManager` drives tool resolution.
+
+**The one atomic-server change (cloud-unaware, self-hosted byte-identical):**
+the MCP transport now resolves its `DatabaseManager` **per request** — a new
+`RequestManager` rmcp extension copied from the actix `RequestDatabaseManager`
+when a composing layer installed one, with the baked-in manager as fallback —
+mirroring the data plane's `db_extractor::request_manager`. With no such
+middleware (the standalone server) the baked-in manager is used exactly as
+before; both sides pinned by new unit tests in `mcp/transport.rs`. Nothing
+else in atomic-server changed; `routes/oauth.rs` was not touched.
+
+**MCP-token-default-scope decision (resolves the open question):** consent
+mints **account-scope** tokens (`allowed_db_id = NULL`) — one MCP URL per
+account, one account = one user in v1. The db-pinned path still works: a code
+carrying an `allowed_db_id` mints an `mcp`-scoped token pinned to that KB, and
+the slice-1 `allowed_db_id` chokepoint enforces it (e2e-pinned: a pinned token
+can't reach another KB via `X-Atomic-Database`).
+
+**Deviations from this plan (deliberate):**
+
+- **OAuth routes are individual exact-path resources, not a `web::scope("")`.**
+  An empty-prefix scope would prefix-match (and swallow) `/api/*`; exact
+  resources keep the discovery/flow paths isolated.
+- **Issuer/endpoint URLs are built from the request `Host` + a configured
+  scheme**, not a second configured hostname — discovery points back at the
+  exact origin the client already addressed, so the routing host and the
+  advertised host can't drift apart.
+- **The consent page authenticates via the session cookie only** (no pasted-
+  token fallback, unlike self-hosted): cloud users are already logged in on
+  their subdomain, and a pasted-token field would be a worse, phishable UX.
+
+**Deferred:** the OAuth consent/login **SPA** (this slice is API + a minimal
+server-rendered approve form only); per-KB-MCP-by-default (awaits multi-user-
+per-account); wiring `purge_expired_oauth_codes` into the reaper loop (the
+function exists; codes are single-use + short-TTL, so stale rows are inert).
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -1370,8 +1426,15 @@ placeholders).
 - **Email deliverability.** Magic-link-only auth makes it critical-path
   (decided 2026-05-25). Mailgun client exists in the prototype crate;
   domain warmup, SPF/DKIM, and a bounce strategy still need an owner.
-- **MCP token default scope.** Account-wide vs per-KB. Affects the MCP setup
-  UX in Claude Desktop's config.
+- **MCP token default scope.** ~~Account-wide vs per-KB.~~ **Resolved (slice
+  7): account scope.** Tokens minted by the cloud OAuth consent flow default
+  to `account` scope (full access to the account's KBs, `allowed_db_id =
+  NULL`), matching "one MCP URL per account" and "one account = one user" in
+  v1. The db-pinned path still works end to end — an authorization carrying an
+  `allowed_db_id` mints an `mcp`-scoped token pinned to that KB, and CloudAuth's
+  `allowed_db_id` chokepoint enforces the pin (a db-pinned MCP token can't read
+  another KB via header override; e2e-pinned). Per-KB-MCP-*by-default* is
+  deferred until the multi-user-per-account story exists.
 - **Email uniqueness.** `accounts.email` is not unique and signup never
   checks it — one email can own unlimited accounts (each rate-limited, each
   its own subdomain). Probably fine (it's also the multi-account story),

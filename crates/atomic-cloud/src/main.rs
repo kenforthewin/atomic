@@ -1407,6 +1407,29 @@ async fn serve(
         readiness.clone(),
     ));
 
+    // Cloud OAuth plane (plan: "OAuth"). It builds per-tenant issuer URLs from
+    // `{public_scheme}://{request Host}` and bounces un-logged-in authorize
+    // requests to `{app_public_url}/login`. Both derive from the same
+    // app-public-url the account plane uses — `https://app.<base>` by default,
+    // or the explicit override (local/dev keeps its http + port). A missing or
+    // unparseable override fails at boot, not on the first OAuth probe.
+    let app_public_url = plane_config
+        .app_public_url
+        .clone()
+        .unwrap_or_else(|| format!("https://app.{base_domain}"));
+    let public_scheme = url::Url::parse(&app_public_url)
+        .map_err(|e| {
+            atomic_cloud::CloudError::InvalidUrl(format!("app public URL {app_public_url:?}: {e}"))
+        })?
+        .scheme()
+        .to_string();
+    let oauth_plane = atomic_cloud::OAuthPlane::new(
+        control.clone(),
+        base_domain.clone(),
+        public_scheme,
+        app_public_url,
+    );
+
     let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
@@ -1589,6 +1612,10 @@ async fn serve(
     // inert fallback AppState (see server.rs module docs).
     let fallback = FallbackAppState::build()?;
     let state = fallback.data();
+    // One MCP transport per process (one shared session manager), cloned into
+    // every worker below. Behind CloudAuth it resolves the tenant's manager
+    // per request (server.rs::FallbackAppState::mcp_transport).
+    let mcp_transport = fallback.mcp_transport(atomic_cloud::DEFAULT_MCP_SSE_KEEP_ALIVE);
 
     tracing::info!("Atomic Cloud starting...");
     tracing::info!(base_domain, "accounts served under *.{base_domain}");
@@ -1605,6 +1632,8 @@ async fn serve(
             auth.clone(),
             account_plane.clone(),
             tenant_plane.clone(),
+            oauth_plane.clone(),
+            mcp_transport.clone(),
             control.clone(),
             chat_streams.clone(),
             readiness.clone(),

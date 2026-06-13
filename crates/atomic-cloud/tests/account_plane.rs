@@ -118,6 +118,13 @@ impl PlaneHarness {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
+        let oauth_plane = atomic_cloud::OAuthPlane::new(
+            control.clone(),
+            BASE_DOMAIN,
+            "http",
+            format!("http://app.{BASE_DOMAIN}"),
+        );
+        let mcp_transport = fallback.mcp_transport(atomic_cloud::DEFAULT_MCP_SSE_KEEP_ALIVE);
         let plane = account_plane.clone();
         let control_for_app = control.clone();
         let chat_streams = ChatStreamLimiter::new(DEFAULT_CHAT_STREAMS_PER_ACCOUNT);
@@ -133,6 +140,8 @@ impl PlaneHarness {
                 auth.clone(),
                 account_plane.clone(),
                 tenant_plane.clone(),
+                oauth_plane.clone(),
+                mcp_transport.clone(),
                 control_for_app.clone(),
                 chat_streams.clone(),
                 readiness.clone(),

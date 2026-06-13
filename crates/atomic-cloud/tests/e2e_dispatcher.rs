@@ -176,6 +176,13 @@ impl E2eHarness {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
         let state = fallback.data();
+        let oauth_plane = atomic_cloud::OAuthPlane::new(
+            control.clone(),
+            BASE_DOMAIN,
+            "http",
+            format!("http://app.{BASE_DOMAIN}"),
+        );
+        let mcp_transport = fallback.mcp_transport(atomic_cloud::DEFAULT_MCP_SSE_KEEP_ALIVE);
         let control_for_app = control.clone();
         let limiter_for_app = chat_streams.clone();
         // This harness runs no fleet gate; the deploy-gating suite owns
@@ -190,6 +197,8 @@ impl E2eHarness {
                 auth.clone(),
                 account_plane.clone(),
                 tenant_plane.clone(),
+                oauth_plane.clone(),
+                mcp_transport.clone(),
                 control_for_app.clone(),
                 limiter_for_app.clone(),
                 readiness.clone(),

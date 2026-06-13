@@ -84,6 +84,8 @@ bind atomic-server's process-global state and have no per-tenant story yet —
 - [`account_cache.rs`](src/account_cache.rs) — per-account `DatabaseManager` cache (idle TTL, hard cap, WS-receiver eviction pinning, generation-checked refresh)
 - [`tenant_plane.rs`](src/tenant_plane.rs) — cloud-owned tenant routes (`DELETE /api/account`, the provider routes)
 - [`account_plane.rs`](src/account_plane.rs) — signup/login request-link + complete
+- [`oauth_routes.rs`](src/oauth_routes.rs) — cloud's per-account OAuth flow (DCR + Auth Code + PKCE), public discovery/register/token + session-authenticated approve; the `/mcp` mount is wired in `server.rs`
+- [`oauth_store.rs`](src/oauth_store.rs) — control-plane `oauth_clients`/`oauth_codes` storage (per-account, hash-only secrets, single-use codes)
 
 **Control plane & provisioning**
 - [`control_plane.rs`](src/control_plane.rs) — `ControlPlane` handle, connect-or-create, the hardened migration runner
@@ -253,10 +255,11 @@ provider or sends real email.
   in-memory channel, so in a multi-pod deployment a WS client on another pod
   misses that execution's progress events. Durable state is always correct;
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
-- Several capabilities are scoped to later slices — cloud OAuth/MCP, backups,
-  observability metrics/tracing, the user-facing `account_events` log, and the
-  signup/billing frontend. See the plan doc's Implementation log for the
-  current frontier.
+- Several capabilities are scoped to later slices — backups, observability
+  metrics/tracing, the user-facing `account_events` log, and the
+  signup/billing/OAuth-consent frontend (the OAuth flow ships as API + a
+  minimal server-rendered approve form). See the plan doc's Implementation log
+  for the current frontier.
 
 ## What's shipped (this slice: billing & quotas)
 
