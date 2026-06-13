@@ -1229,6 +1229,49 @@ before running >1 pod in production.
 leader election, `upgrade_url` content in the credits error (billing
 slice), the failed-migrations reaper arm (deploy gating).
 
+### Slice 5 — deploy gating & fleet migration (2026-06-12, branch `cloud-deploy-gating`)
+
+Landed: migration 008 (per-tenant migration tracking on `account_databases`,
+backfill stamping active rows at the frozen authoring-time target — provably
+at-or-below, the safe direction) and 009 (`deploy_runs` per-boot history);
+`PostgresStorage::target_schema_version()` (the one core change — a const
+accessor); the boot fleet runner (enumerate → fan out, cap 16 → per-tenant
+`initialize()` under the existing advisory lock, which IS the multi-pod
+story); `/ready` gated by the plan's failure-rate policy table verbatim;
+the `account_upgrading` 503 (body verbatim, WS included) on CloudAuth's
+per-request lookup; `deploy status` / `deploy advance` CLI (no override for
+`rollback_required`, deliberately); the failed-migrations reaper arm; and
+the additive-only migration lint as a test scanning both migration dirs
+with fixture probes (forbids DROP/ALTER TYPE/RENAME, SET NOT NULL, and
+validated-at-add constraints; one justified frozen-history exemption:
+core 020's REAL→f64 widening, which predates the additive-only decision).
+
+**Design correction (review-driven, the slice's big lesson):** the original
+recovery split — "boot runner owns unattempted lagging tenants, reaper owns
+recorded failures" — was wrong, because the boot runner enumerates once per
+pod lifetime. Old-pod signups mid-rolling-deploy, failed record writes, and
+panicked migration tasks all produced lagging tenants nobody owned, 503ing
+forever. The reaper's arm now owns **all** lagging rows (lagging-ness, not
+failure state, drives retry); per-tenant advisory locks make racing the
+boot runner safe. This also defuses the mixed-fleet race where an old
+binary's no-op success-record erases a new-target failure record. Both
+regression-pinned, including an e2e proving a late-stamped straggler heals
+without any pod reboot.
+
+**Other review-vetted hardening:** `start_deploy_run`/`finish_deploy_run`
+retry within the wall-clock budget (a transient control-plane blip can no
+longer wedge a pod not-ready with green liveness); stale `migrating`
+deploy_runs rows finalize as `abandoned` and cannot shadow `deploy
+advance`; timed-out fleet runs persist partial counts; monotone
+GREATEST stamping everywhere (an old binary can never regress a newer
+stamp).
+
+**Notes:** readiness gates the load balancer, not the process — the data
+plane serves per-request during `awaiting_review` (e2e-pinned). Small
+fleets hit `rollback_required` easily (1 broken of 2 = 50%); that is the
+policy working as designed — the operator path is fix/delete the tenant
+and redeploy.
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -1480,3 +1523,11 @@ and link the discussion if it lives in a memory file.
   worker events are per-pod in-memory; build the cross-pod relay
   (Postgres LISTEN/NOTIFY) before running more than one pod in
   production. Durable state is unaffected.
+- **2026-06-12** — Slice 5 landed (see Implementation log). Deploy gating
+  per the plan's policy table; additive-only migrations enforced by a
+  lint test over both migration dirs.
+- **2026-06-12** — Migration recovery is keyed on lagging-ness, not
+  recorded failure state: the reaper retries any active tenant below the
+  compiled target. Supersedes the boot-runner/reaper ownership split,
+  which left mid-deploy signups and lost record-writes permanently
+  stragglered.
