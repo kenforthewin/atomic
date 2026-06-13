@@ -27,7 +27,7 @@ use atomic_cloud::{
     DEFAULT_CHAT_STREAMS_PER_ACCOUNT, SESSION_COOKIE,
 };
 use atomic_test_support::MockAiServer;
-use reqwest::header::{HOST, LOCATION};
+use reqwest::header::{HOST, LOCATION, WWW_AUTHENTICATE};
 use reqwest::{redirect::Policy, Method, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -76,7 +76,11 @@ impl OAuthHarness {
             support::test_vault(),
             AccountCacheConfig::default(),
         ));
-        let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN);
+        // `http` scheme like a local/dev deploy, so the MCP `WWW-Authenticate`
+        // challenge points at the same `http://<sub>.<base>` origin the OAuth
+        // discovery is served from (the harness drives plain HTTP on loopback).
+        let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), BASE_DOMAIN)
+            .with_public_scheme("http");
         let account_plane = AccountPlane::new(
             control.clone(),
             cluster.clone(),
@@ -271,6 +275,31 @@ impl OAuthHarness {
             .to_str()
             .expect("location str")
             .to_string()
+    }
+
+    /// POST an MCP `initialize` to `subdomain`'s `/mcp` with the given bearer
+    /// token (the OAuth-minted mcp token), returning the raw response.
+    async fn mcp_initialize(&self, subdomain: &str, token: &str) -> reqwest::Response {
+        self.req(Method::POST, subdomain, "/mcp")
+            .bearer_auth(token)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "claude", "version": "0" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send mcp initialize")
     }
 
     /// Exchange a code at the token endpoint, returning the raw response.
@@ -927,6 +956,202 @@ async fn db_pinned_oauth_token_is_chokepoint_enforced() {
                 resp.status(),
                 StatusCode::FORBIDDEN,
                 "db-pinned token can't reach another KB"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn mcp_token_is_tenant_isolated_across_subdomains() {
+    with_control_db(
+        "mcp_token_is_tenant_isolated_across_subdomains",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let alpha = h.provision("alpha").await;
+            let _bravo = h.provision("bravo").await;
+
+            // An account-scope mcp token for alpha (the consent flow's default
+            // — issued directly here; the full mint path is covered above).
+            let token = issue_token(
+                &h.control,
+                &alpha.account_id,
+                TokenScope::Mcp,
+                None,
+                "mcp-oauth: alpha",
+            )
+            .await
+            .expect("issue alpha mcp token");
+
+            // On alpha's own subdomain it initializes an MCP session: it
+            // operates on alpha's knowledge base (CloudAuth resolves alpha's
+            // tenant and injects its manager, which the transport resolves
+            // per-request).
+            let on_alpha = h.mcp_initialize("alpha", &token).await;
+            assert_eq!(
+                on_alpha.status(),
+                StatusCode::OK,
+                "alpha's mcp token works on alpha's /mcp"
+            );
+            assert!(
+                on_alpha.headers().contains_key("mcp-session-id"),
+                "mcp session established on the owning tenant"
+            );
+
+            // The SAME token on bravo's subdomain → 401: CloudAuth verifies
+            // `WHERE account_id = bravo AND hash = ?`, and alpha's token hashes
+            // to no bravo row (the cross-tenant chokepoint). It never reaches
+            // bravo's knowledge base.
+            let on_bravo = h.mcp_initialize("bravo", &token).await;
+            assert_eq!(
+                on_bravo.status(),
+                StatusCode::UNAUTHORIZED,
+                "alpha's mcp token is rejected on bravo's /mcp (cross-tenant)"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn db_pinned_mcp_token_cannot_reach_another_kb_via_mcp() {
+    with_control_db(
+        "db_pinned_mcp_token_cannot_reach_another_kb_via_mcp",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let account = h.provision("alpha").await;
+
+            // A db-pinned mcp token: it may only touch `the-pinned-kb`.
+            let pinned = issue_token(
+                &h.control,
+                &account.account_id,
+                TokenScope::Mcp,
+                Some("the-pinned-kb"),
+                "mcp-oauth: pinned",
+            )
+            .await
+            .expect("issue db-pinned mcp token");
+
+            // Trying to reach a DIFFERENT KB on /mcp via the X-Atomic-Database
+            // header → 403 at the CloudAuth chokepoint, before the request ever
+            // reaches the MCP transport's manager resolution. This proves the
+            // MCP path is governed by the SAME allowed_db_id chokepoint the
+            // data plane uses — a db-pinned MCP token can't read another KB
+            // through the MCP context's db selection.
+            let resp = h
+                .req(Method::POST, "alpha", "/mcp")
+                .bearer_auth(&pinned)
+                .header("X-Atomic-Database", "some-other-kb")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": { "name": "claude", "version": "0" }
+                        }
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+                .expect("send mcp with db override");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "db-pinned mcp token can't select another KB on /mcp"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
+#[actix_web::test]
+async fn unauthenticated_mcp_returns_401_pointing_at_tenant_discovery() {
+    with_control_db(
+        "unauthenticated_mcp_returns_401_pointing_at_tenant_discovery",
+        |url| async move {
+            let h = OAuthHarness::spawn(&url).await;
+            let _account = h.provision("alpha").await;
+
+            // No credential on /mcp → 401 carrying the MCP-compliant
+            // WWW-Authenticate challenge pointing at alpha's OWN OAuth
+            // protected-resource metadata, so Claude Desktop discovers the
+            // cloud OAuth flow for this exact tenant.
+            let resp = h
+                .req(Method::POST, "alpha", "/mcp")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+                .expect("send unauthenticated mcp");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let challenge = resp
+                .headers()
+                .get(WWW_AUTHENTICATE)
+                .expect("unauthenticated /mcp must carry WWW-Authenticate")
+                .to_str()
+                .expect("challenge str");
+            assert!(
+                challenge.starts_with("Bearer "),
+                "Bearer challenge: {challenge}"
+            );
+            assert!(
+                challenge.contains("resource_metadata="),
+                "challenge carries resource_metadata: {challenge}"
+            );
+            assert!(
+                challenge
+                    .contains("http://alpha.cloudtest.local/.well-known/oauth-protected-resource"),
+                "resource_metadata points at alpha's own discovery: {challenge}"
+            );
+
+            // The pointed-at discovery actually resolves (proving the client
+            // following the challenge reaches alpha's OAuth metadata).
+            let meta: Value = h
+                .req(
+                    Method::GET,
+                    "alpha",
+                    "/.well-known/oauth-protected-resource",
+                )
+                .send()
+                .await
+                .expect("send discovery")
+                .json()
+                .await
+                .expect("discovery json");
+            assert_eq!(meta["resource"], "http://alpha.cloudtest.local/mcp");
+
+            // The /api data plane, by contrast, gets a plain 401 — no MCP
+            // discovery noise leaks onto it.
+            let api = h
+                .req(Method::GET, "alpha", "/api/atoms")
+                .send()
+                .await
+                .expect("send unauthenticated api");
+            assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                !api.headers().contains_key(WWW_AUTHENTICATE),
+                "the data plane 401 carries no MCP discovery challenge"
             );
 
             h.stop().await;

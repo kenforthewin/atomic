@@ -179,6 +179,13 @@ struct AuthCtx {
     /// `atomic.cloud` — or `localhost` for local/test deployments, where
     /// hosts look like `kenny.localhost:8080`.
     base_domain: String,
+    /// Scheme of the tenant's public origin (`https` in production, `http`
+    /// for local/dev). Used only to build the `WWW-Authenticate`
+    /// `resource_metadata` URL on an unauthenticated `/mcp` request — the
+    /// same scheme [`crate::oauth_routes::OAuthPlane`] builds its discovery
+    /// URLs from, so a client following the challenge reaches the tenant's
+    /// own OAuth metadata.
+    public_scheme: String,
 }
 
 /// The middleware factory. Cheap to clone; construct once and hand to every
@@ -192,6 +199,10 @@ impl CloudAuth {
     /// Build the middleware for accounts hosted under `base_domain`
     /// (`<subdomain>.<base_domain>`). A leading dot and any port in
     /// incoming `Host` values are tolerated; matching is case-insensitive.
+    ///
+    /// The public scheme defaults to `https`; local/dev deployments served
+    /// over plain HTTP set it with [`with_public_scheme`](Self::with_public_scheme)
+    /// so the MCP `WWW-Authenticate` challenge points at a reachable URL.
     pub fn new(
         control: ControlPlane,
         cache: Arc<AccountCache>,
@@ -206,8 +217,23 @@ impl CloudAuth {
                 control,
                 cache,
                 base_domain,
+                public_scheme: "https".to_string(),
             }),
         }
+    }
+
+    /// Override the scheme used to build the MCP `WWW-Authenticate`
+    /// `resource_metadata` URL (default `https`). Wire it from the same
+    /// app-public-URL scheme [`crate::oauth_routes::OAuthPlane`] uses, so the
+    /// challenge a `/mcp` client follows resolves to the tenant's own OAuth
+    /// discovery over the right scheme (`http` for local/dev).
+    pub fn with_public_scheme(mut self, scheme: impl Into<String>) -> Self {
+        // The Arc is freshly constructed and not yet shared, so this is the
+        // single owner — mutate in place rather than reallocating.
+        Arc::get_mut(&mut self.ctx)
+            .expect("CloudAuth not yet cloned when configuring the public scheme")
+            .public_scheme = scheme.into();
+        self
     }
 }
 
@@ -258,7 +284,10 @@ where
             let mut req = req;
             match authenticate(&ctx, &mut req).await {
                 Ok(()) => svc.call(req).await.map(|res| res.map_into_left_body()),
-                Err(denial) => Ok(req.into_response(denial).map_into_right_body()),
+                Err(denial) => {
+                    let denial = decorate_mcp_unauthorized(&ctx, &req, denial);
+                    Ok(req.into_response(denial).map_into_right_body())
+                }
             }
         })
     }
@@ -419,6 +448,55 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         storage_state,
     });
     Ok(())
+}
+
+/// The MCP Streamable HTTP endpoint path, mounted by the cloud composition
+/// at `/mcp` (see [`crate::server::configure_cloud_app`]). Trailing-slash
+/// variants are normalized away by the transport's `NormalizePath`, but the
+/// challenge is attached before that runs, so accept the bare path only.
+const MCP_PATH: &str = "/mcp";
+
+/// Add the MCP-compliant `WWW-Authenticate` challenge to a 401 on the `/mcp`
+/// path, so an MCP client (Claude Desktop, the MCP Inspector) that hits the
+/// tenant's MCP endpoint without a token discovers the OAuth flow.
+///
+/// This is the cloud counterpart of self-hosted's
+/// [`McpAuth`](atomic_server::mcp_auth) `WWW-Authenticate` header: under cloud
+/// the MCP scope authenticates through [`CloudAuth`] (the bearer MCP token the
+/// OAuth flow mints), not `McpAuth`, so the challenge that points clients at
+/// the OAuth discovery document has to be produced here. `resource_metadata`
+/// points at the tenant's *own* `/.well-known/oauth-protected-resource` —
+/// `{public_scheme}://{request Host}/...`, the same origin
+/// [`crate::oauth_routes`] serves its per-tenant discovery from — so the
+/// client walks straight into this account's OAuth flow.
+///
+/// Only a 401 on the MCP path is decorated; every other denial (including
+/// 401s on `/api/*`, where API clients already hold a token) is returned
+/// verbatim, so self-hosted-style discovery noise never leaks onto the data
+/// plane.
+fn decorate_mcp_unauthorized(
+    ctx: &AuthCtx,
+    req: &ServiceRequest,
+    denial: HttpResponse,
+) -> HttpResponse {
+    if denial.status() != actix_web::http::StatusCode::UNAUTHORIZED || req.path() != MCP_PATH {
+        return denial;
+    }
+    let Some(host) = request_host(req) else {
+        return denial;
+    };
+    let challenge = format!(
+        "Bearer resource_metadata=\"{}://{}/.well-known/oauth-protected-resource\"",
+        ctx.public_scheme, host
+    );
+    let Ok(value) = HeaderValue::from_str(&challenge) else {
+        // A `Host` with bytes illegal in a header value can't form a valid
+        // challenge; return the plain 401 rather than a malformed header.
+        return denial;
+    };
+    let mut denial = denial;
+    denial.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    denial
 }
 
 /// The host the client addressed: `Host` header, falling back to the URI

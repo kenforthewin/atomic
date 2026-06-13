@@ -1380,6 +1380,19 @@ accepts it on `/api/*` and `/mcp` (full flow e2e-pinned).
 Per-tenant **MCP**: atomic-server's `mcp_scope` now mounts under CloudAuth +
 `cloud_plane_guard` ([`server.rs`](../../crates/atomic-cloud/src/server.rs)),
 so the tenant's injected `RequestDatabaseManager` drives tool resolution.
+Under cloud, **CloudAuth is the MCP auth layer** — self-hosted's `McpAuth` is
+not in the cloud composition — so CloudAuth also produces the MCP-compliant
+401: an unauthenticated `/mcp` request gets a `WWW-Authenticate: Bearer
+resource_metadata="{scheme}://{Host}/.well-known/oauth-protected-resource"`
+header pointing at the **tenant's own** discovery document (the same origin
+`oauth_routes` serves it from), so Claude Desktop discovers this account's
+OAuth flow. The decoration fires only for a 401 on the `/mcp` path
+([`auth.rs`](../../crates/atomic-cloud/src/auth.rs) `decorate_mcp_unauthorized`,
+fed the public scheme via `CloudAuth::with_public_scheme`); `/api/*` 401s stay
+plain. The MCP path is governed by the **same** `allowed_db_id` chokepoint as
+the data plane — a db-pinned MCP token can't select another KB on `/mcp` via
+`X-Atomic-Database` (e2e-pinned, alongside cross-tenant rejection: account A's
+MCP token on B's `/mcp` → 401).
 
 **The one atomic-server change (cloud-unaware, self-hosted byte-identical):**
 the MCP transport now resolves its `DatabaseManager` **per request** — a new

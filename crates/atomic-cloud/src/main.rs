@@ -1367,7 +1367,23 @@ async fn serve(
     // Cluster handle for the storage-recompute loop's maintenance
     // connection, captured before `cluster` is moved into the account plane.
     let cluster_for_jobs = cluster.clone();
-    let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain);
+    // The tenant public origin's scheme — `https` in production, `http` for
+    // local/dev — drives both CloudAuth's MCP `WWW-Authenticate` challenge and
+    // the OAuth plane's per-tenant discovery URLs (below), so they're derived
+    // once here from the same app-public-URL the account plane uses. A missing
+    // or unparseable override fails at boot, not on the first OAuth probe.
+    let app_public_url = plane_config
+        .app_public_url
+        .clone()
+        .unwrap_or_else(|| format!("https://app.{base_domain}"));
+    let public_scheme = url::Url::parse(&app_public_url)
+        .map_err(|e| {
+            atomic_cloud::CloudError::InvalidUrl(format!("app public URL {app_public_url:?}: {e}"))
+        })?
+        .scheme()
+        .to_string();
+    let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain)
+        .with_public_scheme(public_scheme.clone());
     let tenant_plane = TenantPlane::new(
         control.clone(),
         cluster.clone(),
@@ -1409,20 +1425,8 @@ async fn serve(
 
     // Cloud OAuth plane (plan: "OAuth"). It builds per-tenant issuer URLs from
     // `{public_scheme}://{request Host}` and bounces un-logged-in authorize
-    // requests to `{app_public_url}/login`. Both derive from the same
-    // app-public-url the account plane uses — `https://app.<base>` by default,
-    // or the explicit override (local/dev keeps its http + port). A missing or
-    // unparseable override fails at boot, not on the first OAuth probe.
-    let app_public_url = plane_config
-        .app_public_url
-        .clone()
-        .unwrap_or_else(|| format!("https://app.{base_domain}"));
-    let public_scheme = url::Url::parse(&app_public_url)
-        .map_err(|e| {
-            atomic_cloud::CloudError::InvalidUrl(format!("app public URL {app_public_url:?}: {e}"))
-        })?
-        .scheme()
-        .to_string();
+    // requests to `{app_public_url}/login` — both off the same `public_scheme`
+    // / `app_public_url` derived above (shared with CloudAuth's MCP challenge).
     let oauth_plane = atomic_cloud::OAuthPlane::new(
         control.clone(),
         base_domain.clone(),

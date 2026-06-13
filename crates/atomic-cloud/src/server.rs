@@ -47,6 +47,15 @@
 //!   [`RequestDatabaseManager`], which the transport resolves per request
 //!   (its cloud-unaware `RequestManager` override), so every tenant's `/mcp`
 //!   call hits its own knowledge base — never the inert baked-in manager.
+//!   CloudAuth *is* the MCP auth layer here (self-hosted's
+//!   [`McpAuth`](atomic_server::mcp_auth) is not used), so it also produces
+//!   the MCP-compliant 401: an unauthenticated `/mcp` request gets a
+//!   `WWW-Authenticate: Bearer resource_metadata="…"` header pointing at the
+//!   tenant's own `/.well-known/oauth-protected-resource` (see
+//!   [`crate::auth`] → `decorate_mcp_unauthorized`), so Claude Desktop
+//!   discovers this account's OAuth flow. The same MCP token is governed by
+//!   CloudAuth's `allowed_db_id` chokepoint as the data plane — a db-pinned
+//!   token can't reach another KB through the transport's db selection.
 //! - `/api/*` — atomic-server's full route table
 //!   ([`api_scope`](atomic_server::app::api_scope)) wrapped in [`CloudAuth`]
 //!   (in place of self-hosted's `BearerAuth`) plus [`cloud_plane_guard`].
