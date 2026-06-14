@@ -279,6 +279,68 @@ pub async fn stale_tenant_backups(
     .map_err(CloudError::db("listing stale tenant backups"))
 }
 
+/// Per-tenant backup freshness, for the `backup status` operator command. One
+/// row per active tenant database: its last successful backup (if any) and the
+/// last recorded error (if a dump has failed since the last success).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TenantBackupStatus {
+    pub account_id: String,
+    pub subdomain: String,
+    pub db_name: String,
+    /// `None` means never backed up yet.
+    pub last_backup_at: Option<DateTime<Utc>>,
+    /// The most recent dump error, retained until the next success clears it.
+    pub last_backup_error: Option<String>,
+}
+
+/// Every active tenant's backup status, stale-first (never-backed-up and
+/// oldest-success first), for the `backup status` command's per-tenant table.
+/// Joins `accounts` for the human-facing subdomain.
+pub async fn tenant_backup_status(
+    control: &ControlPlane,
+) -> Result<Vec<TenantBackupStatus>, CloudError> {
+    sqlx::query_as(
+        "SELECT ad.account_id, a.subdomain, ad.db_name, \
+                ad.last_backup_at, ad.last_backup_error \
+         FROM account_databases ad \
+         JOIN accounts a ON a.id = ad.account_id \
+         WHERE ad.status = 'active' AND a.status = 'active' \
+         ORDER BY ad.last_backup_at ASC NULLS FIRST, a.subdomain",
+    )
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing tenant backup status"))
+}
+
+/// One finished-or-in-flight `backup_runs` ledger row, for `backup status`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BackupRunRecord {
+    pub id: String,
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub total: Option<i32>,
+    pub succeeded: Option<i32>,
+    pub failed: Option<i32>,
+}
+
+/// The most recent `backup_runs` rows, newest-first (uses the
+/// `idx_backup_runs_started` index from migration 015). `backup status` shows
+/// these as the recent-pass history.
+pub async fn recent_backup_runs(
+    control: &ControlPlane,
+    limit: i64,
+) -> Result<Vec<BackupRunRecord>, CloudError> {
+    sqlx::query_as(
+        "SELECT id, kind, started_at, finished_at, total, succeeded, failed \
+         FROM backup_runs ORDER BY started_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing recent backup runs"))
+}
+
 // ==================== The nightly pass ====================
 
 /// Run one nightly backup pass: dump every active tenant database (each under
@@ -481,6 +543,43 @@ fn control_db_name(control: &ControlPlane) -> Result<String, CloudError> {
         .get_database()
         .unwrap_or(DEFAULT_CONTROL_DB_NAME)
         .to_string())
+}
+
+// ==================== Listing a tenant's dumps ====================
+
+/// Every backup object in `store` that belongs to one tenant, for the
+/// `backup list --subdomain` operator command. Two key families name a tenant
+/// (see the [object keys](self) above):
+///
+/// - **nightly** dumps live under `backups/<date>/<db_name>.dump` — the file
+///   stem is the tenant's `db_name`, so they're matched by suffix.
+/// - **final** dumps live under `backups/final/<account_id>-<ts>.dump` — the
+///   file stem is prefixed by the account id, so they're matched by the
+///   `final/` listing filtered to this account.
+///
+/// Per-tenant by construction: a tenant's dumps are named by *its* `db_name`
+/// and `account_id`, so this never surfaces another tenant's backups even
+/// though the store is shared. Returns keys sorted (chronological for the
+/// dated nightly tree; lexical for finals, whose timestamps sort the same).
+pub async fn dumps_for_account(
+    store: &Arc<dyn BackupStore>,
+    account_id: &str,
+    db_name: &str,
+) -> Result<Vec<String>, CloudError> {
+    let nightly_suffix = format!("/{db_name}.dump");
+    let mut keys: Vec<String> = store
+        .list("backups/")
+        .await?
+        .into_iter()
+        .filter(|k| {
+            // A nightly dump for this tenant (its db_name as the file stem),
+            // or a final dump named by this account id.
+            k.ends_with(&nightly_suffix)
+                || (k.starts_with("backups/final/") && k.contains(&format!("/{account_id}-")))
+        })
+        .collect();
+    keys.sort();
+    Ok(keys)
 }
 
 // ==================== Final dump (deletion path) ====================

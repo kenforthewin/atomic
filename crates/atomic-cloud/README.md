@@ -237,7 +237,9 @@ atomic-cloud --control-url <URL> <command>
   account    create | delete   (provision/teardown a tenant; delete takes a final dump)
   token      create            (mint an account/database/mcp-scoped token)
   deploy     status | advance  (inspect / acknowledge boot fleet migrations)
-  backup     restore           (restore a dump into a fresh database; runbook)
+  backup     run | status | list | restore
+                               (run a pass; report freshness/stale tenants;
+                                list a tenant's dumps; restore into a fresh DB)
 ```
 
 `--control-url` is global; `serve` and `account` also take `--cluster-url`. Run
@@ -340,10 +342,15 @@ provider or sends real email.
   correctly take none). A dump failure aborts the deletion rather than destroy
   un-backed-up data — the operator's only undo under hard-delete v1. Retention
   (14 daily + 8 weekly; 30-day finals) is bucket lifecycle policy, not code.
-- **Restore CLI + runbook** — `atomic-cloud backup restore` restores a dump
-  into a fresh database, then prints the remaining manual runbook steps
-  (repoint `account_databases.db_name`, evict the running pod's
-  `AccountCache`). PITR via WAL archiving is deferred.
+- **Operator + restore CLI + runbook** — `atomic-cloud backup run` (one pass
+  now), `backup status` (per-tenant `last_backup_at` + last error + the stale
+  set + recent `backup_runs`), `backup list --subdomain` (one tenant's dumps,
+  per-tenant by key construction), and `backup restore` — restore a dump into
+  a fresh database, then print the remaining manual runbook steps (repoint
+  `account_databases.db_name`, evict the running pod's `AccountCache`). The
+  full final-dump → restore → repoint → verify runbook is rehearsed as a test
+  (`tests/backup.rs::final_dump_restore_runbook_roundtrip`). PITR via WAL
+  archiving is deferred.
 
 ## Previously shipped (OAuth & per-tenant MCP)
 

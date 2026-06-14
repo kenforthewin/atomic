@@ -23,9 +23,11 @@ use std::sync::Arc;
 
 use atomic_cloud::backup::backup_tools_available;
 use atomic_cloud::{
-    dump_tenant_database, list_active_tenant_databases, provision_account, record_backup_failure,
-    record_backup_success, restore_database, stale_tenant_backups, start_backup_run, BackupStore,
-    ClusterConfig, ControlPlane, DumpConnection, LocalFileSystemStore, ManagedKeys, NewAccount,
+    delete_account, dump_tenant_database, dumps_for_account, list_active_tenant_databases,
+    provision_account, recent_backup_runs, record_backup_failure, record_backup_success,
+    restore_database, stale_tenant_backups, start_backup_run, tenant_backup_status, tenant_db_name,
+    BackupStore, ClusterConfig, ControlPlane, DumpConnection, LocalFileSystemStore, ManagedKeys,
+    NewAccount,
 };
 use atomic_core::{CreateAtomRequest, DatabaseManager};
 use support::{with_control_db, with_db_guard};
@@ -948,4 +950,354 @@ async fn dump_and_restore_reject_bad_db_names() {
             "restore must reject bad db name {bad:?}"
         );
     }
+}
+
+// ==================== The rehearsed restore runbook (final-dump roundtrip) ====
+
+/// The full disaster-recovery runbook, as a test (plan: "Restore runbook" —
+/// "write and *rehearse* before launch"). It exercises the real operator
+/// sequence end to end:
+///
+/// 1. provision a tenant and write a recognizable atom,
+/// 2. `delete_account` with a configured store (takes the FINAL dump, then
+///    drops the tenant DB — the account's data is now only in `backups/final/`),
+/// 3. restore that exact final dump into a FRESH database,
+/// 4. repoint `account_databases.db_name` to the restored database (the
+///    runbook's manual step the CLI deliberately leaves to the operator),
+/// 5. assert the atom is present in the restored tenant.
+///
+/// This is the proof that the final dump is a real, restorable undo — not just
+/// bytes in a bucket — and that a per-tenant restore touches only that
+/// account's row and its own new database.
+#[tokio::test]
+async fn final_dump_restore_runbook_roundtrip() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "final_dump_restore_runbook_roundtrip: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db("final_dump_restore_runbook_roundtrip", |url| async move {
+        let (control, cluster) = setup(&url).await;
+        let acct = provision_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            NewAccount {
+                email: "runbook@example.com".into(),
+                subdomain: "runbook".into(),
+            },
+        )
+        .await
+        .expect("provision");
+
+        // 1 — write a recognizable atom into the live tenant.
+        const MARKER: &str = "runbook-restore-marker-91bc";
+        let source_url = "https://example.com/runbook-source";
+        let tenant_url = cluster.tenant_db_url(&acct.db_name).unwrap();
+        let atom_id = {
+            let manager = DatabaseManager::new_postgres(".", &tenant_url)
+                .await
+                .expect("open tenant");
+            let core = manager.active_core().await.expect("active core");
+            let created = core
+                .create_atom(
+                    CreateAtomRequest {
+                        content: format!("# Heading\n\n{MARKER} body"),
+                        source_url: Some(source_url.to_string()),
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("create atom")
+                .expect("atom inserted");
+            drop(core);
+            drop(manager);
+            created.atom.id
+        };
+
+        // 2 — delete the account WITH a store: the final dump is taken before
+        // the drop, then the live tenant DB is gone (its data now lives only
+        // in backups/final/).
+        let (_dir, store) = temp_store();
+        delete_account(
+            &control,
+            &cluster,
+            &ManagedKeys::Disabled,
+            Some(&store),
+            &acct.account_id,
+        )
+        .await
+        .expect("delete takes the final dump then drops");
+        assert!(
+            !atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                .await
+                .unwrap(),
+            "the original tenant database is gone after deletion"
+        );
+        let finals = store.list("backups/final/").await.unwrap();
+        assert_eq!(finals.len(), 1, "exactly one final dump: {finals:?}");
+        let final_key = finals[0].clone();
+
+        // 3 — restore that final dump into a FRESH tenant database. (The
+        // accounts row is hard-deleted by the delete, so we re-create a
+        // mapping below to mimic an operator who reinstates the account; the
+        // restore itself only needs the dump bytes + a fresh DB name.)
+        let restore_uuid = uuid::Uuid::new_v4();
+        let restore_db = tenant_db_name(restore_uuid);
+        let conn = DumpConnection::for_cluster(&cluster).unwrap();
+        let dump_bytes = store.get(&final_key).await.expect("read final dump");
+        let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
+        with_db_guard(&base_url, &restore_db, || async {
+            restore_database(&cluster, &conn, &restore_db, &dump_bytes)
+                .await
+                .expect("restore the final dump into a fresh db");
+
+            // 4 — repoint the account's mapping to the restored database (the
+            // runbook's manual control-plane step). We re-seed the account +
+            // mapping for the restored UUID so the repointed row is well-formed
+            // and isolated to this tenant.
+            sqlx::query(
+                "INSERT INTO accounts (id, subdomain, email, status, plan, created_at) \
+                 VALUES ($1, 'runbook-restored', 'runbook@example.com', 'active', 'free', NOW())",
+            )
+            .bind(restore_uuid.to_string())
+            .execute(control.pool())
+            .await
+            .expect("reinstate account row");
+            sqlx::query(
+                "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
+                 VALUES ($1, 'test-cluster-1', $2, 'active')",
+            )
+            .bind(restore_uuid.to_string())
+            .bind(&restore_db)
+            .execute(control.pool())
+            .await
+            .expect("repoint mapping to the restored database");
+
+            // The repoint touched only this account's row — no other mapping
+            // exists for the original account (it was hard-deleted).
+            let orphan_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM account_databases WHERE account_id = $1")
+                    .bind(&acct.account_id)
+                    .fetch_one(control.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(orphan_rows, 0, "the deleted account keeps no mapping row");
+
+            // 5 — the atom is present in the restored tenant.
+            let restored_url = cluster.tenant_db_url(&restore_db).unwrap();
+            let manager = DatabaseManager::new_postgres(".", &restored_url)
+                .await
+                .expect("open restored tenant");
+            let core = manager.active_core().await.expect("restored core");
+            let atom = core
+                .get_atom(&atom_id)
+                .await
+                .expect("query restored atom")
+                .expect("atom present after restore from the final dump");
+            assert!(
+                atom.atom.content.contains(MARKER),
+                "restored atom carries the marker: {:?}",
+                atom.atom.content
+            );
+            assert_eq!(atom.atom.source_url.as_deref(), Some(source_url));
+            drop(core);
+            drop(manager);
+        })
+        .await;
+    })
+    .await;
+}
+
+// ==================== backup status / list helper queries ====================
+
+/// `backup status` reads: per-tenant `last_backup_at` (+ last error), the
+/// stale-tenant set, and the recent `backup_runs` ledger. Drives the same
+/// queries the CLI's `Status` arm prints.
+#[tokio::test]
+async fn backup_status_reports_freshness_and_stale_tenants() {
+    with_control_db(
+        "backup_status_reports_freshness_and_stale_tenants",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let fresh = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "fresh@example.com".into(),
+                    subdomain: "freshtenant".into(),
+                },
+            )
+            .await
+            .expect("provision fresh");
+            let stale = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "stale@example.com".into(),
+                    subdomain: "staletenant".into(),
+                },
+            )
+            .await
+            .expect("provision stale");
+
+            // Backdate both accounts past the staleness horizon so a
+            // never-/long-ago-backed-up tenant actually trips the alert.
+            sqlx::query("UPDATE accounts SET created_at = NOW() - INTERVAL '3 days'")
+                .execute(control.pool())
+                .await
+                .unwrap();
+
+            let now = chrono::Utc::now();
+            // Only `fresh` gets a recent successful backup.
+            record_backup_success(&control, &fresh.account_id, &fresh.db_name, now)
+                .await
+                .unwrap();
+
+            // Per-tenant status: both listed, fresh stamped, stale never.
+            let statuses = tenant_backup_status(&control).await.unwrap();
+            assert_eq!(statuses.len(), 2, "both active tenants listed");
+            let fresh_row = statuses
+                .iter()
+                .find(|s| s.account_id == fresh.account_id)
+                .expect("fresh listed");
+            assert!(fresh_row.last_backup_at.is_some(), "fresh is stamped");
+            assert_eq!(fresh_row.subdomain, "freshtenant");
+            let stale_row = statuses
+                .iter()
+                .find(|s| s.account_id == stale.account_id)
+                .expect("stale listed");
+            assert!(stale_row.last_backup_at.is_none(), "stale never backed up");
+
+            // Staleness query at the 36h horizon: only the never-backed-up
+            // tenant trips it.
+            let stale_set =
+                stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60), now)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                stale_set.len(),
+                1,
+                "exactly one stale tenant: {stale_set:?}"
+            );
+            assert_eq!(stale_set[0].account_id, stale.account_id);
+
+            // A failure on the fresh tenant surfaces its error but keeps it
+            // out of the stale set (its last success is still recent).
+            record_backup_failure(&control, &fresh.account_id, &fresh.db_name, "pg_dump: nope")
+                .await
+                .unwrap();
+            let statuses = tenant_backup_status(&control).await.unwrap();
+            let fresh_row = statuses
+                .iter()
+                .find(|s| s.account_id == fresh.account_id)
+                .unwrap();
+            assert_eq!(
+                fresh_row.last_backup_error.as_deref(),
+                Some("pg_dump: nope")
+            );
+            assert!(
+                fresh_row.last_backup_at.is_some(),
+                "failure keeps last success"
+            );
+
+            // Recent runs ledger: a couple of rows come back newest-first.
+            let r1 = start_backup_run(&control, "nightly").await.unwrap();
+            atomic_cloud::finish_backup_run(&control, &r1, 2, 1, 1)
+                .await
+                .unwrap();
+            let r2 = start_backup_run(&control, "final").await.unwrap();
+            let runs = recent_backup_runs(&control, 10).await.unwrap();
+            assert!(runs.len() >= 2, "at least the two runs we inserted");
+            assert_eq!(runs[0].id, r2, "newest first");
+            assert_eq!(runs[0].kind, "final");
+            assert!(runs[0].finished_at.is_none(), "r2 still in-flight");
+            let r1_row = runs.iter().find(|r| r.id == r1).expect("r1 present");
+            assert_eq!(
+                (r1_row.total, r1_row.succeeded, r1_row.failed),
+                (Some(2), Some(1), Some(1))
+            );
+        },
+    )
+    .await;
+}
+
+/// `backup list --subdomain` reads: a tenant's own dumps (nightly by db_name,
+/// final by account id) and never another tenant's. Drives the same
+/// `dumps_for_account` query the CLI's `List` arm prints.
+#[tokio::test]
+async fn dumps_for_account_lists_only_that_tenants_dumps() {
+    let (_dir, store) = temp_store();
+    let acct_a = "11111111-2222-3333-4444-555555555555";
+    let db_a = "acct_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let acct_b = "99999999-8888-7777-6666-555555555555";
+    let db_b = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Two nightly dumps (different days) + one final for tenant A.
+    store
+        .put(
+            "backups/2026-06-10/acct_aaaaaaaaaaaaaaaaaaaaaaaaaa.dump",
+            b"a1".to_vec(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "backups/2026-06-11/acct_aaaaaaaaaaaaaaaaaaaaaaaaaa.dump",
+            b"a2".to_vec(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            &format!("backups/final/{acct_a}-20260612T010203Z.dump"),
+            b"af".to_vec(),
+        )
+        .await
+        .unwrap();
+    // Tenant B's dumps + a control-plane dump must NOT leak into A's listing.
+    store
+        .put(
+            "backups/2026-06-11/acct_bbbbbbbbbbbbbbbbbbbbbbbbbb.dump",
+            b"b1".to_vec(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            &format!("backups/final/{acct_b}-20260612T010203Z.dump"),
+            b"bf".to_vec(),
+        )
+        .await
+        .unwrap();
+    store
+        .put("backups/2026-06-11/control.dump", b"ctl".to_vec())
+        .await
+        .unwrap();
+
+    let keys = dumps_for_account(&store, acct_a, db_a).await.unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            "backups/2026-06-10/acct_aaaaaaaaaaaaaaaaaaaaaaaaaa.dump".to_string(),
+            "backups/2026-06-11/acct_aaaaaaaaaaaaaaaaaaaaaaaaaa.dump".to_string(),
+            format!("backups/final/{acct_a}-20260612T010203Z.dump"),
+        ],
+        "tenant A sees exactly its two nightly dumps + its final, sorted"
+    );
+
+    // Tenant B is symmetric and disjoint — no cross-tenant leakage.
+    let keys_b = dumps_for_account(&store, acct_b, db_b).await.unwrap();
+    assert_eq!(
+        keys_b,
+        vec![
+            "backups/2026-06-11/acct_bbbbbbbbbbbbbbbbbbbbbbbbbb.dump".to_string(),
+            format!("backups/final/{acct_b}-20260612T010203Z.dump"),
+        ]
+    );
 }

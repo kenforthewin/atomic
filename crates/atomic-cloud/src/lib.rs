@@ -78,10 +78,11 @@ pub use backup::{
 };
 pub use backup_store::{BackupStore, LocalFileSystemStore, S3Config, S3Store};
 pub use backups::{
-    final_dump_before_delete, finish_backup_run, list_active_tenant_databases,
-    record_backup_failure, record_backup_success, run_backup_pass, stale_tenant_backups,
-    start_backup_run, tenant_database_exists, BackupConfig, BackupSummary, BackupTarget,
-    StaleBackup, DEFAULT_MAX_BACKUPS_PER_PASS, DEFAULT_STALENESS_HORIZON,
+    dumps_for_account, final_dump_before_delete, finish_backup_run, list_active_tenant_databases,
+    recent_backup_runs, record_backup_failure, record_backup_success, run_backup_pass,
+    stale_tenant_backups, start_backup_run, tenant_backup_status, tenant_database_exists,
+    BackupConfig, BackupRunRecord, BackupSummary, BackupTarget, StaleBackup, TenantBackupStatus,
+    DEFAULT_MAX_BACKUPS_PER_PASS, DEFAULT_STALENESS_HORIZON,
 };
 pub use billing::dunning::{
     advance_dunning, advance_dunning_with, advance_expired_trials, apply_payment_failed,

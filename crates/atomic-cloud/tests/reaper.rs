@@ -12,10 +12,13 @@ mod support;
 
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use atomic_cloud::reaper::{reaper_lock_key, run_reaper_pass, ReaperPolicy, ReaperSummary};
 use atomic_cloud::{
-    provision_account, record_migration_success, tenant_db_name, tenant_schema_target,
-    ClusterConfig, ControlPlane, ManagedKeys, NewAccount, ProvisionedAccount,
+    provision_account, record_migration_success, tenant_db_name, tenant_schema_target, BackupStore,
+    CloudError, ClusterConfig, ControlPlane, ManagedKeys, NewAccount, ProvisionedAccount,
 };
 use sqlx::{Connection, PgConnection};
 use support::{create_database, drop_database, with_control_db, with_db_guard};
@@ -1707,6 +1710,98 @@ async fn old_binary_success_recording_cannot_strand_the_tenant() {
                 .expect("read tenant schema version");
             conn.close().await.expect("close");
             assert_eq!(schema, target);
+        },
+    )
+    .await;
+}
+
+// ==================== Reaper never takes a final dump for never-activated DBs ====
+
+/// A [`BackupStore`] that counts `put` calls so a test can prove the reaper's
+/// rollback/orphan arms never attempt a final dump. Any `put` is a bug: those
+/// arms drop never-activated databases that hold no user data (and may not
+/// even be dumpable). Only `delete_account` of an *active* account dumps; the
+/// reaper exercises that solely via its interrupted-deletion arm, which is
+/// covered separately in `tests/backup.rs`.
+#[derive(Default)]
+struct CountingBackupStore {
+    puts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BackupStore for CountingBackupStore {
+    async fn put(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), CloudError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn get(&self, _key: &str) -> Result<Vec<u8>, CloudError> {
+        unreachable!("reaper rollback never reads a dump")
+    }
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>, CloudError> {
+        Ok(Vec::new())
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, CloudError> {
+        Ok(false)
+    }
+}
+
+/// The reaper exemption (plan: "Backups & disaster recovery" → the final dump
+/// is scoped to active-account deletion): the stuck-provision *rollback* arm
+/// drops a never-activated tenant database WITHOUT taking a final dump, even
+/// when a backup store is configured. Mirrors
+/// `unresumable_stale_provision_is_rolled_back`, but hands the reaper a
+/// counting store and asserts it was never touched — a never-initialized
+/// database holds no user data and the dump is correctly skipped.
+#[tokio::test]
+async fn reaper_rollback_drops_without_a_final_dump() {
+    with_control_db(
+        "reaper_rollback_drops_without_a_final_dump",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let account_id = Uuid::new_v4();
+            // "not-an-email" fails provision_account's validation, so the
+            // resume deterministically fails and the row is rolled back.
+            seed_provisioning_row(&control, account_id, "not-an-email", "norescue", 10).await;
+            let db_name = tenant_db_name(account_id);
+            create_database(&cluster.cluster_url, &db_name).await;
+            sqlx::query(
+                "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
+                 VALUES ($1, 'test-cluster-1', $2, 'active')",
+            )
+            .bind(account_id.to_string())
+            .bind(&db_name)
+            .execute(control.pool())
+            .await
+            .expect("seed mapping row");
+
+            with_db_guard(&cluster.cluster_url, &db_name, || async {
+                let store = Arc::new(CountingBackupStore::default());
+                let policy = ReaperPolicy {
+                    // A configured store must STILL not be used by the
+                    // rollback arm — the exemption is structural (the arm
+                    // doesn't route through delete_account), not store-gated.
+                    backup_store: Some(store.clone() as Arc<dyn BackupStore>),
+                    ..ReaperPolicy::default()
+                };
+                let summary =
+                    run_reaper_pass(&control, &cluster, &ManagedKeys::Disabled, &policy).await;
+                assert_no_errors(&summary);
+                assert_eq!(summary.stuck_rolled_back, vec![account_id.to_string()]);
+
+                // The database was dropped (rollback ran)...
+                assert!(
+                    !database_exists(&cluster.cluster_url, &db_name).await,
+                    "the never-activated tenant database must be dropped"
+                );
+                // ...but NO final dump was attempted — the cardinal exemption.
+                assert_eq!(
+                    store.puts.load(Ordering::SeqCst),
+                    0,
+                    "the reaper's rollback arm must take no final dump for a \
+                     never-activated database"
+                );
+            })
+            .await;
         },
     )
     .await;

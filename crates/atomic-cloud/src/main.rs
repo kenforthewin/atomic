@@ -268,8 +268,10 @@ enum Command {
         action: DeployAction,
     },
 
-    /// Logical-backup operations: restore a dump into a fresh database
-    /// (plan: "Backups & disaster recovery" → "Restore runbook").
+    /// Logical-backup operations (plan: "Backups & disaster recovery"):
+    /// `run` one pass now, `status` (per-tenant freshness + stale tenants +
+    /// recent runs), `list` a tenant's dumps, and `restore` a dump into a
+    /// fresh database (the runbook).
     Backup {
         #[command(subcommand)]
         action: BackupAction,
@@ -1062,6 +1064,60 @@ enum DeployAction {
 
 #[derive(Subcommand)]
 enum BackupAction {
+    /// Run one nightly backup pass now: dump every active tenant database
+    /// (each under its own per-account advisory lock, so a concurrent serve
+    /// pass never double-dumps a tenant) plus the control plane to the
+    /// configured store, and record a `backup_runs` ledger row. Prints the
+    /// observable summary. This is the same `run_backup_pass` the serve loop
+    /// runs on its interval — useful for an out-of-band catch-up or a
+    /// rehearsal.
+    Run {
+        #[command(flatten)]
+        cluster: ClusterArgs,
+
+        #[command(flatten)]
+        backup: BackupArgs,
+
+        /// Max successful tenant dumps this pass before deferring the rest
+        /// (stale-first ordering, so the next pass picks up the remainder).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_MAX_BACKUPS_PER_PASS",
+            default_value_t = atomic_cloud::DEFAULT_MAX_BACKUPS_PER_PASS
+        )]
+        max_backups_per_pass: usize,
+    },
+
+    /// Report backup health: each active tenant's last successful backup (and
+    /// last error), the staleness alert horizon, the tenants currently past
+    /// it, and the most recent `backup_runs` ledger rows. The operator's
+    /// "is the backup job actually working?" check (plan: "an unmonitored
+    /// backup job is a placebo").
+    Status {
+        /// Staleness alert horizon, in seconds — tenants whose last
+        /// successful backup is older than this are flagged stale (plan:
+        /// ">36h old").
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_BACKUP_STALENESS_SECS",
+            default_value_t = atomic_cloud::DEFAULT_STALENESS_HORIZON.as_secs()
+        )]
+        staleness_secs: u64,
+    },
+
+    /// List one tenant's dumps in the configured store (its nightly dumps
+    /// plus any final dump). Per-tenant by construction — the keys are named
+    /// by this tenant's `db_name` and account id, so another tenant's backups
+    /// never surface.
+    List {
+        #[command(flatten)]
+        backup: BackupArgs,
+
+        /// Subdomain of the account whose dumps to list.
+        #[arg(long)]
+        subdomain: String,
+    },
+
     /// Restore a tenant dump (object key in the configured backup store) into
     /// a FRESH database, then print the runbook's remaining manual steps.
     ///
@@ -1409,6 +1465,167 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Backup { action } => match action {
+            BackupAction::Run {
+                cluster,
+                backup,
+                max_backups_per_pass,
+            } => {
+                let cluster = cluster.into_config();
+                let store = backup.into_store()?;
+                let config = atomic_cloud::BackupConfig {
+                    max_backups_per_pass,
+                    ..atomic_cloud::BackupConfig::default()
+                };
+                let now = chrono::Utc::now();
+                let summary =
+                    atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+
+                println!("backup pass complete:");
+                println!(
+                    "  tenants backed up:    {}",
+                    summary.tenants_backed_up.len()
+                );
+                println!(
+                    "  tenants skipped (locked by another pod): {}",
+                    summary.tenants_skipped_locked.len()
+                );
+                println!(
+                    "  tenants deferred (over cap): {}",
+                    summary.tenants_deferred.len()
+                );
+                println!("  tenants failed:       {}", summary.tenants_failed.len());
+                println!(
+                    "  control plane:        {}",
+                    if summary.control_backed_up {
+                        "backed up"
+                    } else {
+                        "FAILED"
+                    }
+                );
+                for err in &summary.errors {
+                    eprintln!("  error: {err}");
+                }
+                // A pass with any per-target failure or a control-dump miss
+                // exits non-zero so a cron/operator wrapper notices.
+                if !summary.tenants_failed.is_empty()
+                    || !summary.control_backed_up
+                    || !summary.errors.is_empty()
+                {
+                    return Err(format!(
+                        "backup pass completed with {} tenant failure(s); control plane {}",
+                        summary.tenants_failed.len(),
+                        if summary.control_backed_up {
+                            "ok"
+                        } else {
+                            "FAILED"
+                        }
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+
+            BackupAction::Status { staleness_secs } => {
+                let horizon = std::time::Duration::from_secs(staleness_secs);
+                let now = chrono::Utc::now();
+
+                let statuses = atomic_cloud::tenant_backup_status(&control).await?;
+                println!(
+                    "per-tenant backup status ({} active tenant(s)):",
+                    statuses.len()
+                );
+                for s in &statuses {
+                    let last = s
+                        .last_backup_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "never".into());
+                    print!("  {} ({}) last_backup_at={last}", s.subdomain, s.db_name);
+                    if let Some(err) = &s.last_backup_error {
+                        print!("  last_error={err:?}");
+                    }
+                    println!();
+                }
+
+                let stale = atomic_cloud::stale_tenant_backups(&control, horizon, now).await?;
+                println!();
+                if stale.is_empty() {
+                    println!(
+                        "no stale tenants (all active tenants backed up within {}s).",
+                        horizon.as_secs()
+                    );
+                } else {
+                    println!(
+                        "STALE: {} tenant(s) past the {}s horizon (no successful backup):",
+                        stale.len(),
+                        horizon.as_secs()
+                    );
+                    for t in &stale {
+                        let last = t
+                            .last_backup_at
+                            .map(|x| x.to_rfc3339())
+                            .unwrap_or_else(|| "never".into());
+                        println!(
+                            "  {} (account {}) last_backup_at={last}",
+                            t.db_name, t.account_id
+                        );
+                    }
+                }
+
+                let runs = atomic_cloud::recent_backup_runs(&control, 10).await?;
+                println!();
+                println!("recent backup runs (newest first):");
+                for r in &runs {
+                    let finished = r
+                        .finished_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "in-flight".into());
+                    println!(
+                        "  {} kind={} started={} finished={} total={:?} ok={:?} failed={:?}",
+                        r.id,
+                        r.kind,
+                        r.started_at.to_rfc3339(),
+                        finished,
+                        r.total,
+                        r.succeeded,
+                        r.failed
+                    );
+                }
+                Ok(())
+            }
+
+            BackupAction::List { backup, subdomain } => {
+                let account_id = control
+                    .account_id_by_subdomain(&subdomain)
+                    .await?
+                    .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
+                // The tenant's active db_name names its nightly dumps; the
+                // account id names its final dumps.
+                let db_name: String = sqlx::query_scalar(
+                    "SELECT db_name FROM account_databases \
+                     WHERE account_id = $1 AND status = 'active' \
+                     ORDER BY created_at LIMIT 1",
+                )
+                .bind(&account_id)
+                .fetch_optional(control.pool())
+                .await
+                .map_err(|e| format!("looking up tenant db_name: {e}"))?
+                .ok_or_else(|| {
+                    format!("account {account_id} ({subdomain}) has no active tenant database")
+                })?;
+
+                let store = backup.into_store()?;
+                let keys = atomic_cloud::dumps_for_account(&store, &account_id, &db_name).await?;
+                println!(
+                    "{} dump(s) for {subdomain} (account {account_id}, db {db_name}):",
+                    keys.len()
+                );
+                for key in &keys {
+                    let size = store.get(key).await.map(|b| b.len()).unwrap_or(0);
+                    println!("  {key}  ({size} bytes)");
+                }
+                Ok(())
+            }
+
             BackupAction::Restore {
                 cluster,
                 backup,
