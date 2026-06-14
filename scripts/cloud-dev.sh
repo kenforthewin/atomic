@@ -76,6 +76,19 @@ say "migrating the control plane (${CONTROL_URL##*/})"
 cargo run -q -p atomic-cloud -- --control-url "${CONTROL_URL}" migrate
 
 # --- 4. serve ---------------------------------------------------------------
+# Managed OpenRouter keys: opt in by exporting a provisioning key. When set,
+# new signups mint a per-tenant OpenRouter runtime key (allowance default 50¢,
+# OpenRouter-enforced); otherwise provisioning stays disabled (keyless tenants,
+# use BYOK from the dashboard). Real OpenRouter spend — delete test accounts to
+# clean up their keys.
+PROVISIONING_ARGS=()
+if [[ -n "${ATOMIC_CLOUD_OPENROUTER_PROVISIONING_KEY:-}" ]]; then
+  PROVISIONING_ARGS=(--provisioning-mode openrouter)
+  say "managed provisioning ON (OpenRouter) — new signups get a per-tenant key"
+else
+  say "managed provisioning OFF (export ATOMIC_CLOUD_OPENROUTER_PROVISIONING_KEY to enable)"
+fi
+
 say "starting the cloud server on http://${BIND}:${PORT}  (Ctrl-C to stop)"
 say "open http://app.${BASE_DOMAIN}:${PORT}/  — magic-link login URLs print below"
 echo
@@ -87,5 +100,6 @@ exec cargo run -q -p atomic-cloud -- --control-url "${CONTROL_URL}" serve \
   --email-mode log \
   --dangerously-insecure-cookies \
   --reaper-interval-secs 0 \
+  "${PROVISIONING_ARGS[@]}" \
   --spa-dir "${ACCOUNT_DIST}" \
   --product-dir "${PRODUCT_DIST}"
