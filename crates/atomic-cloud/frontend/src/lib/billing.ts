@@ -99,3 +99,84 @@ export function billingNotice(
       };
   }
 }
+
+/**
+ * Start a Stripe-owned billing flow (the `/api/billing/checkout` or
+ * `/api/billing/portal` GET routes). Both 302 cross-origin to a Stripe URL on
+ * success, or return a JSON error (`unknown_plan`, `billing_not_configured`,
+ * `409` no-customer-yet, upstream `502`) on a misconfig/edge.
+ *
+ * Stripe owns checkout — there are no Elements here. We just must not navigate
+ * the browser straight onto the route, because a JSON error would paint a raw
+ * error page. So we *probe* it first with `redirect: 'manual'`:
+ *
+ * - On the cross-origin redirect the response is opaque (`type:
+ *   'opaqueredirect'`, status `0`) — we can't read the `Location`, so we let the
+ *   browser follow it by navigating to the route URL (a top-level navigation,
+ *   which is what the Customer Portal / Checkout require anyway). The probe is a
+ *   cheap idempotent GET; re-running it to redirect for real is fine.
+ * - On a JSON error response we read its message and reject, so the caller can
+ *   surface an in-app banner instead of a raw error page.
+ *
+ * Rejects with a {@link BillingFlowError} carrying a friendly message; never
+ * resolves on the success path (the navigation supersedes this promise).
+ */
+export class BillingFlowError extends Error {}
+
+export async function startBillingFlow(path: string): Promise<never> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      credentials: 'include',
+      redirect: 'manual',
+    });
+  } catch {
+    throw new BillingFlowError(
+      "We couldn't reach the billing service. Check your connection and try again.",
+    );
+  }
+
+  // The cross-origin 302 to Stripe surfaces as an opaque redirect; follow it
+  // with a real top-level navigation.
+  if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
+    window.location.assign(path);
+    // The navigation supersedes this promise; keep the caller's `await` pending.
+    return new Promise<never>(() => {});
+  }
+
+  // Anything else is an error the route reported as JSON — surface it in-app
+  // rather than navigating onto it.
+  throw new BillingFlowError(await billingErrorMessage(response));
+}
+
+/** Map a non-redirect billing route response to a friendly, in-app message. */
+async function billingErrorMessage(response: Response): Promise<string> {
+  let body: unknown = null;
+  try {
+    const text = await response.text();
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+  const code =
+    body && typeof body === 'object' && typeof (body as Record<string, unknown>).error === 'string'
+      ? ((body as Record<string, unknown>).error as string)
+      : null;
+  const message =
+    body && typeof body === 'object' && typeof (body as Record<string, unknown>).message === 'string'
+      ? ((body as Record<string, unknown>).message as string)
+      : null;
+
+  switch (code) {
+    case 'unknown_plan':
+      return 'That plan isn’t available for checkout on this deployment. Please contact support.';
+    case 'billing_not_configured':
+      return 'Billing isn’t enabled on this deployment, so there’s nothing to set up.';
+    default:
+      return (
+        message ?? 'We couldn’t start the billing session. Please try again in a moment.'
+      );
+  }
+}

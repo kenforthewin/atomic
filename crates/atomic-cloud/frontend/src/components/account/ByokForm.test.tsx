@@ -87,4 +87,37 @@ describe('ByokForm', () => {
     // And the secret never appears as visible text anywhere in the document.
     expect(screen.queryByText('sk-or-secret-value')).not.toBeInTheDocument();
   });
+
+  it('re-enables the form after a successful save (not stuck submitting)', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(apiModule, 'saveByokProvider').mockResolvedValue({
+      status: 'saved',
+      provider: 'openrouter',
+      origin: 'user',
+      reembed_warning: null,
+    });
+    // The parent reloads status in place (it bumps a nonce — this same instance
+    // stays mounted), so a save that left `submitting` set would brick the form.
+    render(<ByokForm hasExistingKey onSaved={() => {}} />);
+
+    const submit = () => screen.getByRole('button', { name: /replace key|validating/i });
+    await user.type(screen.getByLabelText(/new api key/i), 'sk-or-secret-value');
+    await user.click(submit());
+
+    // After the save resolves the button must return to its idle label and be
+    // usable again — never frozen in the 'Validating…' / disabled state.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /replace key/i })).toBeInTheDocument();
+    });
+    const button = screen.getByRole('button', { name: /replace key/i });
+    expect(button).not.toHaveAttribute('aria-busy', 'true');
+    // The key field is cleared on success, so submit is (correctly) disabled
+    // for being empty — re-typing a key must re-enable it, proving the form
+    // isn't disabled by a stuck `submitting` flag.
+    expect(screen.queryByRole('button', { name: /validating/i })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText(/new api key/i), 'sk-or-another');
+    expect(screen.getByRole('button', { name: /replace key/i })).toBeEnabled();
+    // And every field is interactive again (not disabled by `submitting`).
+    expect(screen.getByLabelText(/new api key/i)).toBeEnabled();
+  });
 });

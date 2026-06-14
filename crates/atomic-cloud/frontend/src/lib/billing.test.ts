@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { billingDescriptor, billingNotice } from './billing';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { billingDescriptor, billingNotice, startBillingFlow, BillingFlowError } from './billing';
 import type { BillingState } from './api';
 
 const ALL_STATES: BillingState[] = [
@@ -75,5 +75,75 @@ describe('billingNotice', () => {
   it('keeps the read-only and suspended copy reassuring about data retention', () => {
     expect(billingNotice('read_only', null)?.body).toMatch(/data is safe/i);
     expect(billingNotice('suspended', null)?.body).toMatch(/retained/i);
+  });
+});
+
+describe('startBillingFlow', () => {
+  const realFetch = globalThis.fetch;
+  const realLocation = window.location;
+  let assign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    assign = vi.fn();
+    // jsdom's `location.assign` is non-configurable, so swap the whole object
+    // for a mock that records the navigation target.
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...realLocation, assign },
+    });
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: realLocation,
+    });
+    vi.restoreAllMocks();
+  });
+
+  it('follows an opaque cross-origin redirect with a top-level navigation', async () => {
+    // The real Stripe 302 surfaces as an opaque redirect (status 0, type
+    // 'opaqueredirect') under `redirect: 'manual'`. The Response ctor can't
+    // mint that type, so stand in a minimal shape the helper reads.
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue({ type: 'opaqueredirect', status: 0 }) as unknown as typeof fetch;
+
+    // Never resolves on success — the navigation supersedes it — so race it.
+    const flow = startBillingFlow('/api/billing/checkout?plan=pro');
+    await Promise.race([flow, new Promise((r) => setTimeout(r, 10))]);
+
+    expect(assign).toHaveBeenCalledWith('/api/billing/checkout?plan=pro');
+  });
+
+  it('surfaces a friendly message for an unmapped plan (unknown_plan JSON)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'unknown_plan', message: 'No such purchasable plan.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    await expect(startBillingFlow('/api/billing/checkout?plan=pro')).rejects.toBeInstanceOf(
+      BillingFlowError,
+    );
+    // Never navigates onto the raw JSON.
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it('maps billing_not_configured to a friendly in-app message', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'billing_not_configured' }), { status: 503 }),
+    ) as unknown as typeof fetch;
+
+    await expect(startBillingFlow('/api/billing/portal')).rejects.toThrow(/billing isn’t enabled/i);
+  });
+
+  it('reports a friendly message when the request itself fails', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('network down')) as unknown as typeof fetch;
+
+    await expect(startBillingFlow('/api/billing/portal')).rejects.toThrow(/couldn't reach/i);
+    expect(assign).not.toHaveBeenCalled();
   });
 });

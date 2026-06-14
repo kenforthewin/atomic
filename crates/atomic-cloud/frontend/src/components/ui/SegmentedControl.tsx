@@ -42,6 +42,11 @@ export function SegmentedControl<T extends string>({
               key={seg.value}
               className={cn(
                 'relative flex cursor-pointer flex-col gap-0.5 rounded-xl border p-4 transition-all',
+                // Keyboard focus lands on the visually-hidden radio; mirror it
+                // onto the visible card with the app's accent focus ring so a
+                // tabbing/arrowing user can see where they are. Distinct from
+                // selection (border/background warming), which can coexist.
+                'has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent',
                 selected
                   ? 'border-accent/50 bg-accent-subtle/60 shadow-sm'
                   : 'border-border bg-bg-white hover:border-accent/30 hover:bg-accent-subtle/30',

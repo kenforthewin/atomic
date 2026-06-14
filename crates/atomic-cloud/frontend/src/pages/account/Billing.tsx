@@ -1,29 +1,35 @@
+import { useState } from 'react';
 import { CreditCard, ExternalLink } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import { useAccount } from '../../lib/accountContext';
 import { Card } from '../../components/ui/Card';
 import { StatusPill } from '../../components/ui/StatusPill';
 import { Banner } from '../../components/ui/Banner';
+import { Spinner } from '../../components/ui/Spinner';
 import { UsageMeter } from '../../components/account/UsageMeter';
 import type { BillingState } from '../../lib/api';
-import { billingDescriptor } from '../../lib/billing';
+import { billingDescriptor, BillingFlowError, startBillingFlow } from '../../lib/billing';
 import { daysUntil, formatCents, formatDate, formatUsage } from '../../lib/format';
 
 /**
  * Billing = Stripe portal + status. We render the plan, the serving state, and
  * the trial/dunning context, then hand off to Stripe for everything money:
- * "Manage billing" navigates to the portal route (a server 302 into the
- * Customer Portal), and the upgrade CTA navigates to the checkout route. No
- * card entry, invoice tables, or Stripe Elements live here — Stripe owns that.
+ * "Manage billing" opens the portal route (a server 302 into the Customer
+ * Portal), and the upgrade CTA opens the checkout route. No card entry, invoice
+ * tables, or Stripe Elements live here — Stripe owns that.
  *
- * The portal/checkout routes are `GET` redirects, so these are plain
- * navigations (`window.location` via a real `<a href>`), not fetches; a
- * full-page redirect to Stripe is exactly the intended flow, and a top-level
- * navigation is what the Customer Portal requires.
+ * The portal/checkout routes are `GET` redirects to Stripe, but a *misconfig*
+ * (no price mapped for a plan, no customer yet, an upstream error) makes them
+ * answer with JSON instead. Navigating the browser straight onto the route
+ * would then paint a raw JSON error page, so both actions go through
+ * {@link startBillingFlow}: it probes the route (`redirect: 'manual'`), follows
+ * the real Stripe redirect with a top-level navigation, and on a JSON error
+ * surfaces an in-app banner instead. The full-page redirect to Stripe is still
+ * exactly the intended flow.
  *
  * When Stripe isn't configured on the deployment (`billing_configured: false`),
- * those routes 503 `billing_not_configured`; rather than navigate the browser
- * onto a raw error, we disable the actions and explain.
+ * those routes 503 `billing_not_configured`; we disable the actions up front and
+ * explain, so the flow isn't even attempted.
  */
 export function Billing() {
   const { overview } = useAccount();
@@ -31,6 +37,27 @@ export function Billing() {
   const { plan, usage, billing_configured: configured } = overview;
   const status = billingDescriptor(overview.billing_state);
   const trialDays = daysUntil(overview.trial_ends_at);
+  // Which flow (if any) is in flight, plus any in-app error from a misconfig —
+  // so a bad checkout/portal lands as a banner here, not a raw JSON page.
+  const [pending, setPending] = useState<'checkout' | 'portal' | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
+
+  async function openBillingFlow(kind: 'checkout' | 'portal', path: string) {
+    setFlowError(null);
+    setPending(kind);
+    try {
+      // Resolves only into a navigation away; a rejection means a misconfig we
+      // surface in-app rather than letting the browser land on raw JSON.
+      await startBillingFlow(path);
+    } catch (err) {
+      setFlowError(
+        err instanceof BillingFlowError
+          ? err.message
+          : 'We couldn’t start the billing session. Please try again in a moment.',
+      );
+      setPending(null);
+    }
+  }
   // The free tier (and the trial of it) can upgrade; a paid plan manages
   // through the portal. `pro` is the seeded purchasable tier.
   const canUpgrade = plan.id === 'free' || overview.billing_state === 'trialing';
@@ -85,25 +112,45 @@ export function Billing() {
           trialEndsAt={overview.trial_ends_at}
         />
 
+        {flowError && (
+          <Banner tone="error" title="Couldn’t open billing" className="mt-6">
+            {flowError}
+          </Banner>
+        )}
+
         <div className="mt-6 flex flex-wrap gap-3">
           {canUpgrade && configured && (
-            <a
-              href="/api/billing/checkout?plan=pro"
-              className="group inline-flex items-center justify-center gap-2.5 rounded-xl bg-accent px-7 py-3.5 text-base font-medium text-white transition-all hover:bg-accent-dark hover:shadow-lg hover:shadow-accent/20 focus-visible:outline-2"
+            <button
+              type="button"
+              onClick={() => openBillingFlow('checkout', '/api/billing/checkout?plan=pro')}
+              disabled={pending !== null}
+              aria-busy={pending === 'checkout' || undefined}
+              className="group inline-flex items-center justify-center gap-2.5 rounded-xl bg-accent px-7 py-3.5 text-base font-medium text-white transition-all hover:bg-accent-dark hover:shadow-lg hover:shadow-accent/20 disabled:cursor-not-allowed disabled:opacity-60"
             >
+              {pending === 'checkout' ? (
+                <Spinner className="h-5 w-5" label="Starting checkout" />
+              ) : (
+                <ExternalLink className="h-4 w-4 opacity-80" aria-hidden="true" />
+              )}
               Upgrade to Pro
-              <ExternalLink className="h-4 w-4 opacity-80" aria-hidden="true" />
-            </a>
+            </button>
           )}
           {configured && (
-            <a
-              href="/api/billing/portal"
-              className="inline-flex items-center justify-center gap-2.5 rounded-xl border border-border bg-bg-white px-7 py-3.5 text-base font-medium text-text-primary transition-all hover:border-accent/30 hover:bg-accent-subtle/50 focus-visible:outline-2"
+            <button
+              type="button"
+              onClick={() => openBillingFlow('portal', '/api/billing/portal')}
+              disabled={pending !== null}
+              aria-busy={pending === 'portal' || undefined}
+              className="inline-flex items-center justify-center gap-2.5 rounded-xl border border-border bg-bg-white px-7 py-3.5 text-base font-medium text-text-primary transition-all hover:border-accent/30 hover:bg-accent-subtle/50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <CreditCard className="h-5 w-5" strokeWidth={1.5} aria-hidden="true" />
+              {pending === 'portal' ? (
+                <Spinner className="h-5 w-5 text-accent" label="Opening billing" />
+              ) : (
+                <CreditCard className="h-5 w-5" strokeWidth={1.5} aria-hidden="true" />
+              )}
               Manage billing
               <ExternalLink className="h-4 w-4 text-text-muted" aria-hidden="true" />
-            </a>
+            </button>
           )}
         </div>
 

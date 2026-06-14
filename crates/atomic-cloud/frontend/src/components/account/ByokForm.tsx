@@ -86,6 +86,12 @@ export function ByokForm({ hasExistingKey, onSaved }: ByokFormProps) {
       } else {
         setError('Something went wrong saving your provider. Please try again.');
       }
+    } finally {
+      // Always re-enable the form. The parent reloads status in place (it bumps
+      // a nonce — this same instance stays mounted), so without this the button
+      // would be stuck spinning and every field disabled after a *successful*
+      // save. The parent surfaces the "Saved" affordance; here we just return
+      // to an idle, usable state.
       setSubmitting(false);
     }
   }
