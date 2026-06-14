@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="512" height="512" viewBox="0 0 100 100" version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <mask id="nodeGaps" maskUnits="userSpaceOnUse">
+      <rect width="100" height="100" fill="white"/>
+      <circle cx="18.8" cy="62.4" r="7.2" fill="black"/>
+      <circle cx="49.9" cy="46.8" r="7.2" fill="black"/>
+      <circle cx="81.0" cy="42"   r="7.2" fill="black"/>
+      <circle cx="49.9" cy="80.0" r="7.2" fill="black"/>
+      <circle cx="81.0" cy="78.8" r="7.2" fill="black"/>
+    </mask>
+  </defs>
+  <g mask="url(#nodeGaps)">
+    <path d="M 49.9,80 A 32.6,32.6 0 1,1 81.0,42"
+      stroke="#9333ea" stroke-width="5" stroke-linecap="round" fill="none"/>
+    <line x1="18.8" y1="62.4" x2="49.9" y2="46.8" stroke="#9333ea" stroke-width="5" stroke-linecap="round"/>
+    <line x1="49.9" y1="46.8" x2="81.0" y2="42" stroke="#9333ea" stroke-width="5" stroke-linecap="round"/>
+    <line x1="49.9" y1="46.8" x2="49.9" y2="80.0" stroke="#9333ea" stroke-width="5" stroke-linecap="round"/>
+    <line x1="81.0" y1="42" x2="81.0" y2="78.8" stroke="#9333ea" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <circle cx="18.8" cy="62.4" r="6" fill="#9333ea"/>
+  <circle cx="49.9" cy="46.8" r="6" fill="#9333ea"/>
+  <circle cx="81.0" cy="42"   r="6" fill="#9333ea"/>
+  <circle cx="49.9" cy="80.0" r="6" fill="#9333ea"/>
+  <circle cx="81.0" cy="78.8" r="6" fill="#9333ea"/>
+</svg>

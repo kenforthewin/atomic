@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Atomic Cloud — a hosted, AI-native knowledge graph. Your notes, semantically connected, run for you." />
+    <meta name="theme-color" content="#faf9f7" />
+    <!--
+      The cloud server injects the base domain here at serve time so the SPA
+      can tell the app host from a tenant subdomain. Falls back to the runtime
+      window.location parsing when the placeholder is left untouched (dev).
+    -->
+    <meta name="atomic-cloud-base-domain" content="__ATOMIC_CLOUD_BASE_DOMAIN__" />
+    <title>Atomic Cloud</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
