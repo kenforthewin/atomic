@@ -138,7 +138,9 @@ enum Command {
         /// back stuck provisions, reclaims orphaned tenant databases,
         /// clears self-reservations, and purges expired links/sessions/
         /// reservations. Per-account advisory locks make concurrent passes
-        /// across pods safe.
+        /// across pods safe. `0` disables the reaper entirely — dev only, for
+        /// a box whose tenant cluster is SHARED with the test suite, where
+        /// orphan-reclaim would otherwise drop the suite's `acct_*` databases.
         #[arg(long, env = "ATOMIC_CLOUD_REAPER_INTERVAL_SECS", default_value_t = 60)]
         reaper_interval_secs: u64,
 
@@ -1381,7 +1383,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cache_config,
                 cache_sweep_interval_secs.map(std::time::Duration::from_secs),
                 // tokio::time::interval panics on a zero period; clamp.
-                std::time::Duration::from_secs(reaper_interval_secs.max(1)),
+                std::time::Duration::from_secs(reaper_interval_secs),
                 email.into_sender()?,
                 plane_config,
                 dispatcher_config,
@@ -2302,6 +2304,17 @@ async fn run_reaper_loop(
         backup_timeout,
         ..atomic_cloud::ReaperPolicy::default()
     };
+    // `--reaper-interval-secs 0` disables the reaper (dev only): a local box
+    // doesn't need stuck-provision recovery or orphan reclaim, and orphan
+    // reclaim on a cluster SHARED with the test suite would drop the suite's
+    // `acct_*` tenant databases (they're orphans relative to this control
+    // plane). Pend forever rather than return — completing would fire the
+    // serve `select!` arm and stop the server.
+    if reaper_interval.is_zero() {
+        tracing::warn!("reaper disabled (--reaper-interval-secs 0); dev only");
+        std::future::pending::<()>().await;
+        return;
+    }
     let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
         &mut rand::thread_rng(),
         0..=reaper_interval.as_millis() as u64,

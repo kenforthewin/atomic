@@ -86,5 +86,6 @@ exec cargo run -q -p atomic-cloud -- --control-url "${CONTROL_URL}" serve \
   --bind "${BIND}" --port "${PORT}" \
   --email-mode log \
   --dangerously-insecure-cookies \
+  --reaper-interval-secs 0 \
   --spa-dir "${ACCOUNT_DIST}" \
   --product-dir "${PRODUCT_DIST}"

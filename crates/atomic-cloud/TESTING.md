@@ -206,13 +206,15 @@ faithful through the built-and-served path above, so do a final pass there.
 
 ## Two things that will bite you
 
-1. **Never point a dev `serve` at the test cluster (`atomic_cloud_test_*` / the
-   suite's DBs) while tests run.** The server's reaper drops tenant databases
-   it doesn't recognize, which includes the test suite's. Use a **separate dev
-   control DB** (`atomic_cloud_dev`, as above) and **stop the dev server before
-   running `cargo test`**. The tenant data cluster (`atomic_test`) is shared,
-   but the reaper keys off the control DB, so a distinct control DB keeps them
-   apart.
+1. **The reaper vs. the test suite, on a shared cluster.** The server's
+   orphan-reclaim drops `acct_*` tenant databases it doesn't recognize — which,
+   on the cluster the test suite shares, includes the suite's. `cloud-dev.sh`
+   handles this by passing **`--reaper-interval-secs 0`** (disables the reaper;
+   a dev box doesn't need it), so dev and `cargo test` can run against the same
+   cluster without the reaper eating test DBs. If you run `serve` by hand against
+   the test cluster, pass `--reaper-interval-secs 0` too (or stop it before
+   `cargo test`). Either way, use a **separate dev control DB**
+   (`atomic_cloud_dev`).
 2. **`--dangerously-insecure-cookies` is dev-only.** It exists solely so the
    session cookie survives plain HTTP on a non-`localhost` host. Production
    runs over HTTPS without it.
