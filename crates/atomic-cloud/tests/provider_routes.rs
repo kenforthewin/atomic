@@ -522,6 +522,58 @@ async fn managed_signup_embeds_via_control_plane_config_only() {
     .await;
 }
 
+/// Regression: the data-plane `GET /api/provider/verify` route (atomic-server's
+/// AI-onboarding gate — the product app calls it to decide whether to show the
+/// "configure a provider" step) must report a managed-key account as
+/// **configured**, exactly like the cloud status route and the embedding
+/// pipeline already do.
+///
+/// This is the served-core view of provider config, distinct from the cloud
+/// `/api/account/provider` status route (which reads the control plane) and
+/// from the pipeline (which builds providers from the injected config). The
+/// verify route resolves the *tenant core* the injected managed config was
+/// installed on and asks it whether a provider is configured — so it exercises
+/// the manager→core→`settings_for_ai` overlay end to end. A managed key is
+/// minted at signup, stored encrypted, and pointed-to by the active pointer;
+/// the served core opened with that explicit config must surface it here.
+#[actix_web::test]
+async fn managed_account_verify_route_reports_configured() {
+    with_control_db(
+        "managed_account_verify_route_reports_configured",
+        |url| async move {
+            let h = ProviderHarness::spawn_managed(&url).await;
+            let (account, token) = h.provision("alpha").await;
+
+            // Sanity: provisioning minted exactly one managed key and the
+            // active pointer resolves it (the bug is downstream of storage).
+            assert_eq!(h.api.creates().len(), 1, "one managed key at provision");
+            assert_eq!(
+                active_pointer(&h.control, &account.account_id).await,
+                Some(("openrouter".to_string(), "managed".to_string())),
+                "active pointer resolves the managed row"
+            );
+
+            // The product app's onboarding gate: a fresh account-scope bearer
+            // token (no cookie auth involved) against the tenant subdomain.
+            let resp = h
+                .api(Method::GET, "alpha", "/api/provider/verify")
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("send verify");
+            let (status, body) = h.read(resp).await;
+            assert_eq!(status, StatusCode::OK, "verify route: {body}");
+            assert_eq!(
+                body["configured"], true,
+                "managed-key account is configured per the served core: {body}"
+            );
+
+            h.stop().await;
+        },
+    )
+    .await;
+}
+
 /// BYOK validation failure (plan: "BYOK entry & validation" — reject the
 /// save, surface the provider's error verbatim): a 401 from the key
 /// endpoint produces a 400 carrying the provider's message, stores nothing
