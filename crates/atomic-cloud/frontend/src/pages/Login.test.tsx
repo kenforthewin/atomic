@@ -5,9 +5,9 @@ import { MemoryRouter } from 'react-router-dom';
 import { Login } from './Login';
 import * as apiModule from '../lib/api';
 
-function renderLogin() {
+function renderLogin(initialEntry = '/login') {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <Login />
     </MemoryRouter>,
   );
@@ -56,5 +56,15 @@ describe('Login', () => {
       await screen.findByText(/that email address doesn't look valid/i),
     ).toBeInTheDocument();
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('confirms a just-deleted account when redirected with ?deleted=1', () => {
+    renderLogin('/login?deleted=1');
+    expect(screen.getByText(/your account was deleted/i)).toBeInTheDocument();
+  });
+
+  it('shows no deletion banner on a normal sign-in visit', () => {
+    renderLogin('/login');
+    expect(screen.queryByText(/your account was deleted/i)).not.toBeInTheDocument();
   });
 });

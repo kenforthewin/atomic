@@ -3,31 +3,12 @@ import { renderHook, waitFor } from '@testing-library/react';
 import { useOverview } from './useOverview';
 import * as apiModule from './api';
 import { ApiError } from './api';
-import type { AccountOverview } from './api';
+import { overview } from '../test/fixtures';
 
-const READY: AccountOverview = {
-  subdomain: 'alpha',
-  email: 'alpha@example.com',
-  plan: { id: 'pro', name: 'Pro' },
+const READY = overview({
   billing_state: 'trialing',
   trial_ends_at: '2026-06-28T00:00:00Z',
-  usage: {
-    atoms_used: 3,
-    atom_limit: null,
-    kb_count: 1,
-    kb_limit: null,
-    ai_credits_monthly_cents: 50,
-  },
-  provider: {
-    configured: true,
-    origin: 'managed',
-    provider: 'openrouter',
-    model_config: { embedding_model: 'openai/text-embedding-3-small' },
-    last_validated_at: null,
-    last_validation_error: null,
-  },
-  mcp_url: 'https://alpha.atomic.cloud/mcp',
-};
+});
 
 describe('useOverview', () => {
   beforeEach(() => {

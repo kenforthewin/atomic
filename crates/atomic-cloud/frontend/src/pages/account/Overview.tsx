@@ -10,10 +10,9 @@ import {
 import { useAccount } from '../../lib/accountContext';
 import { Card } from '../../components/ui/Card';
 import { StatusPill } from '../../components/ui/StatusPill';
-import type { PillTone } from '../../components/ui/StatusPill';
 import { UsageMeter } from '../../components/account/UsageMeter';
-import type { BillingState } from '../../lib/api';
 import { formatCents, formatUsage } from '../../lib/format';
+import { billingDescriptor } from '../../lib/billing';
 import { originLabel, providerLabel } from '../../lib/provider';
 
 /**
@@ -201,19 +200,4 @@ function QuickLink({
       </div>
     </Link>
   );
-}
-
-function billingDescriptor(state: BillingState): { tone: PillTone; label: string } {
-  switch (state) {
-    case 'active':
-      return { tone: 'success', label: 'Active' };
-    case 'trialing':
-      return { tone: 'accent', label: 'Trial' };
-    case 'past_due':
-      return { tone: 'warning', label: 'Past due' };
-    case 'read_only':
-      return { tone: 'warning', label: 'Read-only' };
-    case 'suspended':
-      return { tone: 'error', label: 'Suspended' };
-  }
 }

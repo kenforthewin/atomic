@@ -295,6 +295,15 @@ struct PlaneState {
     /// Serializes the provider-mutation routes per account; see
     /// [`AccountLocks`].
     provider_locks: AccountLocks,
+    /// Whether Stripe is configured on this deployment (mirrors
+    /// [`crate::billing_routes::Billing::is_configured`]). Surfaced in the
+    /// account overview so the dashboard's billing page can disable the
+    /// portal/checkout actions with an explanatory note when billing is off,
+    /// rather than navigating the browser onto a raw `billing_not_configured`
+    /// 503. Defaults to `false` (billing disabled) until `serve` flips it via
+    /// [`TenantPlane::with_billing_configured`]; tests that don't exercise
+    /// billing leave the default.
+    billing_configured: bool,
 }
 
 /// Per-account serialization of the provider-mutation routes (BYOK save,
@@ -363,8 +372,34 @@ impl TenantPlane {
                 backup_policy: DeletionBackupPolicy::DisabledAcknowledged,
                 backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
                 provider_locks: AccountLocks::default(),
+                billing_configured: false,
             }),
         }
+    }
+
+    /// Record whether Stripe billing is configured on this deployment, so the
+    /// account overview can tell the dashboard to enable or disable the
+    /// portal/checkout actions (an unconfigured deployment 503s those routes).
+    /// `serve` sets this from [`crate::billing_routes::Billing::is_configured`];
+    /// tests leave the `false` default. Like [`with_backup_store`], this
+    /// rebuilds the shared `web::Data`, so it must be called before the plane
+    /// is shared with workers.
+    ///
+    /// [`with_backup_store`]: TenantPlane::with_backup_store
+    pub fn with_billing_configured(mut self, configured: bool) -> Self {
+        let state = &*self.state;
+        self.state = web::Data::new(PlaneState {
+            control: state.control.clone(),
+            cluster: state.cluster.clone(),
+            managed: state.managed.clone(),
+            vault: state.vault.clone(),
+            cache: Arc::clone(&state.cache),
+            backup_policy: state.backup_policy.clone(),
+            backup_timeout: state.backup_timeout,
+            provider_locks: AccountLocks::default(),
+            billing_configured: configured,
+        });
+        self
     }
 
     /// Wire the backup store the deletion route takes its final pre-drop dump
@@ -390,6 +425,7 @@ impl TenantPlane {
             backup_policy: DeletionBackupPolicy::Enabled(store),
             backup_timeout: timeout,
             provider_locks: AccountLocks::default(),
+            billing_configured: state.billing_configured,
         });
         self
     }
@@ -558,6 +594,10 @@ async fn account_overview_route(
             "name": account_row.plan_name,
         },
         "billing_state": tenant.billing_state.as_str(),
+        // Whether Stripe is wired on this deployment; the dashboard disables
+        // the portal/checkout actions with an explanatory note when false
+        // (those routes 503 `billing_not_configured` otherwise).
+        "billing_configured": state.billing_configured,
         "trial_ends_at": account_row.trial_ends_at.map(|t| t.to_rfc3339()),
         "usage": {
             "atoms_used": atoms_used,

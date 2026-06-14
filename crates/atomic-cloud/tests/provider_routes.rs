@@ -1947,6 +1947,14 @@ async fn account_overview_assembles_shape_and_refuses_db_scope() {
                 body["trial_ends_at"].is_string(),
                 "trialing account carries trial_ends_at: {body}"
             );
+            // `billing_configured` reflects whether Stripe is wired; this test
+            // builds the plane without `with_billing_configured`, so it's the
+            // `false` default — the dashboard then disables the portal/checkout
+            // actions and explains rather than 503ing the browser.
+            assert_eq!(
+                body["billing_configured"], false,
+                "billing_configured present and false without Stripe: {body}"
+            );
 
             // Usage: both atoms counted, exactly one knowledge base. The
             // limit fields are present (null = unlimited under the widened

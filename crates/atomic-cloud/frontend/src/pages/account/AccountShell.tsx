@@ -91,6 +91,7 @@ export function AccountShell() {
           <BillingBanner
             billingState={overview.billing_state}
             trialEndsAt={overview.trial_ends_at}
+            billingConfigured={overview.billing_configured}
           />
         </div>
         <div className="grid gap-8 lg:grid-cols-[200px_minmax(0,1fr)]">

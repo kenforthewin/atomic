@@ -34,9 +34,10 @@ export function Mcp() {
         </div>
         <CopyField value={overview.mcp_url} label="MCP endpoint URL" />
         <p className="mt-3 text-sm text-text-muted">
-          One endpoint covers your whole account. The first time a client
-          connects, you’ll be asked to sign in and approve access — no token to
-          copy by hand.
+          One endpoint covers your whole account — every knowledge base, under a
+          single account-scoped grant. The first time a client connects, you’ll
+          be asked to sign in and approve access; there’s no token to copy by
+          hand.
         </p>
       </Card>
 
@@ -61,8 +62,46 @@ export function Mcp() {
           and complete the one-time authorization.
         </p>
       </Card>
+
+      <Card>
+        <h2 className="font-medium text-lg">How authorization works</h2>
+        <p className="mt-2 text-sm text-text-secondary leading-relaxed">
+          Atomic uses OAuth 2.0, so your client registers itself and walks you
+          through a standard sign-in-and-approve flow — no secret keys to paste
+          or rotate. The grant is scoped to your account and you can revoke it at
+          any time by removing the connector. Clients discover the flow
+          automatically from{' '}
+          <a
+            href={discoveryUrl(overview.mcp_url)}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-accent transition-colors hover:text-accent-dark"
+          >
+            the resource metadata
+          </a>
+          .
+        </p>
+      </Card>
     </div>
   );
+}
+
+/**
+ * The MCP protected-resource discovery URL for this endpoint. The MCP URL is
+ * `<origin>/mcp`; its discovery document lives at
+ * `<origin>/.well-known/oauth-protected-resource/mcp` (the per-resource form
+ * cloud serves — see `oauth_routes.rs`). We derive the origin from the MCP URL
+ * so this stays correct regardless of the deployment's base domain.
+ */
+function discoveryUrl(mcpUrl: string): string {
+  try {
+    const url = new URL(mcpUrl);
+    return `${url.origin}/.well-known/oauth-protected-resource/mcp`;
+  } catch {
+    // Defensive: if mcp_url is ever malformed, fall back to a relative path on
+    // the current origin (the dashboard is served from the tenant origin).
+    return '/.well-known/oauth-protected-resource/mcp';
+  }
 }
 
 function Step({ n, children }: { n: number; children: React.ReactNode }) {

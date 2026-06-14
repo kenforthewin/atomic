@@ -1,11 +1,16 @@
 import { Banner } from '../ui/Banner';
-import type { BannerTone } from '../ui/Banner';
 import type { BillingState } from '../../lib/api';
-import { daysUntil } from '../../lib/format';
+import { billingNotice } from '../../lib/billing';
 
 interface BillingBannerProps {
   billingState: BillingState;
   trialEndsAt: string | null;
+  /**
+   * Whether Stripe is configured. When false the portal route 503s, so we drop
+   * the "Manage billing" action (the page itself explains the deployment has no
+   * billing) and keep the informational notice.
+   */
+  billingConfigured: boolean;
 }
 
 /**
@@ -19,8 +24,12 @@ interface BillingBannerProps {
  * account before the overview loads, and the shell renders a dedicated
  * blocking screen — but it's handled defensively for completeness.
  */
-export function BillingBanner({ billingState, trialEndsAt }: BillingBannerProps) {
-  const notice = describe(billingState, trialEndsAt);
+export function BillingBanner({
+  billingState,
+  trialEndsAt,
+  billingConfigured,
+}: BillingBannerProps) {
+  const notice = billingNotice(billingState, trialEndsAt);
   if (!notice) return null;
 
   return (
@@ -28,7 +37,7 @@ export function BillingBanner({ billingState, trialEndsAt }: BillingBannerProps)
       tone={notice.tone}
       title={notice.title}
       action={
-        notice.action ? (
+        notice.action && billingConfigured ? (
           <a
             href="/api/billing/portal"
             className="inline-flex items-center rounded-lg bg-bg-white/70 px-3 py-1.5 text-sm font-medium text-text-primary ring-1 ring-inset ring-current/20 transition-colors hover:bg-bg-white focus-visible:outline-2"
@@ -41,54 +50,4 @@ export function BillingBanner({ billingState, trialEndsAt }: BillingBannerProps)
       {notice.body}
     </Banner>
   );
-}
-
-interface Notice {
-  tone: BannerTone;
-  title: string;
-  body: string;
-  action: boolean;
-}
-
-function describe(state: BillingState, trialEndsAt: string | null): Notice | null {
-  switch (state) {
-    case 'active':
-      return null;
-    case 'trialing': {
-      const days = daysUntil(trialEndsAt);
-      const left =
-        days === null
-          ? 'Your free trial is active.'
-          : days <= 0
-            ? 'Your free trial ends today.'
-            : `${days} day${days === 1 ? '' : 's'} left in your free trial.`;
-      return {
-        tone: 'info',
-        title: left,
-        body: 'You have full access to the paid tier. Add billing before it ends to keep your provider, higher limits, and AI allowance.',
-        action: true,
-      };
-    }
-    case 'past_due':
-      return {
-        tone: 'warning',
-        title: 'Your last payment didn’t go through.',
-        body: 'You still have full access for now. Update your payment method to avoid an interruption.',
-        action: true,
-      };
-    case 'read_only':
-      return {
-        tone: 'warning',
-        title: 'Your account is read-only.',
-        body: 'A payment is overdue, so writes are paused — your data is safe and fully readable. Update billing to restore full access.',
-        action: true,
-      };
-    case 'suspended':
-      return {
-        tone: 'error',
-        title: 'Your account is suspended.',
-        body: 'Serving is paused for non-payment. Your data is retained — update billing to restore access.',
-        action: true,
-      };
-  }
 }

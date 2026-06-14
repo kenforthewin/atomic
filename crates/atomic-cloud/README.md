@@ -417,10 +417,12 @@ provider or sends real email.
   misses that execution's progress events. Durable state is always correct;
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
 - Several capabilities are scoped to later slices — observability
-  metrics/tracing, the user-facing `account_events` log, and the
-  signup/billing SPA frontend. The OAuth flow is shipped as API + a minimal
-  server-rendered consent/approve form (no SPA); a richer consent UI is later.
-  See the plan doc's Implementation log for the current frontier.
+  metrics/tracing and the user-facing `account_events` log. The account-plane
+  SPA (signup/login + the authenticated `/account/*` dashboard) ships in
+  [`frontend/`](frontend) and is served by the cloud server. The OAuth flow is
+  shipped as API + a minimal server-rendered consent/approve form (no SPA); a
+  richer consent UI is later. See the plan doc's Implementation log for the
+  current frontier.
 - **Backup PITR is deferred**: backups are nightly logical dumps (`pg_dump
   -Fc`) per tenant + control plane, not point-in-time recovery via WAL
   archiving — recovery granularity is one day. The restore CLI restores into

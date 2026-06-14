@@ -266,6 +266,13 @@ export interface AccountOverview {
   email: string;
   plan: PlanSummary;
   billing_state: BillingState;
+  /**
+   * Whether Stripe is configured on this deployment. When false, the
+   * portal/checkout routes 503 (`billing_not_configured`), so the billing page
+   * disables those actions and explains why instead of navigating onto a raw
+   * error.
+   */
+  billing_configured: boolean;
   trial_ends_at: string | null;
   usage: UsageSummary;
   provider: ProviderSummary | null;

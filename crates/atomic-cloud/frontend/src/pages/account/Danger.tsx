@@ -5,7 +5,8 @@ import { Card } from '../../components/ui/Card';
 import { Field } from '../../components/ui/Field';
 import { Button } from '../../components/ui/Button';
 import { Banner } from '../../components/ui/Banner';
-import { ApiError, deleteAccount } from '../../lib/api';
+import { deleteAccount } from '../../lib/api';
+import { deletionErrorMessage } from './deletionError';
 import { appHostLoginUrl } from '../../lib/host';
 
 /**
@@ -31,20 +32,11 @@ export function Danger() {
     try {
       await deleteAccount(subdomain);
       // The account and its session are gone — leave the (now-dead) tenant
-      // subdomain for the app host's login.
-      window.location.assign(appHostLoginUrl());
+      // subdomain for the app host's login, flagging the deletion so the login
+      // page confirms it.
+      window.location.assign(appHostLoginUrl('deleted=1'));
     } catch (err) {
-      if (err instanceof ApiError) {
-        if (err.status === 503 && err.code === 'deletion_busy') {
-          setError(
-            'A backup of your account is in progress. No data was changed — try again in a few seconds.',
-          );
-        } else {
-          setError(err.message);
-        }
-      } else {
-        setError('Something went wrong. Please try again.');
-      }
+      setError(deletionErrorMessage(err));
       setSubmitting(false);
     }
   }

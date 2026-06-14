@@ -1919,7 +1919,12 @@ async fn serve(
         vault,
         Arc::clone(&cache),
     )
-    .with_backup_store(Arc::clone(&backup_store), backup_config.backup_timeout);
+    .with_backup_store(Arc::clone(&backup_store), backup_config.backup_timeout)
+    // Tell the dashboard overview whether the portal/checkout routes are live
+    // (a Stripe key is configured) so the billing page enables or explains its
+    // actions instead of bouncing the browser onto a `billing_not_configured`
+    // 503.
+    .with_billing_configured(quota_billing.billing.is_configured());
 
     // The reaper loop runs concurrently with the server below via select!,
     // not tokio::spawn: spawn's Send bound trips rustc's

@@ -72,14 +72,19 @@ export function isAppHost(): boolean {
  * Absolute URL of the app-host login page, used to bounce an unauthenticated
  * dashboard request out of a tenant subdomain. Prefers the configured base
  * domain; otherwise rewrites the current host's first label to `app`.
+ *
+ * `query` appends a search string (e.g. `'deleted=1'` after an account
+ * deletion, so the login page can confirm the account is gone). Pass it without
+ * the leading `?`.
  */
-export function appHostLoginUrl(): string {
-  if (typeof window === 'undefined') return '/login';
+export function appHostLoginUrl(query?: string): string {
+  const suffix = query ? `?${query}` : '';
+  if (typeof window === 'undefined') return `/login${suffix}`;
   const { protocol, port } = window.location;
   const portSuffix = port ? `:${port}` : '';
   const base = configuredBaseDomain();
   const appHost = base ? `app.${base}` : appHostFromCurrent();
-  return `${protocol}//${appHost}${portSuffix}/login`;
+  return `${protocol}//${appHost}${portSuffix}/login${suffix}`;
 }
 
 /**

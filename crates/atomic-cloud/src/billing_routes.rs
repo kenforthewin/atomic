@@ -152,6 +152,15 @@ impl Billing {
         }
     }
 
+    /// Whether Stripe is configured on this deployment (a secret key was
+    /// supplied). When false, every billing route degrades to a structured
+    /// `billing_not_configured` 503 — the dashboard reads this (surfaced in
+    /// the account overview) to disable the portal/checkout actions with an
+    /// explanatory note rather than navigating the browser onto a raw 503.
+    pub fn is_configured(&self) -> bool {
+        self.state.provider.is_some()
+    }
+
     /// Register the authenticated tenant-plane billing routes (portal,
     /// checkout). Behind the same `CloudAuth` as the rest of `/api/*`; the
     /// caller wires the auth wrap.

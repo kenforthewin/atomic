@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { PublicLayout } from '../layouts/PublicLayout';
 import { AuthLayout } from '../layouts/AuthLayout';
 import { CheckEmail } from '../components/CheckEmail';
@@ -23,6 +24,10 @@ export function Login() {
   const [submitting, setSubmitting] = useState(false);
   const [sentTo, setSentTo] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const [params] = useSearchParams();
+  // Set by the dashboard's account-deletion redirect: the tenant is gone, so we
+  // confirm it here on the app host rather than on a now-dead subdomain.
+  const justDeleted = params.get('deleted') === '1';
 
   const trimmedEmail = email.trim();
   const clientValid = isEmailFormatOk(trimmedEmail);
@@ -103,6 +108,12 @@ export function Login() {
         }
       >
         <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-5">
+          {justDeleted && !formError && (
+            <Banner tone="success" title="Your account was deleted.">
+              Your workspace and all its data have been removed. Thanks for
+              trying Atomic — you can start fresh anytime.
+            </Banner>
+          )}
           {formError && (
             <Banner tone="error" title="Couldn't send your link">
               {formError}
