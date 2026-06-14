@@ -487,10 +487,7 @@ impl TenantPlane {
 /// from the tenant database (atoms summed across knowledge bases, KB count
 /// from the manager) so it cannot skew from a stored counter, the same
 /// source the quota guard enforces against.
-async fn account_overview_route(
-    req: HttpRequest,
-    state: web::Data<PlaneState>,
-) -> HttpResponse {
+async fn account_overview_route(req: HttpRequest, state: web::Data<PlaneState>) -> HttpResponse {
     let tenant = match require_account_scope(&req) {
         Ok(tenant) => tenant,
         Err(denial) => return denial,
@@ -557,34 +554,29 @@ async fn account_overview_route(
     // Provider summary: status only, never the key (same contract as the
     // provider status route). A read failure degrades to `null`, not a 500 —
     // the dashboard shows "no provider summary" rather than nothing.
-    let provider = match get_active_credentials(
-        &state.control,
-        state.vault.as_ref(),
-        account_id,
-    )
-    .await
-    {
-        Ok(Some(credentials)) => json!({
-            "configured": true,
-            "origin": credentials.origin.as_str(),
-            "provider": credentials.provider.as_str(),
-            "model_config": credentials.model_config,
-            "last_validated_at": credentials.last_validated_at.map(|t| t.to_rfc3339()),
-            "last_validation_error": credentials.last_validation_error,
-        }),
-        Ok(None) => json!({
-            "configured": false,
-            "origin": Value::Null,
-            "provider": Value::Null,
-            "model_config": Value::Null,
-            "last_validated_at": Value::Null,
-            "last_validation_error": Value::Null,
-        }),
-        Err(e) => {
-            tracing::warn!(account_id, error = %e, "overview: provider summary unavailable");
-            Value::Null
-        }
-    };
+    let provider =
+        match get_active_credentials(&state.control, state.vault.as_ref(), account_id).await {
+            Ok(Some(credentials)) => json!({
+                "configured": true,
+                "origin": credentials.origin.as_str(),
+                "provider": credentials.provider.as_str(),
+                "model_config": credentials.model_config,
+                "last_validated_at": credentials.last_validated_at.map(|t| t.to_rfc3339()),
+                "last_validation_error": credentials.last_validation_error,
+            }),
+            Ok(None) => json!({
+                "configured": false,
+                "origin": Value::Null,
+                "provider": Value::Null,
+                "model_config": Value::Null,
+                "last_validated_at": Value::Null,
+                "last_validation_error": Value::Null,
+            }),
+            Err(e) => {
+                tracing::warn!(account_id, error = %e, "overview: provider summary unavailable");
+                Value::Null
+            }
+        };
 
     HttpResponse::Ok().json(json!({
         "subdomain": tenant.subdomain,
