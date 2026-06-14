@@ -60,12 +60,23 @@
 //!   ([`api_scope`](atomic_server::app::api_scope)) wrapped in [`CloudAuth`]
 //!   (in place of self-hosted's `BearerAuth`) plus [`cloud_plane_guard`].
 //! - **The account-plane SPA** ([`crate::spa`]) — the built signup/login +
-//!   `/account/*` dashboard, served as the app's **fallback**
-//!   (`default_service`) when a [`SpaServer`](crate::spa::SpaServer) is wired.
-//!   Registered **last**, so every explicit route above wins the match and the
-//!   fallback only ever handles an unmatched path (a client-routed page like
-//!   `/login`, or a build asset) — it can never shadow a JSON/API route. A
-//!   deployment with no built frontend simply omits it and unmatched paths 404.
+//!   `/account/*` dashboard, served when a [`SpaServer`](crate::spa::SpaServer)
+//!   is wired, in two pieces both registered **after** every JSON route:
+//!     - The **tenant dashboard gate**
+//!       ([`AccountGate`](crate::spa::AccountGate)) — a tenant-host
+//!       `GET /account/*` navigation, session-gated server-side: a valid
+//!       session cookie serves the SPA shell, anything else `302`s to the
+//!       app-host login. So an unauthenticated browser never renders the
+//!       dashboard chrome (no flash-then-bounce), while an unauthenticated
+//!       `/api/*` call still gets the structured JSON `401` (it's matched
+//!       earlier, by CloudAuth) — the redirect is for HTML navigations only.
+//!     - The **SPA fallback** (`default_service`) — registered **last**, so
+//!       every explicit route above (including the gate) wins the match and
+//!       the fallback only ever handles an unmatched path (an app-host
+//!       client-routed page like `/login`, or a build asset on any host) — it
+//!       can never shadow a JSON/API route.
+//!   A deployment with no built frontend simply omits both and unmatched paths
+//!   404.
 //!
 //! Deliberately **not** registered, with their replacements landing in later
 //! slices (plan: `docs/plans/atomic-cloud.md`):
@@ -431,6 +442,12 @@ pub fn configure_cloud_app(
         rate_limiter,
         billing,
     } = quota_billing;
+    // Clones for the account-dashboard session gate, captured before `control`
+    // and `auth` are moved into the data-plane scope below. The gate needs the
+    // control plane (to verify the session cookie) and the host split CloudAuth
+    // resolved (base domain + scheme), so it shares one source of truth.
+    let control_for_gate = control.clone();
+    let auth_for_gate = auth.clone();
     move |cfg: &mut web::ServiceConfig| {
         cfg.app_data(state)
             .route("/health", web::get().to(health))
@@ -507,14 +524,33 @@ pub fn configure_cloud_app(
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth)
         });
+        // The account-dashboard session gate, registered AHEAD of the SPA
+        // fallback: a tenant-host `GET /account/*` navigation is served the
+        // SPA shell only when the request carries a valid session cookie;
+        // otherwise it 302s to the app-host login, so an unauthenticated
+        // browser never renders the dashboard chrome. The `/api/*` plane is
+        // matched before this (CloudAuth), so an unauthenticated background
+        // fetch still gets the structured JSON 401 — only HTML navigations
+        // redirect. Built from the same base domain / scheme `CloudAuth`
+        // resolved, so the host split has one source of truth.
+        if let Some(spa) = spa.clone() {
+            crate::spa::AccountGate::new(
+                spa,
+                control_for_gate,
+                auth_for_gate.base_domain(),
+                auth_for_gate.public_scheme(),
+            )
+            .configure(cfg);
+        }
         // The SPA fallback is registered LAST, as the app's `default_service`:
         // actix matches every explicit service above first (health, ready, the
-        // account/oauth/billing planes, the tenant plane, `/mcp`, `/ws`, and
-        // `/api/*`), and only an unmatched path — a browser navigation to a
-        // client-routed page like `/login` or `/account/provider`, or a build
-        // asset — falls through here. So the SPA can never shadow a JSON route.
-        // When no built frontend is wired (a pure-API pod, or a test that
-        // doesn't exercise serving), the fallback is simply absent and
+        // account/oauth/billing planes, the tenant plane, the gated
+        // `/account/*` scope, `/mcp`, `/ws`, and `/api/*`), and only an
+        // unmatched path — a browser navigation to a client-routed app-host
+        // page like `/login`, or a build asset on any host — falls through
+        // here. So the SPA can never shadow a JSON route. When no built
+        // frontend is wired (a pure-API pod, or a test that doesn't exercise
+        // serving), the fallback (and the gate above) are simply absent and
         // unmatched paths 404 as before.
         if let Some(spa) = spa {
             spa.configure_fallback(cfg);

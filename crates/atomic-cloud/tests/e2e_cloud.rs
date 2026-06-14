@@ -1426,21 +1426,34 @@ async fn straggler_accounts_get_account_upgrading_503() {
     .await;
 }
 
-/// The account-plane SPA fallback through the **composed** server: the app
-/// host serves the base-domain-injected shell on a client-routed path, a
-/// tenant subdomain serves the shell for an `/account/*` deep link, and —
-/// critically — the JSON planes (`/health`, the unauthenticated tenant
-/// `/api/*`) still resolve and are never shadowed by the fallback.
+/// The account-plane SPA through the **composed** server, end to end:
+///
+/// - the app host serves the base-domain-injected shell on a client-routed
+///   path;
+/// - a tenant `/account/*` navigation is session-gated server-side — an
+///   unauthenticated one is a `302` to the app-host login (never a flash of
+///   the dashboard shell), a session-cookie'd one serves the shell;
+/// - and — critically — the JSON planes (`/health`, the unauthenticated
+///   tenant `/api/*`) still resolve and are never shadowed by the SPA: an
+///   unauthenticated API call is the structured JSON `401`, not the redirect.
 #[actix_web::test]
-async fn spa_fallback_serves_app_and_tenant_without_shadowing_json() {
+async fn spa_serves_app_gates_tenant_dashboard_and_never_shadows_json() {
     with_control_db(
-        "spa_fallback_serves_app_and_tenant_without_shadowing_json",
+        "spa_serves_app_gates_tenant_dashboard_and_never_shadows_json",
         |url| async move {
             let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
             let tenant = h.provision("alpha").await;
 
-            // App host (`app.<base>`): a client-routed path with no file →
-            // the SPA shell, with the base domain injected into the meta tag.
+            // A client that does NOT follow redirects, so the `302` from the
+            // account gate is observable as a `302` rather than transparently
+            // followed to the login page.
+            let no_redirect = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build non-redirecting client");
+
+            // App host (`app.<base>` and the bare base): a client-routed path
+            // with no file → the SPA shell, base domain injected into the meta.
             for host in [format!("app.{BASE_DOMAIN}"), BASE_DOMAIN.to_string()] {
                 for path in ["/", "/login", "/signup"] {
                     let resp = h
@@ -1466,22 +1479,84 @@ async fn spa_fallback_serves_app_and_tenant_without_shadowing_json() {
                 }
             }
 
-            // Tenant subdomain: an `/account/*` deep link serves the same SPA
-            // shell (the client then cookie-authes the API and redirects on
-            // 401). The shell is served unauthenticated — the gate is the API.
-            let resp = h
-                .api(Method::GET, &tenant.subdomain, "/account/provider")
+            // Tenant subdomain, NO session: an `/account/*` navigation is a
+            // `302` to the app-host login — the dashboard chrome is never sent
+            // to an unauthenticated browser.
+            let resp = no_redirect
+                .get(format!("{}/account/provider", h.base_url))
+                .header(HOST, format!("{}.{BASE_DOMAIN}", tenant.subdomain))
                 .send()
                 .await
-                .expect("send tenant deep link");
-            assert_eq!(resp.status(), StatusCode::OK, "tenant deep link serves shell");
+                .expect("send unauth tenant deep link");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "unauthenticated /account/* redirects, not 200 shell"
+            );
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                location.ends_with(&format!("app.{BASE_DOMAIN}/login")),
+                "redirect targets the app-host login: {location}"
+            );
+
+            // Tenant subdomain, WITH a valid session: the same navigation now
+            // serves the SPA shell (HTML 200, base domain injected).
+            let session = create_session(
+                &h.control,
+                &tenant.account_id,
+                Duration::from_secs(3600),
+                None,
+                None,
+            )
+            .await
+            .expect("create session");
+            let resp = no_redirect
+                .get(format!("{}/account/provider", h.base_url))
+                .header(HOST, format!("{}.{BASE_DOMAIN}", tenant.subdomain))
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .send()
+                .await
+                .expect("send authed tenant deep link");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a valid session serves the dashboard shell"
+            );
             let ct = resp
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
-            assert!(ct.contains("text/html"), "tenant deep link is HTML: {ct}");
+            assert!(ct.contains("text/html"), "authed deep link is HTML: {ct}");
+            let body = resp.text().await.expect("body");
+            assert!(
+                body.contains(&format!(r#"content="{BASE_DOMAIN}""#)),
+                "authed dashboard shell carries the injected base domain"
+            );
+
+            // A session for ANOTHER tenant must NOT unlock this dashboard (the
+            // cookie crosses subdomains by design — the account-scoped verify
+            // is the chokepoint). Presented on bravo's subdomain, alpha's
+            // session redirects exactly like no cookie at all.
+            let bravo = h.provision("bravo").await;
+            let resp = no_redirect
+                .get(format!("{}/account/billing", h.base_url))
+                .header(HOST, format!("{}.{BASE_DOMAIN}", bravo.subdomain))
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .send()
+                .await
+                .expect("send cross-tenant session");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "alpha's session does not unlock bravo's dashboard"
+            );
 
             // JSON planes are NOT shadowed:
             // - `/health` resolves to its JSON on any host.
@@ -1502,16 +1577,18 @@ async fn spa_fallback_serves_app_and_tenant_without_shadowing_json() {
             assert!(ct.contains("application/json"), "health stays JSON: {ct}");
 
             // - the tenant `/api/account/overview` without auth returns the
-            //   API's structured 401 (CloudAuth), not the HTML shell.
-            let resp = h
-                .api(Method::GET, &tenant.subdomain, "/api/account/overview")
+            //   API's structured 401 (CloudAuth), NOT the gate's HTML redirect:
+            //   an API call (or the dashboard's background fetch) gets JSON.
+            let resp = no_redirect
+                .get(format!("{}/api/account/overview", h.base_url))
+                .header(HOST, format!("{}.{BASE_DOMAIN}", tenant.subdomain))
                 .send()
                 .await
                 .expect("send unauth overview");
             assert_eq!(
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
-                "unauthenticated overview is a 401, not the shell"
+                "unauthenticated overview is a JSON 401, not the gate redirect"
             );
             let ct = resp
                 .headers()

@@ -26,20 +26,34 @@
 //!    path that escapes the dist root is refused — so the fallback can never
 //!    read outside the build output.
 //!
+//! 3. **The tenant dashboard gate** ([`AccountGate`]). The `/account/*`
+//!    dashboard is the one part of the SPA that must not be served to a
+//!    browser that isn't logged in. Registered as an explicit tenant-host
+//!    scope ahead of the fallback, the gate verifies the session cookie
+//!    server-side: a valid session serves the same shell the fallback would,
+//!    anything else `302`s to the app-host login — so an unauthenticated
+//!    navigation never flashes the dashboard chrome before client-bouncing.
+//!    The data plane is untouched: `/api/*` is matched earlier (by
+//!    `CloudAuth`), so an unauthenticated API call still returns the
+//!    structured JSON `401`, never this redirect.
+//!
 //! The whole thing is **optional**: a deployment (or a test) that wires no
-//! dist directory simply doesn't register the fallback, and unmatched paths
-//! 404 as before. `serve` points it at `frontend/dist`; the README documents
-//! producing that build.
+//! dist directory simply doesn't register the fallback or the gate, and
+//! unmatched paths 404 as before. `serve` points it at `frontend/dist`; the
+//! README documents producing that build.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use actix_web::http::header::{
-    CacheControl, CacheDirective, ContentType, HeaderValue, CONTENT_TYPE,
+    CacheControl, CacheDirective, ContentType, HeaderValue, CONTENT_TYPE, LOCATION,
 };
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{guard, web, HttpRequest, HttpResponse};
 
+use crate::auth::{subdomain_from_host, SESSION_COOKIE};
+use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+use crate::tokens;
 
 /// The meta-tag placeholder the build leaves in `index.html` for the server
 /// to rewrite with the deployment's base domain. Must match the value in
@@ -129,6 +143,188 @@ impl SpaServer {
         cfg.app_data(web::Data::new(self))
             .default_service(web::route().to(serve_spa));
     }
+}
+
+/// The session gate in front of the tenant dashboard (`/account/*`).
+///
+/// The dashboard is the one part of the SPA that must not be served to a
+/// browser that isn't logged in: it would flash an empty shell, fire an
+/// `/api/account/overview` request, eat a 401, and only *then* client-bounce
+/// to the login page. Instead this gate runs **server-side**, ahead of the
+/// SPA fallback: a tenant-host `GET /account/*` with no valid session is a
+/// `302` straight to the app-host login (`https://app.<base>/login`) — the
+/// browser never renders the dashboard chrome for an unauthenticated user.
+///
+/// It guards only HTML *navigations* to `/account/*`. The data plane keeps
+/// its own contract untouched: `/api/*` is matched first (by `CloudAuth`),
+/// so an unauthenticated `/api/account/overview` still returns the structured
+/// JSON `401`, never this redirect — exactly as an API client (or the
+/// dashboard's own background fetch after a session expiry) expects.
+///
+/// A valid session serves the same SPA shell the fallback would: the gate
+/// only decides *whether* to serve it, and delegates the bytes to the held
+/// [`SpaServer`]. Resolution is fail-closed — an unknown subdomain, a missing
+/// or expired cookie, or a control-plane hiccup all redirect to login rather
+/// than reveal the dashboard or leak whether the subdomain names a real
+/// account.
+#[derive(Clone)]
+pub struct AccountGate {
+    spa: SpaServer,
+    control: ControlPlane,
+    /// Normalized base domain (`atomic.cloud`, or `localhost` in dev), for
+    /// building the app-host login URL the unauthenticated case redirects to.
+    base_domain: std::sync::Arc<str>,
+    /// Scheme of the public origin (`https` in prod, `http` for local/dev) —
+    /// the redirect target's scheme, matching what `CloudAuth` and the OAuth
+    /// plane build their URLs with.
+    public_scheme: std::sync::Arc<str>,
+}
+
+impl AccountGate {
+    /// Build the gate from the loaded SPA plus the control plane and origin
+    /// settings the redirect/lookup need. `base_domain` is normalized
+    /// (lowercased, leading dot stripped) here so callers can pass the raw
+    /// `--base-domain` value.
+    pub fn new(
+        spa: SpaServer,
+        control: ControlPlane,
+        base_domain: &str,
+        public_scheme: &str,
+    ) -> Self {
+        Self {
+            spa,
+            control,
+            base_domain: base_domain
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .into(),
+            public_scheme: public_scheme.to_ascii_lowercase().into(),
+        }
+    }
+
+    /// Register the tenant-host `/account/*` scope ahead of the SPA fallback.
+    ///
+    /// Guarded to tenant subdomains (the dashboard never exists on the app
+    /// host) and to `GET`/`HEAD` (a navigation, not an API call). Must be
+    /// registered **before** [`SpaServer::configure_fallback`] so the gate
+    /// wins the match for `/account/*`; everything else — assets, app-host
+    /// pages — still falls through to the unguarded fallback.
+    pub fn configure(self, cfg: &mut web::ServiceConfig) {
+        let base_for_guard = self.base_domain.to_string();
+        cfg.service(
+            web::scope("/account")
+                .guard(tenant_host_guard(base_for_guard))
+                .guard(guard::Any(guard::Get()).or(guard::Head()))
+                .app_data(web::Data::new(self))
+                // `""` is `/account`, `"/{tail:.*}"` is every deeper path.
+                .route("", web::route().to(serve_account))
+                .route("/{tail:.*}", web::route().to(serve_account)),
+        );
+    }
+
+    /// The app-host login URL an unauthenticated dashboard request bounces to.
+    fn login_redirect_url(&self) -> String {
+        login_redirect_url(&self.public_scheme, &self.base_domain)
+    }
+
+    /// Whether `req` carries a session cookie that verifies against the
+    /// account named by the request's `Host` subdomain. Fail-closed: any
+    /// missing piece (no host, unknown/inactive subdomain, no cookie, expired
+    /// session, lookup error) is `false`.
+    async fn has_valid_session(&self, req: &HttpRequest) -> bool {
+        let Some(host) = req
+            .headers()
+            .get(actix_web::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri().host())
+        else {
+            return false;
+        };
+        let Some(subdomain) = subdomain_from_host(host, &self.base_domain) else {
+            return false;
+        };
+        let Some(cookie) = req.cookie(SESSION_COOKIE) else {
+            return false;
+        };
+
+        // Resolve the subdomain to an active account, then verify the session
+        // against it — the same `account_id`-scoped check `CloudAuth` makes,
+        // so a session for another tenant (the cookie crosses subdomains)
+        // resolves nothing here either.
+        let account_id: Option<(String,)> = match sqlx::query_as(
+            "SELECT id FROM accounts WHERE subdomain = $1 AND status = 'active'",
+        )
+        .bind(&subdomain)
+        .fetch_optional(self.control.pool())
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(error = %e, subdomain, "account-gate lookup failed");
+                return false;
+            }
+        };
+        let Some((account_id,)) = account_id else {
+            return false;
+        };
+
+        match tokens::verify_session(&self.control, &account_id, cookie.value()).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!(error = %e, account_id, "account-gate session verify failed");
+                false
+            }
+        }
+    }
+}
+
+/// The `/account/*` handler: serve the SPA shell for a logged-in browser, or
+/// `302` to the app-host login for everyone else.
+async fn serve_account(req: HttpRequest, gate: web::Data<AccountGate>) -> HttpResponse {
+    if gate.has_valid_session(&req).await {
+        return spa_shell_response(gate.spa.index_html());
+    }
+    // No session → bounce to the app-host login. `302` (not `307`) because the
+    // browser must re-issue as a plain `GET` of the login page, and the
+    // dashboard navigation that triggered this is always itself a `GET`.
+    HttpResponse::Found()
+        .insert_header((LOCATION, gate.login_redirect_url()))
+        .insert_header(CacheControl(vec![CacheDirective::NoCache]))
+        .finish()
+}
+
+/// The app-host login URL the gate redirects an unauthenticated dashboard
+/// navigation to: `<scheme>://app.<base>/login`. Free function so the
+/// construction is unit-testable without standing up a control plane.
+fn login_redirect_url(public_scheme: &str, base_domain: &str) -> String {
+    format!("{public_scheme}://app.{base_domain}/login")
+}
+
+/// Whether `host` is a tenant subdomain under `base_domain` — the predicate
+/// the gate's route guard applies. A host that resolves no single-label
+/// subdomain below the base (the bare base, a deep name, a foreign host) is
+/// not a tenant. The reserved `app` label — the public app host — is excluded
+/// explicitly so the gate never fires on `app.<base>` (matching the frontend's
+/// host split and CloudAuth's `app`-is-never-an-account invariant); an
+/// `app.<base>/account/*` request thus falls through to the SPA fallback
+/// rather than the dashboard gate.
+fn host_is_tenant(host: &str, base_domain: &str) -> bool {
+    subdomain_from_host(host, base_domain).is_some_and(|sub| sub != "app")
+}
+
+/// Route guard matching only **tenant** subdomains (`<slug>.<base>`), the
+/// mirror of the account plane's app-host guard. Reads the same host source
+/// as `CloudAuth` (the `Host` header, falling back to the URI authority).
+fn tenant_host_guard(base_domain: String) -> impl guard::Guard {
+    guard::fn_guard(move |ctx: &guard::GuardContext<'_>| {
+        let head = ctx.head();
+        head.headers()
+            .get(actix_web::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| head.uri.host())
+            .is_some_and(|host| host_is_tenant(host, &base_domain))
+    })
 }
 
 /// The fallback handler: serve an existing build file, or the SPA shell.
@@ -313,6 +509,32 @@ mod tests {
         assert!(
             !spa.index_html().contains(BASE_DOMAIN_PLACEHOLDER),
             "placeholder fully replaced"
+        );
+    }
+
+    #[test]
+    fn account_gate_host_split_and_login_url() {
+        // Only a single-label subdomain under the base is a tenant; the bare
+        // base, `app.<base>`, and foreign hosts are not (so the gate never
+        // fires on the app host). Ports are tolerated.
+        assert!(host_is_tenant("alpha.atomic.cloud", "atomic.cloud"));
+        assert!(host_is_tenant("alpha.atomic.cloud:8080", "atomic.cloud"));
+        assert!(!host_is_tenant("atomic.cloud", "atomic.cloud"));
+        assert!(!host_is_tenant("app.atomic.cloud", "atomic.cloud"));
+        assert!(!host_is_tenant("a.b.atomic.cloud", "atomic.cloud"));
+        assert!(!host_is_tenant("evil.com", "atomic.cloud"));
+        // Local/dev base: `kenny.localhost` is a tenant, bare `localhost` not.
+        assert!(host_is_tenant("kenny.localhost", "localhost"));
+        assert!(!host_is_tenant("localhost", "localhost"));
+
+        // The redirect target is the app-host login over the public scheme.
+        assert_eq!(
+            login_redirect_url("https", "atomic.cloud"),
+            "https://app.atomic.cloud/login"
+        );
+        assert_eq!(
+            login_redirect_url("http", "localhost"),
+            "http://app.localhost/login"
         );
     }
 

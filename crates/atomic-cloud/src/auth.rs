@@ -235,6 +235,23 @@ impl CloudAuth {
             .public_scheme = scheme.into();
         self
     }
+
+    /// The normalized base domain (`atomic.cloud`, `localhost`) this
+    /// middleware routes under. `pub(crate)` so the composition can build the
+    /// account-dashboard session gate ([`crate::spa::AccountGate`]) from the
+    /// same base domain `CloudAuth` already resolved — one source of truth for
+    /// the host split, no extra `configure_cloud_app` argument.
+    pub(crate) fn base_domain(&self) -> &str {
+        &self.ctx.base_domain
+    }
+
+    /// The public-origin scheme (`https` in prod, `http` for local/dev). Used
+    /// alongside [`base_domain`](Self::base_domain) to build the account
+    /// gate's login-redirect URL, matching the scheme the MCP challenge and
+    /// OAuth discovery URLs use.
+    pub(crate) fn public_scheme(&self) -> &str {
+        &self.ctx.public_scheme
+    }
 }
 
 impl<S, B> Transform<S, ServiceRequest> for CloudAuth

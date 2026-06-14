@@ -40,18 +40,23 @@ the deployable bundle with `npm run build`.
 
 ## How the dist is served
 
-The cloud server (`atomic-cloud`, actix) serves the built `dist/` directory as
-its **fallback** route — registered last in `configure_cloud_app`, after every
-JSON/OAuth/MCP/WS route, so it only ever handles an unmatched path (a
-client-routed page, or a build asset) and can never shadow an API route. The
-serving layer lives in [`src/spa.rs`](../src/spa.rs):
+The cloud server (`atomic-cloud`, actix) serves the built `dist/` directory
+after every JSON/OAuth/MCP/WS route — so the SPA can never shadow an API route.
+The serving layer lives in [`src/spa.rs`](../src/spa.rs), in two pieces:
 
-- a real file under `dist/` (a hashed asset, the favicon, a logo) is served as
-  that file with an appropriate cache header;
-- anything else returns `index.html` (the SPA shell) so client-side routing
-  takes over;
-- the base-domain meta placeholder is rewritten **once at startup** with the
-  deployment's real base domain.
+- **The tenant dashboard gate.** A tenant-host `GET /account/*` navigation is
+  session-gated **server-side**: a request carrying a valid session cookie is
+  served the SPA shell; anything else is a `302` to the app-host login
+  (`https://app.<base>/login`). So an unauthenticated browser never flashes the
+  dashboard chrome — it lands on login immediately. The data plane is untouched:
+  `/api/*` is matched earlier (by `CloudAuth`), so an unauthenticated background
+  fetch still gets the structured JSON `401`, never the redirect.
+- **The fallback** (registered last, the app's `default_service`). A real file
+  under `dist/` (a hashed asset, the favicon, a logo) is served as that file
+  with an appropriate cache header; anything else (an app-host client-routed
+  page like `/login`) returns `index.html` (the SPA shell) so client-side
+  routing takes over. The base-domain meta placeholder is rewritten **once at
+  startup** with the deployment's real base domain.
 
 Point the server at the build with `--spa-dir` (env `ATOMIC_CLOUD_SPA_DIR`); it
 defaults to `crates/atomic-cloud/frontend/dist`. If that directory has no
@@ -111,10 +116,14 @@ structured cloud states into branded frames:
 - **trialing / past_due / read_only** → a global `BillingBanner`;
 - **ready** → the chrome (top bar, nav) wrapping the active section.
 
-A `401` never reaches the shell — the API client redirects an expired session to
-the app-host login. The loaded overview is shared with child routes via an
-outlet context (`src/lib/accountContext.ts`), so the overview page renders
-without its own fetch; the provider page fetches the fuller provider status.
+Authentication is enforced at two depths. A browser that isn't logged in never
+even loads the shell on `/account/*` — the server-side gate (above) `302`s it to
+login first. And once the shell *is* loaded, a `401` from a later fetch (a
+session that expired mid-session) never reaches the shell either — the API
+client redirects to the app-host login. The loaded overview is shared with child
+routes via an outlet context (`src/lib/accountContext.ts`), so the overview page
+renders without its own fetch; the provider page fetches the fuller provider
+status.
 
 ## Layout
 

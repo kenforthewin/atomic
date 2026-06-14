@@ -123,6 +123,7 @@ deferred.
 - [`account_plane.rs`](src/account_plane.rs) — signup/login request-link + complete
 - [`oauth_routes.rs`](src/oauth_routes.rs) — cloud's per-account OAuth flow (DCR + Auth Code + PKCE), public discovery/register/token + session-authenticated approve; the `/mcp` mount is wired in `server.rs`
 - [`oauth_store.rs`](src/oauth_store.rs) — control-plane `oauth_clients`/`oauth_codes` storage (per-account, hash-only secrets, single-use codes)
+- [`spa.rs`](src/spa.rs) — serves the account-plane SPA ([`frontend/`](frontend)): the base-domain-injected `index.html`, the traversal-guarded asset/shell fallback (`default_service`), and the tenant dashboard **session gate** (an unauthenticated tenant `GET /account/*` → `302` to the app-host login; a valid session → the shell)
 
 **Control plane & provisioning**
 - [`control_plane.rs`](src/control_plane.rs) — `ControlPlane` handle, connect-or-create, the hardened migration runner
@@ -170,6 +171,55 @@ deferred.
 - [`deploy.rs`](src/deploy.rs) — readiness state machine + failure-rate policy + `deploy_runs` history
 
 - [`error.rs`](src/error.rs) — `CloudError`
+
+## Frontend (account-plane SPA)
+
+The cloud "front door" — signup, login, and the authenticated per-tenant
+account dashboard — is a Vite + React 18 + TypeScript + Tailwind v4 SPA in
+[`frontend/`](frontend). Its design language (warm light-paper palette, Crimson
+Pro serif display, DM Sans body, one purple accent, the node-graph motif) is
+**sourced from the marketing site** (`atomic-website`); the dark product app
+(`atomic/src`) is a separate surface and untouched here. One build serves two
+route contexts, switched by the request `Host`:
+
+| Context | Hosts | What it serves |
+|---|---|---|
+| **App host** | the bare base domain + `app.<base>` | public pre-auth pages: landing, `/signup`, `/login` |
+| **Tenant subdomain** | `<slug>.<base>` | the authenticated `/account/*` dashboard (overview, provider/BYOK, billing, MCP, danger) — same-origin, session-cookie authed |
+
+**Build it** (`dist/` and `node_modules/` are git-ignored, never committed —
+produce the bundle as part of the deploy):
+
+```bash
+npm --prefix crates/atomic-cloud/frontend ci
+npm --prefix crates/atomic-cloud/frontend run build   # tsc + vite → dist/
+```
+
+**Serving** is wired in [`spa.rs`](src/spa.rs) and registered last in
+`configure_cloud_app`, after every JSON/OAuth/MCP/WS route, so the SPA can never
+shadow an API route. The server (`serve`) points at the build with `--spa-dir`
+(env `ATOMIC_CLOUD_SPA_DIR`, default `crates/atomic-cloud/frontend/dist`); if
+that directory has no `index.html` (a pure-API pod, or a dev run that hasn't
+built the frontend) the SPA is simply absent and unmatched paths 404 — **the
+APIs still run without a built frontend**. Two pieces:
+
+- **The tenant dashboard gate** — an unauthenticated tenant `GET /account/*`
+  navigation is a server-side `302` to the app-host login (never a flash of the
+  dashboard shell); a valid session cookie serves the shell. `/api/*` is matched
+  earlier (CloudAuth), so an unauthenticated API call still gets the structured
+  JSON `401`, never the redirect.
+- **The fallback** (`default_service`) — a real file under `dist/` is served as
+  that file; anything else returns the base-domain-injected `index.html` so
+  client-side routing takes over.
+
+**Dev story.** Run the SPA's Vite dev server (`npm --prefix
+crates/atomic-cloud/frontend run dev`) and a local `serve` (above) side by side;
+point the dev server's proxy at the cloud server on `:8080` for the same-origin
+JSON routes. Without the server-injected base-domain meta tag, the SPA's host
+detection ([`frontend/src/lib/host.ts`](frontend/src/lib/host.ts)) falls back to
+a label-count heuristic, so the dashboard is drivable against e.g.
+`alpha.localhost`. See [`frontend/README.md`](frontend/README.md) for the full
+component map, the typed API client, and the dashboard's state handling.
 
 ## Running it locally
 
