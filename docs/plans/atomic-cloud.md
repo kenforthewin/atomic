@@ -1520,6 +1520,57 @@ unrecoverable loss got the closest read):**
 **Deferred (per plan):** PITR via WAL archiving, cross-region replicas, the
 admin cache-evict endpoint, observability metrics — all later slices.
 
+### Slice 9 — account-plane frontend (2026-06-14, branch `cloud-frontend`)
+
+The cloud "front door" — a polished React SPA at
+[`crates/atomic-cloud/frontend/`](../../crates/atomic-cloud/frontend) (Vite +
+React 18 + TypeScript + Tailwind v4), styled to match the **marketing website**
+(`atomic-website`): warm light-paper palette, Crimson Pro serif display + DM
+Sans body (self-hosted via `@fontsource`, no runtime CDN), one purple accent,
+the node-graph motif. The dark product app (`src/`) is a separate surface and
+was **not** touched; atomic-core/atomic-server are untouched (all Rust changes
+are in atomic-cloud: one read endpoint + the static-serving wiring).
+
+- **One build, two host contexts** (switched by `Host`, read from a
+  server-injected `<meta>` base-domain tag): the **app host** (bare base +
+  `app.<base>`) serves the public pages — a focused landing, `/signup` (live
+  `<slug>.<base>` preview, the real validation/`subdomain_taken`/429 handling),
+  `/login` (account-existence-neutral, mirroring the backend); the **tenant
+  subdomain** serves the authenticated dashboard at `/account/*`, same-origin
+  and **session-cookie authed** (no bearer-token juggling), with a 401 →
+  app-host-login bounce.
+- **Dashboard**: Overview (plan/usage/KB count with `billing_state` banners —
+  trialing/past_due/read_only/suspended/out-of-credits), Provider/BYOK settings
+  (mirrors the product app's `AIProviderStep` against the cloud provider routes;
+  managed status + usage, switch to BYOK with server-side validation surfaced
+  verbatim, model selection within the curated list, the existing-key-never-shown
+  rule), Billing (status + "Manage billing"/upgrade → Stripe via a fetch→redirect
+  helper, in-app error on misconfig — **Stripe owns checkout**, no Elements), MCP
+  setup (the `<origin>/mcp` URL + Claude-Desktop connect instructions), and a
+  typed-subdomain-confirmation delete flow.
+- **Rust (atomic-cloud only)**: a new `GET /api/account/overview` (account-scope,
+  CloudAuth) assembling plan/billing/usage/provider summary from the control
+  plane + the tenant manager (`count_atoms`, `list_databases`) — **never** key
+  material; db/MCP-scoped tokens 403. The SPA is served by actix-files as the
+  app's `default_service`, registered **last** so it never shadows a
+  JSON/OAuth/MCP/WS route; `/account/*` is server-side auth-gated (unauth → 302
+  to app login, API 401 stays JSON). `dist`/`node_modules` are gitignored, never
+  committed; `dist` is produced by `npm run build`.
+
+**Quality bar**: the design-fidelity review found the website match **exact, no
+off-brand drift**; real loading/error/empty/disabled states throughout,
+accessible, responsive; 40 vitest tests + Rust serving/overview integration
+tests green. A first review fix closed a stuck-submit bug on the BYOK form, a
+segmented-control focus-ring gap, and raw-JSON-on-checkout-misconfig.
+
+**Note on polish**: this is a complete, faithfully-themed, fully-wired first
+implementation; final *visual* polish is an iterative pass with a human running
+it (automated review can't fully judge "looks great").
+
+**Deferred**: the `account_events` user-facing activity log can ride a future
+pass; per-page deep-linking polish and any marketing-grade landing content live
+on the separate `atomic-website`.
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
@@ -1831,3 +1882,18 @@ and link the discussion if it lives in a memory file.
 - **2026-06-13** — Backup retention (14 daily + 8 weekly; final 30-day) is
   object-store bucket-lifecycle policy keyed off the dated object layout, not
   application code. PITR/WAL archiving remains deferred.
+- **2026-06-14** — Slice 9 landed (see Implementation log): the account-plane
+  frontend — a polished React SPA (the cloud front door) styled to match the
+  marketing website (light/paper, Crimson Pro + DM Sans, node-graph motif),
+  not the dark product app. One build serves the public app-host pages
+  (landing/signup/login) and the per-tenant authenticated dashboard
+  (/account/*, same-origin session-cookie authed). Billing is Stripe-portal +
+  status; the dashboard reads a new account-scope GET /api/account/overview.
+  atomic-core/atomic-server untouched; the SPA is served as the cloud app's
+  default_service, registered last so it never shadows an API/OAuth/MCP route.
+- **2026-06-14** — With slice 9, the frontloaded functional build-out is
+  complete: control plane, provisioning, auth, providers, dispatcher, deploy
+  gating, billing/quotas, OAuth/MCP, backups, and the account frontend.
+  Remaining work is observability and the iterative visual polish of the
+  frontend (a human-in-the-loop pass), plus the deferred items each slice
+  recorded.
