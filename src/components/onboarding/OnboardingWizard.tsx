@@ -1,10 +1,10 @@
 import { createPortal } from 'react-dom';
 import { Button } from '../ui/Button';
 import { StepIndicator } from './StepIndicator';
-import { useOnboardingState, STEPS } from './useOnboardingState';
+import { useOnboardingState, getVisibleSteps } from './useOnboardingState';
 import { useSettingsStore } from '../../stores/settings';
 import { useTagsStore } from '../../stores/tags';
-import { isDesktopApp, getTransport } from '../../lib/transport';
+import { isDesktopApp, getTransport, isCloudTenant } from '../../lib/transport';
 
 import { WelcomeStep } from './steps/WelcomeStep';
 import { AIProviderStep } from './steps/AIProviderStep';
@@ -22,15 +22,18 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
   const testOpenRouterConnection = useSettingsStore(s => s.testOpenRouterConnection);
   const configureAutotagTargets = useTagsStore(s => s.configureAutotagTargets);
 
-  const currentStepDef = STEPS[state.currentStep];
+  const steps = getVisibleSteps();
+  const currentStepDef = steps[state.currentStep];
   const isFirstStep = state.currentStep === 0;
-  const isLastStep = state.currentStep === STEPS.length - 1;
+  const isLastStep = state.currentStep === steps.length - 1;
 
   // Determine if current step can proceed
   const canProceed = (() => {
     switch (currentStepDef.id) {
       case 'welcome': {
-        if (isDesktopApp()) return true;
+        // Cloud is already connected via the session cookie, like the desktop
+        // sidecar — no server form to satisfy before proceeding.
+        if (isDesktopApp() || isCloudTenant()) return true;
         return getTransport().isConnected();
       }
       case 'ai-provider': {
@@ -160,7 +163,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
               Set up Atomic
             </h1>
             <p className="text-xs text-[var(--color-text-secondary)] mt-0.5">
-              Step {state.currentStep + 1} of {STEPS.length}: {currentStepDef.label}
+              Step {state.currentStep + 1} of {steps.length}: {currentStepDef.label}
             </p>
           </div>
           <StepIndicator currentStep={state.currentStep} onStepClick={handleStepClick} />

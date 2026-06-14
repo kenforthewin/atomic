@@ -14,7 +14,14 @@ import { useDatabasesStore } from '../../stores/databases';
 import { useUIStore } from '../../stores/ui';
 import { useTheme, useFont } from '../../hooks';
 import { verifyProviderConfigured } from '../../lib/api';
+import { isCloudTenant } from '../../lib/transport';
+import { useSettingsStore } from '../../stores/settings';
 import { isTauri } from '../../lib/platform';
+
+// Per-tenant setting marking that a cloud account finished onboarding. On cloud
+// the AI provider is always configured (managed), so provider-configured can't
+// gate first-run setup the way it does for self-hosted installs — this flag does.
+const CLOUD_ONBOARDING_SETTING = 'onboarding_completed';
 
 
 export function Layout() {
@@ -108,6 +115,18 @@ export function Layout() {
   useEffect(() => {
     const checkSetup = async () => {
       try {
+        if (isCloudTenant()) {
+          // Cloud: the provider is already provisioned, so setup is gated on
+          // whether the account finished onboarding (tag categories,
+          // integrations). The app initializes regardless — the wizard, if
+          // shown, overlays an already-loading app.
+          await useSettingsStore.getState().fetchSettings();
+          const done = useSettingsStore.getState().settings[CLOUD_ONBOARDING_SETTING] === 'true';
+          setIsSetupRequired(!done);
+          await initializeApp();
+          return;
+        }
+
         const configured = await verifyProviderConfigured();
         setIsSetupRequired(!configured);
 
@@ -143,6 +162,16 @@ export function Layout() {
   };
 
   const handleSetupComplete = async () => {
+    // On cloud, persist completion per-tenant so the wizard doesn't reappear on
+    // the next visit or another device. Best-effort: a failed write just means
+    // the user sees the (idempotent) wizard again rather than losing data.
+    if (isCloudTenant()) {
+      try {
+        await useSettingsStore.getState().setSetting(CLOUD_ONBOARDING_SETTING, 'true');
+      } catch (e) {
+        console.error('Failed to record onboarding completion:', e);
+      }
+    }
     setIsSetupRequired(false);
     // Now initialize the app
     await initializeApp();

@@ -154,15 +154,34 @@ export function WelcomeStep({ state, dispatch, onNext, onComplete }: WelcomeStep
         <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg p-4 text-left max-w-md w-full">
           <h3 className="text-sm font-medium text-[var(--color-text-primary)] mb-2">What you'll set up:</h3>
           <ul className="space-y-1.5 text-sm text-[var(--color-text-secondary)]">
-            <li className="flex items-center gap-2">
-              <span className="text-[var(--color-accent)]">1.</span> AI provider for embeddings, tagging & chat
-            </li>
-            <li className="flex items-center gap-2">
-              <span className="text-[var(--color-accent)]">2.</span> Optional integrations (MCP, mobile, browser extension)
-            </li>
-            <li className="flex items-center gap-2">
-              <span className="text-[var(--color-accent)]">3.</span> Import existing notes or start fresh
-            </li>
+            {isCloud ? (
+              // Cloud: AI is already provisioned (managed key), so onboarding is
+              // about the rest — what gets auto-tagged, optional integrations,
+              // and bringing notes in.
+              <>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">1.</span> Tag categories the auto-tagger will use
+                </li>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">2.</span> Optional integrations (MCP, mobile, browser extension)
+                </li>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">3.</span> Import existing notes or start fresh
+                </li>
+              </>
+            ) : (
+              <>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">1.</span> AI provider for embeddings, tagging & chat
+                </li>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">2.</span> Optional integrations (MCP, mobile, browser extension)
+                </li>
+                <li className="flex items-center gap-2">
+                  <span className="text-[var(--color-accent)]">3.</span> Import existing notes or start fresh
+                </li>
+              </>
+            )}
           </ul>
         </div>
 

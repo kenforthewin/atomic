@@ -1,5 +1,5 @@
 import { Check } from 'lucide-react';
-import { STEPS } from './useOnboardingState';
+import { getVisibleSteps } from './useOnboardingState';
 
 interface StepIndicatorProps {
   currentStep: number;
@@ -7,9 +7,10 @@ interface StepIndicatorProps {
 }
 
 export function StepIndicator({ currentStep, onStepClick }: StepIndicatorProps) {
+  const steps = getVisibleSteps();
   return (
     <div className="flex items-center justify-center gap-0 px-4">
-      {STEPS.map((step, index) => (
+      {steps.map((step, index) => (
         <div key={step.id} className="flex items-center">
           {/* Step circle */}
           <button
@@ -34,7 +35,7 @@ export function StepIndicator({ currentStep, onStepClick }: StepIndicatorProps) 
           </button>
 
           {/* Connecting line */}
-          {index < STEPS.length - 1 && (
+          {index < steps.length - 1 && (
             <div className={`w-6 h-0.5 mx-0.5 transition-colors duration-200 ${
               index < currentStep
                 ? 'bg-[var(--color-accent)]'

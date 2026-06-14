@@ -1,5 +1,6 @@
 import { useReducer } from 'react';
 import type { AvailableModel, OllamaModel } from '../../lib/api';
+import { isCloudTenant } from '../../lib/transport';
 
 export type StepId =
   | 'welcome'
@@ -333,3 +334,18 @@ export const STEPS: { id: StepId; label: string; required: boolean }[] = [
   { id: 'integrations', label: 'Integrations', required: true },
   { id: 'tutorial', label: 'Tutorial', required: true },
 ];
+
+/**
+ * The steps to show in the current environment. On Atomic Cloud the AI provider
+ * is provisioned by the control plane (managed key, or BYOK set in the account
+ * dashboard), so the provider step is dropped — but the tenant still needs the
+ * rest of setup (tag categories for auto-tagging, integrations, the tutorial).
+ * All wizard machinery indexes into this list, so it stays the single source of
+ * truth for step order and count.
+ */
+export function getVisibleSteps(): { id: StepId; label: string; required: boolean }[] {
+  if (isCloudTenant()) {
+    return STEPS.filter(step => step.id !== 'ai-provider');
+  }
+  return STEPS;
+}
