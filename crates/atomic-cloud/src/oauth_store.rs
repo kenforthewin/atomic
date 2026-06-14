@@ -260,21 +260,38 @@ pub async fn get_oauth_client(
 ///
 /// The PKCE `code_challenge` is stored as-is; it is already a hash of the
 /// client's verifier, and the token endpoint re-derives and compares.
+///
+/// `expires_at` is stamped server-side as `NOW() + ttl` so that mint and
+/// [`consume_oauth_code`] (which filters `expires_at > NOW()`) read the same
+/// clock — the Postgres server's. Computing the expiry on the client clock
+/// (`Utc::now()`) instead would make a short-TTL code's liveness depend on the
+/// skew between the app pod and the database: a zero-TTL code born "expired"
+/// on the client could still read as live if the server's `NOW()` lagged the
+/// client's `Utc::now()`. Anchoring both ends to the server clock removes that
+/// race entirely.
 pub async fn insert_oauth_code(
     control: &ControlPlane,
     code: NewOAuthCode<'_>,
     ttl: Duration,
 ) -> Result<String, CloudError> {
-    let ttl = chrono::Duration::from_std(ttl)
-        .map_err(|_| CloudError::Invariant("oauth code ttl out of range".to_string()))?;
-    let expires_at = Utc::now() + ttl;
+    // Carried to the server as fractional seconds; `make_interval` reconstructs
+    // the interval against the server clock. `f64` seconds covers any TTL we
+    // mint (the longest, [`OAUTH_CODE_TTL`], is minutes) with sub-millisecond
+    // fidelity, and rejects a non-finite/NaN duration before it reaches SQL.
+    let ttl_secs = ttl.as_secs_f64();
+    if !ttl_secs.is_finite() {
+        return Err(CloudError::Invariant(
+            "oauth code ttl out of range".to_string(),
+        ));
+    }
     let (plaintext, hash) = generate_secret(OAUTH_CODE_PREFIX);
 
     sqlx::query(
         "INSERT INTO oauth_codes \
          (code_hash, account_id, client_id, code_challenge, code_challenge_method, \
           redirect_uri, scope, allowed_db_id, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                 NOW() + make_interval(secs => $9))",
     )
     .bind(&hash)
     .bind(code.account_id)
@@ -284,7 +301,7 @@ pub async fn insert_oauth_code(
     .bind(code.redirect_uri)
     .bind(code.scope.as_str())
     .bind(code.allowed_db_id)
-    .bind(expires_at)
+    .bind(ttl_secs)
     .execute(control.pool())
     .await
     .map_err(CloudError::db("inserting oauth code"))?;

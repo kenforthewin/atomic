@@ -535,6 +535,131 @@ async fn delete_takes_final_dump_before_dropping() {
     .await;
 }
 
+/// A [`BackupStore`] whose `put` always fails — used to prove the fail-closed
+/// guarantee: a final-dump *upload* failure must abort `delete_account` before
+/// any drop, leaving the tenant database and its control row intact and the
+/// deletion retryable. `get`/`list`/`exists` are unused by this path.
+struct FailingPutStore;
+
+#[async_trait::async_trait]
+impl BackupStore for FailingPutStore {
+    async fn put(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), atomic_cloud::CloudError> {
+        Err(atomic_cloud::CloudError::BackupStore(
+            "simulated upload failure".into(),
+        ))
+    }
+    async fn get(&self, _key: &str) -> Result<Vec<u8>, atomic_cloud::CloudError> {
+        unreachable!("the fail-closed delete path never reads")
+    }
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>, atomic_cloud::CloudError> {
+        unreachable!("the fail-closed delete path never lists")
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, atomic_cloud::CloudError> {
+        unreachable!("the fail-closed delete path never probes")
+    }
+}
+
+/// The load-bearing fail-closed guarantee: when the final dump cannot be
+/// stored, `delete_account` must error and drop nothing. With hard-delete v1
+/// the final dump is the operator's only undo (plan: "Backups & disaster
+/// recovery"), so a failed dump that nonetheless dropped the tenant would be
+/// unrecoverable customer-data loss. Asserts the negative path the happy-path
+/// test cannot: after a delete that *errors*, the tenant database still exists
+/// and the `account_databases` row is intact (the account is fully retryable).
+#[tokio::test]
+async fn failed_final_dump_aborts_delete_before_dropping() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "failed_final_dump_aborts_delete_before_dropping: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db(
+        "failed_final_dump_aborts_delete_before_dropping",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let acct = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "failclosed@example.com".into(),
+                    subdomain: "failclosed".into(),
+                },
+            )
+            .await
+            .expect("provision");
+
+            // Sanity: the tenant database and its mapping row exist pre-delete.
+            assert!(
+                atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "tenant database exists before the delete"
+            );
+
+            // Delete with a store that fails the dump *upload*. The dump itself
+            // runs (pg_dump succeeds), but the put fails — the error must
+            // propagate before step 5's terminate_and_drop.
+            let store: Arc<dyn BackupStore> = Arc::new(FailingPutStore);
+            let err = atomic_cloud::delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                Some(&store),
+                &acct.account_id,
+            )
+            .await
+            .expect_err("a failed final dump must abort the delete");
+            assert!(
+                matches!(&err, atomic_cloud::CloudError::BackupStore(_)),
+                "expected a BackupStore error from the failed upload, got {err:?}"
+            );
+
+            // The cardinal guarantee: NOTHING was dropped. The tenant database
+            // is still present, so the operator can retry once the store
+            // recovers — no customer data was lost.
+            assert!(
+                atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "tenant database must still exist after a failed final dump"
+            );
+
+            // And the control row is intact (delete aborted before step 6's
+            // mapping-row removal), so the account is fully retryable.
+            let row_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM account_databases WHERE account_id = $1")
+                    .bind(&acct.account_id)
+                    .fetch_one(control.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(row_count, 1, "the account_databases row must survive");
+
+            // Clean up: a successful delete (local store) now drops the tenant
+            // DB so the suite leaves nothing behind.
+            let (_dir, ok_store) = temp_store();
+            atomic_cloud::delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                Some(&ok_store),
+                &acct.account_id,
+            )
+            .await
+            .expect("cleanup delete succeeds once the store recovers");
+            assert!(
+                !atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "tenant database is gone after the successful retry"
+            );
+        },
+    )
+    .await;
+}
+
 // ==================== db-name validation ====================
 
 #[tokio::test]

@@ -1647,6 +1647,13 @@ async fn serve(
     // `run_backup_pass`, mirroring the reaper loop. Cross-pod safe (per-tenant
     // advisory locks), and each pass logs a staleness alert for any tenant
     // whose last successful backup is older than the horizon.
+    //
+    // Unlike the reaper above, this runs via tokio::spawn rather than select!:
+    // the backup pass only dumps and uploads — it never calls provision_account
+    // — so it is free of the sqlx higher-ranked-lifetime future that trips
+    // spawn's Send bound there. Don't "fix" this to match the reaper's select!;
+    // spawn is the lighter idiom and is sound precisely because no provision
+    // future crosses it.
     tokio::spawn(run_backup_loop(
         control.clone(),
         cluster.clone(),
