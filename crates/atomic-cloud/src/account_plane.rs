@@ -107,9 +107,15 @@
 //! `Domain=.<base>; Secure; HttpOnly; SameSite=Lax; Max-Age=<session TTL>`
 //! (plan: "Web sessions" — the leading dot makes one session work across
 //! every subdomain; the account-scoped verification in `CloudAuth` is what
-//! keeps that from crossing tenants). `Secure` is unconditional: on plain-
-//! HTTP dev deployments browsers still accept it for localhost, and a
-//! deployment flag to strip it would eventually strip it in production.
+//! keeps that from crossing tenants). `Secure` is on by default and must
+//! stay on in production. The one exception is a local/headless dev box
+//! served over plain HTTP on a non-`localhost` host (e.g. reached over
+//! Tailscale): browsers only exempt `localhost`/`*.localhost` from the
+//! `Secure`-requires-HTTPS rule, so on such a host a `Secure` cookie is
+//! silently dropped and the dashboard can never authenticate. The
+//! [`AccountPlaneConfig::cookie_secure`] flag (CLI:
+//! `--dangerously-insecure-cookies`, default off) drops `Secure` for exactly
+//! that case and warns loudly at boot; never use it in production.
 //! The redirect targets `<slug>.<base>` with the scheme/port of
 //! [`AccountPlaneConfig::app_public_url`] — production defaults yield
 //! `https://<slug>.<base>/`; dev setups keep their explicit port.
@@ -248,6 +254,14 @@ pub struct AccountPlaneConfig {
     /// Web-session lifetime and cookie `Max-Age`. Production callers use
     /// the [`SESSION_TTL`] default; tests shrink it.
     pub session_ttl: std::time::Duration,
+    /// Whether the session cookie carries the `Secure` attribute. Defaults to
+    /// `true` and MUST stay `true` in production — a `Secure` cookie is only
+    /// sent over HTTPS. Set `false` ONLY for a local/headless dev deployment
+    /// served over plain HTTP on a non-`localhost` host (e.g. reached over
+    /// Tailscale), where browsers would otherwise silently drop the session
+    /// cookie and the dashboard could never authenticate. Boot warns loudly
+    /// when this is `false`.
+    pub cookie_secure: bool,
     /// Free-trial policy applied at signup completion (plan: "Trials"). The
     /// default grants the paid tier for [`DEFAULT_TRIAL_DAYS`] days with no
     /// card; [`TrialPolicy::disabled`] opts a deployment out (new accounts go
@@ -310,6 +324,7 @@ impl AccountPlaneConfig {
             rate_limits: RateLimits::default(),
             max_concurrent_provisions: DEFAULT_MAX_CONCURRENT_PROVISIONS,
             session_ttl: SESSION_TTL,
+            cookie_secure: true,
             trial: TrialPolicy::default_enabled(),
         }
     }
@@ -344,6 +359,8 @@ struct PlaneState {
     /// consumed; never waited on — a saturated process answers 503.
     provision_permits: Arc<Semaphore>,
     session_ttl: std::time::Duration,
+    /// `Secure` attribute on the session cookie (config; default true).
+    cookie_secure: bool,
     /// Free-trial policy applied right after a first-time provision in
     /// `/signup/complete` (plan: "Trials").
     trial: TrialPolicy,
@@ -402,6 +419,7 @@ impl AccountPlane {
                     config.max_concurrent_provisions.max(1),
                 )),
                 session_ttl: config.session_ttl,
+                cookie_secure: config.cookie_secure,
                 trial: config.trial,
             }),
         })
@@ -931,7 +949,7 @@ async fn session_redirect(
     let cookie = Cookie::build(SESSION_COOKIE, session)
         .domain(format!(".{}", state.base_domain))
         .path("/")
-        .secure(true)
+        .secure(state.cookie_secure)
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(

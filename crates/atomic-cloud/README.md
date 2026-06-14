@@ -223,6 +223,11 @@ component map, the typed API client, and the dashboard's state handling.
 
 ## Running it locally
 
+> Running it on a **headless box over Tailscale/SSH** to click through the UI
+> in a browser? See **[TESTING.md](TESTING.md)** — it covers the host routing,
+> the SSH tunnel, and the `--dangerously-insecure-cookies` dev flag the
+> plain-HTTP session cookie needs.
+
 Cloud is Postgres-only. A dev cluster (superuser, can `CREATE/DROP DATABASE`)
 is the only prerequisite — the repo's test compose file works:
 

@@ -171,6 +171,14 @@ enum Command {
         #[arg(long, env = "ATOMIC_CLOUD_APP_PUBLIC_URL")]
         app_public_url: Option<String>,
 
+        /// DEV ONLY. Drop the `Secure` attribute from the session cookie so it
+        /// works over plain HTTP on a non-`localhost` host (e.g. a headless
+        /// dev box reached over Tailscale). NEVER set this in production — it
+        /// allows the session cookie to travel over unencrypted connections.
+        /// Default off (the cookie is `Secure`). Boot warns loudly when set.
+        #[arg(long, env = "ATOMIC_CLOUD_DANGEROUSLY_INSECURE_COOKIES")]
+        dangerously_insecure_cookies: bool,
+
         /// Directory holding the built account-plane SPA (`npm run build` →
         /// `dist`) to serve as the cloud server's fallback route — the
         /// signup/login pages and the authenticated `/account/*` dashboard.
@@ -1256,6 +1264,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             master_key_env,
             trust_proxy_header,
             app_public_url,
+            dangerously_insecure_cookies,
             spa_dir,
             max_concurrent_provisions,
             provisioning,
@@ -1304,11 +1313,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 ..AccountCacheConfig::default()
             };
+            if dangerously_insecure_cookies {
+                tracing::warn!(
+                    "DANGER: --dangerously-insecure-cookies is set — the session cookie \
+                     omits the Secure attribute and can travel over unencrypted HTTP. \
+                     This is for local/headless dev over plain HTTP only; NEVER use it \
+                     in production."
+                );
+            }
             let plane_config = AccountPlaneConfig {
                 app_public_url: app_public_url.clone(),
                 trust_proxy_header,
                 rate_limits: RateLimits::default(),
                 max_concurrent_provisions,
+                cookie_secure: !dangerously_insecure_cookies,
                 ..AccountPlaneConfig::new(base_domain.clone())
             };
 

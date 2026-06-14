@@ -1023,6 +1023,48 @@ async fn signup_complete_end_to_end() {
     .await;
 }
 
+/// With `cookie_secure: false` (the `--dangerously-insecure-cookies` dev flag,
+/// for a headless box served over plain HTTP on a non-`localhost` host where a
+/// `Secure` cookie would be silently dropped) the session cookie omits the
+/// `Secure` attribute but keeps every other protection (`HttpOnly`,
+/// `SameSite=Lax`, the base-domain scope). The default stays `Secure`
+/// (asserted by `signup_complete_end_to_end`); this pins the opt-out.
+#[actix_web::test]
+async fn insecure_cookie_flag_drops_secure_only() {
+    with_control_db("insecure_cookie_flag_drops_secure_only", |url| async move {
+        let config = AccountPlaneConfig {
+            cookie_secure: false,
+            ..plane_config(RateLimits::default())
+        };
+        let h = PlaneHarness::spawn(&url, config).await;
+        let token = h.signup_token("kenny@example.com", "kenny").await;
+
+        let resp = h.complete("signup", &token).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let cookie = set_cookie_header(&resp);
+
+        assert!(
+            !cookie.contains("Secure"),
+            "the insecure-cookie flag must drop the Secure attribute: {cookie}"
+        );
+        // Every other protection is unchanged.
+        for attribute in ["HttpOnly", "SameSite=Lax", "Path=/"] {
+            assert!(
+                cookie.contains(attribute),
+                "cookie must still carry {attribute}: {cookie}"
+            );
+        }
+        assert!(
+            cookie.contains(&format!("Domain={BASE_DOMAIN}"))
+                || cookie.contains(&format!("Domain=.{BASE_DOMAIN}")),
+            "cookie must still be base-domain scoped: {cookie}"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}
+
 /// Double-click safety: the second consumption of the same signup link is a
 /// clean `invalid_link` 400 (the consume UPDATE matched zero rows) — never
 /// a second provision. Account and tenant-mapping rows stay singular.
