@@ -65,7 +65,7 @@ import {
   type IngestionResult,
   type FeedPollResult,
 } from '../../lib/api';
-import { getTransport, switchTransport, switchToLocal, isDesktopApp, isLocalServer, getLocalServerConfig, getMcpBridgePath, type HttpTransportConfig } from '../../lib/transport';
+import { getTransport, switchTransport, switchToLocal, isDesktopApp, isLocalServer, getLocalServerConfig, getMcpBridgePath, isCloudTenant, type HttpTransportConfig } from '../../lib/transport';
 import { pickDirectory, isMacOS, openExternalUrl } from '../../lib/platform';
 import { importMarkdownFolder, type ImportProgress } from '../../lib/import';
 import { importAppleNotes, AppleNotesImportError } from '../../lib/import-apple-notes';
@@ -1044,6 +1044,20 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const isRemoteMode = isDesktopApp() ? !isLocalServer() : true;
   const localServerConfig = isDesktopApp() ? getLocalServerConfig() : null;
 
+  // On Atomic Cloud the provider/models and the connection itself are owned by
+  // the control plane (managed key or dashboard BYOK; fixed cookie-auth origin;
+  // account-scoped tokens live in the dashboard). Those tabs would only mislead
+  // — and their fetches (provider models, /api/auth/tokens) 404 — so a cloud
+  // tenant never sees them.
+  const isCloud = isCloudTenant();
+  const visibleTabs = useMemo(
+    () =>
+      isCloud
+        ? SETTINGS_TABS.filter(tab => tab.id !== 'ai' && tab.id !== 'connection')
+        : SETTINGS_TABS,
+    [isCloud],
+  );
+
   // Check Ollama connection
   const checkOllamaConnection = useCallback(async (host: string) => {
     setOllamaStatus('checking');
@@ -1327,19 +1341,25 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
       const transport = getTransport();
       if (transport.isConnected()) {
         fetchSettings();
-        // Fetch OpenRouter models
-        setIsLoadingModels(true);
-        getAvailableLlmModels()
-          .then(models => setAvailableModels(models))
-          .catch(err => { console.error('Failed to load models:', err); toast.error('Failed to load models', { description: String(err) }); })
-          .finally(() => setIsLoadingModels(false));
-        // Fetch curated OpenRouter embedding model registry
-        getOpenRouterEmbeddingModels()
-          .then(models => setOpenrouterEmbeddingModels(models))
-          .catch(err => { console.error('Failed to load embedding models:', err); });
+        // Provider/model config is control-plane-owned on cloud — skip the
+        // model registry fetches that feed the (hidden) AI Models tab.
+        if (!isCloud) {
+          // Fetch OpenRouter models
+          setIsLoadingModels(true);
+          getAvailableLlmModels()
+            .then(models => setAvailableModels(models))
+            .catch(err => { console.error('Failed to load models:', err); toast.error('Failed to load models', { description: String(err) }); })
+            .finally(() => setIsLoadingModels(false));
+          // Fetch curated OpenRouter embedding model registry
+          getOpenRouterEmbeddingModels()
+            .then(models => setOpenrouterEmbeddingModels(models))
+            .catch(err => { console.error('Failed to load embedding models:', err); });
+        }
       }
-      // Load API tokens when connected to a non-local server
-      if (!isLocalServer() && transport.isConnected()) {
+      // Load API tokens when connected to a non-local server. Cloud tenants
+      // manage account-scoped tokens in the dashboard, not here (the data-plane
+      // /api/auth/tokens route is not exposed), so skip it.
+      if (!isLocalServer() && !isCloud && transport.isConnected()) {
         loadApiTokens();
       }
       // Reset token creation state
@@ -1348,7 +1368,15 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
       setShowTokenSection(false);
       setConfirmRevokeId(null);
     }
-  }, [isOpen, fetchSettings, loadApiTokens]);
+  }, [isOpen, isCloud, fetchSettings, loadApiTokens]);
+
+  // If the active tab isn't available in this mode (e.g. a cloud tenant landing
+  // on the hidden AI/Connection tab via initialTab), fall back to General.
+  useEffect(() => {
+    if (isOpen && !visibleTabs.some(tab => tab.id === activeTab)) {
+      setActiveTab('general');
+    }
+  }, [isOpen, activeTab, visibleTabs]);
 
   // Load feeds when integrations tab is active.
   useEffect(() => {
@@ -1690,7 +1718,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
           <nav className="md:hidden border-b border-[var(--color-border)] bg-[var(--color-bg-main)]/35 overflow-x-auto">
             <div className="flex gap-1 p-2 min-w-max">
-              {SETTINGS_TABS.map((tab) => (
+              {visibleTabs.map((tab) => (
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
@@ -1708,7 +1736,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
 
           <nav className="hidden md:block w-48 flex-shrink-0 border-r border-[var(--color-border)] bg-[var(--color-bg-main)]/35 p-2 overflow-y-auto">
             <div className="space-y-1">
-              {SETTINGS_TABS.map((tab) => (
+              {visibleTabs.map((tab) => (
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
