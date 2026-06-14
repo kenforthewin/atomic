@@ -193,6 +193,16 @@ enum Command {
         )]
         spa_dir: std::path::PathBuf,
 
+        /// Optional directory holding the built PRODUCT app (`npm run
+        /// build:web` → `dist-web`) to serve at the tenant root, so the
+        /// dashboard's "Open knowledge base" link lands on the real product
+        /// app on the same origin. Mainly a local/dev convenience — in
+        /// production a reverse proxy serves the product app at the tenant
+        /// root. Unset (the default) means the tenant root falls back to the
+        /// account dashboard.
+        #[arg(long, env = "ATOMIC_CLOUD_PRODUCT_DIR")]
+        product_dir: Option<std::path::PathBuf>,
+
         /// Max signups provisioning concurrently in this process; further
         /// signup completions get a 503 + Retry-After without consuming
         /// their link (the plan budgets 4-8).
@@ -1266,6 +1276,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             app_public_url,
             dangerously_insecure_cookies,
             spa_dir,
+            product_dir,
             max_concurrent_provisions,
             provisioning,
             billing,
@@ -1383,6 +1394,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 backup_config,
                 std::time::Duration::from_secs(backup_interval_secs.max(1)),
                 spa_dir,
+                product_dir,
             )
             .await
         }
@@ -1897,6 +1909,7 @@ async fn serve(
     backup_config: atomic_cloud::BackupConfig,
     backup_interval: std::time::Duration,
     spa_dir: std::path::PathBuf,
+    product_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -2216,6 +2229,19 @@ async fn serve(
              serving API only"
         ),
     }
+    // Optionally attach the product app (`dist-web`) to serve at the tenant
+    // root — a local/dev convenience so the dashboard's "Open knowledge base"
+    // link reaches the real product app on the same origin. Requires the
+    // account SPA to be present (it's the host that holds the product app);
+    // without `--product-dir` the tenant root falls back to the dashboard.
+    let spa = match (spa, &product_dir) {
+        (Some(spa), Some(dir)) => {
+            let spa = spa.with_product_dir(dir).await?;
+            tracing::info!(product_dir = %dir.display(), "serving product app at the tenant root");
+            Some(spa)
+        }
+        (spa, _) => spa,
+    };
 
     tracing::info!(bind, port, "listening on http://{bind}:{port}");
     tracing::info!(bind, port, "health: http://{bind}:{port}/health");

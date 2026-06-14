@@ -74,6 +74,30 @@ const ASSET_MAX_AGE_SECS: u32 = 31_536_000;
 pub struct SpaServer {
     root: std::sync::Arc<Path>,
     index_html: std::sync::Arc<str>,
+    /// Normalized base domain, so the fallback can tell a tenant host
+    /// (`<slug>.<base>`) from the app host and pick the right shell.
+    base_domain: std::sync::Arc<str>,
+    /// The optional product knowledge-base app (the dark atoms/canvas SPA,
+    /// `dist-web`). When attached, a tenant-host navigation that isn't a real
+    /// file and isn't `/account/*` serves THIS app's shell at the tenant root,
+    /// so the dashboard's "Open knowledge base" link lands on the product app.
+    /// Absent in production (nginx serves the product app at the tenant root)
+    /// and in pure-account dev; present when `serve --product-dir` points at a
+    /// built `dist-web`. Its assets share the `/assets/` path with the account
+    /// SPA, but Vite content-hashes filenames so the two never collide — the
+    /// fallback resolves an asset by checking both roots.
+    product: Option<ProductApp>,
+}
+
+/// The product knowledge-base app served at the tenant root (dev convenience;
+/// see [`SpaServer::product`]).
+#[derive(Clone)]
+struct ProductApp {
+    root: std::sync::Arc<Path>,
+    /// The product app's `index.html`, served as its SPA shell. Unlike the
+    /// account SPA there is no base-domain meta to inject — the product app
+    /// talks to its same-origin tenant API and needs no cloud config.
+    index_html: std::sync::Arc<str>,
 }
 
 impl SpaServer {
@@ -104,7 +128,45 @@ impl SpaServer {
         Ok(Self {
             root: root.into(),
             index_html: index_html.into(),
+            base_domain: normalized.into(),
+            product: None,
         })
+    }
+
+    /// Attach the product knowledge-base app (its built `dist-web`) so the
+    /// tenant root serves it (see [`Self::product`]). No-ops with a single
+    /// warn when the directory has no `index.html` — a dev run that didn't
+    /// build the product web bundle still boots, the "Open knowledge base"
+    /// link just falls back to the account dashboard as before. A directory
+    /// that exists but is unreadable is a hard error.
+    pub async fn with_product_dir(
+        mut self,
+        dist_dir: impl AsRef<Path>,
+    ) -> Result<Self, CloudError> {
+        let root = dist_dir.as_ref().to_path_buf();
+        let index_path = root.join("index.html");
+        match tokio::fs::read_to_string(&index_path).await {
+            Ok(index_html) => {
+                self.product = Some(ProductApp {
+                    root: root.into(),
+                    index_html: index_html.into(),
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    product_dir = %root.display(),
+                    "no built product app found (run `npm run build:web`); \
+                     the tenant root serves the account dashboard only"
+                );
+            }
+            Err(source) => {
+                return Err(CloudError::Io {
+                    context: format!("reading product index.html at {}", index_path.display()),
+                    source,
+                });
+            }
+        }
+        Ok(self)
     }
 
     /// Build the [`SpaServer`] only if `dist_dir` exists and carries an
@@ -334,28 +396,56 @@ fn tenant_host_guard(base_domain: String) -> impl guard::Guard {
 /// error, not a page navigation). This keeps the fallback from masking a
 /// mistyped API call as an HTML 200.
 async fn serve_spa(req: HttpRequest, spa: web::Data<SpaServer>) -> HttpResponse {
-    if !matches!(*req.method(), actix_web::http::Method::GET | actix_web::http::Method::HEAD) {
+    if !matches!(
+        *req.method(),
+        actix_web::http::Method::GET | actix_web::http::Method::HEAD
+    ) {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "not_found" }));
     }
 
-    // Try to serve an existing file under dist for the request path; fall back
-    // to the SPA shell for anything that isn't a real file (deep links).
-    if let Some(resolved) = resolve_asset_path(&spa.root, req.path()) {
-        match tokio::fs::read(&resolved).await {
-            Ok(bytes) => return asset_response(&resolved, bytes),
-            // A path that resolved inside dist but isn't a file (a directory,
-            // or a deep link that coincidentally matches a real subdir name)
-            // falls through to the shell.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::error!(path = req.path(), error = %e, "serving SPA asset failed");
-                return HttpResponse::InternalServerError()
-                    .json(serde_json::json!({ "error": "asset_read_failed" }));
+    // Try to serve an existing build file. Check the account dist first, then
+    // the product dist (when attached): the two share the `/assets/` path but
+    // Vite content-hashes filenames, so a given asset lives in exactly one of
+    // them and "check both" resolves it without collision. Anything that isn't
+    // a real file (a deep link) falls through to a shell below.
+    let product_root = spa.product.as_ref().map(|p| p.root.as_ref());
+    for root in std::iter::once(spa.root.as_ref()).chain(product_root) {
+        if let Some(resolved) = resolve_asset_path(root, req.path()) {
+            match tokio::fs::read(&resolved).await {
+                Ok(bytes) => return asset_response(&resolved, bytes),
+                // Resolved inside a dist root but isn't a file (a directory, or
+                // a deep link that coincidentally matches a real subdir name):
+                // keep looking, then fall through to the shell.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::error!(path = req.path(), error = %e, "serving SPA asset failed");
+                    return HttpResponse::InternalServerError()
+                        .json(serde_json::json!({ "error": "asset_read_failed" }));
+                }
             }
         }
     }
 
+    // No file matched → serve a SPA shell. On a tenant host with the product
+    // app attached, the tenant root belongs to the product knowledge base
+    // (the dashboard lives behind the `/account/*` gate, matched earlier), so
+    // serve the product shell. The app host — and any tenant host without a
+    // product app — gets the account SPA shell.
+    if let Some(product) = &spa.product {
+        if request_host(&req).is_some_and(|h| host_is_tenant(h, &spa.base_domain)) {
+            return spa_shell_response(&product.index_html);
+        }
+    }
     spa_shell_response(spa.index_html())
+}
+
+/// The request's host (`Host` header, falling back to the URI authority),
+/// the same source [`AccountGate`] and `CloudAuth` read.
+fn request_host(req: &HttpRequest) -> Option<&str> {
+    req.headers()
+        .get(actix_web::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().host())
 }
 
 /// Resolve a request path to a candidate file under `root`, or `None` when the
@@ -425,7 +515,10 @@ fn spa_shell_response(index_html: &str) -> HttpResponse {
 /// emits. Unknown extensions get no header (actix/browsers sniff), which is
 /// fine for the SPA's narrow output set.
 fn content_type_for(path: &Path) -> Option<HeaderValue> {
-    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
     let value = match ext.as_str() {
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",

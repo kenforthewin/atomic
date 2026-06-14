@@ -12,7 +12,27 @@ cookie to work over plain HTTP. Both are handled below.
 
 ---
 
-## TL;DR
+## One command
+
+```bash
+scripts/cloud-dev.sh      # on the box: Postgres (Docker) + both frontends built + cloud server (host)
+```
+
+That brings up the whole stack — Postgres in Docker, the account-plane
+frontend **and** the product knowledge-base app built and served by the cloud
+server on one origin (so "Open knowledge base" works), all the dev flags wired
+in, a stable dev master key persisted across restarts. `SKIP_BUILD=1` skips the
+frontend builds for a fast restart; `REBUILD=1` forces them; `BIND=0.0.0.0`
+exposes it directly over Tailscale instead of through an SSH tunnel.
+
+You still need to (a) resolve `*.cloudtest.local` to the box — see "Resolving
+tenant subdomains" below (dnsmasq is the one-time fix) — and (b) reach the port
+(SSH tunnel or `BIND=0.0.0.0`). Then open `http://app.cloudtest.local:8080/`.
+
+The rest of this doc is the manual breakdown of what that script does, plus the
+DNS/cookie details worth understanding.
+
+## TL;DR (manual)
 
 On the **box** (over SSH):
 
@@ -21,7 +41,8 @@ cd ~/git/atomic
 docker compose -f docker-compose.test.yml up -d                 # Postgres on :5433
 
 npm --prefix crates/atomic-cloud/frontend ci
-npm --prefix crates/atomic-cloud/frontend run build             # produces frontend/dist
+npm --prefix crates/atomic-cloud/frontend run build             # account frontend → frontend/dist
+npm ci && npm run build:web                                     # product app → dist-web
 
 export ATOMIC_CLOUD_MASTER_KEY=$(openssl rand -hex 32)
 CTL=postgres://atomic:atomic_test@localhost:5433/atomic_cloud_dev   # NB: a DEV control DB, not the test one
@@ -34,7 +55,8 @@ cargo run -p atomic-cloud -- --control-url "$CTL" serve \
   --app-public-url http://app.cloudtest.local:8080 \
   --bind 127.0.0.1 --port 8080 \
   --email-mode log \
-  --dangerously-insecure-cookies
+  --dangerously-insecure-cookies \
+  --product-dir dist-web         # serve the product app at the tenant root (the KB link)
 ```
 
 On your **laptop**:
@@ -162,6 +184,11 @@ get from the magic-link flow:
   Provider/BYOK settings, Billing (the "Manage billing" button needs Stripe
   keys; without them it shows the configured-off state), MCP setup, and the
   typed-confirmation delete flow.
+- **`alpha.cloudtest.local:8080/`** — with `--product-dir` set, the **product
+  knowledge-base app** (the dark atoms/canvas UI) served at the tenant root;
+  the dashboard's "Open knowledge base" link lands here. Without it, the tenant
+  root falls back to the dashboard. (In production a reverse proxy serves the
+  product app here — `--product-dir` reproduces that on one origin for dev.)
 
 ## Fast visual iteration (Vite HMR)
 
