@@ -213,6 +213,9 @@ fn collect_keys<'a>(
 /// Production object store, backed by [`object_store`]'s `AmazonS3` client.
 pub struct S3Store {
     inner: Arc<dyn object_store::ObjectStore>,
+    /// Normalized key prefix (no surrounding slashes), or `None`. Prepended to
+    /// every key so operators can share one bucket (`--backup-prefix`).
+    prefix: Option<String>,
 }
 
 /// What [`S3Store`] needs to address a bucket. Credentials are NOT here —
@@ -228,6 +231,13 @@ pub struct S3Config {
     /// Override endpoint for S3-compatible providers (R2, MinIO). `None`
     /// targets AWS S3 proper.
     pub endpoint: Option<String>,
+    /// Optional key prefix prepended to every object key, for operators
+    /// sharing one bucket across deployments (`--backup-prefix`). Composes
+    /// *in front of* the existing `backups/` layout: with prefix `prod` a
+    /// nightly dump lands at `prod/backups/<date>/<db>.dump`. Empty/`None`
+    /// keeps the bare `backups/...` layout. Surrounding slashes are
+    /// normalized so `prod`, `prod/`, and `/prod/` are equivalent.
+    pub prefix: Option<String>,
 }
 
 impl S3Store {
@@ -254,14 +264,50 @@ impl S3Store {
             .map_err(|e| CloudError::BackupStore(format!("building S3 client: {e}")))?;
         Ok(Self {
             inner: Arc::new(store),
+            prefix: normalize_prefix(config.prefix.as_deref()),
         })
+    }
+
+    /// The full object path for a backup `key`: the configured prefix (if any)
+    /// joined in front of the bare key. The `backups/...` layout is preserved
+    /// underneath the prefix.
+    fn full_key(&self, key: &str) -> String {
+        match &self.prefix {
+            Some(prefix) => format!("{prefix}/{key}"),
+            None => key.to_string(),
+        }
+    }
+
+    /// Strip the configured prefix back off a listed key so callers see the
+    /// same bare `backups/...` keys they put. A listing that (defensively)
+    /// returns a key outside the prefix is passed through unchanged.
+    fn strip_prefix<'a>(&self, full: &'a str) -> &'a str {
+        match &self.prefix {
+            Some(prefix) => full
+                .strip_prefix(prefix)
+                .map(|rest| rest.trim_start_matches('/'))
+                .unwrap_or(full),
+            None => full,
+        }
+    }
+}
+
+/// Normalize an operator-supplied `--backup-prefix` to an internal form with no
+/// leading/trailing slashes (empty → `None`), so `prod`, `prod/`, and `/prod/`
+/// all yield `prod`. Empty after trimming means "no prefix".
+fn normalize_prefix(prefix: Option<&str>) -> Option<String> {
+    let trimmed = prefix?.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
 #[async_trait]
 impl BackupStore for S3Store {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), CloudError> {
-        let path = object_store::path::Path::from(key);
+        let path = object_store::path::Path::from(self.full_key(key));
         self.inner
             .put(&path, bytes.into())
             .await
@@ -270,7 +316,7 @@ impl BackupStore for S3Store {
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, CloudError> {
-        let path = object_store::path::Path::from(key);
+        let path = object_store::path::Path::from(self.full_key(key));
         let result = self
             .inner
             .get(&path)
@@ -285,19 +331,21 @@ impl BackupStore for S3Store {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, CloudError> {
         use futures::StreamExt;
-        let path = object_store::path::Path::from(prefix);
+        let path = object_store::path::Path::from(self.full_key(prefix));
         let mut stream = self.inner.list(Some(&path));
         let mut keys = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta =
                 meta.map_err(|e| CloudError::BackupStore(format!("S3 list {prefix:?}: {e}")))?;
-            keys.push(meta.location.to_string());
+            // Return bare keys (prefix stripped) so callers round-trip with
+            // the same keys they put.
+            keys.push(self.strip_prefix(&meta.location.to_string()).to_string());
         }
         Ok(keys)
     }
 
     async fn exists(&self, key: &str) -> Result<bool, CloudError> {
-        let path = object_store::path::Path::from(key);
+        let path = object_store::path::Path::from(self.full_key(key));
         match self.inner.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
@@ -333,5 +381,41 @@ mod tests {
         let path = store.resolve("backups/final/abc.dump").unwrap();
         assert!(path.ends_with("backups/final/abc.dump"));
         assert!(path.starts_with("/var/atomic/backups"));
+    }
+
+    #[test]
+    fn prefix_normalization_is_slash_insensitive() {
+        // `prod`, `prod/`, `/prod/` all collapse to `prod`; empty → None.
+        assert_eq!(normalize_prefix(Some("prod")).as_deref(), Some("prod"));
+        assert_eq!(normalize_prefix(Some("prod/")).as_deref(), Some("prod"));
+        assert_eq!(normalize_prefix(Some("/prod/")).as_deref(), Some("prod"));
+        assert_eq!(normalize_prefix(Some("a/b")).as_deref(), Some("a/b"));
+        assert_eq!(normalize_prefix(Some("")), None);
+        assert_eq!(normalize_prefix(Some("///")), None);
+        assert_eq!(normalize_prefix(None), None);
+    }
+
+    #[test]
+    fn s3_prefix_composes_with_backups_layout_and_round_trips() {
+        // full_key prepends the prefix in front of the bare backups/ key;
+        // strip_prefix is its inverse, so list() returns the same bare keys
+        // put() was given. Built without touching the network (the inner
+        // client is never called).
+        let store = S3Store {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: normalize_prefix(Some("/prod/")),
+        };
+        let bare = "backups/2026-06-09/acct_x.dump";
+        let full = store.full_key(bare);
+        assert_eq!(full, "prod/backups/2026-06-09/acct_x.dump");
+        assert_eq!(store.strip_prefix(&full), bare);
+
+        // No prefix is a pure passthrough.
+        let none = S3Store {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: None,
+        };
+        assert_eq!(none.full_key(bare), bare);
+        assert_eq!(none.strip_prefix(bare), bare);
     }
 }

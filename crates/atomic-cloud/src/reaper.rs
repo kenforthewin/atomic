@@ -262,6 +262,11 @@ pub struct ReaperPolicy {
     /// never-activated databases and deliberately don't route through
     /// `delete_account`, so they never dump regardless of this field.
     pub backup_store: Option<std::sync::Arc<dyn crate::backup_store::BackupStore>>,
+
+    /// Per-`pg_dump` budget for arm 3's final dump (adversarial-review issue
+    /// 1); see [`BackupConfig::backup_timeout`](crate::BackupConfig::backup_timeout).
+    /// [`Default`] is [`DEFAULT_BACKUP_TIMEOUT`](crate::backup::DEFAULT_BACKUP_TIMEOUT).
+    pub backup_timeout: Duration,
 }
 
 impl std::fmt::Debug for ReaperPolicy {
@@ -310,6 +315,7 @@ impl Default for ReaperPolicy {
             self_reservation_grace: Duration::from_secs(5 * 60),
             magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
             backup_store: None,
+            backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
         }
     }
 }
@@ -475,10 +481,24 @@ fn cutoff(age: Duration) -> DateTime<Utc> {
 /// cancelled future dropping the connection ends the session and frees the
 /// lock — it can never strand on a connection returned to the pool.
 ///
-/// Public so the nightly backup pass ([`crate::backups`]) takes the *same*
-/// per-account lock the reaper does: a backup of an active tenant and a
-/// reaper drop of that same tenant are then mutually exclusive, so a dump can
-/// never race a `DROP DATABASE`.
+/// Public so the nightly backup pass ([`crate::backups`]) **and every
+/// active-account deletion path** take the *same* per-account lock the reaper
+/// does. A backup of an active tenant and a drop of that same tenant are then
+/// mutually exclusive, so a dump can never race a `DROP DATABASE`:
+///
+/// - the **reaper's** interrupted-deletion arm takes this lock per row before
+///   calling [`delete_account`](crate::provision::delete_account) (in
+///   [`DeleteLock::AlreadyHeld`](crate::provision::DeleteLock::AlreadyHeld)
+///   mode, so it doesn't self-deadlock re-acquiring its own hold);
+/// - the **HTTP route** and the **CLI** call `delete_account` in
+///   [`DeleteLock::Acquire`](crate::provision::DeleteLock::Acquire) mode, which
+///   takes this same lock itself around the final-dump-and-drop window.
+///
+/// So the invariant — a backup pass mid-`pg_dump` of tenant X can never race a
+/// delete that drops X — now holds for the route and CLI too, not just the
+/// reaper's own drop (adversarial-review issue 2). A delete that finds the lock
+/// held by a backup pass waits briefly, then returns [`CloudError::Busy`]
+/// (route → 503 retry) rather than racing.
 pub async fn try_account_advisory_lock(
     control: &ControlPlane,
     account_id: &str,
@@ -1017,13 +1037,29 @@ async fn complete_interrupted_deletions(
             // key delete failed.
             // Pass the backup store so a deletion that died before its drop
             // still takes the final dump before this completes the
-            // destruction (module docs on ReaperPolicy::backup_store).
+            // destruction (module docs on ReaperPolicy::backup_store). The
+            // policy is an explicit decision: a configured store means a
+            // fail-closed final dump; no store means acknowledged-disabled
+            // (dev) — never a silent skip (adversarial-review issue 3).
+            //
+            // We ALREADY hold this account's advisory lock (taken per row
+            // above), so delete_account runs in DeleteLock::AlreadyHeld mode —
+            // re-acquiring the same session-level lock on a second connection
+            // would self-deadlock against our own hold (adversarial-review
+            // issue 2).
+            let backup_timeout = policy.backup_timeout;
+            let backup_policy = match policy.backup_store.as_ref() {
+                Some(store) => crate::backups::BackupPolicy::Required(store),
+                None => crate::backups::BackupPolicy::DisabledAcknowledged,
+            };
             crate::provision::delete_account(
                 control,
                 cluster,
                 managed,
-                policy.backup_store.as_ref(),
+                backup_policy,
+                crate::provision::DeleteLock::AlreadyHeld,
                 &account_id,
+                backup_timeout,
             )
             .await?;
             Ok(true)

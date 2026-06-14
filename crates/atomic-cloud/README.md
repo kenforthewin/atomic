@@ -253,7 +253,7 @@ any subcommand with `--help` for the full flag set. Notable `serve` groups:
 - **Dispatcher**: `--dispatcher`, `--dispatcher-tick-ms`, the four `--*-pool-total`/`--*-pool-per-tenant` caps, `--reports-per-tenant-cap`
 - **Backpressure**: `--breaker-*`, `--retry-after-cap-secs`, `--chat-streams-per-account`
 - **Deploy gating**: `--fleet-migration-*`, `--deploy-ready-failure-rate`, `--deploy-review-failure-rate`
-- **Backups**: `--backup-store local|s3` (+ `--backup-base-dir`, `--backup-bucket`, `--backup-region`, `--backup-endpoint`; S3 access-key/secret are env-only `AWS_*`), `--backup-interval-secs`, `--max-backups-per-pass`, `--backup-staleness-secs`
+- **Backups**: `--backup-store local|s3` (+ `--backup-base-dir`, `--backup-bucket`, `--backup-region`, `--backup-endpoint`, `--backup-prefix` for a shared-bucket key prefix; S3 access-key/secret are env-only `AWS_*`), `--backup-interval-secs`, `--max-backups-per-pass`, `--backup-staleness-secs`, `--backup-timeout-secs` (per-`pg_dump`/`pg_restore` kill budget; default 30m)
 
 Every flag has an `ATOMIC_CLOUD_*` env fallback. Secrets (master key, provisioning
 key) are **only** read from the environment — never argv — to keep them out of
@@ -261,7 +261,7 @@ process listings.
 
 ## Migrations
 
-Control-plane migrations live in [`migrations/`](migrations) (`001`–`015`) and
+Control-plane migrations live in [`migrations/`](migrations) (`001`–`016`) and
 run through the hardened runner in `control_plane.rs` (schema-version table,
 advisory lock on a detached connection, errors propagated). Tenant databases run
 atomic-core's own migrations via `initialize()`.
@@ -295,6 +295,30 @@ passed to `pg_dump`/`pg_restore` via `PGPASSWORD` **in the child environment,
 never argv** (a unit test pins this), and every database name is shape-validated
 by `is_tenant_db_name` before any DDL.
 
+Three robustness properties the runner guarantees:
+
+- **Each `pg_dump`/`pg_restore` is killed if it overruns `--backup-timeout-secs`**
+  (default 30m). A hung child — a tenant holding a lock that blocks `pg_dump`'s
+  `ACCESS SHARE`, a network stall, a wedged process — is killed and recorded as
+  a typed timeout failure rather than hanging the serial pass forever. One
+  tenant's timeout never aborts the pass; the whole-pass worst case is bounded
+  by `backup_timeout × max_backups_per_pass`.
+- **Most-overdue-first ordering by last *attempt***, not last *success*: a
+  tenant whose dump keeps failing stamps `last_backup_attempt_at` each pass, so
+  it sinks behind a healthy-but-due tenant instead of starving it at the front
+  of every capped pass. A never-attempted tenant still sorts first.
+- **Stale in-flight `backup_runs` rows are finalized `'abandoned'`** (a pod
+  killed mid-pass leaves a row never finished) — at pass start and on `backup
+  status`, mirroring `deploy_runs`.
+
+The pass and **every active-account deletion path** take the *same* per-account
+advisory lock, so a backup mid-`pg_dump` of tenant X and a `DROP DATABASE` of X
+are genuinely mutually exclusive — for the reaper's interrupted-deletion arm
+(which holds the lock and calls `delete_account` in `DeleteLock::AlreadyHeld`
+mode), the HTTP route, and the CLI (both `DeleteLock::Acquire`). A delete that
+finds the lock held by a backup waits briefly, then returns a typed `Busy`
+(HTTP 503, retry) rather than racing.
+
 **Final dump on deletion is fail-closed and mandatory.** `delete_account` takes
 the final `backups/final/` dump **before** the `DROP DATABASE`; if the dump (or
 its upload) fails, the deletion **aborts** and drops nothing — under hard-delete
@@ -304,6 +328,13 @@ HTTP route, the CLI, and the reaper's *interrupted-deletion* completion arm). Th
 reaper's stuck-provision rollback and orphan-database reclaim drop tenants that
 **never activated** (no real user data, possibly not even dumpable) and
 deliberately take **no** final dump.
+
+The backup decision is an **explicit `BackupPolicy`**, never a fail-open absent
+store: `Required(store)` takes the dump; `DisabledAcknowledged` drops without one
+after a loud `warn!` (dev, or the never-activated reaper paths). A composition
+that *forgets* to wire the store on an enabled deployment is a type error, not a
+silent unrecoverable drop — the route holds `Enabled(store)` vs
+`DisabledAcknowledged`, with no third "forgot it" state.
 
 ### Restore runbook (rehearse before launch)
 

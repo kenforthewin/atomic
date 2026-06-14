@@ -485,8 +485,10 @@ async fn full_disaster_recovery_rehearsal() {
             &h.control,
             &h.cluster,
             &ManagedKeys::Disabled,
-            Some(&h.store),
+            atomic_cloud::BackupPolicy::Required(&h.store),
+            atomic_cloud::DeleteLock::Acquire,
             &alpha.account_id,
+            atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
         )
         .await
         .expect("delete alpha takes the final dump then drops");
@@ -561,9 +563,15 @@ async fn full_disaster_recovery_rehearsal() {
         let dump_bytes = h.store.get(&final_key).await.expect("read final dump");
         let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
         with_db_guard(&base_url, &restore_db, || async {
-            restore_database(&h.cluster, &conn, &restore_db, &dump_bytes)
-                .await
-                .expect("restore alpha's final dump into a fresh db");
+            restore_database(
+                &h.cluster,
+                &conn,
+                &restore_db,
+                &dump_bytes,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect("restore alpha's final dump into a fresh db");
 
             // 3b — reinstate alpha's account + repoint its mapping to the
             // restored database (the runbook's control-plane step). We reuse

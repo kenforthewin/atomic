@@ -49,6 +49,48 @@ pub const DEFAULT_STALENESS_HORIZON: Duration = Duration::from_secs(36 * 60 * 60
 /// v1 fleets are small — and overridable via the CLI.
 pub const DEFAULT_MAX_BACKUPS_PER_PASS: usize = 256;
 
+/// The backup decision for an account deletion (adversarial-review issue 3).
+///
+/// The active-account deletion path (the HTTP route, the CLI, the reaper's
+/// interrupted-deletion arm) must take a fail-closed **final dump before the
+/// `DROP DATABASE`** — under hard-delete v1 that dump is the operator's only
+/// undo, so destroying un-backed-up data is never allowed. Making the store an
+/// `Option` defaulted to `None` (the prior shape) was fail-*open*: a
+/// composition that simply forgot to wire the store would silently drop a
+/// tenant with no final dump — the exact unrecoverable loss this slice
+/// prevents.
+///
+/// This enum makes the policy an **explicit decision** the type system
+/// enforces. There is no default; every caller states which arm it means:
+///
+/// - [`Required`](Self::Required) — backups are enabled; the deletion **must**
+///   take a final dump to this store before dropping anything. A missing store
+///   on this path is impossible by construction.
+/// - [`DisabledAcknowledged`](Self::DisabledAcknowledged) — backups are
+///   deliberately disabled for this deletion (dev clusters with no store, or
+///   the reaper's never-activated rollback/orphan paths that hold no real user
+///   data). [`delete_account`](crate::provision::delete_account) emits a loud
+///   `warn!` and drops without a final dump. Choosing this is a conscious act,
+///   not a forgotten builder call.
+#[derive(Clone, Copy)]
+pub enum BackupPolicy<'a> {
+    /// Backups enabled: take a fail-closed final dump to this store first.
+    Required(&'a Arc<dyn BackupStore>),
+    /// Backups disabled by an explicit, acknowledged operator decision: drop
+    /// without a final dump (with a loud warning).
+    DisabledAcknowledged,
+}
+
+impl<'a> BackupPolicy<'a> {
+    /// The store to dump to, or `None` when backups are acknowledged-disabled.
+    pub fn store(&self) -> Option<&'a Arc<dyn BackupStore>> {
+        match self {
+            BackupPolicy::Required(store) => Some(store),
+            BackupPolicy::DisabledAcknowledged => None,
+        }
+    }
+}
+
 /// An active tenant database the nightly pass backs up.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BackupTarget {
@@ -111,6 +153,12 @@ pub struct BackupConfig {
     /// Staleness horizon for [`stale_tenant_backups`] — not used by the pass
     /// itself, carried here so `serve` configures one place.
     pub staleness_horizon: Duration,
+    /// Per-`pg_dump` wall-clock budget (adversarial-review issue 1). A tenant
+    /// whose dump overruns this is killed and recorded as a typed timeout
+    /// failure; the pass proceeds to the next tenant rather than hanging. The
+    /// whole-pass worst case is bounded by this × the per-pass cap (see
+    /// [`run_backup_pass`]). Defaults to [`DEFAULT_BACKUP_TIMEOUT`].
+    pub backup_timeout: Duration,
 }
 
 impl Default for BackupConfig {
@@ -118,6 +166,7 @@ impl Default for BackupConfig {
         Self {
             max_backups_per_pass: DEFAULT_MAX_BACKUPS_PER_PASS,
             staleness_horizon: DEFAULT_STALENESS_HORIZON,
+            backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
         }
     }
 }
@@ -150,17 +199,26 @@ pub fn final_key(account_id: &str, ts: DateTime<Utc>) -> String {
 
 // ==================== Control-plane queries ====================
 
-/// Active tenant databases the nightly pass backs up, stale-first
-/// (never-backed-up sorts first via `NULLS FIRST`) so a capped pass makes
-/// progress on the most-overdue tenants. Only `status = 'active'` rows: a
-/// provisioning/half-built tenant may not be dumpable.
+/// Active tenant databases the nightly pass backs up, **most-overdue-first**.
+///
+/// Ordering is by the most recent *attempt* — `COALESCE(last_backup_at,
+/// last_backup_attempt_at)` ascending, NULLS FIRST — not by last *success*
+/// alone (adversarial-review issue 5). A tenant whose dump keeps failing never
+/// stamps `last_backup_at`; ordering by success alone would float it to the
+/// front of *every* pass and, under a small cap, let a cohort of broken tenants
+/// permanently starve healthy-but-due ones. Because the pass stamps
+/// `last_backup_attempt_at` on success *and* failure, a just-failed tenant
+/// sinks behind a healthy-but-due tenant until its turn comes round again,
+/// while a genuinely never-attempted tenant (both columns NULL) still sorts
+/// first. Only `status = 'active'` rows: a provisioning/half-built tenant may
+/// not be dumpable.
 pub async fn list_active_tenant_databases(
     control: &ControlPlane,
 ) -> Result<Vec<BackupTarget>, CloudError> {
     sqlx::query_as(
         "SELECT account_id, db_name FROM account_databases \
          WHERE status = 'active' \
-         ORDER BY last_backup_at ASC NULLS FIRST, account_id",
+         ORDER BY COALESCE(last_backup_at, last_backup_attempt_at) ASC NULLS FIRST, account_id",
     )
     .fetch_all(control.pool())
     .await
@@ -177,7 +235,7 @@ pub async fn record_backup_success(
 ) -> Result<(), CloudError> {
     sqlx::query(
         "UPDATE account_databases \
-         SET last_backup_at = $3, last_backup_error = NULL \
+         SET last_backup_at = $3, last_backup_attempt_at = $3, last_backup_error = NULL \
          WHERE account_id = $1 AND db_name = $2",
     )
     .bind(account_id)
@@ -190,37 +248,54 @@ pub async fn record_backup_success(
 }
 
 /// Record a failed backup of `db_name` for `account_id`. `last_backup_at` is
-/// left untouched — the staleness monitor must keep seeing the *last
-/// success*, not be reset by a failure (a tenant whose backups keep failing
-/// must trip the alert, not look fresh).
+/// left untouched — the staleness monitor must keep seeing the *last success*,
+/// not be reset by a failure (a tenant whose backups keep failing must trip the
+/// alert, not look fresh). But `last_backup_attempt_at` **is** stamped: it
+/// records that the pass *tried* this tenant, so the most-overdue-first
+/// ordering (see [`list_active_tenant_databases`]) doesn't let a persistently
+/// failing tenant pre-empt healthy-but-due ones every pass
+/// (adversarial-review issue 5). `at` is the attempt time.
 pub async fn record_backup_failure(
     control: &ControlPlane,
     account_id: &str,
     db_name: &str,
     error: &str,
+    at: DateTime<Utc>,
 ) -> Result<(), CloudError> {
     let bounded: String = error
         .chars()
         .take(crate::backup::DUMP_STDERR_MAX_LEN)
         .collect();
     sqlx::query(
-        "UPDATE account_databases SET last_backup_error = $3 \
+        "UPDATE account_databases \
+         SET last_backup_error = $3, last_backup_attempt_at = $4 \
          WHERE account_id = $1 AND db_name = $2",
     )
     .bind(account_id)
     .bind(db_name)
     .bind(&bounded)
+    .bind(at)
     .execute(control.pool())
     .await
     .map_err(CloudError::db("recording backup failure"))?;
     Ok(())
 }
 
+/// How long a `backup_runs` row may sit in-flight (`status = 'running'`,
+/// `finished_at IS NULL`) before [`finalize_abandoned_backup_runs`] treats it
+/// as a dead pod's debris (adversarial-review issue 6). A real nightly pass is
+/// bounded by `backup_timeout × cap`; this is comfortably past any honest pass
+/// so a live pod's row is never mislabeled, while a pod killed mid-pass no
+/// longer shows a perpetually in-flight pass. 6 hours.
+pub const DEFAULT_BACKUP_RUN_ABANDON_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Insert this pass's `backup_runs` row (`kind` = `'nightly'` | `'final'`)
-/// and return its id.
+/// and return its id. The row starts `status = 'running'` so a pod killed
+/// before [`finish_backup_run`] is finalizable by
+/// [`finalize_abandoned_backup_runs`].
 pub async fn start_backup_run(control: &ControlPlane, kind: &str) -> Result<String, CloudError> {
     let run_id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO backup_runs (id, kind) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO backup_runs (id, kind, status) VALUES ($1, $2, 'running')")
         .bind(&run_id)
         .bind(kind)
         .execute(control.pool())
@@ -229,7 +304,10 @@ pub async fn start_backup_run(control: &ControlPlane, kind: &str) -> Result<Stri
     Ok(run_id)
 }
 
-/// Finish a `backup_runs` row with its counts and finish timestamp.
+/// Finish a `backup_runs` row with its counts and finish timestamp, flipping
+/// `status` to `'completed'`. The UPDATE is unconditional by id, so a row this
+/// pod's slow finish reaches after a finalizer already marked it `'abandoned'`
+/// is corrected to the real `'completed'` verdict (mirrors deploy_runs).
 pub async fn finish_backup_run(
     control: &ControlPlane,
     run_id: &str,
@@ -239,7 +317,7 @@ pub async fn finish_backup_run(
 ) -> Result<(), CloudError> {
     sqlx::query(
         "UPDATE backup_runs \
-         SET finished_at = NOW(), total = $2, succeeded = $3, failed = $4 \
+         SET finished_at = NOW(), status = 'completed', total = $2, succeeded = $3, failed = $4 \
          WHERE id = $1",
     )
     .bind(run_id)
@@ -250,6 +328,44 @@ pub async fn finish_backup_run(
     .await
     .map_err(CloudError::db("recording backup-run outcome"))?;
     Ok(())
+}
+
+/// Finalize stale in-flight `backup_runs` rows as `'abandoned'`
+/// (adversarial-review issue 6 — mirrors
+/// [`finalize_abandoned_runs`](crate::deploy::finalize_abandoned_runs) for
+/// deploys). A pod killed mid-pass leaves a row `finished_at IS NULL` forever,
+/// so `backup status` would show a perpetually in-flight pass; this marks any
+/// row still `'running'` (or legacy NULL-status) and older than `older_than` as
+/// `'abandoned'` with a `finished_at`. Run at pass start and from `backup
+/// status`. Returns how many rows were finalized. The race against a
+/// slow-but-alive pod is self-correcting: its eventual [`finish_backup_run`]
+/// overwrites `'abandoned'` with the real verdict (the UPDATE there is by id,
+/// unconditional).
+pub async fn finalize_abandoned_backup_runs(
+    control: &ControlPlane,
+    older_than: Duration,
+) -> Result<u64, CloudError> {
+    let stale_secs = older_than.as_secs_f64();
+    let finalized = sqlx::query(
+        "UPDATE backup_runs \
+         SET status = 'abandoned', finished_at = NOW() \
+         WHERE finished_at IS NULL \
+           AND (status = 'running' OR status IS NULL) \
+           AND started_at < NOW() - make_interval(secs => $1)",
+    )
+    .bind(stale_secs)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("finalizing abandoned backup runs"))?
+    .rows_affected();
+    if finalized > 0 {
+        tracing::warn!(
+            finalized,
+            "backup runs stuck in-flight past the abandon horizon were finalized as \
+             'abandoned' (dead pods; see `backup status`)"
+        );
+    }
+    Ok(finalized)
 }
 
 /// Active tenants whose last successful backup is older than `horizon` (or
@@ -322,6 +438,9 @@ pub struct BackupRunRecord {
     pub total: Option<i32>,
     pub succeeded: Option<i32>,
     pub failed: Option<i32>,
+    /// `'running'` | `'completed'` | `'abandoned'`; NULL for rows written by a
+    /// pre-migration-016 binary (treated as running iff `finished_at IS NULL`).
+    pub status: Option<String>,
 }
 
 /// The most recent `backup_runs` rows, newest-first (uses the
@@ -332,7 +451,7 @@ pub async fn recent_backup_runs(
     limit: i64,
 ) -> Result<Vec<BackupRunRecord>, CloudError> {
     sqlx::query_as(
-        "SELECT id, kind, started_at, finished_at, total, succeeded, failed \
+        "SELECT id, kind, started_at, finished_at, total, succeeded, failed, status \
          FROM backup_runs ORDER BY started_at DESC LIMIT $1",
     )
     .bind(limit)
@@ -352,6 +471,15 @@ pub async fn recent_backup_runs(
 /// Cross-pod safe by the reaper's mechanism: a tenant contended by another
 /// pod's pass is skipped (observable, never waited on), and the control dump
 /// is idempotent (same key per day; last writer wins).
+///
+/// **Whole-pass bound (adversarial-review issue 1).** Each `pg_dump` is bounded
+/// by [`BackupConfig::backup_timeout`] and a timed-out tenant is killed and
+/// recorded failed (not awaited forever), so a pathological pass runs for at
+/// most `backup_timeout × (max_backups_per_pass + 1)` (the `+1` is the control
+/// dump) plus per-tenant upload/bookkeeping — it can't run unbounded past the
+/// next interval. One tenant's timeout never aborts the pass: the others still
+/// run and record, and the timed-out tenant's advisory lock is released as its
+/// `back_up_one_tenant` future unwinds.
 pub async fn run_backup_pass(
     control: &ControlPlane,
     cluster: &ClusterConfig,
@@ -360,6 +488,14 @@ pub async fn run_backup_pass(
     now: DateTime<Utc>,
 ) -> BackupSummary {
     let mut summary = BackupSummary::default();
+
+    // Finalize any in-flight rows a prior pod left behind on a mid-pass crash
+    // (adversarial-review issue 6): best-effort, never blocks the pass.
+    if let Err(e) = finalize_abandoned_backup_runs(control, DEFAULT_BACKUP_RUN_ABANDON_AFTER).await
+    {
+        tracing::warn!(error = %e, "backup pass: finalizing abandoned runs failed");
+    }
+
     let run_id = match start_backup_run(control, "nightly").await {
         Ok(id) => Some(id),
         Err(e) => {
@@ -402,7 +538,7 @@ pub async fn run_backup_pass(
             summary.tenants_deferred.push(target.account_id.clone());
             continue;
         }
-        match back_up_one_tenant(control, &conn, store, target, now).await {
+        match back_up_one_tenant(control, &conn, store, target, now, config.backup_timeout).await {
             TenantBackupOutcome::Done => {
                 backed_up += 1;
                 summary.tenants_backed_up.push(target.account_id.clone());
@@ -432,6 +568,7 @@ pub async fn run_backup_pass(
                     &target.account_id,
                     &target.db_name,
                     &e.to_string(),
+                    now,
                 )
                 .await
                 {
@@ -443,7 +580,7 @@ pub async fn run_backup_pass(
 
     // Control-plane dump (plan: "plus the control plane"). One per pass, no
     // lock — the key is per-day and the dump is idempotent.
-    match back_up_control_plane(control, &conn, store, now).await {
+    match back_up_control_plane(control, &conn, store, now, config.backup_timeout).await {
         Ok(()) => summary.control_backed_up = true,
         Err(e) => {
             tracing::error!(error = %e, "backup pass: control-plane dump failed");
@@ -481,6 +618,7 @@ async fn back_up_one_tenant(
     store: &Arc<dyn BackupStore>,
     target: &BackupTarget,
     now: DateTime<Utc>,
+    timeout: Duration,
 ) -> TenantBackupOutcome {
     let lock_conn = match try_account_advisory_lock(control, &target.account_id).await {
         Ok(Some(conn)) => conn,
@@ -489,7 +627,7 @@ async fn back_up_one_tenant(
     };
 
     let result = async {
-        let dump = dump_tenant_database(conn, &target.db_name).await?;
+        let dump = dump_tenant_database(conn, &target.db_name, timeout).await?;
         let key = nightly_tenant_key(now, &target.db_name);
         store.put(&key, dump).await?;
         record_backup_success(control, &target.account_id, &target.db_name, now).await?;
@@ -525,9 +663,10 @@ async fn back_up_control_plane(
     conn: &DumpConnection,
     store: &Arc<dyn BackupStore>,
     now: DateTime<Utc>,
+    timeout: Duration,
 ) -> Result<(), CloudError> {
     let control_db = control_db_name(control)?;
-    let dump = dump_control_database(conn, &control_db).await?;
+    let dump = dump_control_database(conn, &control_db, timeout).await?;
     let key = nightly_control_key(now);
     store.put(&key, dump).await?;
     tracing::info!(control_db, "backed up control-plane database");
@@ -609,12 +748,13 @@ pub async fn final_dump_before_delete(
     account_id: &str,
     db_name: &str,
     now: DateTime<Utc>,
+    timeout: Duration,
 ) -> Result<String, CloudError> {
     let run_id = start_backup_run(control, "final").await.ok();
 
     let conn = DumpConnection::for_cluster(cluster)?;
     let result = async {
-        let dump = dump_tenant_database(&conn, db_name).await?;
+        let dump = dump_tenant_database(&conn, db_name, timeout).await?;
         let key = final_key(account_id, now);
         store.put(&key, dump).await?;
         Ok::<String, CloudError>(key)

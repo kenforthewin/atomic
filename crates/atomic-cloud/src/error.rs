@@ -222,6 +222,18 @@ pub enum CloudError {
     /// argv or in any error value (see [`crate::backup`]).
     #[error("backup runner: {0}")]
     Backup(String),
+
+    /// A per-account operation couldn't take the account's advisory lock
+    /// because a concurrent holder (a backup pass mid-dump, or a reaper pass)
+    /// owns it past the retry budget. Surfaced by [`delete_account`] in
+    /// [`DeleteLock::Acquire`] mode (adversarial-review issue 2): the caller
+    /// retries rather than racing a `DROP DATABASE` against a live dump. The
+    /// HTTP route maps this to a 503 (retryable).
+    ///
+    /// [`delete_account`]: crate::provision::delete_account
+    /// [`DeleteLock::Acquire`]: crate::provision::DeleteLock::Acquire
+    #[error("resource busy: {0}")]
+    Busy(String),
 }
 
 impl CloudError {

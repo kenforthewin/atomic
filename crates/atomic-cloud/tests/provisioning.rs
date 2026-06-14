@@ -757,8 +757,10 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                None,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("delete succeeds");
@@ -816,8 +818,10 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                None,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("re-delete is a no-op");
@@ -825,8 +829,10 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                None,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
                 &uuid::Uuid::new_v4().to_string(),
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("deleting an unknown account is a no-op");

@@ -226,8 +226,10 @@ async fn hint_rows_cascade_with_account_deletion() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                None,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
                 &account.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("delete account");

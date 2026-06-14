@@ -157,9 +157,15 @@ async fn backup_status_and_ledger_round_trip() {
         // A failure records the error but does NOT reset last_backup_at — the
         // monitor must keep seeing the last *success*, so a tenant whose
         // backups start failing still trips the alert by its stale success.
-        record_backup_failure(&control, &acct.account_id, &acct.db_name, "pg_dump: boom")
-            .await
-            .unwrap();
+        record_backup_failure(
+            &control,
+            &acct.account_id,
+            &acct.db_name,
+            "pg_dump: boom",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let (last_at, last_err): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
             sqlx::query_as(
                 "SELECT last_backup_at, last_backup_error FROM account_databases \
@@ -534,6 +540,576 @@ async fn concurrent_pass_skips_a_locked_tenant() {
     .await;
 }
 
+// ==================== Per-dump timeout (issue 1) ====================
+
+/// A tenant whose `pg_dump` overruns the per-dump timeout is killed and
+/// recorded as a typed timeout failure — the pass does NOT hang on it and the
+/// OTHER tenant + control plane still back up (adversarial-review issue 1). We
+/// inject the timeout at the runner seam by configuring a 1ms budget: no real
+/// `pg_dump` of a populated tenant finishes that fast, so it deterministically
+/// times out, while the rest of the pass proceeds.
+#[tokio::test]
+async fn pass_records_a_timeout_failure_and_keeps_going() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "pass_records_a_timeout_failure_and_keeps_going: skipping \
+             (pg_dump/pg_restore not on PATH)"
+        );
+        return;
+    }
+    with_control_db(
+        "pass_records_a_timeout_failure_and_keeps_going",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            // Two active tenants — both will time out under a 1ms budget, but
+            // the pass must run to completion (control plane backed up) and
+            // record EACH as a failure rather than hanging on the first.
+            let mut accts = Vec::new();
+            for (email, sub) in [("t1@example.com", "toa"), ("t2@example.com", "tob")] {
+                accts.push(
+                    provision_account(
+                        &control,
+                        &cluster,
+                        &ManagedKeys::Disabled,
+                        NewAccount {
+                            email: email.into(),
+                            subdomain: sub.into(),
+                        },
+                    )
+                    .await
+                    .expect("provision"),
+                );
+            }
+
+            let (_dir, store) = temp_store();
+            let now = chrono::Utc::now();
+            // 1ms per-dump budget: pg_dump cannot complete; it times out and is
+            // killed. The control-plane dump uses the same budget and likewise
+            // times out — that's fine, the point is the pass returns promptly
+            // and records typed failures instead of hanging forever.
+            let config = atomic_cloud::BackupConfig {
+                backup_timeout: std::time::Duration::from_millis(1),
+                ..atomic_cloud::BackupConfig::default()
+            };
+
+            let started = std::time::Instant::now();
+            let summary =
+                atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+            let elapsed = started.elapsed();
+
+            // The pass returned promptly — no hung child wedged it. (A real
+            // dump of two tenants takes well under this; the point is it did
+            // not block on a 60s-style stall.)
+            assert!(
+                elapsed < std::time::Duration::from_secs(30),
+                "a timing-out pass must not hang: took {elapsed:?}"
+            );
+
+            // BOTH tenants recorded failed; none reported backed up. One
+            // tenant's timeout did not abort the pass before the other.
+            assert_eq!(
+                summary.tenants_failed.len(),
+                2,
+                "both tenants time out and are recorded failed: {summary:?}"
+            );
+            assert!(
+                summary.tenants_backed_up.is_empty(),
+                "no tenant completed within 1ms: {summary:?}"
+            );
+
+            // The failure surfaced as a timeout on each tenant's row, and
+            // last_backup_at was left untouched (a failure must not look fresh).
+            for acct in &accts {
+                let (last_at, last_err): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT last_backup_at, last_backup_error FROM account_databases \
+                     WHERE account_id = $1",
+                    )
+                    .bind(&acct.account_id)
+                    .fetch_one(control.pool())
+                    .await
+                    .unwrap();
+                assert!(last_at.is_none(), "a timed-out tenant is not stamped fresh");
+                let err = last_err.expect("a timed-out tenant carries an error");
+                assert!(
+                    err.contains("timed out"),
+                    "the recorded error names the timeout: {err}"
+                );
+            }
+        },
+    )
+    .await;
+}
+
+// ============== Cap / deferral + starvation ordering (issues 4 & 5) ==========
+
+/// `max_backups_per_pass` caps a pass: exactly the cap is dumped and the rest
+/// are deferred (most-overdue-first), and a second pass picks up the deferred
+/// ones (adversarial-review issue 4). With three tenants and a cap of two, pass
+/// one dumps two and defers one; pass two reaches the deferred tenant.
+#[tokio::test]
+async fn cap_defers_excess_and_next_pass_reaches_them() {
+    if !backup_tools_available().await {
+        eprintln!("cap_defers_excess_and_next_pass_reaches_them: skipping (no pg_dump)");
+        return;
+    }
+    with_control_db(
+        "cap_defers_excess_and_next_pass_reaches_them",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            let mut accts = Vec::new();
+            for (email, sub) in [
+                ("c1@example.com", "capa"),
+                ("c2@example.com", "capb"),
+                ("c3@example.com", "capc"),
+            ] {
+                accts.push(
+                    provision_account(
+                        &control,
+                        &cluster,
+                        &ManagedKeys::Disabled,
+                        NewAccount {
+                            email: email.into(),
+                            subdomain: sub.into(),
+                        },
+                    )
+                    .await
+                    .expect("provision"),
+                );
+            }
+
+            let (_dir, store) = temp_store();
+            let config = atomic_cloud::BackupConfig {
+                max_backups_per_pass: 2,
+                ..atomic_cloud::BackupConfig::default()
+            };
+
+            // Pass one: exactly two dumped, exactly one deferred.
+            let now1 = chrono::Utc::now();
+            let s1 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1).await;
+            assert_eq!(s1.tenants_backed_up.len(), 2, "cap dumps exactly 2: {s1:?}");
+            assert_eq!(s1.tenants_deferred.len(), 1, "one deferred: {s1:?}");
+            assert!(s1.control_backed_up);
+
+            // The deferred tenant is the one NOT backed up — and it was never
+            // stamped, so the most-overdue ordering surfaces it next pass.
+            let deferred_id = s1.tenants_deferred[0].clone();
+            assert!(
+                !s1.tenants_backed_up.contains(&deferred_id),
+                "the deferred tenant is not also reported backed up"
+            );
+
+            // Pass two (slightly later): the deferred tenant — now the most
+            // overdue (NULL last_backup_at sorts first) — is reached.
+            let now2 = now1 + chrono::Duration::seconds(1);
+            let s2 = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2).await;
+            assert!(
+                s2.tenants_backed_up.contains(&deferred_id),
+                "the previously deferred tenant is reached next pass: {s2:?}"
+            );
+
+            // After two passes every tenant has a dump on disk.
+            for acct in &accts {
+                let last: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                    "SELECT last_backup_at FROM account_databases WHERE account_id = $1",
+                )
+                .bind(&acct.account_id)
+                .fetch_one(control.pool())
+                .await
+                .unwrap();
+                assert!(
+                    last.is_some(),
+                    "tenant {} eventually backed up",
+                    acct.account_id
+                );
+            }
+        },
+    )
+    .await;
+}
+
+/// A persistently-FAILING tenant must not starve a healthy-but-due one under a
+/// small cap across passes (adversarial-review issue 5). Ordering by the most
+/// recent *attempt* (not last success) means a tenant whose dump keeps failing
+/// sinks behind a never-attempted/healthy-but-due tenant once it has been
+/// tried, instead of floating to the front of every pass forever.
+#[tokio::test]
+async fn persistently_failing_tenant_does_not_starve_a_healthy_one() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "persistently_failing_tenant_does_not_starve_a_healthy_one: skipping (no pg_dump)"
+        );
+        return;
+    }
+    with_control_db(
+        "persistently_failing_tenant_does_not_starve_a_healthy_one",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+
+            let broken = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "broken@example.com".into(),
+                    subdomain: "brokenten".into(),
+                },
+            )
+            .await
+            .expect("provision broken");
+            let healthy = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "healthy@example.com".into(),
+                    subdomain: "healthyten".into(),
+                },
+            )
+            .await
+            .expect("provision healthy");
+
+            // A store that always fails the broken tenant's upload; the healthy
+            // tenant uploads fine.
+            let (_dir, inner) = temp_store();
+            let store: Arc<dyn BackupStore> = Arc::new(PutFailsForKey {
+                inner: Arc::clone(&inner),
+                fail_substring: broken.db_name.clone(),
+            });
+
+            // Cap of ONE: only one tenant is attempted per pass. If ordering
+            // floated the broken tenant first every pass, the healthy tenant
+            // would never be reached. Run two passes and assert the healthy
+            // tenant DID get backed up.
+            let config = atomic_cloud::BackupConfig {
+                max_backups_per_pass: 1,
+                ..atomic_cloud::BackupConfig::default()
+            };
+
+            let now1 = chrono::Utc::now();
+            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now1).await;
+            // After pass one, the broken tenant has a last_backup_attempt_at
+            // (failure stamped) but no last_backup_at; the healthy tenant has
+            // neither yet → it sorts first next pass.
+            let now2 = now1 + chrono::Duration::seconds(1);
+            let _ = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now2).await;
+
+            let healthy_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                "SELECT last_backup_at FROM account_databases WHERE account_id = $1",
+            )
+            .bind(&healthy.account_id)
+            .fetch_one(control.pool())
+            .await
+            .unwrap();
+            assert!(
+                healthy_at.is_some(),
+                "the healthy-but-due tenant must be reached despite the broken one's repeated \
+                 failures (no starvation)"
+            );
+
+            // And the broken tenant kept failing (still no success), proving it
+            // was genuinely contending the front of the queue.
+            let broken_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                "SELECT last_backup_at FROM account_databases WHERE account_id = $1",
+            )
+            .bind(&broken.account_id)
+            .fetch_one(control.pool())
+            .await
+            .unwrap();
+            assert!(broken_at.is_none(), "the broken tenant never succeeded");
+        },
+    )
+    .await;
+}
+
+// ==================== Abandoned-run finalizer (issue 6) ====================
+
+/// A pod killed mid-pass leaves a `backup_runs` row `finished_at IS NULL`
+/// forever; [`finalize_abandoned_backup_runs`] marks rows older than the
+/// horizon `'abandoned'` so status doesn't show a perpetually in-flight pass
+/// (adversarial-review issue 6). A genuinely recent in-flight row is left
+/// alone.
+#[tokio::test]
+async fn finalize_abandoned_backup_runs_marks_only_stale_in_flight() {
+    with_control_db(
+        "finalize_abandoned_backup_runs_marks_only_stale_in_flight",
+        |url| async move {
+            let (control, _cluster) = setup(&url).await;
+
+            // A stale in-flight row (started 7h ago, never finished).
+            let stale_id = start_backup_run(&control, "nightly").await.unwrap();
+            sqlx::query(
+                "UPDATE backup_runs SET started_at = NOW() - INTERVAL '7 hours' WHERE id = $1",
+            )
+            .bind(&stale_id)
+            .execute(control.pool())
+            .await
+            .unwrap();
+
+            // A fresh in-flight row (just started) that must NOT be touched.
+            let fresh_id = start_backup_run(&control, "nightly").await.unwrap();
+
+            let finalized = atomic_cloud::finalize_abandoned_backup_runs(
+                &control,
+                std::time::Duration::from_secs(6 * 60 * 60),
+            )
+            .await
+            .unwrap();
+            assert_eq!(finalized, 1, "exactly the one stale row is finalized");
+
+            let runs = recent_backup_runs(&control, 10).await.unwrap();
+            let stale = runs.iter().find(|r| r.id == stale_id).unwrap();
+            assert_eq!(stale.status.as_deref(), Some("abandoned"));
+            assert!(
+                stale.finished_at.is_some(),
+                "abandoned row gets a finished_at"
+            );
+
+            let fresh = runs.iter().find(|r| r.id == fresh_id).unwrap();
+            assert_eq!(fresh.status.as_deref(), Some("running"));
+            assert!(fresh.finished_at.is_none(), "the fresh row stays in-flight");
+        },
+    )
+    .await;
+}
+
+// ============ Delete vs backup mutual exclusion (issues 2 & 3) ===============
+
+/// A delete and a concurrent backup pass on the SAME tenant serialize on the
+/// per-account advisory lock (adversarial-review issue 2). Holding the lock
+/// (standing in for a backup pass mid-dump), a `DeleteLock::Acquire` delete
+/// observes the contention and returns `CloudError::Busy` rather than racing a
+/// `DROP DATABASE` against the live dump. With the lock released, the same
+/// delete proceeds.
+#[tokio::test]
+async fn delete_in_acquire_mode_is_busy_while_a_backup_holds_the_lock() {
+    if !backup_tools_available().await {
+        eprintln!(
+            "delete_in_acquire_mode_is_busy_while_a_backup_holds_the_lock: skipping (no pg_dump)"
+        );
+        return;
+    }
+    with_control_db(
+        "delete_in_acquire_mode_is_busy_while_a_backup_holds_the_lock",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let acct = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "busy@example.com".into(),
+                    subdomain: "busyten".into(),
+                },
+            )
+            .await
+            .expect("provision");
+
+            // Hold the account's advisory lock — a backup pass mid-dump.
+            let held = atomic_cloud::reaper::try_account_advisory_lock(&control, &acct.account_id)
+                .await
+                .expect("take lock")
+                .expect("lock free");
+
+            // A delete in Acquire mode cannot take the lock and, after its
+            // brief retry budget, returns Busy. NOTHING is dropped (the guard
+            // wraps the whole destructive window).
+            let (_dir, store) = temp_store();
+            let started = std::time::Instant::now();
+            let err = delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                atomic_cloud::BackupPolicy::Required(&store),
+                atomic_cloud::DeleteLock::Acquire,
+                &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect_err("delete must be Busy while a backup holds the lock");
+            assert!(
+                matches!(err, atomic_cloud::CloudError::Busy(_)),
+                "expected Busy, got {err:?}"
+            );
+            // It waited the retry budget (~10s) rather than failing instantly or
+            // hanging forever.
+            assert!(
+                started.elapsed() >= std::time::Duration::from_secs(1),
+                "a Busy delete should have retried briefly, not failed instantly"
+            );
+
+            // The tenant database is untouched: the lock guarded the whole
+            // destructive window, so the delete never started dropping.
+            assert!(
+                atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "no drop happened under contention"
+            );
+            // No final dump was taken either (the delete never reached the dump).
+            assert!(
+                store.list("backups/final/").await.unwrap().is_empty(),
+                "a Busy delete takes no final dump"
+            );
+
+            // Release the lock; the same delete now proceeds to completion.
+            let _ = sqlx::Connection::close(held).await;
+            delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                atomic_cloud::BackupPolicy::Required(&store),
+                atomic_cloud::DeleteLock::Acquire,
+                &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect("delete succeeds once the lock is free");
+            assert!(
+                !atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "the tenant database is dropped after the lock frees"
+            );
+            assert_eq!(
+                store.list("backups/final/").await.unwrap().len(),
+                1,
+                "the successful delete took its final dump"
+            );
+        },
+    )
+    .await;
+}
+
+/// The reaper's interrupted-deletion arm ALREADY holds the per-account lock
+/// when it calls `delete_account`; passing `DeleteLock::AlreadyHeld` must let
+/// the deletion complete WITHOUT self-deadlocking on the lock it already owns
+/// (adversarial-review issue 2). This drives `delete_account` directly under a
+/// caller-held lock, exactly as the reaper does.
+#[tokio::test]
+async fn delete_in_already_held_mode_does_not_self_deadlock() {
+    if !backup_tools_available().await {
+        eprintln!("delete_in_already_held_mode_does_not_self_deadlock: skipping (no pg_dump)");
+        return;
+    }
+    with_control_db(
+        "delete_in_already_held_mode_does_not_self_deadlock",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let acct = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "held@example.com".into(),
+                    subdomain: "heldten".into(),
+                },
+            )
+            .await
+            .expect("provision");
+
+            // The caller (reaper) holds the lock first...
+            let held = atomic_cloud::reaper::try_account_advisory_lock(&control, &acct.account_id)
+                .await
+                .expect("take lock")
+                .expect("lock free");
+
+            // ...then delete in AlreadyHeld mode. This must NOT try to
+            // re-acquire (which would self-deadlock) and must complete the
+            // deletion. A generous timeout proves "completes", not "hangs".
+            let (_dir, store) = temp_store();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                delete_account(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    atomic_cloud::BackupPolicy::Required(&store),
+                    atomic_cloud::DeleteLock::AlreadyHeld,
+                    &acct.account_id,
+                    atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+                ),
+            )
+            .await
+            .expect("AlreadyHeld delete must not deadlock/hang");
+            outcome.expect("delete completes");
+
+            // Release the caller's lock (the reaper does this after).
+            let _ = sqlx::Connection::close(held).await;
+
+            assert!(
+                !atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "the deletion completed and dropped the tenant database"
+            );
+            assert_eq!(
+                store.list("backups/final/").await.unwrap().len(),
+                1,
+                "the final dump was taken before the drop"
+            );
+        },
+    )
+    .await;
+}
+
+/// An acknowledged-disabled backup policy deletes WITHOUT a final dump (the
+/// explicit dev path, adversarial-review issue 3) — distinct from the
+/// `Required` path which always dumps. This pins that the policy is an explicit
+/// decision: there is no silent "forgot the store" drop, only `Required(store)`
+/// (dumps) or `DisabledAcknowledged` (drops with a loud warn, no dump).
+#[tokio::test]
+async fn disabled_acknowledged_policy_drops_without_a_final_dump() {
+    if !backup_tools_available().await {
+        eprintln!("disabled_acknowledged_policy_drops_without_a_final_dump: skipping (no pg_dump)");
+        return;
+    }
+    with_control_db(
+        "disabled_acknowledged_policy_drops_without_a_final_dump",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            let acct = provision_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                NewAccount {
+                    email: "nodump@example.com".into(),
+                    subdomain: "nodumpten".into(),
+                },
+            )
+            .await
+            .expect("provision");
+
+            let (_dir, store) = temp_store();
+            delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
+                &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect("acknowledged-disabled delete proceeds");
+
+            assert!(
+                !atomic_cloud::tenant_database_exists(&cluster, &acct.db_name)
+                    .await
+                    .unwrap(),
+                "the tenant database is dropped"
+            );
+            assert!(
+                store.list("backups/final/").await.unwrap().is_empty(),
+                "acknowledged-disabled takes NO final dump"
+            );
+        },
+    )
+    .await;
+}
+
 // ==================== Real dump → restore → verify ====================
 
 #[tokio::test]
@@ -594,9 +1170,10 @@ async fn dump_restore_round_trip_rehydrates_real_data() {
 
             // Dump the tenant database to bytes.
             let conn = DumpConnection::for_cluster(&cluster).unwrap();
-            let dump = dump_tenant_database(&conn, &acct.db_name)
-                .await
-                .expect("dump tenant database");
+            let dump =
+                dump_tenant_database(&conn, &acct.db_name, atomic_cloud::DEFAULT_BACKUP_TIMEOUT)
+                    .await
+                    .expect("dump tenant database");
             assert!(!dump.is_empty(), "a real dump is non-empty");
             // pg_dump custom-format dumps start with the magic "PGDMP".
             assert_eq!(&dump[..5], b"PGDMP", "custom-format dump header");
@@ -615,9 +1192,15 @@ async fn dump_restore_round_trip_rehydrates_real_data() {
             let restore_db = atomic_cloud::tenant_db_name(restore_uuid);
             let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
             with_db_guard(&base_url, &restore_db, || async {
-                restore_database(&cluster, &conn, &restore_db, &from_store)
-                    .await
-                    .expect("restore into fresh db");
+                restore_database(
+                    &cluster,
+                    &conn,
+                    &restore_db,
+                    &from_store,
+                    atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+                )
+                .await
+                .expect("restore into fresh db");
 
                 // Open the restored database and assert the atom rehydrated.
                 let restored_url = cluster.tenant_db_url(&restore_db).unwrap();
@@ -671,15 +1254,21 @@ async fn restore_refuses_to_clobber_an_existing_database() {
             .expect("provision");
 
             let conn = DumpConnection::for_cluster(&cluster).unwrap();
-            let dump = dump_tenant_database(&conn, &acct.db_name)
+            let dump = dump_tenant_database(&conn, &acct.db_name, atomic_cloud::DEFAULT_BACKUP_TIMEOUT)
                 .await
                 .expect("dump");
 
             // Restoring onto the LIVE tenant database must be refused — a
             // restore that overwrote live data is the accident this guards.
-            let err = restore_database(&cluster, &conn, &acct.db_name, &dump)
-                .await
-                .expect_err("restore must refuse an existing target");
+            let err = restore_database(
+                &cluster,
+                &conn,
+                &acct.db_name,
+                &dump,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect_err("restore must refuse an existing target");
             assert!(
                 matches!(&err, atomic_cloud::CloudError::Backup(msg) if msg.contains("already exists")),
                 "expected an 'already exists' Backup error, got {err:?}"
@@ -743,8 +1332,10 @@ async fn delete_takes_final_dump_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                Some(&store),
+                atomic_cloud::BackupPolicy::Required(&store),
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("delete with final dump");
@@ -778,8 +1369,10 @@ async fn delete_takes_final_dump_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                Some(&store),
+                atomic_cloud::BackupPolicy::Required(&store),
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("idempotent re-delete");
@@ -866,8 +1459,10 @@ async fn failed_final_dump_aborts_delete_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                Some(&store),
+                atomic_cloud::BackupPolicy::Required(&store),
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect_err("a failed final dump must abort the delete");
@@ -903,8 +1498,10 @@ async fn failed_final_dump_aborts_delete_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
-                Some(&ok_store),
+                atomic_cloud::BackupPolicy::Required(&ok_store),
+                atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("cleanup delete succeeds once the store recovers");
@@ -937,14 +1534,21 @@ async fn dump_and_restore_reject_bad_db_names() {
     ] {
         assert!(
             matches!(
-                dump_tenant_database(&conn, bad).await,
+                dump_tenant_database(&conn, bad, atomic_cloud::DEFAULT_BACKUP_TIMEOUT).await,
                 Err(atomic_cloud::CloudError::InvalidDatabaseName(_))
             ),
             "dump must reject bad db name {bad:?}"
         );
         assert!(
             matches!(
-                restore_database(&cluster, &conn, bad, b"ignored").await,
+                restore_database(
+                    &cluster,
+                    &conn,
+                    bad,
+                    b"ignored",
+                    atomic_cloud::DEFAULT_BACKUP_TIMEOUT
+                )
+                .await,
                 Err(atomic_cloud::CloudError::InvalidDatabaseName(_))
             ),
             "restore must reject bad db name {bad:?}"
@@ -1026,8 +1630,10 @@ async fn final_dump_restore_runbook_roundtrip() {
             &control,
             &cluster,
             &ManagedKeys::Disabled,
-            Some(&store),
+            atomic_cloud::BackupPolicy::Required(&store),
+            atomic_cloud::DeleteLock::Acquire,
             &acct.account_id,
+            atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
         )
         .await
         .expect("delete takes the final dump then drops");
@@ -1051,9 +1657,15 @@ async fn final_dump_restore_runbook_roundtrip() {
         let dump_bytes = store.get(&final_key).await.expect("read final dump");
         let base_url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
         with_db_guard(&base_url, &restore_db, || async {
-            restore_database(&cluster, &conn, &restore_db, &dump_bytes)
-                .await
-                .expect("restore the final dump into a fresh db");
+            restore_database(
+                &cluster,
+                &conn,
+                &restore_db,
+                &dump_bytes,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect("restore the final dump into a fresh db");
 
             // 4 — repoint the account's mapping to the restored database (the
             // runbook's manual control-plane step). We re-seed the account +
@@ -1189,9 +1801,15 @@ async fn backup_status_reports_freshness_and_stale_tenants() {
 
             // A failure on the fresh tenant surfaces its error but keeps it
             // out of the stale set (its last success is still recent).
-            record_backup_failure(&control, &fresh.account_id, &fresh.db_name, "pg_dump: nope")
-                .await
-                .unwrap();
+            record_backup_failure(
+                &control,
+                &fresh.account_id,
+                &fresh.db_name,
+                "pg_dump: nope",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
             let statuses = tenant_backup_status(&control).await.unwrap();
             let fresh_row = statuses
                 .iter()

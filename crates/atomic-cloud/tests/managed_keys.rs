@@ -428,9 +428,17 @@ async fn delete_account_deletes_the_managed_key() {
         .expect("provision");
         let (_, external_key_id) = RecordingProvisioning::nth_key(0);
 
-        delete_account(&control, &cluster, &managed, None, &account.account_id)
-            .await
-            .expect("delete");
+        delete_account(
+            &control,
+            &cluster,
+            &managed,
+            atomic_cloud::BackupPolicy::DisabledAcknowledged,
+            atomic_cloud::DeleteLock::Acquire,
+            &account.account_id,
+            atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+        )
+        .await
+        .expect("delete");
 
         assert_eq!(api.deleted_key_ids(), vec![external_key_id]);
         assert_eq!(account_status(&control, &account.account_id).await, None);
@@ -438,9 +446,17 @@ async fn delete_account_deletes_the_managed_key() {
 
         // Best-effort contract: a deletion retry after the rows are gone
         // succeeds quietly and calls the API zero further times.
-        delete_account(&control, &cluster, &managed, None, &account.account_id)
-            .await
-            .expect("retried delete is a no-op");
+        delete_account(
+            &control,
+            &cluster,
+            &managed,
+            atomic_cloud::BackupPolicy::DisabledAcknowledged,
+            atomic_cloud::DeleteLock::Acquire,
+            &account.account_id,
+            atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+        )
+        .await
+        .expect("retried delete is a no-op");
         assert_eq!(api.deleted_key_ids().len(), 1, "no second delete call");
     })
     .await;
@@ -468,9 +484,17 @@ async fn deletion_proceeds_when_key_delete_fails() {
             .expect("provision");
 
             api.fail_delete.store(true, Ordering::SeqCst);
-            delete_account(&control, &cluster, &managed, None, &account.account_id)
-                .await
-                .expect("deletion must not wedge on a provider outage");
+            delete_account(
+                &control,
+                &cluster,
+                &managed,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
+                &account.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
+            )
+            .await
+            .expect("deletion must not wedge on a provider outage");
 
             // The delete was attempted, the account is fully gone regardless.
             assert_eq!(api.deleted_key_ids().len(), 1);

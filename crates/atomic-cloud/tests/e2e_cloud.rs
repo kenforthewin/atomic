@@ -850,8 +850,10 @@ async fn cli_style_deletion_self_heals_without_eviction() {
                 &h.control,
                 &h.cluster,
                 &ManagedKeys::Disabled,
-                None,
+                atomic_cloud::BackupPolicy::DisabledAcknowledged,
+                atomic_cloud::DeleteLock::Acquire,
                 &alpha.account_id,
+                atomic_cloud::DEFAULT_BACKUP_TIMEOUT,
             )
             .await
             .expect("delete account");

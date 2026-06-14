@@ -74,14 +74,15 @@ pub use backpressure::{
 };
 pub use backup::{
     backup_tools_available, dump_control_database, dump_tenant_database, restore_database,
-    DumpConnection, DUMP_STDERR_MAX_LEN,
+    DumpConnection, DEFAULT_BACKUP_TIMEOUT, DUMP_STDERR_MAX_LEN,
 };
 pub use backup_store::{BackupStore, LocalFileSystemStore, S3Config, S3Store};
 pub use backups::{
-    dumps_for_account, final_dump_before_delete, finish_backup_run, list_active_tenant_databases,
-    recent_backup_runs, record_backup_failure, record_backup_success, run_backup_pass,
-    stale_tenant_backups, start_backup_run, tenant_backup_status, tenant_database_exists,
-    BackupConfig, BackupRunRecord, BackupSummary, BackupTarget, StaleBackup, TenantBackupStatus,
+    dumps_for_account, final_dump_before_delete, finalize_abandoned_backup_runs, finish_backup_run,
+    list_active_tenant_databases, recent_backup_runs, record_backup_failure, record_backup_success,
+    run_backup_pass, stale_tenant_backups, start_backup_run, tenant_backup_status,
+    tenant_database_exists, BackupConfig, BackupPolicy, BackupRunRecord, BackupSummary,
+    BackupTarget, StaleBackup, TenantBackupStatus, DEFAULT_BACKUP_RUN_ABANDON_AFTER,
     DEFAULT_MAX_BACKUPS_PER_PASS, DEFAULT_STALENESS_HORIZON,
 };
 pub use billing::dunning::{
@@ -157,7 +158,7 @@ pub use provider_credentials::{
 };
 pub use provision::{
     delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,
-    NewAccount, ProvisionedAccount,
+    DeleteLock, NewAccount, ProvisionedAccount,
 };
 pub use provisioning_api::{
     CreatedRuntimeKey, OpenRouterProvisioning, ProvisioningApi, RuntimeKeyUsage,

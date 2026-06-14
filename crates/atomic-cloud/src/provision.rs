@@ -49,17 +49,18 @@
 //!   a dead account.
 
 use std::str::FromStr;
-use std::sync::Arc;
+use std::time::Duration;
 
 use atomic_core::DatabaseManager;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
-use crate::backup_store::BackupStore;
+use crate::backups::BackupPolicy;
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 use crate::managed_keys::ManagedKeys;
+use crate::reaper::try_account_advisory_lock;
 use crate::reserved_subdomains;
 
 /// Where tenant databases live: the shared Postgres cluster.
@@ -596,6 +597,71 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
     }
 }
 
+/// Who holds the per-account advisory lock when [`delete_account`] runs
+/// (adversarial-review issue 2).
+///
+/// The destructive sequence (final dump → `DROP DATABASE`) and the nightly
+/// backup pass must be **mutually exclusive per account**, so a pass mid-dump
+/// of tenant X can never race a delete that `DROP DATABASE`s X — they both key
+/// on [`reaper_lock_key`](crate::reaper::reaper_lock_key). This enum says
+/// whether `delete_account` should take that lock itself or trust the caller's:
+///
+/// - [`Acquire`](Self::Acquire) — the caller does NOT hold the lock (the HTTP
+///   route and the CLI). `delete_account` takes it (with a brief
+///   wait-and-retry) for the destructive window, and returns
+///   [`CloudError::Busy`] if a backup pass holds it past the retry budget —
+///   the operator retries rather than racing.
+/// - [`AlreadyHeld`](Self::AlreadyHeld) — the caller ALREADY holds the lock
+///   (the reaper's interrupted-deletion arm, which takes it per row before
+///   calling here). `delete_account` must NOT re-acquire it on the same
+///   account, or it would **self-deadlock** against the caller's own session.
+///   The session-level lock is non-reentrant across distinct connections, so
+///   the reaper threads `AlreadyHeld` and `delete_account` skips acquisition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteLock {
+    /// The caller holds no lock; `delete_account` takes the per-account lock.
+    Acquire,
+    /// The caller already holds the per-account lock; don't re-acquire.
+    AlreadyHeld,
+}
+
+/// How long [`delete_account`] (in [`DeleteLock::Acquire`] mode) retries the
+/// per-account advisory lock before giving up with [`CloudError::Busy`]. A
+/// nightly dump of one tenant is the only realistic contender, and a tenant
+/// dump completes in seconds-to-minutes; this budget waits out a brief overlap
+/// without wedging the caller (or the reaper, which never waits on a lock).
+const DELETE_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(10);
+/// Poll interval while waiting for the deletion lock.
+const DELETE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Take the per-account advisory lock for a deletion's destructive window,
+/// retrying briefly if a backup pass holds it. Returns the held session (drop
+/// or close ends it, releasing the lock — even on an early `?` return through
+/// the deletion sequence). [`CloudError::Busy`] when the lock stays contended
+/// past [`DELETE_LOCK_RETRY_BUDGET`]: the caller (route/CLI) retries rather
+/// than racing a backup mid-dump.
+///
+/// Polls `try_account_advisory_lock` (never blocks in Postgres) so it can't
+/// deadlock with the reaper, which also only ever *tries* the lock.
+async fn acquire_delete_lock(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Result<PgConnection, CloudError> {
+    let deadline = std::time::Instant::now() + DELETE_LOCK_RETRY_BUDGET;
+    loop {
+        if let Some(conn) = try_account_advisory_lock(control, account_id).await? {
+            return Ok(conn);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CloudError::Busy(format!(
+                "account {account_id} is locked by a concurrent backup or reaper pass; \
+                 retry the deletion shortly"
+            )));
+        }
+        tokio::time::sleep(DELETE_LOCK_RETRY_INTERVAL).await;
+    }
+}
+
 /// Hard-delete an account: revoke its tokens, delete its sessions, take a
 /// final logical dump of its tenant database, drop that database, remove its
 /// control-plane rows, and park the freed subdomain in `subdomains_reserved`
@@ -604,16 +670,24 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
 /// Implements the plan's deletion sequence ("Provisioning lifecycle" →
 /// "Account deletion"):
 ///
+/// - **Mutual exclusion with the nightly backup pass (adversarial-review issue
+///   2)** — the destructive window (final dump → drop) runs under the same
+///   per-account advisory lock the nightly pass takes, so a backup and a
+///   delete of the same tenant are genuinely mutually exclusive. `lock`
+///   ([`DeleteLock`]) says whether to acquire it here (the route/CLI) or trust
+///   the caller's hold (the reaper's interrupted-deletion arm, which would
+///   self-deadlock if this re-acquired).
 /// - **The final logical dump to `backups/final/` before the drop (step 4)**
 ///   — the operator's only undo under hard-delete v1 (plan: "Backups &
-///   disaster recovery" → "Final dump on account deletion"). Taken when, and
-///   only when, a `backup` store is supplied: the HTTP deletion route and the
-///   CLI both pass one for real (active) account deletions, so a
-///   fat-fingered confirmation or a deletion-path bug is recoverable. It is
-///   **fail-closed** — a dump error aborts the deletion *before* any database
-///   is dropped, so unrecoverable destruction never proceeds on a failed
-///   backup. A database already dropped by an earlier (retried) deletion is
-///   the one tolerated case: the dump is skipped for a tenant whose database
+///   disaster recovery" → "Final dump on account deletion"). `policy`
+///   ([`BackupPolicy`]) is an **explicit decision**, never a fail-open absent
+///   store (issue 3): [`Required`](BackupPolicy::Required) takes the dump;
+///   [`DisabledAcknowledged`](BackupPolicy::DisabledAcknowledged) drops without
+///   one after a loud `warn!` (dev, or the reaper's never-activated paths). It
+///   is **fail-closed** — a dump error aborts the deletion *before* any
+///   database is dropped, so unrecoverable destruction never proceeds on a
+///   failed backup. A database already dropped by an earlier (retried) deletion
+///   is the one tolerated case: the dump is skipped for a tenant whose database
 ///   no longer exists. Callers that delete *never-activated* tenants (the
 ///   reaper's stuck-provision rollback and orphan-database reclaim, which
 ///   don't call this function at all) hold no real user data and correctly
@@ -643,9 +717,22 @@ pub async fn delete_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     managed: &ManagedKeys,
-    backup: Option<&Arc<dyn BackupStore>>,
+    policy: BackupPolicy<'_>,
+    lock: DeleteLock,
     account_id: &str,
+    backup_timeout: Duration,
 ) -> Result<(), CloudError> {
+    // Acquire the per-account advisory lock for the destructive window unless
+    // the caller already holds it (the reaper). Held for the whole function so
+    // the final dump and the drop are atomic against a concurrent backup pass;
+    // released by closing the session when `_lock_guard` drops (even on an
+    // early `?` return). In AlreadyHeld mode we take nothing — re-acquiring the
+    // same session-level lock on a second connection would self-deadlock
+    // against the reaper's own hold.
+    let _lock_guard = match lock {
+        DeleteLock::AlreadyHeld => None,
+        DeleteLock::Acquire => Some(acquire_delete_lock(control, account_id).await?),
+    };
     // 1 — revoke all tokens. The accounts-row delete below cascades these
     // away entirely; revoking first closes the crash window where tokens
     // would still verify while the tenant database is being dropped.
@@ -698,28 +785,39 @@ pub async fn delete_account(
     // step 5 destroys anything, so an un-backed-up tenant is never dropped.
     // Skipped per-database for a tenant whose database is already gone (a
     // retried deletion past the drop) — the dump has nothing to capture and a
-    // never-initialized database may not even be dumpable. No-op entirely
-    // when no `backup` store was supplied (operator paths that intentionally
-    // forgo it; never the active-account HTTP/CLI path).
-    if let Some(store) = backup {
-        for db_name in &db_names {
-            if crate::backups::tenant_database_exists(cluster, db_name).await? {
-                crate::backups::final_dump_before_delete(
-                    control,
-                    cluster,
-                    store,
-                    account_id,
-                    db_name,
-                    chrono::Utc::now(),
-                )
-                .await?;
-            } else {
-                tracing::info!(
-                    account_id,
-                    db_name,
-                    "skipping final dump: tenant database already gone (retried deletion)"
-                );
+    // never-initialized database may not even be dumpable. With an
+    // acknowledged-disabled policy (dev, or the reaper's never-activated
+    // paths), no dump is taken — a deliberate, logged choice, not a forgotten
+    // store (adversarial-review issue 3).
+    match policy.store() {
+        Some(store) => {
+            for db_name in &db_names {
+                if crate::backups::tenant_database_exists(cluster, db_name).await? {
+                    crate::backups::final_dump_before_delete(
+                        control,
+                        cluster,
+                        store,
+                        account_id,
+                        db_name,
+                        chrono::Utc::now(),
+                        backup_timeout,
+                    )
+                    .await?;
+                } else {
+                    tracing::info!(
+                        account_id,
+                        db_name,
+                        "skipping final dump: tenant database already gone (retried deletion)"
+                    );
+                }
             }
+        }
+        None => {
+            tracing::warn!(
+                account_id,
+                "deleting account WITHOUT a final dump (backups acknowledged-disabled); \
+                 this destruction is unrecoverable under hard-delete v1"
+            );
         }
     }
 

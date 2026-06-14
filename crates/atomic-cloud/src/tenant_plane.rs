@@ -206,6 +206,33 @@ const USAGE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound provider error bodies before they enter responses and logs.
 const PROVIDER_ERROR_MAX_CHARS: usize = 500;
 
+/// The owned form of [`crate::BackupPolicy`] the tenant plane holds across
+/// workers (adversarial-review issue 3). `serve` installs
+/// [`Enabled`](Self::Enabled) with the configured store; tests and dev keep
+/// the [`DisabledAcknowledged`](Self::DisabledAcknowledged) default, which the
+/// route turns into a loud-warn drop. There is no third "forgot to wire it"
+/// state — that's the whole point.
+#[derive(Clone)]
+enum DeletionBackupPolicy {
+    /// Backups enabled: the deletion route takes a fail-closed final dump to
+    /// this store before any drop.
+    Enabled(Arc<dyn crate::backup_store::BackupStore>),
+    /// Backups acknowledged-disabled: the route drops without a final dump,
+    /// after a loud warning.
+    DisabledAcknowledged,
+}
+
+impl DeletionBackupPolicy {
+    /// Borrow as the call-time [`crate::BackupPolicy`] passed to
+    /// [`delete_account`](crate::delete_account).
+    fn as_policy(&self) -> crate::BackupPolicy<'_> {
+        match self {
+            DeletionBackupPolicy::Enabled(store) => crate::BackupPolicy::Required(store),
+            DeletionBackupPolicy::DisabledAcknowledged => crate::BackupPolicy::DisabledAcknowledged,
+        }
+    }
+}
+
 /// Everything the tenant-plane handlers need, shared across workers.
 struct PlaneState {
     control: ControlPlane,
@@ -226,13 +253,18 @@ struct PlaneState {
     /// the WebSocket channel it owns — would linger until the idle TTL);
     /// provider writes live-rotate through it.
     cache: Arc<AccountCache>,
-    /// Backup store for the final pre-drop dump in `DELETE /api/account`
-    /// (plan: "Account deletion" step 4). `None` means deletions proceed with
-    /// no final dump — unrecoverable under hard-delete v1; `serve` always
-    /// wires one via [`TenantPlane::with_backup_store`]. The HTTP deletion
-    /// route is the canonical active-account deletion path, so this is where
-    /// the operator's undo is earned.
-    backup_store: Option<Arc<dyn crate::backup_store::BackupStore>>,
+    /// The deletion backup policy for `DELETE /api/account` (plan: "Account
+    /// deletion" step 4; adversarial-review issue 3). An **explicit** decision,
+    /// not a fail-open `Option<store>`: either a store is wired (the final
+    /// pre-drop dump is taken — the operator's only undo under hard-delete v1)
+    /// or backups are acknowledged-disabled (dev), and forgetting to wire the
+    /// store on an enabled deployment is impossible by construction. `serve`
+    /// always installs the store via [`TenantPlane::with_backup_store`]; tests
+    /// and dev leave the acknowledged-disabled default.
+    backup_policy: DeletionBackupPolicy,
+    /// Per-`pg_dump` budget for the final dump (adversarial-review issue 1);
+    /// see [`BackupConfig::backup_timeout`](crate::BackupConfig::backup_timeout).
+    backup_timeout: std::time::Duration,
     /// Serializes the provider-mutation routes per account; see
     /// [`AccountLocks`].
     provider_locks: AccountLocks,
@@ -298,18 +330,29 @@ impl TenantPlane {
                 managed,
                 vault,
                 cache,
-                backup_store: None,
+                // Backups are acknowledged-disabled until `with_backup_store`
+                // says otherwise (dev/tests). This is an explicit policy, not a
+                // fail-open `None` (adversarial-review issue 3).
+                backup_policy: DeletionBackupPolicy::DisabledAcknowledged,
+                backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
                 provider_locks: AccountLocks::default(),
             }),
         }
     }
 
     /// Wire the backup store the deletion route takes its final pre-drop dump
-    /// to (plan: "Account deletion" step 4). `serve` calls this; tests that
-    /// don't exercise deletion-backups leave it unset (deletions then take no
-    /// final dump, exactly as before this slice). Must be called before the
-    /// plane is shared with workers — it rebuilds the shared `web::Data`.
-    pub fn with_backup_store(mut self, store: Arc<dyn crate::backup_store::BackupStore>) -> Self {
+    /// to (plan: "Account deletion" step 4), with the per-dump `timeout`. This
+    /// flips the deletion policy to [`DeletionBackupPolicy::Enabled`]: the
+    /// route then takes a fail-closed final dump before any drop. `serve` calls
+    /// this; tests that don't exercise deletion-backups leave the
+    /// acknowledged-disabled default (deletions then take no final dump, with a
+    /// loud warning). Must be called before the plane is shared with workers —
+    /// it rebuilds the shared `web::Data`.
+    pub fn with_backup_store(
+        mut self,
+        store: Arc<dyn crate::backup_store::BackupStore>,
+        timeout: std::time::Duration,
+    ) -> Self {
         let state = &*self.state;
         self.state = web::Data::new(PlaneState {
             control: state.control.clone(),
@@ -317,7 +360,8 @@ impl TenantPlane {
             managed: state.managed.clone(),
             vault: state.vault.clone(),
             cache: Arc::clone(&state.cache),
-            backup_store: Some(store),
+            backup_policy: DeletionBackupPolicy::Enabled(store),
+            backup_timeout: timeout,
             provider_locks: AccountLocks::default(),
         });
         self
@@ -408,12 +452,19 @@ async fn delete_account_route(
     let task_state = state.clone();
     let account_id = tenant.principal.account_id.clone();
     let outcome = actix_web::rt::spawn(async move {
+        // The HTTP route is the canonical active-account deletion path, so it
+        // takes the per-account advisory lock itself (DeleteLock::Acquire) —
+        // making this delete and a concurrent nightly backup pass of the same
+        // tenant mutually exclusive (adversarial-review issue 2) — and states
+        // an explicit backup policy (issue 3).
         delete_account(
             &task_state.control,
             &task_state.cluster,
             &task_state.managed,
-            task_state.backup_store.as_ref(),
+            task_state.backup_policy.as_policy(),
+            crate::provision::DeleteLock::Acquire,
             &account_id,
+            task_state.backup_timeout,
         )
         .await?;
         task_state.cache.evict(&account_id).await;
@@ -432,6 +483,18 @@ async fn delete_account_route(
         }
     };
     if let Err(e) = outcome {
+        // A Busy error (a backup pass holds the account's advisory lock past
+        // the retry budget) is transient, not a failure: tell the caller to
+        // retry (503 + Retry-After) rather than report the deletion broken
+        // (adversarial-review issue 2).
+        if matches!(e, crate::error::CloudError::Busy(_)) {
+            tracing::info!(
+                account_id = tenant.principal.account_id,
+                subdomain = tenant.subdomain,
+                "account deletion deferred: a backup pass holds the account lock; client should retry"
+            );
+            return deletion_busy();
+        }
         tracing::error!(
             account_id = tenant.principal.account_id,
             subdomain = tenant.subdomain,
@@ -1254,6 +1317,21 @@ fn deletion_failed() -> HttpResponse {
                     account is still reachable, request a fresh login link \
                     to sign in and try again.",
     }))
+}
+
+/// A deletion couldn't take the account's advisory lock because a backup pass
+/// holds it (adversarial-review issue 2). Transient: a 503 with a short
+/// `Retry-After` so the client retries once the dump completes. Nothing was
+/// destroyed — the lock guards the destructive window, so a Busy result means
+/// the delete never started dropping.
+fn deletion_busy() -> HttpResponse {
+    HttpResponse::ServiceUnavailable()
+        .insert_header(("Retry-After", "15"))
+        .json(serde_json::json!({
+            "error": "deletion_busy",
+            "message": "A backup of this account is in progress. No data was \
+                        changed; retry the deletion in a few seconds.",
+        }))
 }
 
 #[cfg(test)]

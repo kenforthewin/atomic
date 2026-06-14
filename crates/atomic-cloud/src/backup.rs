@@ -38,11 +38,12 @@
 
 use std::process::Stdio;
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::postgres::PgConnectOptions;
 use sqlx::Connection;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use crate::error::CloudError;
 use crate::provision::{is_tenant_db_name, ClusterConfig};
@@ -52,6 +53,16 @@ use crate::provision::{is_tenant_db_name, ClusterConfig};
 /// unbounded log/error growth on a pathological run. Mirrors
 /// [`MIGRATION_ERROR_MAX_LEN`](crate::fleet_migration::MIGRATION_ERROR_MAX_LEN).
 pub const DUMP_STDERR_MAX_LEN: usize = 4096;
+
+/// Default per-subprocess wall-clock budget for one `pg_dump`/`pg_restore`
+/// (plan: "Backups & disaster recovery"; adversarial-review issue 1). A single
+/// hung child — a tenant holding a long lock that blocks `pg_dump`'s
+/// `ACCESS SHARE`, a network stall, a wedged process — must never hang a
+/// tenant's backup forever (and, in the serial nightly pass, every *other*
+/// tenant behind it). On timeout the child is **killed** and the dump records a
+/// typed failure rather than blocking. 30 minutes is generous for a v1 personal
+/// KB while still bounding the worst case; overridable via `--backup-timeout-secs`.
+pub const DEFAULT_BACKUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Connection parameters for one database on the cluster, as discrete fields
 /// so the password can be routed to the child's environment and everything
@@ -166,22 +177,27 @@ async fn binary_present(bin: &str) -> bool {
 
 /// `pg_dump -Fc` the tenant database `db_name` and return the custom-format
 /// dump bytes. The password rides in `PGPASSWORD` (never argv); `db_name` is
-/// shape-validated first.
+/// shape-validated first. The dump is bounded by `timeout`: a child that runs
+/// past it is **killed** and the call returns a [`CloudError::Backup`] timeout
+/// failure rather than hanging (adversarial-review issue 1).
 pub async fn dump_tenant_database(
     conn: &DumpConnection,
     db_name: &str,
+    timeout: Duration,
 ) -> Result<Vec<u8>, CloudError> {
     let db_name = checked_tenant_db_name(db_name)?;
-    dump_database(conn, db_name).await
+    dump_database(conn, db_name, timeout).await
 }
 
-/// `pg_dump -Fc` the control-plane database and return the dump bytes.
+/// `pg_dump -Fc` the control-plane database and return the dump bytes. Bounded
+/// by `timeout` (see [`dump_tenant_database`]).
 pub async fn dump_control_database(
     conn: &DumpConnection,
     db_name: &str,
+    timeout: Duration,
 ) -> Result<Vec<u8>, CloudError> {
     let db_name = checked_control_db_name(db_name)?;
-    dump_database(conn, db_name).await
+    dump_database(conn, db_name, timeout).await
 }
 
 /// Build the `pg_dump` command for an already-validated database name —
@@ -210,12 +226,23 @@ fn build_dump_command(conn: &DumpConnection, db_name: &str) -> Command {
 /// small in v1 (a personal KB); if and when they aren't, this becomes a
 /// streamed temp file — the [`BackupStore`](crate::backup_store::BackupStore)
 /// seam already takes owned bytes so that swap is local.
-async fn dump_database(conn: &DumpConnection, db_name: &str) -> Result<Vec<u8>, CloudError> {
+///
+/// `pg_dump` is **spawned** (not `.output()`d) so the child handle is owned and
+/// can be killed if it overruns `timeout` — a hung dump (lock contention,
+/// network stall, a wedged child) must not hang the serial nightly pass
+/// (adversarial-review issue 1). On timeout the child is killed and a typed
+/// [`CloudError::Backup`] timeout is returned.
+async fn dump_database(
+    conn: &DumpConnection,
+    db_name: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, CloudError> {
     let mut command = build_dump_command(conn, db_name);
-    let output = command
-        .output()
-        .await
+    let child = command
+        .spawn()
         .map_err(|e| CloudError::Backup(format!("spawning pg_dump for {db_name:?}: {e}")))?;
+
+    let output = wait_with_timeout(child, timeout, "pg_dump", db_name).await?;
 
     if !output.status.success() {
         return Err(CloudError::Backup(format!(
@@ -232,6 +259,79 @@ async fn dump_database(conn: &DumpConnection, db_name: &str) -> Result<Vec<u8>, 
     Ok(output.stdout)
 }
 
+/// Await a spawned dump/restore child for at most `timeout`, capturing its
+/// piped stdout/stderr. On timeout the child is **killed** (`child.kill()`
+/// sends `SIGKILL` and reaps it, so no zombie/orphan lingers) and a typed
+/// [`CloudError::Backup`] timeout is returned promptly. `tool`/`db_name` name
+/// the operation in the error.
+///
+/// The stdout/stderr pipes are drained on concurrent tasks while the child is
+/// awaited, so a child that fills a pipe can't deadlock the wait; the child
+/// handle is retained (not consumed by `wait_with_output`) precisely so the
+/// timeout arm can kill it.
+async fn wait_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    tool: &str,
+    db_name: &str,
+) -> Result<std::process::Output, CloudError> {
+    use tokio::io::AsyncReadExt;
+
+    // Drain both pipes on their own tasks so a child writing more than a pipe
+    // buffer (a large dump on stdout, verbose stderr) never blocks on a full
+    // pipe while we wait. Taking the handles leaves the child itself intact and
+    // killable.
+    let stdout_drain = child.stdout.take().map(|mut out| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let stderr_drain = child.stderr.take().map(|mut err| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            return Err(CloudError::Backup(format!(
+                "awaiting {tool} for {db_name:?}: {e}"
+            )));
+        }
+        Err(_elapsed) => {
+            // The child overran its budget. Kill it (and reap it) so it leaves
+            // no orphan, then report a typed timeout. `kill` is best-effort —
+            // a child that already exited between the timeout firing and the
+            // kill is fine. Draining tasks unblock once the killed child's
+            // pipes close.
+            let _ = child.kill().await;
+            return Err(CloudError::Backup(format!(
+                "{tool} for {db_name:?} timed out after {}s and was killed",
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    let stdout = match stdout_drain {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let stderr = match stderr_drain {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Restore a `-Fc` dump into a **fresh** database named `target_db_name` on
 /// the cluster: create the database (failing if it already exists — a restore
 /// must never clobber a live tenant), then `pg_restore` the bytes into it.
@@ -245,6 +345,7 @@ pub async fn restore_database(
     conn: &DumpConnection,
     target_db_name: &str,
     dump: &[u8],
+    timeout: Duration,
 ) -> Result<(), CloudError> {
     let target_db_name = checked_tenant_db_name(target_db_name)?;
 
@@ -291,7 +392,9 @@ pub async fn restore_database(
         CloudError::Backup(format!("spawning pg_restore for {target_db_name:?}: {e}"))
     })?;
 
-    // Stream the dump to the child's stdin, then await completion. Take the
+    // Stream the dump to the child's stdin, then await completion under the
+    // same kill-on-timeout budget as the dump path (adversarial-review issue
+    // 1): a wedged pg_restore must not hang the restore forever. Take the
     // handle so it's dropped (closing stdin / signalling EOF) before we wait.
     let mut stdin = child
         .stdin
@@ -307,9 +410,7 @@ pub async fn restore_database(
         .map_err(|e| CloudError::Backup(format!("closing pg_restore stdin: {e}")))?;
     drop(stdin);
 
-    let output = child.wait_with_output().await.map_err(|e| {
-        CloudError::Backup(format!("awaiting pg_restore for {target_db_name:?}: {e}"))
-    })?;
+    let output = wait_with_timeout(child, timeout, "pg_restore", target_db_name).await?;
     if !output.status.success() {
         return Err(CloudError::Backup(format!(
             "pg_restore for {target_db_name:?} exited {}: {}",
@@ -418,6 +519,89 @@ mod tests {
             Some(SENTINEL),
             "password must be passed via PGPASSWORD in the child environment"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_with_timeout_kills_an_overrunning_child_promptly() {
+        // Adversarial-review issue 1: a child that overruns its budget is
+        // killed and a typed timeout returned — not awaited forever. Use a
+        // long-sleeping child (no pg_dump needed) and a tiny timeout; assert
+        // the call returns promptly (the child was killed, not waited out) and
+        // the error is a Backup timeout.
+        let mut command = Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn sleep");
+        let id = child.id();
+
+        let started = std::time::Instant::now();
+        let result = wait_with_timeout(
+            child,
+            Duration::from_millis(100),
+            "pg_dump",
+            "acct_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        // Returned promptly (well before the 60s sleep): the child was killed,
+        // not waited out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout must return promptly after killing the child, took {elapsed:?}"
+        );
+        let err = result.expect_err("an overrunning child must be a timeout error");
+        match err {
+            CloudError::Backup(msg) => {
+                assert!(msg.contains("timed out"), "expected a timeout error: {msg}");
+                assert!(
+                    msg.contains("killed"),
+                    "must report the child was killed: {msg}"
+                );
+            }
+            other => panic!("expected CloudError::Backup timeout, got {other:?}"),
+        }
+
+        // The child is gone — kill() reaped it, so it left no orphan. Give the
+        // OS a beat, then confirm the pid no longer names a live `sleep`.
+        if let Some(pid) = id {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // `kill -0` on a reaped pid fails; on a still-running one succeeds.
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(
+                !alive,
+                "the timed-out child (pid {pid}) must be reaped, not orphaned"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_with_timeout_returns_output_for_a_fast_child() {
+        // The happy path: a child that finishes within budget yields its
+        // captured stdout and a success status.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf PGDMPdata")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn sh");
+        let out = wait_with_timeout(child, Duration::from_secs(10), "pg_dump", "acct_x")
+            .await
+            .expect("fast child succeeds");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"PGDMPdata");
     }
 
     #[test]
