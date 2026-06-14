@@ -190,6 +190,47 @@ get from the magic-link flow:
   root falls back to the dashboard. (In production a reverse proxy serves the
   product app here — `--product-dir` reproduces that on one origin for dev.)
 
+## AI providers: managed keys vs BYOK
+
+By default (`--provisioning-mode disabled`) new tenants are **keyless** — no AI
+provider — so the product app's onboarding shows the AI-provider step. Two ways
+to give a tenant working AI:
+
+**BYOK (no OpenRouter account needed).** On the dashboard's **Provider** page,
+paste an OpenRouter or OpenAI-compatible key (or point an `openai_compat` base
+URL at any local OpenAI-compatible server). Validated before storage; takes
+effect live.
+
+**Managed keys (real OpenRouter).** The cloud mints a per-tenant OpenRouter
+runtime key at signup. It's real spend, so it needs real credentials:
+
+1. An OpenRouter account with credit, and a **Provisioning API key** (a distinct
+   key type — OpenRouter dashboard → Settings → Provisioning API Keys — that can
+   *mint* runtime keys; not a normal API key).
+2. Turn it on (one env var; `cloud-dev.sh` flips `--provisioning-mode openrouter`
+   when it's set):
+   ```bash
+   export ATOMIC_CLOUD_OPENROUTER_PROVISIONING_KEY=<provisioning-key>
+   REBUILD=1 scripts/cloud-dev.sh          # log shows "managed provisioning ON"
+   ```
+3. **Sign up a NEW account through the web flow** (`app.<base>/signup`). Two
+   constraints by design: the CLI `account create` is **keyless** (operator
+   tooling never holds the provisioning key), so it won't mint one; and existing
+   keyless tenants aren't upgraded retroactively. Signup step 9 mints the key
+   (default **50¢/mo** allowance, OpenRouter-enforced; `--managed-key-allowance-cents`
+   to change), encrypts it, stores it. Create an atom → it embeds/tags with no
+   BYOK setup; the Provider page shows `managed` + usage. Managed mode pins the
+   embedding model fleet-wide and curates the LLM list (expected).
+4. **Clean up.** Each test signup mints a real key. Deleting the account
+   (dashboard danger zone) deletes its key via the provisioning API; revoke any
+   stragglers in the OpenRouter provisioning dashboard. Spend is capped per key
+   at the allowance.
+
+> The mint→encrypt→store→delete *lifecycle* is covered by automated tests with a
+> recording provisioning double; the only thing the manual test adds is
+> confirming real inference works through a managed key (which needs the real
+> OpenRouter credentials above — a fake minted key can't call the model).
+
 ## Fast visual iteration (Vite HMR)
 
 For tight styling loops, run the Vite dev server (hot reload) instead of
