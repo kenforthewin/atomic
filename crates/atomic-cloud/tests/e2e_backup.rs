@@ -746,9 +746,7 @@ async fn staleness_alert_surfaces_only_the_stale_tenant() {
             assert_eq!(summary.tenants_backed_up.len(), 2, "{summary:?}");
 
             let horizon = Duration::from_secs(36 * 60 * 60);
-            let none_stale = stale_tenant_backups(&h.control, horizon)
-                .await
-                .unwrap();
+            let none_stale = stale_tenant_backups(&h.control, horizon).await.unwrap();
             assert!(
                 none_stale.is_empty(),
                 "right after a pass, no tenant is stale: {none_stale:?}"
@@ -768,9 +766,7 @@ async fn staleness_alert_surfaces_only_the_stale_tenant() {
             // The staleness alert surfaces EXACTLY the stale tenant — never the
             // fresh one (per-tenant: the query reads each tenant's own
             // last_backup_at, never conflating them).
-            let alerted = stale_tenant_backups(&h.control, horizon)
-                .await
-                .unwrap();
+            let alerted = stale_tenant_backups(&h.control, horizon).await.unwrap();
             assert_eq!(alerted.len(), 1, "exactly one stale tenant: {alerted:?}");
             assert_eq!(
                 alerted[0].account_id, stale.account_id,

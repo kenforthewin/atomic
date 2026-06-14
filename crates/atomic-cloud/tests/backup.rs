@@ -148,10 +148,9 @@ async fn backup_status_and_ledger_round_trip() {
         record_backup_success(&control, &acct.account_id, &acct.db_name, now)
             .await
             .unwrap();
-        let fresh =
-            stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60))
-                .await
-                .unwrap();
+        let fresh = stale_tenant_backups(&control, std::time::Duration::from_secs(36 * 60 * 60))
+            .await
+            .unwrap();
         assert!(fresh.is_empty(), "a just-backed-up tenant is not stale");
 
         // A failure records the error but does NOT reset last_backup_at — the
