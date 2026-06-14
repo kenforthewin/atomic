@@ -27,8 +27,19 @@ actix-web = "4.9"
 # (`provider_credentials.model_config`) on control-plane rows.
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "json"] }
 
-# Async
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+# Async — `process` + `io-util` + `fs` power the pg_dump/pg_restore backup
+# runner (spawn with PGPASSWORD in the child env, stream the dump over
+# stdin/stdout) and the local-filesystem BackupStore.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal", "process", "io-util", "fs"] }
+
+# Backup object storage (plan: "Backups & disaster recovery"). One crate
+# covers S3 + every S3-compatible endpoint behind a single signing/retry
+# implementation — chosen over hand-rolling AWS SigV4. The `aws` feature pulls
+# the AmazonS3 client; tests never construct it (they use the local store).
+object_store = { version = "0.11", features = ["aws"] }
+
+# Streamed object listing (S3Store::list) and the local store's recursive
+# walk hand back futures::Stream; `futures` is already a dependency below.
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

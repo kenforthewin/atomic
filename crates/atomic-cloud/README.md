@@ -152,6 +152,11 @@ deferred.
 - [`provisioning_api.rs`](src/provisioning_api.rs) — `ProvisioningApi` trait + OpenRouter client
 - [`curated_models.rs`](src/curated_models.rs) — pinned embedding model + curated LLM list
 
+**Backups & disaster recovery**
+- [`backup_store.rs`](src/backup_store.rs) — `BackupStore` trait + `LocalFileSystemStore` (dev/tests, pure `tokio::fs`) / `S3Store` (production, via `object_store`)
+- [`backup.rs`](src/backup.rs) — the `pg_dump -Fc` / `pg_restore` runner (password via `PGPASSWORD` in the child env, never argv; bounded stderr capture)
+- [`backups.rs`](src/backups.rs) — the nightly pass (per-tenant advisory-locked + control plane), the fail-closed final dump before deletion, the `backup_runs` ledger queries, and the staleness monitor
+
 **Background execution**
 - [`dispatcher.rs`](src/dispatcher.rs) — the per-pod dispatcher loop (hint scan → N+1 poll → round-robin drain)
 - [`pools.rs`](src/pools.rs) — four bounded worker pools with per-tenant caps
@@ -229,9 +234,10 @@ atomic-cloud --control-url <URL> <command>
 
   serve      Run the multi-tenant HTTP server
   migrate    Create (if needed) + migrate the control-plane database
-  account    create | delete   (provision/teardown a tenant)
+  account    create | delete   (provision/teardown a tenant; delete takes a final dump)
   token      create            (mint an account/database/mcp-scoped token)
   deploy     status | advance  (inspect / acknowledge boot fleet migrations)
+  backup     restore           (restore a dump into a fresh database; runbook)
 ```
 
 `--control-url` is global; `serve` and `account` also take `--cluster-url`. Run
@@ -245,6 +251,7 @@ any subcommand with `--help` for the full flag set. Notable `serve` groups:
 - **Dispatcher**: `--dispatcher`, `--dispatcher-tick-ms`, the four `--*-pool-total`/`--*-pool-per-tenant` caps, `--reports-per-tenant-cap`
 - **Backpressure**: `--breaker-*`, `--retry-after-cap-secs`, `--chat-streams-per-account`
 - **Deploy gating**: `--fleet-migration-*`, `--deploy-ready-failure-rate`, `--deploy-review-failure-rate`
+- **Backups**: `--backup-store local|s3` (+ `--backup-base-dir`, `--backup-bucket`, `--backup-region`, `--backup-endpoint`; S3 access-key/secret are env-only `AWS_*`), `--backup-interval-secs`, `--max-backups-per-pass`, `--backup-staleness-secs`
 
 Every flag has an `ATOMIC_CLOUD_*` env fallback. Secrets (master key, provisioning
 key) are **only** read from the environment — never argv — to keep them out of
@@ -252,7 +259,7 @@ process listings.
 
 ## Migrations
 
-Control-plane migrations live in [`migrations/`](migrations) (`001`–`014`) and
+Control-plane migrations live in [`migrations/`](migrations) (`001`–`015`) and
 run through the hardened runner in `control_plane.rs` (schema-version table,
 advisory lock on a detached connection, errors propagated). Tenant databases run
 atomic-core's own migrations via `initialize()`.
@@ -292,13 +299,53 @@ provider or sends real email.
   in-memory channel, so in a multi-pod deployment a WS client on another pod
   misses that execution's progress events. Durable state is always correct;
   build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
-- Several capabilities are scoped to later slices — backups, observability
+- Several capabilities are scoped to later slices — observability
   metrics/tracing, the user-facing `account_events` log, and the
   signup/billing SPA frontend. The OAuth flow is shipped as API + a minimal
   server-rendered consent/approve form (no SPA); a richer consent UI is later.
   See the plan doc's Implementation log for the current frontier.
+- **Backup PITR is deferred**: backups are nightly logical dumps (`pg_dump
+  -Fc`) per tenant + control plane, not point-in-time recovery via WAL
+  archiving — recovery granularity is one day. The restore CLI restores into
+  a *fresh* database; **repointing `account_databases.db_name` and evicting a
+  running pod's `AccountCache` entry are deliberate manual runbook steps** (a
+  CLI invocation can't reach another process's in-memory cache; an admin evict
+  endpoint is a later slice).
 
-## What's shipped (this slice: OAuth & per-tenant MCP)
+## What's shipped (this slice: backups & disaster recovery)
+
+- **`BackupStore` seam** — a trait (`put`/`get`/`list`/`exists`) with a
+  `LocalFileSystemStore` (dev + every test; pure `tokio::fs`, never network)
+  and an `S3Store` backed by the `object_store` crate (S3 + any S3-compatible
+  endpoint; SigV4 not hand-rolled). `serve`/CLI select it via
+  `--backup-store local|s3`; S3 credentials are env-only.
+- **Logical dump/restore runner** — `pg_dump -Fc` / `pg_restore` via
+  `tokio::process`, with the connection **password in `PGPASSWORD` in the
+  child env, never argv** (a unit test asserts a sentinel password is only in
+  the env), `is_tenant_db_name` shape-validation before any DDL, and bounded
+  stderr capture. A real dump → restore → verify roundtrip is integration-
+  tested (provision a tenant, write an atom, dump, restore into a fresh DB,
+  assert the atom rehydrated) — gated on `pg_dump` being on PATH.
+- **Nightly pass** (`backups.rs`) — dumps every active tenant (each under the
+  reaper's per-account advisory lock, so two pods never dump one tenant at
+  once) plus the control plane, records per-tenant `last_backup_at` /
+  `last_backup_error` and a `backup_runs` ledger row (migration `015`), and
+  runs the **staleness monitor** (error-level alert when a tenant's last
+  successful backup is >36h old). Wired into `serve` with a jittered start +
+  CLI knobs, mirroring the reaper loop.
+- **Fail-closed final dump on deletion** — `delete_account` takes a final
+  `backups/final/` dump **before** the `DROP DATABASE`, scoped to the
+  active-account deletion path (HTTP route, CLI, and the reaper's
+  interrupted-deletion arm; the never-activated rollback/orphan paths
+  correctly take none). A dump failure aborts the deletion rather than destroy
+  un-backed-up data — the operator's only undo under hard-delete v1. Retention
+  (14 daily + 8 weekly; 30-day finals) is bucket lifecycle policy, not code.
+- **Restore CLI + runbook** — `atomic-cloud backup restore` restores a dump
+  into a fresh database, then prints the remaining manual runbook steps
+  (repoint `account_databases.db_name`, evict the running pod's
+  `AccountCache`). PITR via WAL archiving is deferred.
+
+## Previously shipped (OAuth & per-tenant MCP)
 
 - **Per-account OAuth 2.0** — cloud's own Dynamic Client Registration +
   Authorization Code + PKCE (S256) flow on the tenant subdomain

@@ -206,6 +206,22 @@ pub enum CloudError {
     /// material.
     #[error("invalid Stripe configuration: {0}")]
     InvalidStripeConfig(String),
+
+    /// A backup object-store operation failed (put/get/list/exists), or its
+    /// configuration was invalid. `context` carries the operation and the
+    /// underlying store error; it never contains S3 credentials (those live
+    /// only in the process environment — see [`crate::backup_store`]).
+    #[error("backup store: {0}")]
+    BackupStore(String),
+
+    /// A `pg_dump` / `pg_restore` invocation failed: the binary was missing,
+    /// the process exited non-zero, or its output couldn't be captured. The
+    /// message carries the operation, the exit status, and a **bounded** tail
+    /// of the tool's stderr — never the connection password, which is passed
+    /// to the child via `PGPASSWORD` in its environment and never appears in
+    /// argv or in any error value (see [`crate::backup`]).
+    #[error("backup runner: {0}")]
+    Backup(String),
 }
 
 impl CloudError {
@@ -222,5 +238,15 @@ impl CloudError {
     ) -> impl FnOnce(atomic_core::AtomicCoreError) -> CloudError {
         let context = context.into();
         move |source| CloudError::Core { context, source }
+    }
+
+    /// Wrap a filesystem [`std::io::Error`] from the local backup store with
+    /// `context`, as a [`CloudError::BackupStore`]. Keeps the local store's
+    /// `map_err` call sites to one line.
+    pub(crate) fn backup_io(
+        context: impl Into<String>,
+    ) -> impl FnOnce(std::io::Error) -> CloudError {
+        let context = context.into();
+        move |source| CloudError::BackupStore(format!("{context}: {source}"))
     }
 }

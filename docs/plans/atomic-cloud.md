@@ -1447,6 +1447,58 @@ server-rendered approve form only); per-KB-MCP-by-default (awaits multi-user-
 per-account); wiring `purge_expired_oauth_codes` into the reaper loop (the
 function exists; codes are single-use + short-TTL, so stale rows are inert).
 
+### Slice 8 — backups & disaster recovery (2026-06-13, branch `cloud-backups`)
+
+Landed the v1 backup story — mandatory before real user data exists, because
+hard-delete v1 makes a reaper bug or a fat-fingered delete unrecoverable
+without it. Everything is in `atomic-cloud`; `atomic-core`/`atomic-server` are
+untouched (backups are a control-plane + subprocess + object-storage concern).
+
+- **`BackupStore` seam** ([`backup_store.rs`](../../crates/atomic-cloud/src/backup_store.rs))
+  — the `EmailSender`/`BillingProvider`/`ProvisioningApi` shape: a trait
+  (`put`/`get`/`list`/`exists`), a `LocalFileSystemStore` (dev + **every**
+  test; pure `tokio::fs`, path-traversal-guarded, never network), and an
+  `S3Store` over the `object_store` crate (S3 + any S3-compatible endpoint;
+  SigV4 not hand-rolled — one well-maintained dep). S3 credentials env-only.
+- **Dump/restore runner** ([`backup.rs`](../../crates/atomic-cloud/src/backup.rs))
+  — `pg_dump -Fc` / `pg_restore` via `tokio::process`. **Credential hygiene is
+  load-bearing**: the password rides in `PGPASSWORD` in the child env, *never*
+  argv (a unit test asserts a sentinel password appears only in the spawned
+  command's env, never its args); connection params are discrete
+  `--host/--port/--username/--dbname` flags. Every db name passes
+  `is_tenant_db_name` before reaching a flag or DDL. stderr is bounded into a
+  typed `CloudError::Backup`. A real dump → restore → verify roundtrip is
+  integration-tested (write an atom, dump, restore into a fresh DB, assert the
+  atom rehydrated) — `pg_dump`-probed, skips-with-message when absent.
+- **Nightly pass + final dump + staleness**
+  ([`backups.rs`](../../crates/atomic-cloud/src/backups.rs), migration 015) —
+  the pass dumps every active tenant (each under the reaper's **same**
+  per-account advisory lock, so a dump can never race a `DROP DATABASE`) plus
+  the control plane, recording `account_databases.last_backup_at` /
+  `last_backup_error` and a `backup_runs` ledger row; a jittered `serve` loop
+  mirrors the reaper. The staleness monitor alerts (error-level) when any
+  tenant's last successful backup is >36h old. The **final dump** hooks into
+  `delete_account` *before* the drop, **fail-closed** (a dump failure aborts
+  the deletion), scoped to the active-account path (HTTP route, CLI, reaper
+  interrupted-deletion arm) — the never-activated rollback/orphan paths drop
+  no-data databases and take none. Retention is bucket lifecycle, not code.
+- **Restore CLI + runbook** — `atomic-cloud backup restore` restores into a
+  *fresh* DB and prints the remaining manual steps; repointing
+  `account_databases.db_name` and evicting a running pod's `AccountCache` are
+  deliberate human runbook steps (the CLI can't reach another process's cache;
+  an admin evict endpoint is a later slice — the slice-2 deletion-gap shape).
+
+**Deviations from this plan (deliberate):** the `delete_account` final dump is
+threaded as an `Option<&BackupStore>` argument and surfaced to the HTTP route
+and reaper via builder-style `with_backup_store` / a `ReaperPolicy` field, so
+the ~30 existing test call sites compile unchanged and the never-activated
+drop paths opt out by construction (they don't call `delete_account`). The
+reaper and backup pass share `reaper_lock_key`, making backup/drop mutually
+exclusive per account for free.
+
+**Deferred (per plan):** PITR via WAL archiving, cross-region replicas, the
+admin cache-evict endpoint, observability metrics — all later slices.
+
 ## Open questions (carried across sections)
 
 - **Free tier shape & abuse model.** Open free signup needs CAPTCHA +

@@ -34,6 +34,9 @@ const CONTROL_TABLES: &[&str] = &[
     // Migration 014 — per-account OAuth (DCR clients + authorization codes).
     "oauth_clients",
     "oauth_codes",
+    // Migration 015 — backup-run ledger (015 also adds
+    // `account_databases.last_backup_at` / `last_backup_error`).
+    "backup_runs",
 ];
 
 /// The migration-tracking columns 008 adds to `account_databases` (plan:

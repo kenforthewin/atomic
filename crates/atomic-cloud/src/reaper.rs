@@ -176,8 +176,9 @@ use crate::provision::{
 };
 
 /// Tunables for a reaper pass. [`Default`] is the production configuration;
-/// tests shrink fields to drive specific arms.
-#[derive(Debug, Clone)]
+/// tests shrink fields to drive specific arms. `Debug` is hand-written (the
+/// backup store is a trait object); see the impl below.
+#[derive(Clone)]
 pub struct ReaperPolicy {
     /// How long an account may sit in `status='provisioning'` before it
     /// counts as stuck (plan: 5 minutes). Anything younger is an in-flight
@@ -250,6 +251,46 @@ pub struct ReaperPolicy {
     /// the retention only preserves the forensic breadcrumbs
     /// (`request_ip`, timing) for a debugging window.
     pub magic_link_retention_after_expiry: Duration,
+
+    /// Backup store handed to arm 3's [`delete_account`] so an interrupted
+    /// deletion the reaper *completes* still takes the final pre-drop dump
+    /// (plan: "Account deletion" step 4) — a deletion that died before the
+    /// drop holds real user data that must be backed up before the reaper
+    /// finishes destroying it. `None` (the [`Default`]) takes no dump, which
+    /// is correct only for paths with no real data to lose; `serve` always
+    /// sets it. The stuck-provision rollback and orphan-reclaim arms drop
+    /// never-activated databases and deliberately don't route through
+    /// `delete_account`, so they never dump regardless of this field.
+    pub backup_store: Option<std::sync::Arc<dyn crate::backup_store::BackupStore>>,
+}
+
+impl std::fmt::Debug for ReaperPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The backup store is a trait object (not Debug); render only its
+        // presence so `?summary`-style logs stay useful without requiring a
+        // Debug bound on every BackupStore impl.
+        f.debug_struct("ReaperPolicy")
+            .field("stuck_provision_age", &self.stuck_provision_age)
+            .field("max_resumes_per_pass", &self.max_resumes_per_pass)
+            .field(
+                "provision_rollback_ceiling",
+                &self.provision_rollback_ceiling,
+            )
+            .field("deletion_recovery_grace", &self.deletion_recovery_grace)
+            .field(
+                "max_migration_retries_per_pass",
+                &self.max_migration_retries_per_pass,
+            )
+            .field("migration_alert_retries", &self.migration_alert_retries)
+            .field("migration_retry", &self.migration_retry)
+            .field("self_reservation_grace", &self.self_reservation_grace)
+            .field(
+                "magic_link_retention_after_expiry",
+                &self.magic_link_retention_after_expiry,
+            )
+            .field("backup_store", &self.backup_store.is_some())
+            .finish()
+    }
 }
 
 impl Default for ReaperPolicy {
@@ -268,6 +309,7 @@ impl Default for ReaperPolicy {
             migration_retry: crate::fleet_migration::FleetMigrationConfig::default(),
             self_reservation_grace: Duration::from_secs(5 * 60),
             magic_link_retention_after_expiry: Duration::from_secs(24 * 60 * 60),
+            backup_store: None,
         }
     }
 }
@@ -424,6 +466,42 @@ fn cutoff(age: Duration) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
+/// Try to take the per-account advisory lock on a dedicated, pool-detached
+/// control-plane session, returning the held connection. `Ok(None)` means
+/// another holder (a concurrent reaper pass on another pod, or the nightly
+/// backup pass — both key on [`reaper_lock_key`]) owns it: skip the work,
+/// never wait. The lock is session-level, so the caller releases it by
+/// **closing the returned connection** (`conn.close().await`); even a
+/// cancelled future dropping the connection ends the session and frees the
+/// lock — it can never strand on a connection returned to the pool.
+///
+/// Public so the nightly backup pass ([`crate::backups`]) takes the *same*
+/// per-account lock the reaper does: a backup of an active tenant and a
+/// reaper drop of that same tenant are then mutually exclusive, so a dump can
+/// never race a `DROP DATABASE`.
+pub async fn try_account_advisory_lock(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Result<Option<PgConnection>, CloudError> {
+    let mut conn = control
+        .pool()
+        .acquire()
+        .await
+        .map_err(CloudError::db("acquiring advisory-lock connection"))?
+        .detach();
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(reaper_lock_key(account_id))
+        .fetch_one(&mut conn)
+        .await
+        .map_err(CloudError::db("taking account advisory lock"))?;
+    if acquired {
+        Ok(Some(conn))
+    } else {
+        let _ = conn.close().await;
+        Ok(None)
+    }
+}
+
 /// A held per-account reaper lock: a dedicated control-plane session owning
 /// `pg_try_advisory_lock(reaper_lock_key(account_id))`. Session-level on a
 /// connection detached from the pool, so the lock can never leak back into
@@ -441,23 +519,9 @@ impl AccountLock {
         control: &ControlPlane,
         account_id: &str,
     ) -> Result<Option<Self>, CloudError> {
-        let mut conn = control
-            .pool()
-            .acquire()
-            .await
-            .map_err(CloudError::db("acquiring reaper lock connection"))?
-            .detach();
-        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-            .bind(reaper_lock_key(account_id))
-            .fetch_one(&mut conn)
-            .await
-            .map_err(CloudError::db("taking reaper advisory lock"))?;
-        if acquired {
-            Ok(Some(Self { conn }))
-        } else {
-            let _ = conn.close().await;
-            Ok(None)
-        }
+        Ok(try_account_advisory_lock(control, account_id)
+            .await?
+            .map(|conn| Self { conn }))
     }
 
     /// Release by ending the session — unconditional, no unlock call that
@@ -951,7 +1015,17 @@ async fn complete_interrupted_deletions(
             // the accounts-row CASCADE removes it), so the retry here can
             // still find the external id even when the original attempt's
             // key delete failed.
-            crate::provision::delete_account(control, cluster, managed, &account_id).await?;
+            // Pass the backup store so a deletion that died before its drop
+            // still takes the final dump before this completes the
+            // destruction (module docs on ReaperPolicy::backup_store).
+            crate::provision::delete_account(
+                control,
+                cluster,
+                managed,
+                policy.backup_store.as_ref(),
+                &account_id,
+            )
+            .await?;
             Ok(true)
         }
         .await;

@@ -753,9 +753,15 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
             .await
             .expect("create session");
 
-            delete_account(&control, &cluster, &ManagedKeys::Disabled, &acct.account_id)
-                .await
-                .expect("delete succeeds");
+            delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                None,
+                &acct.account_id,
+            )
+            .await
+            .expect("delete succeeds");
 
             assert!(
                 !database_exists(&cluster.cluster_url, &acct.db_name).await,
@@ -806,13 +812,20 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
             assert!(matches!(err, CloudError::SubdomainReserved(_)));
 
             // Re-delete is a no-op, as is deleting an unknown account.
-            delete_account(&control, &cluster, &ManagedKeys::Disabled, &acct.account_id)
-                .await
-                .expect("re-delete is a no-op");
             delete_account(
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                None,
+                &acct.account_id,
+            )
+            .await
+            .expect("re-delete is a no-op");
+            delete_account(
+                &control,
+                &cluster,
+                &ManagedKeys::Disabled,
+                None,
                 &uuid::Uuid::new_v4().to_string(),
             )
             .await

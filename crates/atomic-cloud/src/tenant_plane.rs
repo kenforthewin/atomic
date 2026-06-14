@@ -226,6 +226,13 @@ struct PlaneState {
     /// the WebSocket channel it owns — would linger until the idle TTL);
     /// provider writes live-rotate through it.
     cache: Arc<AccountCache>,
+    /// Backup store for the final pre-drop dump in `DELETE /api/account`
+    /// (plan: "Account deletion" step 4). `None` means deletions proceed with
+    /// no final dump — unrecoverable under hard-delete v1; `serve` always
+    /// wires one via [`TenantPlane::with_backup_store`]. The HTTP deletion
+    /// route is the canonical active-account deletion path, so this is where
+    /// the operator's undo is earned.
+    backup_store: Option<Arc<dyn crate::backup_store::BackupStore>>,
     /// Serializes the provider-mutation routes per account; see
     /// [`AccountLocks`].
     provider_locks: AccountLocks,
@@ -291,9 +298,29 @@ impl TenantPlane {
                 managed,
                 vault,
                 cache,
+                backup_store: None,
                 provider_locks: AccountLocks::default(),
             }),
         }
+    }
+
+    /// Wire the backup store the deletion route takes its final pre-drop dump
+    /// to (plan: "Account deletion" step 4). `serve` calls this; tests that
+    /// don't exercise deletion-backups leave it unset (deletions then take no
+    /// final dump, exactly as before this slice). Must be called before the
+    /// plane is shared with workers — it rebuilds the shared `web::Data`.
+    pub fn with_backup_store(mut self, store: Arc<dyn crate::backup_store::BackupStore>) -> Self {
+        let state = &*self.state;
+        self.state = web::Data::new(PlaneState {
+            control: state.control.clone(),
+            cluster: state.cluster.clone(),
+            managed: state.managed.clone(),
+            vault: state.vault.clone(),
+            cache: Arc::clone(&state.cache),
+            backup_store: Some(store),
+            provider_locks: AccountLocks::default(),
+        });
+        self
     }
 
     /// Register the tenant-plane routes on `cfg`, each behind `auth` (and
@@ -385,6 +412,7 @@ async fn delete_account_route(
             &task_state.control,
             &task_state.cluster,
             &task_state.managed,
+            task_state.backup_store.as_ref(),
             &account_id,
         )
         .await?;

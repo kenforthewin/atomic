@@ -207,6 +207,43 @@ enum Command {
             default_value_t = atomic_cloud::DEFAULT_CHAT_STREAMS_PER_ACCOUNT
         )]
         chat_streams_per_account: usize,
+
+        #[command(flatten)]
+        backup: BackupArgs,
+
+        /// How often the nightly backup pass runs, in seconds (plan:
+        /// "Backups & disaster recovery" → nightly logical dumps). Each pass
+        /// dumps every active tenant database (per-tenant advisory-locked,
+        /// cross-pod safe) plus the control plane to the configured backup
+        /// store. The default is 24h; a jittered start keeps a fleet of pods
+        /// from synchronizing their passes.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_BACKUP_INTERVAL_SECS",
+            default_value_t = 24 * 60 * 60
+        )]
+        backup_interval_secs: u64,
+
+        /// Max tenant dumps per nightly pass before deferring the rest to the
+        /// next pass (each shells out to pg_dump). Stale-first ordering means
+        /// a capped pass makes progress on the most-overdue tenants.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_MAX_BACKUPS_PER_PASS",
+            default_value_t = atomic_cloud::DEFAULT_MAX_BACKUPS_PER_PASS
+        )]
+        max_backups_per_pass: usize,
+
+        /// Staleness alert horizon in seconds (plan: ">36h old"). After each
+        /// nightly pass, any active tenant whose last successful backup is
+        /// older than this is logged at error level — the
+        /// "unmonitored-backup-job-is-a-placebo" alert.
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_BACKUP_STALENESS_SECS",
+            default_value_t = atomic_cloud::DEFAULT_STALENESS_HORIZON.as_secs()
+        )]
+        backup_staleness_secs: u64,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -229,6 +266,13 @@ enum Command {
     Deploy {
         #[command(subcommand)]
         action: DeployAction,
+    },
+
+    /// Logical-backup operations: restore a dump into a fresh database
+    /// (plan: "Backups & disaster recovery" → "Restore runbook").
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
     },
 }
 
@@ -352,6 +396,76 @@ impl ProvisioningArgs {
                         ..ManagedKeyConfig::default()
                     },
                 })
+            }
+        }
+    }
+}
+
+/// Where logical backups land (plan: "Backups & disaster recovery"). `local`
+/// is the dev/self-hosted default — a directory tree, always available, never
+/// network — and `s3` targets S3 or any S3-compatible endpoint via
+/// [`object_store`]. S3 access-key/secret are read from the **environment**
+/// (the standard `AWS_*` vars), never argv.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BackupStoreKind {
+    /// A local directory tree under `--backup-base-dir`.
+    Local,
+    /// An S3 / S3-compatible bucket.
+    S3,
+}
+
+/// Backup-store selection, shared by `serve` (nightly + final dumps),
+/// `account delete` (the final dump), and `backup restore`. Defaults to a
+/// local store under `./backups`, so a fresh dev deployment has working
+/// backups with no flags.
+#[derive(Args, Clone)]
+struct BackupArgs {
+    /// Backup object-store backend.
+    #[arg(long, env = "ATOMIC_CLOUD_BACKUP_STORE", default_value = "local")]
+    backup_store: BackupStoreKind,
+
+    /// Base directory for `--backup-store local`.
+    #[arg(
+        long,
+        env = "ATOMIC_CLOUD_BACKUP_BASE_DIR",
+        default_value = "./backups"
+    )]
+    backup_base_dir: String,
+
+    /// Bucket name for `--backup-store s3` (required in that mode).
+    #[arg(long, env = "ATOMIC_CLOUD_BACKUP_BUCKET")]
+    backup_bucket: Option<String>,
+
+    /// AWS region for `--backup-store s3`. S3-compatible endpoints usually
+    /// accept `us-east-1`/`auto`.
+    #[arg(long, env = "ATOMIC_CLOUD_BACKUP_REGION", default_value = "us-east-1")]
+    backup_region: String,
+
+    /// Override endpoint for an S3-compatible provider (R2/MinIO). Omit for
+    /// AWS S3 proper.
+    #[arg(long, env = "ATOMIC_CLOUD_BACKUP_ENDPOINT")]
+    backup_endpoint: Option<String>,
+}
+
+impl BackupArgs {
+    /// Build the configured backup store. S3 credentials come from the
+    /// environment (never argv); a misconfigured S3 selection (missing
+    /// bucket) fails at boot, not on the first dump.
+    fn into_store(self) -> Result<Arc<dyn atomic_cloud::BackupStore>, Box<dyn std::error::Error>> {
+        match self.backup_store {
+            BackupStoreKind::Local => Ok(Arc::new(atomic_cloud::LocalFileSystemStore::new(
+                self.backup_base_dir,
+            ))),
+            BackupStoreKind::S3 => {
+                let bucket = self
+                    .backup_bucket
+                    .ok_or("--backup-bucket is required with --backup-store s3")?;
+                let store = atomic_cloud::S3Store::new(&atomic_cloud::S3Config {
+                    bucket,
+                    region: self.backup_region,
+                    endpoint: self.backup_endpoint,
+                })?;
+                Ok(Arc::new(store))
             }
         }
     }
@@ -921,6 +1035,9 @@ enum AccountAction {
         #[command(flatten)]
         cluster: ClusterArgs,
 
+        #[command(flatten)]
+        backup: BackupArgs,
+
         /// Subdomain of the account to delete.
         #[arg(long)]
         subdomain: String,
@@ -941,6 +1058,38 @@ enum DeployAction {
     /// migration itself is broken; redeploy the old binary (see
     /// atomic_cloud::deploy).
     Advance,
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Restore a tenant dump (object key in the configured backup store) into
+    /// a FRESH database, then print the runbook's remaining manual steps.
+    ///
+    /// Restore deliberately does NOT repoint `account_databases.db_name` or
+    /// evict a running serve process's AccountCache — those are the operator's
+    /// explicit, reviewed steps (plan: "Restore runbook"): a CLI invocation
+    /// can't reach another process's in-memory cache, and silently repointing
+    /// the mapping would skip the human checkpoint before a tenant starts
+    /// serving restored data. The command prints exactly what to run.
+    Restore {
+        #[command(flatten)]
+        cluster: ClusterArgs,
+
+        #[command(flatten)]
+        backup: BackupArgs,
+
+        /// Object key of the dump to restore (e.g.
+        /// `backups/2026-06-09/acct_<base32>.dump` or
+        /// `backups/final/<uuid>-<ts>.dump`).
+        #[arg(long)]
+        key: String,
+
+        /// Name of the fresh tenant database to restore into. MUST be a valid
+        /// `acct_<base32>` tenant name and MUST NOT already exist — restore
+        /// never clobbers a live database.
+        #[arg(long)]
+        target_db: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1024,6 +1173,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dispatcher,
             fleet,
             chat_streams_per_account,
+            backup,
+            backup_interval_secs,
+            max_backups_per_pass,
+            backup_staleness_secs,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
@@ -1084,6 +1237,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let quota_jobs = quota.into_config();
 
+            // Backup store + nightly-pass config (plan: "Backups & disaster
+            // recovery"). The store backs the nightly pass, the final pre-drop
+            // dump in DELETE /api/account, and the reaper's interrupted-
+            // deletion completion. Built once, shared by all three.
+            let backup_store = backup.into_store()?;
+            let backup_config = atomic_cloud::BackupConfig {
+                max_backups_per_pass,
+                staleness_horizon: std::time::Duration::from_secs(backup_staleness_secs),
+            };
+
             serve(
                 control,
                 cluster.into_config(),
@@ -1104,6 +1267,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ChatStreamLimiter::new(chat_streams_per_account),
                 quota_billing,
                 quota_jobs,
+                backup_store,
+                backup_config,
+                std::time::Duration::from_secs(backup_interval_secs.max(1)),
             )
             .await
         }
@@ -1142,21 +1308,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
 
-            AccountAction::Delete { cluster, subdomain } => {
+            AccountAction::Delete {
+                cluster,
+                backup,
+                subdomain,
+            } => {
                 let account_id = control
                     .account_id_by_subdomain(&subdomain)
                     .await?
                     .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
-                // Disabled here too: this host has no provisioning key, so
-                // a managed runtime key (if the account has one) cannot be
-                // deleted from the CLI — delete_account logs the residue
-                // loudly with the external id; clean it up via the master
-                // OpenRouter account's key listing. The HTTP deletion route
-                // (the preferred path) deletes the key properly.
+                // The final pre-drop dump (plan: "Account deletion" step 4) is
+                // taken to the configured backup store BEFORE the database is
+                // dropped — fail-closed, so a dump failure aborts the deletion
+                // rather than destroy un-backed-up data. The operator's undo.
+                let backup_store = backup.into_store()?;
+                // Disabled managed keys here: this host has no provisioning
+                // key, so a managed runtime key (if the account has one)
+                // cannot be deleted from the CLI — delete_account logs the
+                // residue loudly with the external id; clean it up via the
+                // master OpenRouter account's key listing. The HTTP deletion
+                // route (the preferred path) deletes the key properly.
                 delete_account(
                     &control,
                     &cluster.into_config(),
                     &ManagedKeys::Disabled,
+                    Some(&backup_store),
                     &account_id,
                 )
                 .await?;
@@ -1229,6 +1405,56 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(())
                     }
                 }
+            }
+        },
+
+        Command::Backup { action } => match action {
+            BackupAction::Restore {
+                cluster,
+                backup,
+                key,
+                target_db,
+            } => {
+                if !atomic_cloud::provision::is_tenant_db_name(&target_db) {
+                    return Err(format!(
+                        "--target-db {target_db:?} is not a valid acct_<base32> tenant database name"
+                    )
+                    .into());
+                }
+                let cluster = cluster.into_config();
+                let store = backup.into_store()?;
+                let conn = atomic_cloud::DumpConnection::for_cluster(&cluster)?;
+
+                println!("fetching dump {key} from the backup store...");
+                let dump = store.get(&key).await?;
+                println!(
+                    "restoring {} bytes into fresh database {target_db}...",
+                    dump.len()
+                );
+                atomic_cloud::restore_database(&cluster, &conn, &target_db, &dump).await?;
+
+                println!("restore complete: {target_db} is populated from {key}.");
+                println!();
+                println!("REMAINING RUNBOOK STEPS (plan: \"Restore runbook\"):");
+                println!("  1. Repoint the account's mapping to the restored database:");
+                println!(
+                    "       UPDATE account_databases SET db_name = '{target_db}' \
+                     WHERE account_id = '<account-id>';"
+                );
+                println!(
+                    "  2. Evict any running serve process's AccountCache entry for that account"
+                );
+                println!(
+                    "     (an admin evict endpoint is out of scope this slice; restart the pod,"
+                );
+                println!(
+                    "     or let the idle TTL reclaim it — until then it serves the OLD db_name)."
+                );
+                println!(
+                    "  3. Drop the old database once you've confirmed the restore \
+                     (it was left intact)."
+                );
+                Ok(())
             }
         },
     }
@@ -1354,6 +1580,9 @@ async fn serve(
     chat_streams: ChatStreamLimiter,
     quota_billing: QuotaBilling,
     quota_jobs: QuotaJobsConfig,
+    backup_store: Arc<dyn atomic_cloud::BackupStore>,
+    backup_config: atomic_cloud::BackupConfig,
+    backup_interval: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sweep_interval = sweep_interval
         .unwrap_or(cache_config.idle_ttl / 4)
@@ -1384,13 +1613,17 @@ async fn serve(
         .to_string();
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain)
         .with_public_scheme(public_scheme.clone());
+    // The deletion route takes its final pre-drop dump to the backup store
+    // (plan: "Account deletion" step 4) — the operator's undo under
+    // hard-delete v1.
     let tenant_plane = TenantPlane::new(
         control.clone(),
         cluster.clone(),
         managed.clone(),
         vault,
         Arc::clone(&cache),
-    );
+    )
+    .with_backup_store(Arc::clone(&backup_store));
 
     // The reaper loop runs concurrently with the server below via select!,
     // not tokio::spawn: spawn's Send bound trips rustc's
@@ -1398,14 +1631,29 @@ async fn serve(
     // positive on provision_account's sqlx futures (the same one
     // tests/provisioning.rs works around with join!), and select! on the
     // main task needs no Send while also tying the reaper's lifetime to
-    // serve's.
+    // serve's. The reaper gets the backup store so it dumps an interrupted
+    // deletion it completes (arm 3) before finishing the destruction.
     let reaper_loop = run_reaper_loop(
         control.clone(),
         cluster.clone(),
         managed.clone(),
         reaper_interval,
         fleet_config.clone(),
+        Arc::clone(&backup_store),
     );
+
+    // Nightly backup pass (plan: "Backups & disaster recovery" → nightly
+    // logical dumps): jittered-start interval glue around the tested
+    // `run_backup_pass`, mirroring the reaper loop. Cross-pod safe (per-tenant
+    // advisory locks), and each pass logs a staleness alert for any tenant
+    // whose last successful backup is older than the horizon.
+    tokio::spawn(run_backup_loop(
+        control.clone(),
+        cluster.clone(),
+        Arc::clone(&backup_store),
+        backup_config,
+        backup_interval,
+    ));
 
     // Deploy gate (plan: "Schema migration on deploy"): boot in migrating
     // mode and run the fleet migration concurrently with serving, so
@@ -1670,12 +1918,16 @@ async fn run_reaper_loop(
     managed: ManagedKeys,
     reaper_interval: std::time::Duration,
     fleet_config: FleetMigrationConfig,
+    backup_store: Arc<dyn atomic_cloud::BackupStore>,
 ) {
     // The failed-migrations arm retries through the boot fleet runner's
     // per-tenant step; handing it the serve-level `--fleet-*` config keeps
-    // the two writers of migration_retry_after on one backoff schedule.
+    // the two writers of migration_retry_after on one backoff schedule. The
+    // backup store lets arm 3 take the final pre-drop dump when it completes
+    // an interrupted deletion (plan: "Account deletion" step 4).
     let policy = atomic_cloud::ReaperPolicy {
         migration_retry: fleet_config,
+        backup_store: Some(backup_store),
         ..atomic_cloud::ReaperPolicy::default()
     };
     let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
@@ -1691,6 +1943,64 @@ async fn run_reaper_loop(
             tracing::debug!("reaper pass: nothing to do");
         } else {
             tracing::info!(?summary, "reaper pass");
+        }
+    }
+}
+
+/// Nightly backup loop (plan: "Backups & disaster recovery" → nightly logical
+/// dumps). The pass semantics — per-tenant advisory locks, control-plane dump,
+/// the observable [`BackupSummary`](atomic_cloud::BackupSummary) and
+/// `backup_runs` ledger row — live in (and are tested through)
+/// [`atomic_cloud::run_backup_pass`]; this is interval glue around it. The
+/// jittered start keeps a fleet of pods booted together from synchronizing
+/// their passes (they'd be safe anyway — contended tenants skip via the
+/// advisory locks — just wasteful). After each pass it runs the staleness
+/// monitor (plan: "alert when any tenant's last successful backup is >36h
+/// old"): an unmonitored backup job is a placebo.
+async fn run_backup_loop(
+    control: ControlPlane,
+    cluster: ClusterConfig,
+    store: Arc<dyn atomic_cloud::BackupStore>,
+    config: atomic_cloud::BackupConfig,
+    interval: std::time::Duration,
+) {
+    let jitter = std::time::Duration::from_millis(rand::Rng::gen_range(
+        &mut rand::thread_rng(),
+        0..=interval.as_millis() as u64,
+    ));
+    tokio::time::sleep(jitter).await;
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        let now = chrono::Utc::now();
+        let summary = atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now).await;
+        if summary.is_quiet() {
+            tracing::debug!("backup pass: nothing to do");
+        } else {
+            tracing::info!(?summary, "backup pass");
+        }
+
+        // Staleness alert. A tenant whose last successful backup is older than
+        // the horizon (or who has never been backed up and is past it) is the
+        // signal that the backup job is failing for that tenant — escalate at
+        // error level so it pages, not just logs.
+        match atomic_cloud::stale_tenant_backups(&control, config.staleness_horizon, now).await {
+            Ok(stale) if !stale.is_empty() => {
+                for tenant in &stale {
+                    tracing::error!(
+                        account_id = tenant.account_id,
+                        db_name = tenant.db_name,
+                        last_backup_at = tenant
+                            .last_backup_at
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "never".into()),
+                        "tenant backup is stale (no successful backup within the staleness \
+                         horizon); the nightly backup job is failing for this tenant"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "backup staleness check failed"),
         }
     }
 }

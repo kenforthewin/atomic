@@ -226,6 +226,7 @@ async fn hint_rows_cascade_with_account_deletion() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                None,
                 &account.account_id,
             )
             .await

@@ -27,6 +27,9 @@ pub mod account_cache;
 pub mod account_plane;
 pub mod auth;
 pub mod backpressure;
+pub mod backup;
+pub mod backup_store;
+pub mod backups;
 pub mod billing;
 pub mod billing_guard;
 pub mod billing_routes;
@@ -68,6 +71,17 @@ pub use auth::{AuthPrincipal, CloudAuth, CredentialSource, ResolvedTenant, SESSI
 pub use backpressure::{
     ai_interactive_route, out_of_credits_guard, provider_failure_policy, BreakerConfig, PauseKind,
     ProviderBreaker, ProviderPause, DEFAULT_RETRY_AFTER_CAP,
+};
+pub use backup::{
+    backup_tools_available, dump_control_database, dump_tenant_database, restore_database,
+    DumpConnection, DUMP_STDERR_MAX_LEN,
+};
+pub use backup_store::{BackupStore, LocalFileSystemStore, S3Config, S3Store};
+pub use backups::{
+    final_dump_before_delete, finish_backup_run, list_active_tenant_databases,
+    record_backup_failure, record_backup_success, run_backup_pass, stale_tenant_backups,
+    start_backup_run, tenant_database_exists, BackupConfig, BackupSummary, BackupTarget,
+    StaleBackup, DEFAULT_MAX_BACKUPS_PER_PASS, DEFAULT_STALENESS_HORIZON,
 };
 pub use billing::dunning::{
     advance_dunning, advance_dunning_with, advance_expired_trials, apply_payment_failed,

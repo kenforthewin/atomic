@@ -850,6 +850,7 @@ async fn cli_style_deletion_self_heals_without_eviction() {
                 &h.control,
                 &h.cluster,
                 &ManagedKeys::Disabled,
+                None,
                 &alpha.account_id,
             )
             .await

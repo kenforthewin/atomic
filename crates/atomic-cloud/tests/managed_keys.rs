@@ -428,7 +428,7 @@ async fn delete_account_deletes_the_managed_key() {
         .expect("provision");
         let (_, external_key_id) = RecordingProvisioning::nth_key(0);
 
-        delete_account(&control, &cluster, &managed, &account.account_id)
+        delete_account(&control, &cluster, &managed, None, &account.account_id)
             .await
             .expect("delete");
 
@@ -438,7 +438,7 @@ async fn delete_account_deletes_the_managed_key() {
 
         // Best-effort contract: a deletion retry after the rows are gone
         // succeeds quietly and calls the API zero further times.
-        delete_account(&control, &cluster, &managed, &account.account_id)
+        delete_account(&control, &cluster, &managed, None, &account.account_id)
             .await
             .expect("retried delete is a no-op");
         assert_eq!(api.deleted_key_ids().len(), 1, "no second delete call");
@@ -468,7 +468,7 @@ async fn deletion_proceeds_when_key_delete_fails() {
             .expect("provision");
 
             api.fail_delete.store(true, Ordering::SeqCst);
-            delete_account(&control, &cluster, &managed, &account.account_id)
+            delete_account(&control, &cluster, &managed, None, &account.account_id)
                 .await
                 .expect("deletion must not wedge on a provider outage");
 

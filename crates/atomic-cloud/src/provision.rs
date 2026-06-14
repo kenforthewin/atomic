@@ -49,12 +49,14 @@
 //!   a dead account.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use atomic_core::DatabaseManager;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
+use crate::backup_store::BackupStore;
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 use crate::managed_keys::ManagedKeys;
@@ -594,16 +596,28 @@ async fn drop_tenant_database_best_effort(cluster: &ClusterConfig, db_name: &str
     }
 }
 
-/// Hard-delete an account: revoke its tokens, delete its sessions, drop its
-/// tenant database, remove its control-plane rows, and park the freed
-/// subdomain in `subdomains_reserved` for 90 days.
+/// Hard-delete an account: revoke its tokens, delete its sessions, take a
+/// final logical dump of its tenant database, drop that database, remove its
+/// control-plane rows, and park the freed subdomain in `subdomains_reserved`
+/// for 90 days.
 ///
 /// Implements the plan's deletion sequence ("Provisioning lifecycle" →
-/// "Account deletion") minus the steps owned by later slices:
+/// "Account deletion"):
 ///
-/// - The final logical dump to `backups/final/` before the drop (step 4) —
-///   backups slice (plan: "Backups & disaster recovery"); until it lands,
-///   deletion is genuinely unrecoverable.
+/// - **The final logical dump to `backups/final/` before the drop (step 4)**
+///   — the operator's only undo under hard-delete v1 (plan: "Backups &
+///   disaster recovery" → "Final dump on account deletion"). Taken when, and
+///   only when, a `backup` store is supplied: the HTTP deletion route and the
+///   CLI both pass one for real (active) account deletions, so a
+///   fat-fingered confirmation or a deletion-path bug is recoverable. It is
+///   **fail-closed** — a dump error aborts the deletion *before* any database
+///   is dropped, so unrecoverable destruction never proceeds on a failed
+///   backup. A database already dropped by an earlier (retried) deletion is
+///   the one tolerated case: the dump is skipped for a tenant whose database
+///   no longer exists. Callers that delete *never-activated* tenants (the
+///   reaper's stuck-provision rollback and orphan-database reclaim, which
+///   don't call this function at all) hold no real user data and correctly
+///   take no final dump.
 /// - AccountCache eviction (step 5) — the serving composition layer owns
 ///   the cache. Its HTTP deletion route ([`crate::tenant_plane`]) evicts
 ///   *after* this returns: once the account rows are gone nothing can
@@ -629,6 +643,7 @@ pub async fn delete_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     managed: &ManagedKeys,
+    backup: Option<&Arc<dyn BackupStore>>,
     account_id: &str,
 ) -> Result<(), CloudError> {
     // 1 — revoke all tokens. The accounts-row delete below cascades these
@@ -675,6 +690,36 @@ pub async fn delete_account(
         let derived = tenant_db_name(uuid);
         if !db_names.contains(&derived) {
             db_names.push(derived);
+        }
+    }
+
+    // 4½ — the final dump (plan: "Account deletion" step 4), BEFORE any drop.
+    // Fail-closed: a dump failure propagates and the function returns *before*
+    // step 5 destroys anything, so an un-backed-up tenant is never dropped.
+    // Skipped per-database for a tenant whose database is already gone (a
+    // retried deletion past the drop) — the dump has nothing to capture and a
+    // never-initialized database may not even be dumpable. No-op entirely
+    // when no `backup` store was supplied (operator paths that intentionally
+    // forgo it; never the active-account HTTP/CLI path).
+    if let Some(store) = backup {
+        for db_name in &db_names {
+            if crate::backups::tenant_database_exists(cluster, db_name).await? {
+                crate::backups::final_dump_before_delete(
+                    control,
+                    cluster,
+                    store,
+                    account_id,
+                    db_name,
+                    chrono::Utc::now(),
+                )
+                .await?;
+            } else {
+                tracing::info!(
+                    account_id,
+                    db_name,
+                    "skipping final dump: tenant database already gone (retried deletion)"
+                );
+            }
         }
     }
 
