@@ -176,7 +176,9 @@ async fn product_app_serves_at_tenant_root_account_on_app_host() {
     let prod_dir = tempfile::tempdir().expect("product tempdir");
     tokio::fs::write(
         prod_dir.path().join("index.html"),
-        r#"<!doctype html><html><body><div id="product-root"></div></body></html>"#,
+        r#"<!doctype html><html><head>
+<meta name="atomic-cloud-tenant" content="__ATOMIC_CLOUD_TENANT__" />
+</head><body><div id="product-root"></div></body></html>"#,
     )
     .await
     .expect("write product index");
@@ -226,6 +228,12 @@ async fn product_app_serves_at_tenant_root_account_on_app_host() {
         assert!(
             text.contains("product-root"),
             "tenant {path} serves the product shell, got: {text}"
+        );
+        // The cloud-tenant marker is injected as "true" so the product client
+        // authenticates by the session cookie instead of prompting for setup.
+        assert!(
+            text.contains(r#"content="true""#) && !text.contains("__ATOMIC_CLOUD_TENANT__"),
+            "tenant {path} marks the product app as a cloud tenant, got: {text}"
         );
     }
 

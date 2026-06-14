@@ -60,6 +60,13 @@ use crate::tokens;
 /// `frontend/index.html` (and `frontend/src/lib/host.ts`).
 const BASE_DOMAIN_PLACEHOLDER: &str = "__ATOMIC_CLOUD_BASE_DOMAIN__";
 
+/// Placeholder in the PRODUCT app's `index.html` (repo-root `index.html`)
+/// replaced with `true` when the cloud server serves the product app at a
+/// tenant root, signalling its client to authenticate by the same-origin
+/// session cookie. Left unreplaced (so it reads as not-a-cloud-tenant) in
+/// self-hosted and Tauri builds, which never serve through here.
+const PRODUCT_CLOUD_PLACEHOLDER: &str = "__ATOMIC_CLOUD_TENANT__";
+
 /// Cache lifetime for hashed build assets (`dist/assets/*`). The filenames
 /// carry a content hash, so they are safe to cache effectively forever; a new
 /// build emits new names. One year, the conventional "immutable" maximum.
@@ -146,7 +153,13 @@ impl SpaServer {
         let root = dist_dir.as_ref().to_path_buf();
         let index_path = root.join("index.html");
         match tokio::fs::read_to_string(&index_path).await {
-            Ok(index_html) => {
+            Ok(raw) => {
+                // Mark the served product app as a cloud tenant so its client
+                // authenticates by the same-origin session cookie instead of
+                // prompting for a server URL + token. Self-hosted/Tauri builds
+                // never go through here, so their placeholder stays unreplaced
+                // (and reads as "not a cloud tenant").
+                let index_html = raw.replace(PRODUCT_CLOUD_PLACEHOLDER, "true");
                 self.product = Some(ProductApp {
                     root: root.into(),
                     index_html: index_html.into(),

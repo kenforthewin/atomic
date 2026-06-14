@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { BookOpen, Check, Copy, KeyRound } from 'lucide-react';
 import { Button } from '../../ui/Button';
-import { isDesktopApp, getTransport, switchTransport } from '../../../lib/transport';
+import { isDesktopApp, isCloudTenant, getTransport, switchTransport } from '../../../lib/transport';
 import { verifyProviderConfigured } from '../../../lib/api';
 import type { OnboardingState, OnboardingAction } from '../useOnboardingState';
 
@@ -23,6 +23,11 @@ interface SetupStatus {
 
 export function WelcomeStep({ state, dispatch, onNext, onComplete }: WelcomeStepProps) {
   const isDesktop = isDesktopApp();
+  // On a cloud tenant the app is already connected via the session cookie —
+  // there's no server to connect to or token to paste, so it shares the
+  // desktop "you're connected, here's what's next" welcome rather than the
+  // self-hosted server-connection form.
+  const isCloud = isCloudTenant();
   const [setupMode, setSetupMode] = useState<SetupMode>('checking');
   const [isClaiming, setIsClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
@@ -33,7 +38,7 @@ export function WelcomeStep({ state, dispatch, onNext, onComplete }: WelcomeStep
 
   // On mount (web mode only), check if we're co-hosted with the server
   useEffect(() => {
-    if (isDesktop) return;
+    if (isDesktop || isCloud) return;
     if (getTransport().isConnected()) return;
 
     const baseUrl = window.location.origin;
@@ -54,7 +59,7 @@ export function WelcomeStep({ state, dispatch, onNext, onComplete }: WelcomeStep
         // No co-hosted server — show manual form
         setSetupMode('manual');
       });
-  }, [isDesktop, dispatch]);
+  }, [isDesktop, isCloud, dispatch]);
 
   const handleClaim = async () => {
     setIsClaiming(true);
@@ -130,7 +135,7 @@ export function WelcomeStep({ state, dispatch, onNext, onComplete }: WelcomeStep
     }
   };
 
-  if (isDesktop) {
+  if (isDesktop || isCloud) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-center space-y-6 px-8">
         <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent)]/10 flex items-center justify-center">

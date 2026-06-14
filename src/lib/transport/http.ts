@@ -26,12 +26,22 @@ export class HttpTransport implements Transport {
   }
 
   async connect(): Promise<void> {
-    if (!this.config.baseUrl) return;
+    // Cloud-tenant mode is same-origin (empty baseUrl) and still connects;
+    // only the unconfigured self-hosted/web case (no baseUrl, no cookie auth)
+    // stays disconnected.
+    if (!this.config.cookieAuth && !this.config.baseUrl) return;
     this.shouldReconnect = true;
-    this.wsUrl = this.config.baseUrl
-      .replace(/^http/, 'ws')
-      .replace(/\/$/, '')
-      + `/ws?token=${encodeURIComponent(this.config.authToken)}`;
+    if (this.config.cookieAuth) {
+      // Same-origin WebSocket; the session cookie rides the upgrade request
+      // automatically, so no `?token=`. (CloudAuth gates `/ws` by the cookie.)
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      this.wsUrl = `${proto}://${window.location.host}/ws`;
+    } else {
+      this.wsUrl = this.config.baseUrl
+        .replace(/^http/, 'ws')
+        .replace(/\/$/, '')
+        + `/ws?token=${encodeURIComponent(this.config.authToken)}`;
+    }
     this.attachLifecycleListeners();
     try {
       await this.connectWs();
@@ -211,7 +221,7 @@ export class HttpTransport implements Transport {
       throw new Error('Authentication expired. Please reconnect with a valid token.');
     }
 
-    if (!this.config.baseUrl) {
+    if (!this.config.cookieAuth && !this.config.baseUrl) {
       throw new Error('Not connected to a server');
     }
 
@@ -219,13 +229,18 @@ export class HttpTransport implements Transport {
     if (!spec) throw new Error(`Unknown command: ${command}`);
 
     const path = typeof spec.path === 'function' ? spec.path(args ?? {}) : spec.path;
+    // Cloud-tenant mode is same-origin, so `baseUrl` is '' and the path is
+    // already root-relative.
     const url = `${this.config.baseUrl}${path}`;
 
-    const headers: Record<string, string> = {
-      'Authorization': `Bearer ${this.config.authToken}`,
-    };
+    // Cloud-tenant mode authenticates by the same-origin session cookie; every
+    // other mode sends the bearer token.
+    const headers: Record<string, string> = this.config.cookieAuth
+      ? {}
+      : { 'Authorization': `Bearer ${this.config.authToken}` };
 
     const fetchOpts: RequestInit = { method: spec.method, headers };
+    if (this.config.cookieAuth) fetchOpts.credentials = 'include';
 
     if (spec.argsMode === 'body' && args) {
       headers['Content-Type'] = 'application/json';
@@ -236,11 +251,18 @@ export class HttpTransport implements Transport {
 
     if (!resp.ok) {
       if (resp.status === 401) {
-        // Token is invalid or revoked — stop all activity and trigger logout
+        // Auth is invalid or revoked — stop all activity and trigger logout.
         this.authExpired = true;
         this.disconnect();
-        localStorage.removeItem('atomic-server-config');
-        window.dispatchEvent(new CustomEvent('atomic:auth-expired'));
+        if (this.config.cookieAuth) {
+          // Cloud tenant: the session expired. There's no stored server-config
+          // to clear; send the browser to the dashboard, whose server-side
+          // gate bounces an unauthenticated user to the app-host login.
+          window.location.assign('/account');
+        } else {
+          localStorage.removeItem('atomic-server-config');
+          window.dispatchEvent(new CustomEvent('atomic:auth-expired'));
+        }
         throw new Error('Authentication expired. Please reconnect with a valid token.');
       }
       const text = await resp.text();

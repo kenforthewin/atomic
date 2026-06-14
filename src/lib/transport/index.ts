@@ -40,7 +40,30 @@ export function getTransport(): Transport {
   return activeTransport;
 }
 
+/**
+ * True when the product app is served on an Atomic Cloud tenant subdomain —
+ * the cloud server injects `<meta name="atomic-cloud-tenant" content="true">`
+ * into the product `index.html` it serves at the tenant root. In that case the
+ * app authenticates by the same-origin session cookie (set by the cloud
+ * dashboard login), so there's no server URL or token to configure. Self-hosted
+ * and Tauri builds never carry the marker (the placeholder stays unreplaced),
+ * so this is `false` and their existing flows are untouched.
+ */
+export function isCloudTenant(): boolean {
+  if (typeof document === 'undefined') return false;
+  const meta = document.querySelector('meta[name="atomic-cloud-tenant"]');
+  return meta?.getAttribute('content') === 'true';
+}
+
 export async function initTransport(): Promise<void> {
+  if (isCloudTenant()) {
+    // Cloud tenant: same-origin, cookie-authenticated. No localStorage config,
+    // no setup prompt — the dashboard session cookie is the credential.
+    activeTransport = new HttpTransport({ baseUrl: '', authToken: '', cookieAuth: true });
+    wireConnectionCallback(activeTransport);
+    connectInBackground(activeTransport);
+    return;
+  }
   if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
     // Desktop app: get sidecar config via single Tauri IPC command
     const { invoke } = await import('@tauri-apps/api/core');
