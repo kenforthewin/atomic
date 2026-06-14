@@ -1488,13 +1488,34 @@ untouched (backups are a control-plane + subprocess + object-storage concern).
   deliberate human runbook steps (the CLI can't reach another process's cache;
   an admin evict endpoint is a later slice — the slice-2 deletion-gap shape).
 
-**Deviations from this plan (deliberate):** the `delete_account` final dump is
-threaded as an `Option<&BackupStore>` argument and surfaced to the HTTP route
-and reaper via builder-style `with_backup_store` / a `ReaperPolicy` field, so
-the ~30 existing test call sites compile unchanged and the never-activated
-drop paths opt out by construction (they don't call `delete_account`). The
-reaper and backup pass share `reaper_lock_key`, making backup/drop mutually
-exclusive per account for free.
+**Deviations from this plan (deliberate):** `delete_account` takes an explicit
+`BackupPolicy` (`Required(store)` | `DisabledAcknowledged`) — *not* an
+`Option` — so a composition that forgets to wire a store is a **type error**,
+not a silent fail-open drop; dev (backups off) is the loud `DisabledAcknowledged`
+path. The reaper and backup pass share `reaper_lock_key`, making backup/drop
+mutually exclusive per account.
+
+**Review-driven hardening (the slice whose whole purpose is preventing
+unrecoverable loss got the closest read):**
+- **Subprocess timeouts.** `pg_dump`/`pg_restore` now `spawn` under a
+  `tokio::time::timeout` + `child.kill()` budget (`--backup-timeout-secs`,
+  default 30m). A hung dump previously held the advisory lock and blocked the
+  serial loop, so the pod took *no further nightly backups until restarted*;
+  now a timed-out tenant is recorded failed and the pass continues.
+- **The lock invariant made true.** The "a dump can never race a `DROP`"
+  guarantee held only for the *reaper's* drop — the HTTP/CLI delete path took
+  no lock. `delete_account` now acquires the same per-account advisory lock
+  (`Acquire` mode → 503 `deletion_busy` if a backup holds it); the reaper's
+  arm, which already holds the lock, passes `AlreadyHeld` to avoid a
+  self-deadlock.
+- **Fairness + observability.** Stale-first ordering now keys on
+  `COALESCE(last_backup_at, last_backup_attempt_at)` so a persistently-failing
+  tenant can't starve healthy-but-due ones; a `finalize_abandoned_backup_runs`
+  sweep closes `backup_runs` rows orphaned by a mid-pass crash; `--backup-prefix`
+  supports shared buckets.
+- **Staleness uses the DB clock.** `stale_tenant_backups` computes its cutoff
+  from `NOW()` in SQL rather than a caller timestamp — skew-immune across pods
+  (also removed a clock-skew test flake at the source).
 
 **Deferred (per plan):** PITR via WAL archiving, cross-region replicas, the
 admin cache-evict endpoint, observability metrics — all later slices.
@@ -1794,3 +1815,19 @@ and link the discussion if it lives in a memory file.
   CSP frame-ancestors on every OAuth HTML path), and the db-pin chokepoint is
   enforced on the MCP default no-selection path (transport reads the injected
   X-Atomic-Database header, header → ?db= → active, matching the Db extractor).
+- **2026-06-13** — Slice 8 landed (see Implementation log): per-tenant +
+  control-plane nightly logical backups (pg_dump -Fc) to a BackupStore
+  (local / S3 via object_store), the fail-closed final dump before account
+  deletion, the restore CLI + rehearsed runbook, and >36h staleness alerting.
+  Backups are opt-in (--backup-enabled / a configured store) so dev and
+  self-hosted clusters are unaffected.
+- **2026-06-13** — The final dump is the operator's only undo for hard-delete
+  v1: it runs before the irreversible DROP and a dump failure ABORTS the
+  deletion (no backup → no drop). delete_account takes an explicit
+  BackupPolicy (type-enforced, never a silent fail-open) and acquires the
+  per-account advisory lock so a backup and a delete of the same tenant can
+  never race. pg_dump/pg_restore run under a kill-budget timeout. Credentials
+  ride in PGPASSWORD env, never argv.
+- **2026-06-13** — Backup retention (14 daily + 8 weekly; final 30-day) is
+  object-store bucket-lifecycle policy keyed off the dated object layout, not
+  application code. PITR/WAL archiving remains deferred.
