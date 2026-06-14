@@ -1652,10 +1652,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("restore complete: {target_db} is populated from {key}.");
                 println!();
+                let target_version = atomic_cloud::tenant_schema_target();
                 println!("REMAINING RUNBOOK STEPS (plan: \"Restore runbook\"):");
-                println!("  1. Repoint the account's mapping to the restored database:");
                 println!(
-                    "       UPDATE account_databases SET db_name = '{target_db}' \
+                    "  1. Repoint the account's mapping to the restored database, recording the"
+                );
+                println!(
+                    "     schema version the dump carries (this binary's compiled target = \
+                     {target_version}) so CloudAuth's straggler gate does not 503 the restored"
+                );
+                println!("     tenant as forever-upgrading:");
+                println!(
+                    "       UPDATE account_databases SET db_name = '{target_db}', \
+                     last_migrated_version = {target_version}, last_migrated_at = NOW() \
                      WHERE account_id = '<account-id>';"
                 );
                 println!(

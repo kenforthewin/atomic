@@ -272,6 +272,90 @@ rolling deploys safe (old code tolerates new columns) and is enforced by
 [`tests/migration_lint.rs`](tests/migration_lint.rs), which scans both this
 crate's and atomic-core's migration directories. Drops happen N+1 deploys later.
 
+## Backups & the restore runbook
+
+Backups are **nightly logical dumps** (`pg_dump -Fc`, custom format) per tenant
+database plus the control plane, written to a [`BackupStore`](src/backup_store.rs)
+(local filesystem in dev/tests; S3-compatible in production via `object_store`).
+Object keys are deterministic and date-prefixed so **retention is bucket
+lifecycle policy, not code** — nothing in this crate ever deletes a backup:
+
+| Key | What | Retention (bucket lifecycle) |
+|---|---|---|
+| `backups/<YYYY-MM-DD>/acct_<base32>.dump` | one tenant's nightly dump | 14 daily + 8 weekly |
+| `backups/<YYYY-MM-DD>/control.dump` | the control-plane nightly dump | 14 daily + 8 weekly |
+| `backups/final/<account-id>-<ts>.dump` | the **final dump taken before an account deletion** | 30 days |
+
+The nightly pass ([`backups.rs`](src/backups.rs)) dumps each active tenant under
+the reaper's **per-account advisory lock** (two pods never dump the same tenant
+at once), stamps `account_databases.last_backup_at`, records a `backup_runs`
+ledger row, and runs the **staleness monitor** (an error-level alert when any
+active tenant's last successful backup is >36h old). The credential password is
+passed to `pg_dump`/`pg_restore` via `PGPASSWORD` **in the child environment,
+never argv** (a unit test pins this), and every database name is shape-validated
+by `is_tenant_db_name` before any DDL.
+
+**Final dump on deletion is fail-closed and mandatory.** `delete_account` takes
+the final `backups/final/` dump **before** the `DROP DATABASE`; if the dump (or
+its upload) fails, the deletion **aborts** and drops nothing — under hard-delete
+v1 the final dump is the operator's only undo, so destroying un-backed-up data is
+never allowed. This applies **only to the active-account deletion path** (the
+HTTP route, the CLI, and the reaper's *interrupted-deletion* completion arm). The
+reaper's stuck-provision rollback and orphan-database reclaim drop tenants that
+**never activated** (no real user data, possibly not even dumpable) and
+deliberately take **no** final dump.
+
+### Restore runbook (rehearse before launch)
+
+A restore is **per-tenant** and never reads or writes another tenant's data,
+control rows, or store keys — its keys are named by *that* tenant's `db_name` and
+`account_id`. The procedure, end to end:
+
+```bash
+# 1. Restore the dump into a FRESH tenant database (a new acct_<base32> name).
+#    Restore refuses to clobber an existing database — it never overwrites a
+#    live tenant. The old database (if any) is left intact until step 4.
+atomic-cloud --control-url $CTL backup restore \
+  --cluster-url $CLUSTER \
+  --backup-store s3 --backup-bucket <bucket> \
+  --key backups/final/<account-id>-<ts>.dump \
+  --target-db acct_<new-base32>
+```
+
+Then, **manually** (the CLI prints these and intentionally does not do them — a
+CLI invocation can't reach a running pod's in-memory cache, and silently
+repointing while a pod serves the old database would split-brain reads):
+
+2. **Repoint the mapping**, recording the schema version the dump carries (the
+   running binary's compiled target) so CloudAuth's straggler gate doesn't 503
+   the restored tenant as forever-`account_upgrading` — a real trap the
+   end-to-end rehearsal (`tests/e2e_backup.rs`) caught:
+
+   ```sql
+   UPDATE account_databases
+      SET db_name = 'acct_<new-base32>',
+          last_migrated_version = <target>,   -- this binary's tenant_schema_target()
+          last_migrated_at = NOW()
+    WHERE account_id = '<account-id>';
+   ```
+
+3. **Evict the running serve process's `AccountCache` entry** for that account —
+   otherwise a serving pod keeps a `DatabaseManager` pointing at the OLD
+   `db_name` and serves the stale database. A CLI restore cannot reach another
+   process's cache (the slice-2 deletion gap); until an admin evict endpoint
+   exists (a later slice), restart the pod or let the idle TTL reclaim the entry.
+   In-process (e.g. the HTTP deletion route) this is `AccountCache::evict`.
+
+4. **Drop the old database** once you've confirmed the restored tenant serves.
+
+The whole sequence — final dump → restore into a fresh DB → repoint (with the
+schema version) → evict → verify — is **rehearsed as a test** so the runbook
+stays honest:
+[`tests/backup.rs::final_dump_restore_runbook_roundtrip`](tests/backup.rs) at the
+library level and [`tests/e2e_backup.rs`](tests/e2e_backup.rs) through the
+composed cloud server (two tenants, isolation asserted at every step). **PITR via
+WAL archiving is deferred** — recovery granularity is one day.
+
 ## Testing
 
 ~198 test functions across [`tests/`](tests) and inline `#[cfg(test)]` modules.
@@ -347,10 +431,18 @@ provider or sends real email.
   set + recent `backup_runs`), `backup list --subdomain` (one tenant's dumps,
   per-tenant by key construction), and `backup restore` — restore a dump into
   a fresh database, then print the remaining manual runbook steps (repoint
-  `account_databases.db_name`, evict the running pod's `AccountCache`). The
-  full final-dump → restore → repoint → verify runbook is rehearsed as a test
-  (`tests/backup.rs::final_dump_restore_runbook_roundtrip`). PITR via WAL
-  archiving is deferred.
+  `account_databases.db_name` **with the schema version**, evict the running
+  pod's `AccountCache`). The full final-dump → restore → repoint → verify
+  runbook is rehearsed at the library level
+  (`tests/backup.rs::final_dump_restore_runbook_roundtrip`) **and end to end
+  through the composed cloud server** with two tenants
+  ([`tests/e2e_backup.rs`](tests/e2e_backup.rs)): provision alpha + beta, nightly
+  pass, delete alpha (final dump), confirm alpha 404s and is gone from
+  `pg_database` while **beta is wholly unaffected**, then restore alpha into a
+  fresh DB, repoint, evict, and confirm its atom is served live — per-tenant
+  isolation asserted at every step, plus a staleness-alert case (one
+  manufactured-old tenant surfaces, a fresh one does not). PITR via WAL archiving
+  is deferred.
 
 ## Previously shipped (OAuth & per-tenant MCP)
 
