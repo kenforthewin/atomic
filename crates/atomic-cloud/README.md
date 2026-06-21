@@ -485,23 +485,6 @@ Test doubles keep suites hermetic and offline: `atomic_test_support::MockAiServe
 `RecordingProvisioning` for the OpenRouter provisioning API. No test hits a real
 provider or sends real email.
 
-## Known v1 limitations
-
-- **Multi-pod WebSocket events**: worker events publish to the executing pod's
-  in-memory channel, so in a multi-pod deployment a WS client on another pod
-  misses that execution's progress events. Durable state is always correct;
-  build the cross-pod relay (Postgres `LISTEN/NOTIFY`) before running >1 pod.
-- **Not yet built**: observability metrics/tracing and the user-facing
-  `account_events` log. The OAuth consent/approve step is a minimal
-  server-rendered form, not a full SPA flow.
-- **No point-in-time recovery**: backups are nightly logical dumps (`pg_dump
-  -Fc`) per tenant + control plane, not PITR via WAL archiving — recovery
-  granularity is one day. The restore CLI restores into a *fresh* database;
-  **repointing `account_databases.db_name` and evicting a running pod's
-  `AccountCache` entry are deliberate manual runbook steps** (a CLI invocation
-  can't reach another process's in-memory cache; an admin evict endpoint is not
-  yet built).
-
 ## Plan tiers, quotas & billing
 
 - **Plan-tier resource limits** — `plans` catalogue + `accounts.plan_id`,
