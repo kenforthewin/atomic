@@ -1438,6 +1438,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      X-Forwarded-For."
                 );
             }
+            if atomic_cloud::provider_config::private_provider_urls_allowed() && !base_is_localhost
+            {
+                tracing::warn!(
+                    "{} is set on a non-localhost deployment: the BYOK provider base-URL SSRF \
+                     gate is DISABLED, so a tenant can point our outbound client at private/\
+                     loopback/metadata addresses. This is a dev/test-only escape — unset it in \
+                     production.",
+                    atomic_cloud::provider_config::ALLOW_PRIVATE_PROVIDER_URLS_ENV,
+                );
+            }
             let plane_config = AccountPlaneConfig {
                 app_public_url: app_public_url.clone(),
                 trust_proxy_header,

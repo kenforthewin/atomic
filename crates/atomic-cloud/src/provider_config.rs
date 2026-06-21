@@ -211,6 +211,16 @@ pub fn validate_byok_model_config(model_config: &Value) -> Result<(), String> {
 pub fn validate_byok_base_url(raw: &str) -> Result<(), &'static str> {
     let url = Url::parse(raw).map_err(|_| "must be a valid URL")?;
 
+    // Dev/test escape hatch: when this env var is set, allow non-https and
+    // private/loopback hosts so local mock providers (the integration suite)
+    // and a developer's local Ollama / OpenAI-compatible server are reachable.
+    // It reopens the SSRF surface this gate closes, so it is NEVER set in
+    // production — `serve` warns loudly at boot if it finds it set. (We still
+    // require the value to be a parseable URL above.)
+    if private_provider_urls_allowed() {
+        return Ok(());
+    }
+
     if url.scheme() != "https" {
         return Err("must use the https scheme");
     }
@@ -248,6 +258,18 @@ pub fn validate_byok_base_url(raw: &str) -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+/// The env var that disables the BYOK base-URL SSRF gate
+/// ([`validate_byok_base_url`]). Dev/test only — see that function's docs.
+pub const ALLOW_PRIVATE_PROVIDER_URLS_ENV: &str = "ATOMIC_CLOUD_ALLOW_PRIVATE_PROVIDER_URLS";
+
+/// Whether the SSRF gate is disabled via [`ALLOW_PRIVATE_PROVIDER_URLS_ENV`]
+/// (set to `1` or `true`). Read live so tests can toggle it per process.
+pub fn private_provider_urls_allowed() -> bool {
+    std::env::var(ALLOW_PRIVATE_PROVIDER_URLS_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Reject loopback (127.0.0.0/8), RFC 1918 private (10/8, 172.16/12,

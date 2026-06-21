@@ -168,6 +168,11 @@ where
         eprintln!("{test_name}: skipping (ATOMIC_TEST_DATABASE_URL not set)");
         return;
     };
+    // Mock AI providers live at http://127.0.0.1:<port>, which the BYOK SSRF
+    // gate rejects in production. Tests run single-threaded, so setting the
+    // dev/test escape here (idempotent) lets the mock-backed BYOK rotations
+    // through without weakening the real gate.
+    std::env::set_var("ATOMIC_CLOUD_ALLOW_PRIVATE_PROVIDER_URLS", "1");
     sweep_leftovers(&base_url).await;
 
     let db_name = format!("{TEST_DB_PREFIX}{}", uuid::Uuid::new_v4().simple());
