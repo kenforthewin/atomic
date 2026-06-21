@@ -2996,6 +2996,78 @@ impl AtomicCore {
         Ok(result)
     }
 
+    /// Compact the tag tree: ask the configured LLM for merge suggestions and
+    /// apply them. Returns the merge result; a no-op (zeroes) when there are no
+    /// existing tags.
+    ///
+    /// Provider config and model resolve through [`Self::settings_for_ai`], so
+    /// an explicit (e.g. cloud-injected managed/BYOK) provider config is
+    /// honored rather than the tenant's raw settings tables — the same overlay
+    /// every other LLM path uses. Keeping this orchestration in the core (not a
+    /// transport handler) is what guarantees that.
+    pub async fn compact_tags(&self) -> Result<compaction::CompactionResult, AtomicCoreError> {
+        let settings_map = self.settings_for_ai().await?;
+        let provider_config = ProviderConfig::from_settings(&settings_map);
+        let model = match provider_config.provider_type {
+            ProviderType::Ollama | ProviderType::OpenAICompat => {
+                provider_config.llm_model().to_string()
+            }
+            ProviderType::OpenRouter => settings_map
+                .get("tagging_model")
+                .cloned()
+                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+        };
+
+        // OpenRouter needs the model's supported sampling params so the request
+        // doesn't send fields the model rejects; refresh the capabilities cache
+        // when stale, falling back to whatever we have on a fetch failure.
+        let supported_params: Option<Vec<String>> = if provider_config.provider_type
+            == ProviderType::OpenRouter
+        {
+            let (cached, is_stale) = match self.get_cached_capabilities().await {
+                Ok(Some(cache)) => {
+                    let stale = cache.is_stale();
+                    (Some(cache), stale)
+                }
+                _ => (None, true),
+            };
+            let capabilities = if is_stale {
+                let client = reqwest::Client::new();
+                match crate::providers::models::fetch_and_return_capabilities(&client).await {
+                    Ok(fresh) => {
+                        let _ = self.save_capabilities_cache(&fresh).await;
+                        fresh
+                    }
+                    Err(_) => cached.unwrap_or_default(),
+                }
+            } else {
+                cached.unwrap_or_default()
+            };
+            capabilities.get_supported_params(&model).cloned()
+        } else {
+            None
+        };
+
+        let all_tags = self.get_tags_for_compaction().await?;
+        if all_tags == "(no existing tags)" {
+            return Ok(compaction::CompactionResult {
+                tags_merged: 0,
+                atoms_retagged: 0,
+            });
+        }
+
+        let merge_suggestions = compaction::fetch_merge_suggestions(
+            &provider_config,
+            &all_tags,
+            &model,
+            supported_params,
+        )
+        .await
+        .map_err(AtomicCoreError::Compaction)?;
+
+        self.apply_tag_merges(&merge_suggestions.merges).await
+    }
+
     // ==================== Chat Operations ====================
 
     /// Create a new conversation
