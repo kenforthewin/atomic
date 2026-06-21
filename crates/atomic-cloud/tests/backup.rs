@@ -34,9 +34,12 @@ use support::{with_control_db, with_db_guard};
 
 /// Migrated control plane + a cluster config pointing at the test cluster.
 async fn setup(control_url: &str) -> (ControlPlane, ClusterConfig) {
-    let control = ControlPlane::connect(control_url)
-        .await
-        .expect("connect control plane");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect control plane");
     control.initialize().await.expect("migrate control plane");
     let cluster = ClusterConfig {
         cluster_id: "test-cluster-1".to_string(),
@@ -921,6 +924,9 @@ async fn delete_in_acquire_mode_is_busy_while_a_backup_holds_the_lock() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -959,6 +965,9 @@ async fn delete_in_acquire_mode_is_busy_while_a_backup_holds_the_lock() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1025,6 +1034,9 @@ async fn delete_in_already_held_mode_does_not_self_deadlock() {
                     &control,
                     &cluster,
                     &ManagedKeys::Disabled,
+                    // No billing provider in tests: the subscription-cancel step is
+                    // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                    None,
                     atomic_cloud::BackupPolicy::Required(&store),
                     atomic_cloud::DeleteLock::AlreadyHeld,
                     &acct.account_id,
@@ -1086,6 +1098,9 @@ async fn disabled_acknowledged_policy_drops_without_a_final_dump() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1331,6 +1346,9 @@ async fn delete_takes_final_dump_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1368,6 +1386,9 @@ async fn delete_takes_final_dump_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1458,6 +1479,9 @@ async fn failed_final_dump_aborts_delete_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1497,6 +1521,9 @@ async fn failed_final_dump_aborts_delete_before_dropping() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::Required(&ok_store),
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -1629,6 +1656,9 @@ async fn final_dump_restore_runbook_roundtrip() {
             &control,
             &cluster,
             &ManagedKeys::Disabled,
+            // No billing provider in tests: the subscription-cancel step is
+            // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+            None,
             atomic_cloud::BackupPolicy::Required(&store),
             atomic_cloud::DeleteLock::Acquire,
             &acct.account_id,

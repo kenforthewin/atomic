@@ -374,6 +374,105 @@ fn migration_sql_is_additive_only() {
     );
 }
 
+/// The `version` of every live `INSERT INTO schema_version (version) VALUES
+/// (N)` in masked migration SQL, in source order. Empty when the migration
+/// writes no version row (the bug this guards against); the test demands
+/// exactly one, equal to the filename's version.
+fn schema_version_inserts(masked: &str) -> Vec<i32> {
+    let tokens = tokenize(masked);
+    let tok = |i: usize| tokens.get(i).map(|(t, _)| t.as_str());
+    let mut versions = Vec::new();
+    for i in 0..tokens.len() {
+        // `INSERT INTO schema_version ( version ) VALUES ( <N> )` — tokenize
+        // splits `(`/`)` away as non-word punctuation, so VERSION and VALUES
+        // are adjacent word tokens and the number follows VALUES directly.
+        if tok(i) == Some("INSERT")
+            && tok(i + 1) == Some("INTO")
+            && tok(i + 2) == Some("SCHEMA_VERSION")
+        {
+            let n = (i + 3..tokens.len())
+                .map(|j| &tokens[j].0)
+                .skip_while(|t| t.as_str() != "VALUES")
+                .nth(1)
+                .and_then(|t| t.parse::<i32>().ok());
+            if let Some(n) = n {
+                versions.push(n);
+            }
+        }
+    }
+    versions
+}
+
+/// Every migration this binary applies — control-plane and tenant — must
+/// stamp its own `schema_version` row with the version its filename names.
+/// The incremental runner ([`PostgresStorage::run_migrations_inner`])
+/// advances `MAX(version)` by exactly this insert; a migration that omits it
+/// (tenant 003/005/008 once did) leaves the recorded version behind the
+/// applied DDL, so a later open re-runs migrations that already ran.
+#[test]
+fn every_migration_stamps_its_schema_version() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dirs = [
+        ("atomic-cloud", manifest.join("migrations")),
+        (
+            "atomic-core",
+            manifest.join("../atomic-core/src/storage/postgres/migrations"),
+        ),
+    ];
+
+    let mut missing = Vec::new();
+    for (prefix, dir) in &dirs {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("reading migration dir {}: {e}", dir.display()))
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        paths.sort();
+
+        for path in &paths {
+            let name = path.file_name().expect("file name").to_string_lossy();
+            let label = format!("{prefix}/{name}");
+            // Filename prefix `NNN_...` is the version the runner registers
+            // this migration under.
+            let expected: i32 = name
+                .split('_')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("migration {label} has no numeric version prefix"));
+
+            let sql = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+            // Exactly one live insert, carrying this file's version. The
+            // count catches both omission (the original bug — tenant
+            // 003/005/008) and an accidental second row from a copy-paste.
+            let inserts = schema_version_inserts(&mask_sql(&sql));
+            match inserts.as_slice() {
+                [v] if *v == expected => {}
+                [] => missing.push(format!(
+                    "  {label}: writes no `INSERT INTO schema_version (version) VALUES ({expected})`"
+                )),
+                [v] => missing.push(format!(
+                    "  {label}: inserts schema_version {v}, filename names {expected}"
+                )),
+                many => missing.push(format!(
+                    "  {label}: {} schema_version inserts {many:?} (expected exactly one for version {expected})",
+                    many.len()
+                )),
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "every migration must stamp its own schema_version row — the \
+         incremental runner advances MAX(version) by exactly that insert. \
+         Add `INSERT INTO schema_version (version) VALUES (N);` matching the \
+         filename's version.\n{}",
+        missing.join("\n")
+    );
+}
+
 // ==================== Lint honesty: fixture probes ====================
 //
 // The lint is only as good as its scanner; these prove each forbidden form
@@ -540,4 +639,42 @@ fn violations_carry_useful_locations() {
     assert_eq!(violations[0].form, "DROP COLUMN");
     assert_eq!(violations[0].line, 4, "line of the form's first token");
     assert_eq!(violations[0].snippet, "DROP COLUMN b;");
+}
+
+#[test]
+fn schema_version_insert_extraction_is_honest() {
+    let inserts = |sql: &str| schema_version_inserts(&mask_sql(sql));
+    // The canonical form every migration uses.
+    assert_eq!(
+        inserts("INSERT INTO schema_version (version) VALUES (8);"),
+        [8]
+    );
+    // Whitespace- and case-tolerant.
+    assert_eq!(
+        inserts("insert  into\n  schema_version  ( version )\n  values ( 22 );"),
+        [22]
+    );
+    // Omission — the original 003/005/008 bug — yields nothing.
+    assert_eq!(
+        inserts("ALTER TABLE atoms ADD COLUMN IF NOT EXISTS embedding_error TEXT;"),
+        Vec::<i32>::new()
+    );
+    // A commented-out insert is masked away, not counted.
+    assert_eq!(
+        inserts("-- INSERT INTO schema_version (version) VALUES (3);\nSELECT 1;"),
+        Vec::<i32>::new()
+    );
+    // A duplicate is surfaced so the test can reject it.
+    assert_eq!(
+        inserts(
+            "INSERT INTO schema_version (version) VALUES (5);\n\
+             INSERT INTO schema_version (version) VALUES (6);"
+        ),
+        [5, 6]
+    );
+    // Unrelated inserts are ignored.
+    assert_eq!(
+        inserts("INSERT INTO schema_version (version) VALUES (1);\nINSERT INTO atoms (id) VALUES ('x');"),
+        [1]
+    );
 }

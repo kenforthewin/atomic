@@ -57,9 +57,12 @@ fn cluster_config() -> ClusterConfig {
 }
 
 async fn connect_control(control_url: &str) -> ControlPlane {
-    let control = ControlPlane::connect(control_url)
-        .await
-        .expect("connect control plane");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect control plane");
     control.initialize().await.expect("migrate control plane");
     control
 }

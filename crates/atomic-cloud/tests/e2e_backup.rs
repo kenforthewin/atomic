@@ -100,9 +100,12 @@ impl BackupHarness {
     /// the backup/reaper loops, which this suite drives by hand), backed by a
     /// fresh local backup store.
     async fn spawn(control_url: &str) -> Self {
-        let control = ControlPlane::connect(control_url)
-            .await
-            .expect("connect control plane");
+        let control = ControlPlane::connect(
+            control_url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
         let cluster = ClusterConfig {
             cluster_id: "test-cluster-1".to_string(),
@@ -486,6 +489,9 @@ async fn full_disaster_recovery_rehearsal() {
             &h.control,
             &h.cluster,
             &ManagedKeys::Disabled,
+            // No billing provider in tests: the subscription-cancel step is
+            // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+            None,
             atomic_cloud::BackupPolicy::Required(&h.store),
             atomic_cloud::DeleteLock::Acquire,
             &alpha.account_id,

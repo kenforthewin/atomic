@@ -85,9 +85,12 @@ async fn fresh_initialize_applies_all_migrations() {
         "fresh_initialize_applies_all_migrations",
         |url| async move {
             // `connect` must create the database — the name is freshly minted.
-            let control = ControlPlane::connect(&url)
-                .await
-                .expect("connect-or-create");
+            let control = ControlPlane::connect(
+                &url,
+                atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+            )
+            .await
+            .expect("connect-or-create");
             let applied = control.initialize().await.expect("run migrations");
 
             assert!(applied >= 1, "fresh database must apply migrations");
@@ -136,7 +139,12 @@ async fn fresh_initialize_applies_all_migrations() {
 #[tokio::test]
 async fn reopen_applies_zero_migrations() {
     with_control_db("reopen_applies_zero_migrations", |url| async move {
-        let first = ControlPlane::connect(&url).await.expect("first connect");
+        let first = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("first connect");
         let applied_first = first.initialize().await.expect("first initialize");
         assert!(applied_first >= 1);
         let rows_after_first = schema_version_rows(&first).await;
@@ -144,7 +152,12 @@ async fn reopen_applies_zero_migrations() {
 
         // Reopen: `connect` takes the database-already-exists path and
         // `initialize` must be a no-op.
-        let second = ControlPlane::connect(&url).await.expect("reopen connect");
+        let second = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("reopen connect");
         let applied_second = second.initialize().await.expect("reopen initialize");
         assert_eq!(applied_second, 0, "reopen must apply zero migrations");
         assert_eq!(
@@ -165,8 +178,18 @@ async fn concurrent_initialize_is_serialized_by_advisory_lock() {
             // fresh database. The advisory lock serializes them: exactly one
             // applies each migration, the other observes the recorded
             // version and applies nothing.
-            let a = ControlPlane::connect(&url).await.expect("connect a");
-            let b = ControlPlane::connect(&url).await.expect("connect b");
+            let a = ControlPlane::connect(
+                &url,
+                atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+            )
+            .await
+            .expect("connect a");
+            let b = ControlPlane::connect(
+                &url,
+                atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+            )
+            .await
+            .expect("connect b");
 
             let (applied_a, applied_b) = tokio::join!(a.initialize(), b.initialize());
             let applied_a = applied_a.expect("initialize a succeeds");
@@ -197,9 +220,12 @@ async fn migration_008_backfills_preexisting_active_rows() {
     with_control_db(
         "migration_008_backfills_preexisting_active_rows",
         |url| async move {
-            let control = ControlPlane::connect(&url)
-                .await
-                .expect("connect-or-create");
+            let control = ControlPlane::connect(
+                &url,
+                atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+            )
+            .await
+            .expect("connect-or-create");
 
             // Bring the schema to exactly version 7 (the embedded files are
             // the source of truth; 008 is deliberately NOT applied yet).

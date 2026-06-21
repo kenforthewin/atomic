@@ -77,9 +77,12 @@ struct Harness {
 
 impl Harness {
     async fn spawn(control_url: &str) -> Self {
-        let control = ControlPlane::connect(control_url)
-            .await
-            .expect("connect control plane");
+        let control = ControlPlane::connect(
+            control_url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
 
         let cluster = ClusterConfig {
@@ -247,16 +250,22 @@ impl Harness {
     async fn run_trial_sweep(&self) -> atomic_cloud::TrialAdvance {
         let free_plan = self.registry.get("free").expect("free plan");
         let cache = Arc::clone(&self.cache);
-        advance_expired_trials(&self.control, chrono::Utc::now(), move |account_id| {
-            let cache = Arc::clone(&cache);
-            let free_plan = free_plan.clone();
-            async move {
-                let handle = cache.get_or_load(&account_id).await?;
-                account_over_plan_limits(&free_plan, &handle.manager)
-                    .await
-                    .map_err(|e| atomic_cloud::CloudError::Invariant(e.to_string()))
-            }
-        })
+        // Disabled managed keys: the post-downgrade key reconcile is a no-op.
+        advance_expired_trials(
+            &self.control,
+            &ManagedKeys::Disabled,
+            chrono::Utc::now(),
+            move |account_id| {
+                let cache = Arc::clone(&cache);
+                let free_plan = free_plan.clone();
+                async move {
+                    let handle = cache.get_or_load(&account_id).await?;
+                    account_over_plan_limits(&free_plan, &handle.manager)
+                        .await
+                        .map_err(|e| atomic_cloud::CloudError::Invariant(e.to_string()))
+                }
+            },
+        )
         .await
         .expect("trial sweep")
     }
@@ -661,7 +670,12 @@ async fn storage_recompute_restricts_writes_without_deleting_then_clears() {
 #[tokio::test]
 async fn period_rollover_is_idempotent_and_retains_old_rows() {
     with_control_db("e2e_period_rollover", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
 
@@ -817,6 +831,13 @@ impl atomic_cloud::BillingProvider for RecordingBilling {
             url: self.portal_url.clone(),
         })
     }
+
+    async fn cancel_subscription(
+        &self,
+        _stripe_subscription_id: &str,
+    ) -> Result<(), atomic_cloud::CloudError> {
+        Ok(())
+    }
 }
 
 /// The exact HMAC-SHA256-over-`"{t}.{body}"` scheme `verify_webhook` checks.
@@ -843,7 +864,12 @@ fn atom_count(v: &Value) -> usize {
 
 /// Shrink the seeded `free` plan's atom/KB limits BEFORE the registry loads.
 async fn set_free_limits(control_url: &str, atom_limit: Option<i32>, kb_limit: Option<i32>) {
-    let control = ControlPlane::connect(control_url).await.expect("connect");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect");
     control.initialize().await.expect("migrate");
     sqlx::query("UPDATE plans SET atom_limit = $1, kb_limit = $2 WHERE id = 'free'")
         .bind(atom_limit)

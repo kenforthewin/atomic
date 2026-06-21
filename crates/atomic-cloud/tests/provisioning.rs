@@ -17,9 +17,12 @@ use support::{create_database, with_control_db, with_db_guard, with_db_name, TES
 
 /// Migrated control plane + a cluster config pointing at the test cluster.
 async fn setup(control_url: &str) -> (ControlPlane, ClusterConfig) {
-    let control = ControlPlane::connect(control_url)
-        .await
-        .expect("connect control plane");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect control plane");
     control.initialize().await.expect("migrate control plane");
     let cluster = ClusterConfig {
         cluster_id: "test-cluster-1".to_string(),
@@ -757,6 +760,9 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -818,6 +824,9 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &acct.account_id,
@@ -829,6 +838,9 @@ async fn delete_account_removes_everything_and_parks_subdomain() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &uuid::Uuid::new_v4().to_string(),

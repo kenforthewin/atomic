@@ -340,7 +340,12 @@ async fn tenant_schema_version(cluster: &ClusterConfig, db_name: &str) -> i32 {
 #[actix_web::test]
 async fn full_deploy_simulation() {
     with_control_db("full_deploy_simulation", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect control");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control");
         control.initialize().await.expect("migrate control plane");
         let cluster = cluster_config();
         let target = tenant_schema_target();
@@ -565,7 +570,12 @@ async fn late_stamped_straggler_heals_without_a_pod_reboot() {
     with_control_db(
         "late_stamped_straggler_heals_without_a_pod_reboot",
         |url| async move {
-            let control = ControlPlane::connect(&url).await.expect("connect control");
+            let control = ControlPlane::connect(
+                &url,
+                atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+            )
+            .await
+            .expect("connect control");
             control.initialize().await.expect("migrate control plane");
             let cluster = cluster_config();
             let target = tenant_schema_target();

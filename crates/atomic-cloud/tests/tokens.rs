@@ -20,9 +20,12 @@ const ACCOUNT_B: &str = "22222222-2222-4222-8222-222222222222";
 /// Migrated control plane with two active accounts to verify cross-account
 /// scoping against.
 async fn setup(control_url: &str) -> ControlPlane {
-    let control = ControlPlane::connect(control_url)
-        .await
-        .expect("connect control plane");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect control plane");
     control.initialize().await.expect("migrate control plane");
     for (id, subdomain) in [(ACCOUNT_A, "alpha"), (ACCOUNT_B, "beta")] {
         sqlx::query(

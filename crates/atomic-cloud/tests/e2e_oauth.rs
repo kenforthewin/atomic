@@ -64,9 +64,12 @@ struct OAuthHarness {
 
 impl OAuthHarness {
     async fn spawn(control_url: &str) -> Self {
-        let control = ControlPlane::connect(control_url)
-            .await
-            .expect("connect control plane");
+        let control = ControlPlane::connect(
+            control_url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
         let cluster = ClusterConfig {
             cluster_id: "test-cluster-1".to_string(),

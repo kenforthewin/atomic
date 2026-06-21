@@ -26,7 +26,12 @@ fn vault() -> EnvMasterKeyVault {
 }
 
 async fn connect(url: &str) -> ControlPlane {
-    let control = ControlPlane::connect(url).await.expect("connect");
+    let control = ControlPlane::connect(
+        url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect");
     control.initialize().await.expect("migrate");
     control
 }

@@ -65,9 +65,12 @@ impl Harness {
     /// Spawn with billing disabled (no Stripe provider) — the default for the
     /// quota/rate-limit tests, which never exercise the webhook route.
     async fn spawn(control_url: &str, rate_limits: DataPlaneRateLimits) -> Self {
-        let control = ControlPlane::connect(control_url)
-            .await
-            .expect("connect control plane");
+        let control = ControlPlane::connect(
+            control_url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
         let billing = atomic_cloud::Billing::with_provider(
             control.clone(),
@@ -230,7 +233,12 @@ impl Harness {
 /// BEFORE the harness loads its plan registry. Per-test control DB, so this
 /// only ever touches test data.
 async fn set_free_limits(control_url: &str, atom_limit: Option<i32>, kb_limit: Option<i32>) {
-    let control = ControlPlane::connect(control_url).await.expect("connect");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect");
     control.initialize().await.expect("migrate");
     sqlx::query("UPDATE plans SET atom_limit = $1, kb_limit = $2 WHERE id = 'free'")
         .bind(atom_limit)
@@ -243,7 +251,12 @@ async fn set_free_limits(control_url: &str, atom_limit: Option<i32>, kb_limit: O
 #[tokio::test]
 async fn plans_are_seeded_and_account_plan_id_is_an_fk() {
     with_control_db("plans_seeded_and_fk", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
 
         // Migration 010 seeds at least 'free' and 'pro'.
@@ -755,7 +768,12 @@ async fn url_ingestion_rate_limit_is_enforced() {
 #[tokio::test]
 async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
     with_control_db("subscription_lifecycle", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
         link_stripe_customer(&control, &account_id, "cus_1")
@@ -829,7 +847,12 @@ async fn subscription_lifecycle_moves_plan_and_clears_dunning() {
 async fn webhook_auto_links_a_fresh_customer_and_widens_the_plan() {
     with_control_db("webhook_auto_link", |url| async move {
         const WEBHOOK_SECRET: &str = "whsec_e2e_secret";
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
 
         // A real account, provisioned the normal way (plan_id starts 'free').
@@ -912,7 +935,12 @@ async fn webhook_auto_links_a_fresh_customer_and_widens_the_plan() {
 #[tokio::test]
 async fn webhook_event_id_is_claimed_exactly_once() {
     with_control_db("webhook_claim_once", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
 
@@ -964,7 +992,12 @@ async fn replayed_subscription_event_does_not_duplicate_the_audit_row() {
     // guards against by asserting the count grows by exactly one per UNIQUE
     // event (the handler skips apply entirely on a claimed id).
     with_control_db("webhook_replay_audit", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
         link_stripe_customer(&control, &account_id, "cus_1")
@@ -1018,7 +1051,12 @@ async fn webhook_claim_rolls_back_with_a_failed_apply() {
     // adversarial finding). This drives the exact tx shape the webhook handler
     // uses: claim_on_conn → apply_on_conn, then deliberately abort.
     with_control_db("webhook_claim_rollback", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
         link_stripe_customer(&control, &account_id, "cus_1")
@@ -1120,7 +1158,12 @@ async fn webhook_claim_rolls_back_with_a_failed_apply() {
 #[tokio::test]
 async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
     with_control_db("dunning_time_machine", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
 
@@ -1164,7 +1207,12 @@ async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
 #[tokio::test]
 async fn start_trial_is_first_time_only_and_idempotent() {
     with_control_db("trial_start", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
 
@@ -1218,7 +1266,12 @@ async fn start_trial_is_first_time_only_and_idempotent() {
 #[tokio::test]
 async fn expired_trial_downgrades_to_free_active_or_read_only() {
     with_control_db("trial_downgrade", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
 
         // Under-limit account: trial expires → free + active.
@@ -1266,7 +1319,12 @@ async fn expired_trial_downgrades_to_free_active_or_read_only() {
 #[tokio::test]
 async fn trial_sweep_downgrades_only_expired_and_never_deletes() {
     with_control_db("trial_sweep", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
 
         let running = seed_account(&control, "running").await;
@@ -1287,9 +1345,13 @@ async fn trial_sweep_downgrades_only_expired_and_never_deletes() {
 
         // Drive the sweep with an over-limit predicate (so the downgrade lands
         // read_only) and assert it only touched the expired account.
-        let advance = advance_expired_trials(&control, chrono::Utc::now(), |_id| async {
-            Ok::<bool, atomic_cloud::CloudError>(true)
-        })
+        // Disabled managed keys: the post-downgrade key reconcile is a no-op.
+        let advance = advance_expired_trials(
+            &control,
+            &ManagedKeys::Disabled,
+            chrono::Utc::now(),
+            |_id| async { Ok::<bool, atomic_cloud::CloudError>(true) },
+        )
         .await
         .expect("advance trials");
         assert_eq!(advance.downgraded_to_read_only, 1);
@@ -1368,16 +1430,22 @@ async fn trialing_account_has_full_access_then_sweep_downgrades_to_read_only() {
             support::test_vault(),
             AccountCacheConfig::default(),
         ));
-        let advance = advance_expired_trials(&harness.control, chrono::Utc::now(), |account_id| {
-            let cache = Arc::clone(&cache);
-            let free_plan = free_plan.clone();
-            async move {
-                let handle = cache.get_or_load(&account_id).await?;
-                atomic_cloud::account_over_plan_limits(&free_plan, &handle.manager)
-                    .await
-                    .map_err(|e| atomic_cloud::CloudError::Invariant(e.to_string()))
-            }
-        })
+        // Disabled managed keys: the post-downgrade key reconcile is a no-op.
+        let advance = advance_expired_trials(
+            &harness.control,
+            &ManagedKeys::Disabled,
+            chrono::Utc::now(),
+            |account_id| {
+                let cache = Arc::clone(&cache);
+                let free_plan = free_plan.clone();
+                async move {
+                    let handle = cache.get_or_load(&account_id).await?;
+                    atomic_cloud::account_over_plan_limits(&free_plan, &handle.manager)
+                        .await
+                        .map_err(|e| atomic_cloud::CloudError::Invariant(e.to_string()))
+                }
+            },
+        )
         .await
         .expect("advance trials");
         assert_eq!(advance.downgraded_to_read_only, 1);
@@ -1551,7 +1619,12 @@ async fn suspended_account_is_blocked_at_auth_read_only_blocks_writes() {
 #[actix_web::test]
 async fn checkout_route_redirects_and_is_account_scope_gated() {
     with_control_db("billing_checkout_route", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let billing = atomic_cloud::Billing::with_provider(
             control.clone(),
@@ -1644,7 +1717,12 @@ async fn checkout_route_redirects_and_is_account_scope_gated() {
 #[actix_web::test]
 async fn portal_route_conflicts_redirects_and_is_account_scope_gated() {
     with_control_db("billing_portal_route", |url| async move {
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let billing = atomic_cloud::Billing::with_provider(
             control.clone(),
@@ -1727,7 +1805,12 @@ async fn portal_route_conflicts_redirects_and_is_account_scope_gated() {
 async fn webhook_rejects_a_bad_signature_with_400() {
     with_control_db("billing_webhook_badsig", |url| async move {
         const SECRET: &str = "whsec_badsig";
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
         link_stripe_customer(&control, &account_id, "cus_sig")
@@ -1812,7 +1895,12 @@ async fn webhook_rejects_a_bad_signature_with_400() {
 async fn webhook_orphaned_customer_is_acked_200_with_no_effect() {
     with_control_db("billing_webhook_orphan", |url| async move {
         const SECRET: &str = "whsec_orphan";
-        let control = ControlPlane::connect(&url).await.expect("connect");
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         control.initialize().await.expect("migrate");
 
         let billing = atomic_cloud::Billing::with_provider(
@@ -1922,6 +2010,17 @@ impl atomic_cloud::BillingProvider for RecordingBilling {
             url: self.portal_url.clone(),
         })
     }
+
+    async fn cancel_subscription(
+        &self,
+        stripe_subscription_id: &str,
+    ) -> Result<(), atomic_cloud::CloudError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("cancel:{stripe_subscription_id}"));
+        Ok(())
+    }
 }
 
 /// A `BillingProvider` whose presence alone enables the webhook route. The
@@ -1949,6 +2048,13 @@ impl atomic_cloud::BillingProvider for StubBillingProvider {
         _return_url: &str,
     ) -> Result<atomic_cloud::StripeSession, atomic_cloud::CloudError> {
         unreachable!("the webhook test does not start a portal session")
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _stripe_subscription_id: &str,
+    ) -> Result<(), atomic_cloud::CloudError> {
+        unreachable!("the webhook test does not cancel a subscription")
     }
 }
 

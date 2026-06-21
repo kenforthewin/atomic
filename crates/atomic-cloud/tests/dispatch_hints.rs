@@ -16,9 +16,12 @@ use support::with_control_db;
 
 /// Migrated control plane handle.
 async fn setup(control_url: &str) -> ControlPlane {
-    let control = ControlPlane::connect(control_url)
-        .await
-        .expect("connect control plane");
+    let control = ControlPlane::connect(
+        control_url,
+        atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("connect control plane");
     control.initialize().await.expect("migrate control plane");
     control
 }
@@ -226,6 +229,9 @@ async fn hint_rows_cascade_with_account_deletion() {
                 &control,
                 &cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &account.account_id,

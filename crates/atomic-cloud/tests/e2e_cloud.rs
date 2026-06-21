@@ -82,9 +82,12 @@ impl CloudHarness {
     /// eviction test can shrink it), `CloudAuth`, fallback state, one worker
     /// on `127.0.0.1:0`.
     async fn spawn(control_url: &str, cache_config: AccountCacheConfig) -> Self {
-        let control = ControlPlane::connect(control_url)
-            .await
-            .expect("connect control plane");
+        let control = ControlPlane::connect(
+            control_url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control plane");
         control.initialize().await.expect("migrate control plane");
         let cluster = ClusterConfig {
             cluster_id: "test-cluster-1".to_string(),
@@ -870,6 +873,9 @@ async fn cli_style_deletion_self_heals_without_eviction() {
                 &h.control,
                 &h.cluster,
                 &ManagedKeys::Disabled,
+                // No billing provider in tests: the subscription-cancel step is
+                // skipped (DEL-1 `billing` is `None`), exactly as the CLI/reaper paths.
+                None,
                 atomic_cloud::BackupPolicy::DisabledAcknowledged,
                 atomic_cloud::DeleteLock::Acquire,
                 &alpha.account_id,
