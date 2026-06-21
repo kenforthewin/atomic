@@ -51,9 +51,11 @@
 //! until someone asks.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use atomic_core::{ProviderConfig, ProviderType};
 use serde_json::Value;
+use url::{Host, Url};
 
 use crate::keyvault::SecretKey;
 use crate::provider_credentials::{Provider, ProviderCredentials};
@@ -129,6 +131,12 @@ pub const BYOK_ALLOWED_KEYS: &[&str] = &[
     "embedding_dimension",
 ];
 
+/// The `model_config` keys whose values are tenant-supplied base URLs that
+/// drive outbound requests — first at save-time validation, then on every
+/// live pipeline call. These must clear [`validate_byok_base_url`] before
+/// they can land (SSRF hardening; see [`validate_byok_model_config`]).
+const BYOK_BASE_URL_KEYS: &[&str] = &["openrouter_base_url", "openai_compat_base_url"];
+
 /// Validate a user-submitted BYOK `model_config` against the documented
 /// vocabulary. Mirrors `validate_managed_model_config`'s shape (an
 /// `Err(message)` written for the 400 body), with the wider
@@ -140,6 +148,13 @@ pub const BYOK_ALLOWED_KEYS: &[&str] = &[
 /// inside `model_config` — would persist a secret unencrypted and display
 /// it forever. Rejecting everything outside the vocabulary closes that by
 /// construction.
+///
+/// It is also the **SSRF gate**: the base-URL keys drive outbound requests,
+/// first at save-time validation and then on every live pipeline call, so a
+/// tenant could otherwise point them at internal addresses on shared infra
+/// (cloud metadata, the control-plane Postgres, east-west services). Every
+/// base URL must clear [`validate_byok_base_url`] — https scheme, host not
+/// in a private/loopback/link-local/metadata range — before it can land.
 pub fn validate_byok_model_config(model_config: &Value) -> Result<(), String> {
     let Some(object) = model_config.as_object() else {
         return Err("model_config must be a JSON object".to_string());
@@ -160,12 +175,113 @@ pub fn validate_byok_model_config(model_config: &Value) -> Result<(), String> {
                     "model_config.embedding_dimension must be a positive integer".to_string(),
                 );
             }
-        } else if !value.is_string() {
+        } else if let Some(text) = value.as_str() {
+            if BYOK_BASE_URL_KEYS.contains(&key.as_str()) {
+                validate_byok_base_url(text)
+                    .map_err(|reason| format!("model_config.{key} {reason}"))?;
+            }
+        } else {
             return Err(format!("model_config.{key} must be a string"));
         }
     }
 
     Ok(())
+}
+
+/// SSRF gate for a tenant-supplied provider base URL (the OpenRouter /
+/// OpenAI-compatible API base). The same string is fetched at save time and
+/// on every live pipeline call, so an unrestricted value lets any
+/// authenticated tenant aim our outbound client at internal addresses on
+/// shared infrastructure. We reject anything that isn't an `https` URL to a
+/// public, literal-or-named host whose literal forms are all outside the
+/// private/loopback/link-local ranges (including the `169.254.169.254` cloud
+/// metadata endpoint).
+///
+/// The error string is a fixed *reason* — it never echoes upstream response
+/// bytes — so it cannot become a read oracle.
+///
+/// TODO(ssrf): this validates the URL's host but does not resolve-and-pin a
+/// named host's address, so a name that passes here and later resolves to a
+/// private address (DNS rebinding) is still reachable on the live call. The
+/// durable fix is to resolve once, pin the IP for both the validation and
+/// pipeline requests, and re-check it against these ranges — or route all
+/// tenant egress through a deny-list forward proxy. That needs resolver /
+/// HTTP-client plumbing beyond this module (the provider clients live in
+/// atomic-core), so it is tracked separately.
+pub fn validate_byok_base_url(raw: &str) -> Result<(), &'static str> {
+    let url = Url::parse(raw).map_err(|_| "must be a valid URL")?;
+
+    if url.scheme() != "https" {
+        return Err("must use the https scheme");
+    }
+
+    match url.host() {
+        Some(Host::Ipv4(addr)) => {
+            if is_blocked_ipv4(&addr) {
+                return Err("must not point at a private, loopback, or link-local address");
+            }
+        }
+        Some(Host::Ipv6(addr)) => {
+            if is_blocked_ipv6(&addr) {
+                return Err("must not point at a private, loopback, or link-local address");
+            }
+        }
+        // A named host: block any name that is *itself* a literal in a
+        // blocked range (e.g. a host written as `[::1]` parses to Ipv6
+        // above, but defensive parsing also catches dotted-decimal names
+        // that slipped through as `Domain`). DNS rebinding is the TODO.
+        Some(Host::Domain(name)) => {
+            if name.is_empty() {
+                return Err("must have a host");
+            }
+            if let Ok(addr) = name.parse::<IpAddr>() {
+                let blocked = match addr {
+                    IpAddr::V4(v4) => is_blocked_ipv4(&v4),
+                    IpAddr::V6(v6) => is_blocked_ipv6(&v6),
+                };
+                if blocked {
+                    return Err("must not point at a private, loopback, or link-local address");
+                }
+            }
+        }
+        None => return Err("must have a host"),
+    }
+
+    Ok(())
+}
+
+/// Reject loopback (127.0.0.0/8), RFC 1918 private (10/8, 172.16/12,
+/// 192.168/16), link-local incl. cloud metadata (169.254.0.0/16, covering
+/// 169.254.169.254), the unspecified `0.0.0.0`, and broadcast.
+fn is_blocked_ipv4(addr: &Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
+}
+
+/// Reject loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
+/// link-local (`fe80::/10`), and IPv4-mapped addresses whose embedded v4 is
+/// itself blocked (so `::ffff:127.0.0.1` can't tunnel past the v4 checks).
+fn is_blocked_ipv6(addr: &Ipv6Addr) -> bool {
+    if addr.is_loopback() || addr.is_unspecified() {
+        return true;
+    }
+    // Unique-local fc00::/7 — top 7 bits are 1111110.
+    if addr.octets()[0] & 0xfe == 0xfc {
+        return true;
+    }
+    // Link-local fe80::/10 — first 10 bits are 1111111010.
+    let segments = addr.segments();
+    if segments[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // IPv4-mapped (::ffff:a.b.c.d): re-check the embedded v4 address.
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return is_blocked_ipv4(&v4);
+    }
+    false
 }
 
 /// The explicit config for a decrypted credentials row.
@@ -264,13 +380,14 @@ mod tests {
 
     #[test]
     fn byok_vocabulary_accepts_documented_keys_only() {
-        // Every documented key, well-typed: fine.
+        // Every documented key, well-typed: fine. Base URLs are public
+        // https endpoints (the SSRF gate is exercised separately below).
         assert_eq!(
             validate_byok_model_config(&json!({
                 "embedding_model": "mock-embed",
                 "llm_model": "any/model",
-                "openrouter_base_url": "http://127.0.0.1:1",
-                "openai_compat_base_url": "http://127.0.0.1:2",
+                "openrouter_base_url": "https://openrouter.ai/api/v1",
+                "openai_compat_base_url": "https://api.example.com/v1",
                 "embedding_dimension": 1536,
             })),
             Ok(())
@@ -302,5 +419,93 @@ mod tests {
         assert_eq!(config.provider_type, ProviderType::OpenRouter);
         assert_eq!(config.openrouter_api_key, None);
         assert_eq!(config.openai_compat_api_key, None);
+    }
+
+    #[test]
+    fn base_url_gate_accepts_public_https() {
+        assert!(validate_byok_base_url("https://openrouter.ai/api/v1").is_ok());
+        assert!(validate_byok_base_url("https://api.example.com:8443/v1").is_ok());
+        // A public literal IP over https is fine.
+        assert!(validate_byok_base_url("https://8.8.8.8/v1").is_ok());
+    }
+
+    #[test]
+    fn base_url_gate_requires_https() {
+        assert_eq!(
+            validate_byok_base_url("http://openrouter.ai/api/v1"),
+            Err("must use the https scheme")
+        );
+        // Non-HTTP schemes that could reach other services are rejected too.
+        assert!(validate_byok_base_url("file:///etc/passwd").is_err());
+        assert!(validate_byok_base_url("gopher://10.0.0.1/").is_err());
+    }
+
+    #[test]
+    fn base_url_gate_blocks_private_and_metadata_ipv4() {
+        for raw in [
+            "https://127.0.0.1/v1",       // loopback
+            "https://10.1.2.3/v1",        // 10/8
+            "https://172.16.5.6/v1",      // 172.16/12
+            "https://192.168.0.1/v1",     // 192.168/16
+            "https://169.254.1.1/v1",     // link-local
+            "https://169.254.169.254/v1", // cloud metadata
+            "https://0.0.0.0/v1",         // unspecified
+        ] {
+            assert!(
+                validate_byok_base_url(raw).is_err(),
+                "expected {raw} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_gate_blocks_private_ipv6() {
+        for raw in [
+            "https://[::1]/v1",                    // loopback
+            "https://[::]/v1",                     // unspecified
+            "https://[fc00::1]/v1",                // unique-local
+            "https://[fd12:3456::1]/v1",           // unique-local
+            "https://[fe80::1]/v1",                // link-local
+            "https://[::ffff:127.0.0.1]/v1",       // v4-mapped loopback
+            "https://[::ffff:169.254.169.254]/v1", // v4-mapped metadata
+        ] {
+            assert!(
+                validate_byok_base_url(raw).is_err(),
+                "expected {raw} to be rejected"
+            );
+        }
+        assert!(validate_byok_base_url("https://[2606:4700::1111]/v1").is_ok());
+    }
+
+    #[test]
+    fn base_url_gate_rejects_missing_host_and_garbage() {
+        assert!(validate_byok_base_url("https://").is_err());
+        assert!(validate_byok_base_url("not a url").is_err());
+        assert!(validate_byok_base_url("").is_err());
+    }
+
+    #[test]
+    fn byok_validation_runs_the_ssrf_gate_on_base_urls() {
+        // A private base URL is rejected, and the message names the field
+        // without echoing any upstream bytes.
+        let err = validate_byok_model_config(&json!({
+            "openrouter_base_url": "https://169.254.169.254/v1",
+        }))
+        .unwrap_err();
+        assert!(err.contains("openrouter_base_url"), "{err}");
+        assert!(err.contains("private"), "{err}");
+
+        let err = validate_byok_model_config(&json!({
+            "openai_compat_base_url": "http://internal.svc/v1",
+        }))
+        .unwrap_err();
+        assert!(err.contains("openai_compat_base_url"), "{err}");
+
+        // Public https base URLs still pass.
+        assert!(validate_byok_model_config(&json!({
+            "openrouter_base_url": "https://openrouter.ai/api/v1",
+            "openai_compat_base_url": "https://api.example.com/v1",
+        }))
+        .is_ok());
     }
 }

@@ -273,10 +273,18 @@ impl OpenRouterProvisioning {
         if status.is_success() {
             return Ok(response);
         }
+        // Do NOT echo the upstream response body into the error: it would turn a
+        // non-2xx into a read-oracle for the configured provisioning endpoint
+        // (SEC-1). Report the status code only — the body is drained so the
+        // connection can be reused, and logged at debug for the operator.
         let body = response.text().await.unwrap_or_default();
+        tracing::debug!(%status, context, body = %truncate(&body, 500), "provisioning API returned a non-success status");
         Err(CloudError::ProviderProvisioning {
             context: context.to_string(),
-            message: format!("HTTP {status}: {}", truncate(&body, 500)),
+            message: format!(
+                "the provider rejected the request (HTTP {})",
+                status.as_u16()
+            ),
         })
     }
 }

@@ -32,6 +32,7 @@ use crate::auth::ResolvedTenant;
 use crate::billing::dunning;
 use crate::billing::{self, BillingProvider, WebhookEvent};
 use crate::control_plane::ControlPlane;
+use crate::managed_keys::ManagedKeys;
 use crate::tokens::TokenScope;
 
 /// Everything the billing routes need. `None` provider means Stripe isn't
@@ -50,6 +51,13 @@ struct BillingState {
     app_public_url: String,
     /// Normalized base domain, for the app-host guard on the webhook.
     base_domain: String,
+    /// Managed runtime-key handle, for reconciling a tenant's managed-AI
+    /// allowance to its plan after a subscription transition commits (MAI-1).
+    /// `Disabled` (or a `with_provider` test that doesn't wire it) makes the
+    /// post-commit reconcile a no-op. The reconcile runs OUTSIDE the webhook's
+    /// claim+apply transaction — a provider PATCH must never extend or wedge
+    /// that transaction.
+    managed: ManagedKeys,
 }
 
 /// Public configuration for [`Billing::new`].
@@ -116,6 +124,11 @@ impl Billing {
                 price_to_plan,
                 app_public_url,
                 base_domain,
+                // Wired by `serve` via `with_managed_keys`; the constructor
+                // can't take it without rippling through every test seam, and
+                // `Disabled` is a correct no-op default for the webhook
+                // reconcile.
+                managed: ManagedKeys::Disabled,
             }),
         })
     }
@@ -148,8 +161,30 @@ impl Billing {
                 price_to_plan,
                 app_public_url: app_public_url.into().trim_end_matches('/').to_string(),
                 base_domain,
+                managed: ManagedKeys::Disabled,
             }),
         }
+    }
+
+    /// Wire the managed runtime-key handle so the webhook reconciles a tenant's
+    /// managed-AI allowance to its plan after a subscription transition commits
+    /// (MAI-1). `serve` calls this; tests that don't exercise managed-key
+    /// reconciliation leave the `Disabled` default (a no-op). Rebuilds the
+    /// shared `web::Data`, so it must be called before the plane is shared with
+    /// workers.
+    pub fn with_managed_keys(mut self, managed: ManagedKeys) -> Self {
+        let state = &*self.state;
+        self.state = web::Data::new(BillingState {
+            control: state.control.clone(),
+            provider: state.provider.clone(),
+            webhook_secret: state.webhook_secret.clone(),
+            plan_to_price: state.plan_to_price.clone(),
+            price_to_plan: state.price_to_plan.clone(),
+            app_public_url: state.app_public_url.clone(),
+            base_domain: state.base_domain.clone(),
+            managed,
+        });
+        self
     }
 
     /// Whether Stripe is configured on this deployment (a secret key was
@@ -159,6 +194,14 @@ impl Billing {
     /// explanatory note rather than navigating the browser onto a raw 503.
     pub fn is_configured(&self) -> bool {
         self.state.provider.is_some()
+    }
+
+    /// The configured billing provider, if any. Threaded into
+    /// [`crate::provision::delete_account`] by the active-deletion HTTP route
+    /// so it can fire a best-effort Stripe subscription cancel before the
+    /// accounts-row CASCADE sweeps the `stripe_subscriptions` pointer (DEL-1).
+    pub fn provider(&self) -> Option<&Arc<dyn BillingProvider>> {
+        self.state.provider.as_ref()
     }
 
     /// Register the authenticated tenant-plane billing routes (portal,
@@ -379,17 +422,20 @@ async fn webhook(
         }
     }
 
-    if let Err(e) = apply(&mut tx, parsed).await {
-        tracing::error!(error = %e, "applying Stripe webhook failed");
-        // Roll the transaction back — the claim and any partial side effects
-        // are discarded, so Stripe's retry re-processes the event from a clean
-        // slate (the side effects did NOT land). A failed rollback is logged
-        // but can't change the 500 we owe Stripe (it will retry regardless).
-        if let Err(e) = tx.rollback().await {
-            tracing::error!(error = %e, event_id, "rolling back failed webhook transaction failed");
+    let reconcile_account = match apply(&mut tx, parsed).await {
+        Ok(account_id) => account_id,
+        Err(e) => {
+            tracing::error!(error = %e, "applying Stripe webhook failed");
+            // Roll the transaction back — the claim and any partial side effects
+            // are discarded, so Stripe's retry re-processes the event from a clean
+            // slate (the side effects did NOT land). A failed rollback is logged
+            // but can't change the 500 we owe Stripe (it will retry regardless).
+            if let Err(e) = tx.rollback().await {
+                tracing::error!(error = %e, event_id, "rolling back failed webhook transaction failed");
+            }
+            return internal_error();
         }
-        return internal_error();
-    }
+    };
 
     if let Err(e) = tx.commit().await {
         // The claim and side effects are still uncommitted (rolled back by the
@@ -398,6 +444,26 @@ async fn webhook(
         tracing::error!(error = %e, event_id, "committing webhook transaction failed");
         return internal_error();
     }
+
+    // Reconcile the managed-key allowance to the now-committed plan, OUTSIDE the
+    // claim+apply transaction — a provider PATCH must never extend or wedge that
+    // transaction (MAI-1). Best-effort: a failure is logged inside
+    // `reconcile_managed_key_limit` and the next plan transition (or an operator)
+    // reconciles it; it must not turn a successfully-applied webhook into a 500
+    // that makes Stripe redeliver. `Disabled` managed keys make this a no-op.
+    if let Some(account_id) = reconcile_account {
+        if let Err(e) =
+            dunning::reconcile_managed_key_limit(&state.control, &state.managed, &account_id).await
+        {
+            tracing::error!(
+                error = %e,
+                account_id,
+                "reconciling managed key limit after subscription transition failed; \
+                 the next transition (or an operator) will reconcile it"
+            );
+        }
+    }
+
     HttpResponse::Ok().json(serde_json::json!({ "received": true }))
 }
 
@@ -406,10 +472,17 @@ async fn webhook(
 ///
 /// Runs on the webhook's claim+apply transaction (`conn`), so every write here
 /// commits or rolls back atomically with the event-id claim.
+///
+/// Returns the account id whose managed-AI allowance must be reconciled to its
+/// (now-updated) plan AFTER the transaction commits — `Some` for the plan-moving
+/// subscription arms (upserted → trial/pro allowance; deleted → free allowance),
+/// `None` for events that don't change the plan tier (payment failed/succeeded,
+/// ignored, or an unresolved customer). The caller runs the reconcile outside
+/// this transaction so a provider PATCH never extends or wedges it (MAI-1).
 async fn apply(
     conn: &mut sqlx::PgConnection,
     event: WebhookEvent,
-) -> Result<(), crate::error::CloudError> {
+) -> Result<Option<String>, crate::error::CloudError> {
     match event {
         WebhookEvent::SubscriptionUpserted(sub) => {
             // Resolve (and, on the very first subscription, ESTABLISH) the
@@ -434,7 +507,10 @@ async fn apply(
                 };
             match account_id {
                 Some(account_id) => {
-                    dunning::apply_subscription_event_on_conn(conn, &account_id, &sub).await
+                    dunning::apply_subscription_event_on_conn(conn, &account_id, &sub).await?;
+                    // Plan may have moved (active/trialing on a paid price) —
+                    // reconcile the managed-key allowance post-commit.
+                    Ok(Some(account_id))
                 }
                 None => {
                     tracing::warn!(
@@ -442,35 +518,40 @@ async fn apply(
                         "subscription event for an unknown Stripe customer with no \
                          resolvable subdomain metadata; ignoring"
                     );
-                    Ok(())
+                    Ok(None)
                 }
             }
         }
         WebhookEvent::SubscriptionDeleted { stripe_customer_id } => {
             match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
                 Some(account_id) => {
-                    dunning::apply_subscription_deleted_on_conn(conn, &account_id).await
+                    dunning::apply_subscription_deleted_on_conn(conn, &account_id).await?;
+                    // Dropped to free — reconcile the managed-key allowance down
+                    // to the free cap post-commit.
+                    Ok(Some(account_id))
                 }
-                None => unknown_customer(&stripe_customer_id),
+                None => unknown_customer(&stripe_customer_id).map(|()| None),
             }
         }
         WebhookEvent::PaymentFailed { stripe_customer_id } => {
             match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
-                Some(account_id) => dunning::apply_payment_failed_on_conn(conn, &account_id).await,
-                None => unknown_customer(&stripe_customer_id),
+                Some(account_id) => dunning::apply_payment_failed_on_conn(conn, &account_id)
+                    .await
+                    .map(|()| None),
+                None => unknown_customer(&stripe_customer_id).map(|()| None),
             }
         }
         WebhookEvent::PaymentSucceeded { stripe_customer_id } => {
             match dunning::account_for_customer_on_conn(conn, &stripe_customer_id).await? {
-                Some(account_id) => {
-                    dunning::apply_payment_succeeded_on_conn(conn, &account_id).await
-                }
-                None => unknown_customer(&stripe_customer_id),
+                Some(account_id) => dunning::apply_payment_succeeded_on_conn(conn, &account_id)
+                    .await
+                    .map(|()| None),
+                None => unknown_customer(&stripe_customer_id).map(|()| None),
             }
         }
         WebhookEvent::Ignored { event_type } => {
             tracing::debug!(event_type, "ignoring unhandled Stripe event");
-            Ok(())
+            Ok(None)
         }
     }
 }

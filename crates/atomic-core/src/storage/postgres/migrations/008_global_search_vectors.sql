@@ -13,3 +13,5 @@ ADD COLUMN IF NOT EXISTS content_tsv tsvector
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_fts
     ON chat_messages USING GIN(content_tsv);
+
+INSERT INTO schema_version (version) VALUES (8);

@@ -3021,32 +3021,31 @@ impl AtomicCore {
         // OpenRouter needs the model's supported sampling params so the request
         // doesn't send fields the model rejects; refresh the capabilities cache
         // when stale, falling back to whatever we have on a fetch failure.
-        let supported_params: Option<Vec<String>> = if provider_config.provider_type
-            == ProviderType::OpenRouter
-        {
-            let (cached, is_stale) = match self.get_cached_capabilities().await {
-                Ok(Some(cache)) => {
-                    let stale = cache.is_stale();
-                    (Some(cache), stale)
-                }
-                _ => (None, true),
-            };
-            let capabilities = if is_stale {
-                let client = reqwest::Client::new();
-                match crate::providers::models::fetch_and_return_capabilities(&client).await {
-                    Ok(fresh) => {
-                        let _ = self.save_capabilities_cache(&fresh).await;
-                        fresh
+        let supported_params: Option<Vec<String>> =
+            if provider_config.provider_type == ProviderType::OpenRouter {
+                let (cached, is_stale) = match self.get_cached_capabilities().await {
+                    Ok(Some(cache)) => {
+                        let stale = cache.is_stale();
+                        (Some(cache), stale)
                     }
-                    Err(_) => cached.unwrap_or_default(),
-                }
+                    _ => (None, true),
+                };
+                let capabilities = if is_stale {
+                    let client = reqwest::Client::new();
+                    match crate::providers::models::fetch_and_return_capabilities(&client).await {
+                        Ok(fresh) => {
+                            let _ = self.save_capabilities_cache(&fresh).await;
+                            fresh
+                        }
+                        Err(_) => cached.unwrap_or_default(),
+                    }
+                } else {
+                    cached.unwrap_or_default()
+                };
+                capabilities.get_supported_params(&model).cloned()
             } else {
-                cached.unwrap_or_default()
+                None
             };
-            capabilities.get_supported_params(&model).cloned()
-        } else {
-            None
-        };
 
         let all_tags = self.get_tags_for_compaction().await?;
         if all_tags == "(no existing tags)" {

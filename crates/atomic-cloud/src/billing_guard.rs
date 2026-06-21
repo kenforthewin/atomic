@@ -45,6 +45,18 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
+/// Mutations that stay open even while writes are blocked. A returning
+/// `read_only` (or storage-`restricted`) tenant still has to be able to mark
+/// onboarding complete — that flag is a per-tenant settings write
+/// (`PUT /api/settings/onboarding_completed`), and blocking it traps the user
+/// re-looping the first-run wizard with no way out (the remedy — paying or
+/// deleting data — lives *past* onboarding). It writes a single, fixed
+/// settings key and creates no metered resource, so exempting it costs the
+/// write-block nothing while unsticking the recovery flow.
+fn is_write_block_exempt(method: &Method, path: &str) -> bool {
+    *method == Method::PUT && path == "/api/settings/onboarding_completed"
+}
+
 /// Data-plane middleware: while the tenant is blocked for writes by EITHER
 /// the dunning `read_only` billing state or the storage `restricted` state,
 /// return a structured 402 for mutating requests (module docs). A missing
@@ -67,7 +79,7 @@ pub async fn billing_write_guard(
     });
 
     if let Some(block) = block {
-        if is_mutating(req.method()) {
+        if is_mutating(req.method()) && !is_write_block_exempt(req.method(), req.path()) {
             let host = req
                 .headers()
                 .get(header::HOST)
@@ -131,6 +143,27 @@ mod tests {
         assert!(!is_mutating(&Method::GET));
         assert!(!is_mutating(&Method::HEAD));
         assert!(!is_mutating(&Method::OPTIONS));
+    }
+
+    #[test]
+    fn onboarding_completion_write_is_exempt() {
+        // The returning read_only tenant must be able to finish onboarding,
+        // so its settings write passes the write-block…
+        assert!(is_write_block_exempt(
+            &Method::PUT,
+            "/api/settings/onboarding_completed"
+        ));
+        // …but nothing else: a different settings key, a different method, or
+        // any other route stays blocked.
+        assert!(!is_write_block_exempt(
+            &Method::PUT,
+            "/api/settings/ai_provider"
+        ));
+        assert!(!is_write_block_exempt(
+            &Method::POST,
+            "/api/settings/onboarding_completed"
+        ));
+        assert!(!is_write_block_exempt(&Method::POST, "/api/atoms"));
     }
 
     #[test]

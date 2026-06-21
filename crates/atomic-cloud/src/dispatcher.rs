@@ -159,6 +159,18 @@ pub use crate::backpressure::RATE_LIMIT_REQUEUE_DELAY;
 /// (`AtomicCore::rearm_pipeline_jobs`; see [`crate::tenant_plane`]).
 pub const PROVIDER_BACKOFF_REASON: &str = "provider-backoff";
 
+/// How many tenant polls a tick runs concurrently. Each poll is bounded by
+/// `tenant_poll_timeout`, but a serial loop still lets a handful of slow
+/// (≤ timeout) tenants push the whole tick — and the drain of hinted work
+/// behind it — into the tens of seconds as the active fleet grows. A bounded
+/// `buffer_unordered` lets healthy tenants make progress while a few wedged
+/// databases time out in parallel, without unleashing an unbounded fan-out of
+/// pool acquisitions against the shared cluster.
+///
+/// TODO(dispatch): promote to a `serve` CLI flag once load testing pins the
+/// right ceiling against the per-pod cache/pool budget (DISP-2).
+const SCAN_CONCURRENCY: usize = 16;
+
 /// Tuning knobs for the dispatcher. Every field is a `serve` CLI flag.
 #[derive(Debug, Clone)]
 pub struct DispatcherConfig {
@@ -379,7 +391,13 @@ impl CoreExecutor {
         account_id: &str,
         db_id: &str,
     ) -> Result<(AtomicCore, TenantHandle), CloudError> {
-        let handle = self.cache.get_or_load(account_id).await?;
+        // Resolve through the no-touch dispatch accessor (DISP-3): this — and
+        // the dispatcher's other dispatch reads (`poll_tenant`,
+        // `over_atom_limit`) — must NOT refresh `last_touched`, or background
+        // polling alone (slow scan at 300s < the 900s idle TTL) keeps every
+        // active tenant warm and thrashes the LRU above `max_entries`. Only
+        // genuine serving traffic should keep a tenant warm.
+        let handle = self.cache.get_for_dispatch(account_id).await?;
         let core = handle
             .manager
             .get_core(db_id)
@@ -418,7 +436,12 @@ impl CoreExecutor {
             ProviderFailureClass::RateLimited { .. } => rate_limited = true,
             ProviderFailureClass::PaymentRequired => payment_required = true,
             ProviderFailureClass::AuthFailed => auth_failed = true,
-            ProviderFailureClass::Other => {}
+            // A transient (5xx/timeout) fault is re-enqueued by layer 1
+            // below, but it carries no rate-limit/billing/credential signal,
+            // so it stays neutral to the breaker — exactly like a genuine
+            // logic failure does (`Other`). (A short breaker pause on
+            // sustained transient faults is a possible future refinement.)
+            ProviderFailureClass::Transient | ProviderFailureClass::Other => {}
         };
         for failure in &pipeline_failures {
             observe(&failure.class);
@@ -514,6 +537,15 @@ impl CoreExecutor {
                         now + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY)
                             .unwrap_or_default()
                     })
+                }
+                // A transient provider outage (5xx/timeout) WILL succeed once
+                // the provider recovers, so — like a rate limit — re-enqueue
+                // with a bounded `not_before` instead of leaving the atom
+                // terminally `failed`. No `Retry-After` hint accompanies a
+                // 5xx/network fault, so the fixed base delay is the horizon;
+                // the breaker is untouched (this isn't a rate-limit streak).
+                ProviderFailureClass::Transient => {
+                    now + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY).unwrap_or_default()
                 }
                 // Genuine failures stay settled; retrying them is the
                 // user's call (the existing retry routes).
@@ -862,105 +894,151 @@ impl Dispatcher {
         };
         let held = self.held_accounts(&candidates).await;
 
+        // Poll candidates with bounded concurrency: one wedged or slow tenant
+        // database (each capped at `tenant_poll_timeout`) must not serially
+        // push the whole tick — and the drain of hinted work behind it — out
+        // by tens of seconds as the active fleet grows (DISP-2). The fan-out
+        // is bounded by `SCAN_CONCURRENCY` so the tick never opens an
+        // unbounded burst of pool acquisitions against the shared cluster.
+        // Held tenants are filtered out before polling — their work sits for
+        // when the hold lifts.
+        use futures::StreamExt;
         let mut queues: VecDeque<TenantQueue> = VecDeque::new();
-        for (account_id, hint_stamp) in candidates {
-            if held.contains(&account_id) {
-                // Dispatch is held (provider pause or mid-upgrade tenant),
-                // not the work: the hint (and the ledger rows behind it)
-                // stay put for when the hold lifts.
-                continue;
-            }
+        let mut polls = futures::stream::iter(candidates.into_iter().filter_map(
+            |(account_id, hint_stamp)| {
+                if held.contains(&account_id) {
+                    // Dispatch is held (provider pause, billing/storage hold,
+                    // or mid-upgrade tenant), not the work: the hint (and the
+                    // ledger rows behind it) stay put for when the hold lifts.
+                    None
+                } else {
+                    Some(self.poll_candidate(account_id, hint_stamp))
+                }
+            },
+        ))
+        .buffer_unordered(SCAN_CONCURRENCY);
+
+        while let Some(result) = polls.next().await {
             outcome.polled += 1;
-            // Bounded per tenant: one wedged or unreachable tenant database
-            // must not head-of-line-block every other tenant's dispatch.
-            // Timeout and error both skip the tenant for this tick with its
-            // hint retained — the next tick (or the slow scan) retries.
-            let poll = match tokio::time::timeout(
-                self.config.tenant_poll_timeout,
-                self.poll_tenant(&account_id),
-            )
-            .await
-            {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        account_id,
-                        error = %e,
-                        "[dispatcher] tenant poll failed; skipping this tick"
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        account_id,
-                        timeout_ms = self.config.tenant_poll_timeout.as_millis() as u64,
-                        "[dispatcher] tenant poll timed out; skipping this tick"
-                    );
-                    continue;
-                }
-            };
-
-            // Atom-limit gate (plan: "Background jobs that hit a limit block,
-            // sit in the ledger"): when the tenant is at/over its account-wide
-            // atom ceiling, DEFER the atom-creating work this tick (feed polls
-            // ingest atoms, report runs write findings) rather than create
-            // atoms uncounted past the quota guard's data-plane reach. The
-            // durable ledger rows are untouched — the feed/report stays
-            // pending and re-derives next tick, proceeding once the user
-            // deletes data or upgrades (mirroring the provider-pause hold).
-            // Non-atom-creating work (embedding, wiki, maintenance) is never
-            // skipped: it doesn't grow the count, and stalling it would strand
-            // the very pipeline that lets a user get back under the limit.
-            let mut poll = poll;
-            if poll.items.iter().any(WorkItem::creates_atoms)
-                && self.over_atom_limit(&account_id).await
-            {
-                let before = poll.items.len();
-                poll.items.retain(|item| !item.creates_atoms());
-                let deferred = before - poll.items.len();
-                tracing::info!(
-                    account_id,
-                    deferred,
-                    "[dispatcher] tenant at atom limit; deferring atom-creating background work \
-                     (feed polls / report runs) this tick"
-                );
+            if result.hint_cleared {
+                outcome.hints_cleared += 1;
             }
-
-            let has_work = !poll.items.is_empty() || poll.ledger_active;
-            match (has_work, hint_stamp) {
-                (false, Some(stamp)) => {
-                    // Ledgers empty: clear, unless an enqueue bumped the
-                    // hint after our scan read it (the dual-write bound).
-                    match clear_hint_if_older(&self.control, &account_id, stamp).await {
-                        Ok(true) => outcome.hints_cleared += 1,
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(account_id, error = %e, "[dispatcher] hint clear failed")
-                        }
-                    }
-                }
-                (true, None) => {
-                    // Slow-path discovery: re-arm the fast path so this
-                    // tenant is watched every tick until it drains.
-                    if let Err(e) = mark_hint(&self.control, &account_id).await {
-                        tracing::warn!(account_id, error = %e, "[dispatcher] hint re-mark failed");
-                    }
-                }
-                _ => {}
-            }
-
-            if !poll.items.is_empty() {
-                queues.push_back(TenantQueue {
-                    account_id,
-                    items: poll.items,
-                });
+            if let Some(queue) = result.queue {
+                queues.push_back(queue);
             }
         }
+        drop(polls);
 
         let (scheduled, handles) = self.drain(&mut queues).await;
         outcome.scheduled = scheduled;
         outcome.handles = handles;
         outcome
+    }
+
+    /// Poll one (non-held) candidate and run its hint lifecycle, returning
+    /// the work to enqueue this tick. The whole body is self-contained so a
+    /// tick can run many candidates concurrently (DISP-2):
+    ///
+    /// 1. Poll the tenant's ledgers, bounded by `tenant_poll_timeout` — a
+    ///    wedged or unreachable database is skipped for the tick with its
+    ///    hint retained (the next tick, or the slow scan, retries).
+    /// 2. Apply the account-wide atom-limit gate: defer atom-creating work
+    ///    (feed polls, report runs) when the tenant is at its ceiling.
+    /// 3. Run the hint lifecycle: clear a now-empty tenant's hint (fenced by
+    ///    its scan stamp), or re-arm the fast path on slow-path discovery.
+    ///
+    /// Errors are logged and folded into an empty result — one broken tenant
+    /// must never abort the whole tick.
+    async fn poll_candidate(
+        &self,
+        account_id: String,
+        hint_stamp: Option<DateTime<Utc>>,
+    ) -> CandidatePoll {
+        // Bounded per tenant: one wedged or unreachable tenant database must
+        // not head-of-line-block every other tenant's dispatch. Timeout and
+        // error both skip the tenant for this tick with its hint retained.
+        let poll = match tokio::time::timeout(
+            self.config.tenant_poll_timeout,
+            self.poll_tenant(&account_id),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    account_id,
+                    error = %e,
+                    "[dispatcher] tenant poll failed; skipping this tick"
+                );
+                return CandidatePoll::empty();
+            }
+            Err(_) => {
+                tracing::warn!(
+                    account_id,
+                    timeout_ms = self.config.tenant_poll_timeout.as_millis() as u64,
+                    "[dispatcher] tenant poll timed out; skipping this tick"
+                );
+                return CandidatePoll::empty();
+            }
+        };
+
+        // Atom-limit gate (plan: "Background jobs that hit a limit block,
+        // sit in the ledger"): when the tenant is at/over its account-wide
+        // atom ceiling, DEFER the atom-creating work this tick (feed polls
+        // ingest atoms, report runs write findings) rather than create
+        // atoms uncounted past the quota guard's data-plane reach. The
+        // durable ledger rows are untouched — the feed/report stays
+        // pending and re-derives next tick, proceeding once the user
+        // deletes data or upgrades (mirroring the provider-pause hold).
+        // Non-atom-creating work (embedding, wiki, maintenance) is never
+        // skipped: it doesn't grow the count, and stalling it would strand
+        // the very pipeline that lets a user get back under the limit.
+        let mut poll = poll;
+        if poll.items.iter().any(WorkItem::creates_atoms) && self.over_atom_limit(&account_id).await
+        {
+            let before = poll.items.len();
+            poll.items.retain(|item| !item.creates_atoms());
+            let deferred = before - poll.items.len();
+            tracing::info!(
+                account_id,
+                deferred,
+                "[dispatcher] tenant at atom limit; deferring atom-creating background work \
+                 (feed polls / report runs) this tick"
+            );
+        }
+
+        let has_work = !poll.items.is_empty() || poll.ledger_active;
+        let mut hint_cleared = false;
+        match (has_work, hint_stamp) {
+            (false, Some(stamp)) => {
+                // Ledgers empty: clear, unless an enqueue bumped the
+                // hint after our scan read it (the dual-write bound).
+                match clear_hint_if_older(&self.control, &account_id, stamp).await {
+                    Ok(true) => hint_cleared = true,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(account_id, error = %e, "[dispatcher] hint clear failed")
+                    }
+                }
+            }
+            (true, None) => {
+                // Slow-path discovery: re-arm the fast path so this
+                // tenant is watched every tick until it drains.
+                if let Err(e) = mark_hint(&self.control, &account_id).await {
+                    tracing::warn!(account_id, error = %e, "[dispatcher] hint re-mark failed");
+                }
+            }
+            _ => {}
+        }
+
+        let queue = (!poll.items.is_empty()).then(|| TenantQueue {
+            account_id,
+            items: poll.items,
+        });
+        CandidatePoll {
+            queue,
+            hint_cleared,
+        }
     }
 
     /// Round-robin admission over per-tenant queues: pop a tenant, admit
@@ -1102,11 +1180,23 @@ impl Dispatcher {
     }
 
     /// The per-tenant dispatch holds (module docs, tick step 1), one round
-    /// trip for both:
+    /// trip for all of them:
     ///
     /// - **Provider pause** (plan: per-tenant circuit breaker): the
     ///   [`ProviderBreaker`] writes `accounts.provider_paused_until`
     ///   (migration 007); both pause kinds hold background dispatch.
+    /// - **Billing hold** (plan: dunning state machine): a delinquent
+    ///   `billing_state IN ('read_only','suspended')` — the same states the
+    ///   data-plane write-guard and CloudAuth's serving gate enforce on the
+    ///   request path — holds background dispatch too, so a non-paying tenant
+    ///   can't keep draining pipeline/report/feed-poll work past the
+    ///   write-block (the bounded managed-spend / dunning-policy escape).
+    ///   Trailing `past_due` is deliberately NOT held: it still serves writes,
+    ///   so its background work runs until it crosses the read-only line.
+    /// - **Storage restriction** (plan: storage quota): a tenant whose
+    ///   `storage_state = 'restricted'` (over its byte limit past the grace
+    ///   window) has writes blocked exactly as `read_only` does; its
+    ///   background work holds for the same reason.
     /// - **Mid-upgrade tenant** (plan: "Schema migration on deploy"): any
     ///   active `account_databases` row lagging the compiled tenant schema
     ///   target — the same predicate CloudAuth's straggler gate applies per
@@ -1131,6 +1221,8 @@ impl Dispatcher {
             "SELECT id FROM accounts \
              WHERE id = ANY($1) \
                AND ((provider_paused_until IS NOT NULL AND provider_paused_until > NOW()) \
+                    OR billing_state IN ('read_only', 'suspended') \
+                    OR storage_state = 'restricted' \
                     OR EXISTS (SELECT 1 FROM account_databases ad \
                                WHERE ad.account_id = accounts.id \
                                  AND ad.status = 'active' \
@@ -1179,7 +1271,9 @@ impl Dispatcher {
         if plan.atom_limit.is_none() {
             return false;
         }
-        let handle = match self.cache.get_or_load(account_id).await {
+        // No-touch dispatch resolve (DISP-3): the atom-limit gate is a
+        // background read and must not keep an idle tenant warm.
+        let handle = match self.cache.get_for_dispatch(account_id).await {
             Ok(handle) => handle,
             Err(e) => {
                 tracing::warn!(account_id, error = %e, "[dispatcher] tenant load for atom-limit gate failed; not deferring");
@@ -1198,7 +1292,9 @@ impl Dispatcher {
     /// The N+1 poll: translate one tenant's ledger state into work items.
     /// Read-only — claims happen in the workers.
     async fn poll_tenant(&self, account_id: &str) -> Result<TenantPoll, CloudError> {
-        let handle = self.cache.get_or_load(account_id).await?;
+        // No-touch dispatch resolve (DISP-3): the N+1 poll runs over every
+        // active tenant and must not keep idle ones warm against the LRU.
+        let handle = self.cache.get_for_dispatch(account_id).await?;
         let (databases, _) = handle
             .manager
             .list_databases()
@@ -1290,6 +1386,24 @@ impl Dispatcher {
             items,
             ledger_active,
         })
+    }
+}
+
+/// What polling one candidate amounted to (DISP-2): the work to enqueue
+/// this tick, if any, plus whether the candidate's hint was cleared — folded
+/// back into the per-tick counters as the concurrent polls complete.
+struct CandidatePoll {
+    queue: Option<TenantQueue>,
+    hint_cleared: bool,
+}
+
+impl CandidatePoll {
+    /// A poll that produced nothing — a timed-out, errored, or empty tenant.
+    fn empty() -> Self {
+        Self {
+            queue: None,
+            hint_cleared: false,
+        }
     }
 }
 

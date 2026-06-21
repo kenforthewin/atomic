@@ -5,3 +5,5 @@ ALTER TABLE tags ADD COLUMN IF NOT EXISTS is_autotag_target BOOLEAN NOT NULL DEF
 UPDATE tags SET is_autotag_target = TRUE
   WHERE parent_id IS NULL
     AND name IN ('Topics', 'People', 'Locations', 'Organizations', 'Events');
+
+INSERT INTO schema_version (version) VALUES (5);

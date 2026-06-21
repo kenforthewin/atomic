@@ -479,8 +479,31 @@ pub fn configure_cloud_app(
         // cloud-unaware `RequestManager` override) — so every tenant's `/mcp`
         // call hits its own knowledge base, never the inert baked-in manager.
         // The plane guard fails closed if the extension is somehow absent.
+        //
+        // The MCP plane carries the SAME data-plane guards as `/api`: it is
+        // another atom-creating data-plane surface (the `create_atom` tool
+        // fires the full embedding/tagging/edge pipeline), so leaving it
+        // unguarded was a billing/quota/write-block/rate-limit bypass any
+        // tenant with an MCP token could drive. The two guards that are
+        // `/api`-specific are intentionally absent: `mark_hint_on_mutation`
+        // marks the dispatcher's REST mutation hints (the MCP transport isn't
+        // a dispatch surface) and `chat_stream_guard` caps the REST chat-stream
+        // routes (MCP has no chat-stream endpoint). The atom-creating guards —
+        // billing write-block, quota, out-of-credits, rate-limit — all apply,
+        // wrapped in the same outermost-last-registered order as `api_scope`
+        // (auth and the plane guard outermost; `quota_guard` introspects the
+        // JSON-RPC body to charge only `create_atom` calls). The guards read
+        // the plan registry and rate limiter from app data, so both are
+        // cloned onto this scope (a cheap Arc clone; the `/api` scope owns the
+        // originals below).
         cfg.service(
             mcp_scope(mcp_transport)
+                .app_data(plan_registry.clone())
+                .app_data(web::Data::new(rate_limiter.clone()))
+                .wrap(from_fn(out_of_credits_guard))
+                .wrap(from_fn(quota_guard))
+                .wrap(from_fn(billing_write_guard))
+                .wrap(from_fn(data_plane_rate_limit_guard))
                 .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth.clone()),
         );

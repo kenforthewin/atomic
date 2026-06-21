@@ -146,14 +146,25 @@ impl ManagedKeys {
     /// key can still complete. On the resume path the active-provider
     /// pointer is re-asserted, healing a crash that landed between the row
     /// insert and the pointer flip.
+    ///
+    /// `allowance_cents` is the per-key monthly credit cap to mint the key
+    /// with — the provisioning caller resolves it from the account's plan
+    /// (`plans.ai_credits_monthly_cents`; free=50, pro=2000 per migration
+    /// 010) so the key is sized to the tier the account is actually on, not
+    /// the fleet-wide fallback. `None` falls back to the configured
+    /// [`ManagedKeyConfig::monthly_allowance_cents`] (the `--managed-key-
+    /// allowance-cents` flag's default), the legacy behavior for callers
+    /// that can't resolve a plan.
     pub(crate) async fn ensure_managed_key(
         &self,
         control: &ControlPlane,
         account_id: &str,
+        allowance_cents: Option<u32>,
     ) -> Result<Option<String>, CloudError> {
         let ManagedKeys::Enabled { api, vault, config } = self else {
             return Ok(None);
         };
+        let allowance_cents = allowance_cents.unwrap_or(config.monthly_allowance_cents);
 
         let existing: Option<Option<String>> = sqlx::query_scalar(
             "SELECT external_key_id FROM provider_credentials \
@@ -191,7 +202,7 @@ impl ManagedKeys {
         let created = api
             .create_key(
                 &managed_key_name(account_id),
-                config.monthly_allowance_cents,
+                allowance_cents,
                 /* monthly_reset */ true,
             )
             .await?;
@@ -329,6 +340,55 @@ impl ManagedKeys {
         for external_key_id in &ids {
             self.delete_external_key_best_effort(account_id, external_key_id)
                 .await;
+        }
+        Ok(())
+    }
+
+    /// Re-size the account's managed runtime key(s) to `allowance_cents`,
+    /// best-effort (plan: plan-change row of the lifecycle table). Called on
+    /// every plan transition so the per-key OpenRouter spend cap tracks the
+    /// account's current tier (`plans.ai_credits_monthly_cents`) — without
+    /// this the key stays pinned at its signup allowance and a paid/trial
+    /// account's AI dies once it spends the free tier's $0.50.
+    ///
+    /// **Best-effort, never fatal.** A plan transition is a billing-state
+    /// change that has already committed by the time this runs; a provider
+    /// outage on the PATCH must not roll it back or wedge the caller (a
+    /// webhook, a trial sweep, a signup). A failure is a loud
+    /// `tracing::error!` and the next transition (or an operator) reconciles
+    /// it. `Disabled` mode and accounts with no managed key are silent no-ops
+    /// (keyless/BYOK accounts have no managed cap to move). Errors only when
+    /// the control-plane *read* of the key id fails.
+    pub(crate) async fn reconcile_key_limit(
+        &self,
+        control: &ControlPlane,
+        account_id: &str,
+        allowance_cents: u32,
+    ) -> Result<(), CloudError> {
+        let ManagedKeys::Enabled { api, .. } = self else {
+            return Ok(());
+        };
+        for external_key_id in self.managed_key_ids(control, account_id).await? {
+            match api
+                .update_key_limit(&external_key_id, allowance_cents)
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    account_id,
+                    external_key_id,
+                    allowance_cents,
+                    "reconciled managed runtime key limit to plan allowance"
+                ),
+                Err(e) => tracing::error!(
+                    account_id,
+                    external_key_id,
+                    allowance_cents,
+                    error = %e,
+                    "failed to reconcile managed runtime key limit; the plan \
+                     transition stands and the next transition (or an operator) \
+                     will reconcile it"
+                ),
+            }
         }
         Ok(())
     }

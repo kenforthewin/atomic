@@ -281,7 +281,23 @@ impl AccountCache {
     /// row anyway, should use
     /// [`get_or_load_with_generation`](Self::get_or_load_with_generation).
     pub async fn get_or_load(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
-        self.lookup_or_build(account_id).await
+        self.lookup_or_build(account_id, true).await
+    }
+
+    /// Resolve `account_id` for **background dispatch**, WITHOUT refreshing the
+    /// entry's idle clock on a hit (DISP-3).
+    ///
+    /// The slow-scan poll (300s) resolves every active tenant; if each of those
+    /// resolves through [`get_or_load`](Self::get_or_load) it bumps
+    /// `last_touched`, so above `max_entries` no idle tenant ever ages out — the
+    /// scan keeps the whole fleet warm and every miss evicts an LRU entry the
+    /// next scan rebuilds, thrashing pool opens against the shared cluster. This
+    /// accessor leaves `last_touched` untouched on a hit, so only genuine
+    /// serving traffic (the request/WS path) keeps a tenant warm; background
+    /// polling can't pin the cache at cap. A miss still builds (and seeds the
+    /// new entry's clock — a load is a load), so dispatch always sees fresh data.
+    pub async fn get_for_dispatch(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
+        self.lookup_or_build(account_id, false).await
     }
 
     /// [`get_or_load`](Self::get_or_load), plus the per-request convergence
@@ -298,20 +314,32 @@ impl AccountCache {
         account_id: &str,
         observed_generation: i64,
     ) -> Result<TenantHandle, CloudError> {
-        let handle = self.lookup_or_build(account_id).await?;
+        let handle = self.lookup_or_build(account_id, true).await?;
         self.refresh_stale_provider_config(account_id, observed_generation)
             .await?;
         Ok(handle)
     }
 
-    async fn lookup_or_build(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
+    /// `touch_on_hit` refreshes the entry's idle clock on a cache hit. The
+    /// serving paths pass `true`; background dispatch passes `false` so polling
+    /// can't keep an idle tenant warm (DISP-3 — see [`get_for_dispatch`]).
+    /// A miss always builds and seeds the new entry's clock regardless.
+    ///
+    /// [`get_for_dispatch`]: Self::get_for_dispatch
+    async fn lookup_or_build(
+        &self,
+        account_id: &str,
+        touch_on_hit: bool,
+    ) -> Result<TenantHandle, CloudError> {
         loop {
             // Fast path: cache hit. Otherwise pick up (or register) the
             // account's build permit while still under the map lock.
             let load_lock = {
                 let mut inner = self.inner.lock().await;
                 if let Some(entry) = inner.entries.get_mut(account_id) {
-                    entry.last_touched = Instant::now();
+                    if touch_on_hit {
+                        entry.last_touched = Instant::now();
+                    }
                     return Ok(entry.handle());
                 }
                 Arc::clone(inner.loading.entry(account_id.to_string()).or_default())
@@ -327,7 +355,9 @@ impl AccountCache {
             {
                 let mut inner = self.inner.lock().await;
                 if let Some(entry) = inner.entries.get_mut(account_id) {
-                    entry.last_touched = Instant::now();
+                    if touch_on_hit {
+                        entry.last_touched = Instant::now();
+                    }
                     return Ok(entry.handle());
                 }
                 let still_registered = inner

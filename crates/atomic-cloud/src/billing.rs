@@ -142,6 +142,19 @@ pub trait BillingProvider: Send + Sync {
         stripe_customer_id: &str,
         return_url: &str,
     ) -> Result<StripeSession, CloudError>;
+
+    /// Cancel a subscription immediately (`DELETE /v1/subscriptions/{id}`).
+    /// Called from account deletion so a destroyed workspace stops billing —
+    /// hard-delete v1 ends the relationship outright rather than letting it
+    /// run to period end. **Idempotent for the caller's purposes**: Stripe
+    /// returns the already-canceled subscription on a repeat, which the
+    /// caller treats as success.
+    ///
+    /// Surfaced as a best-effort step in [`crate::provision::delete_account`]
+    /// — a Stripe outage must never wedge a deletion, so the caller logs and
+    /// proceeds on error (the local rows are wiped regardless; an operator
+    /// reconciles a leaked subscription from the Stripe dashboard).
+    async fn cancel_subscription(&self, stripe_subscription_id: &str) -> Result<(), CloudError>;
 }
 
 /// The real Stripe REST client. Adapted from the parts-bin (commit 4b44c51)
@@ -216,6 +229,34 @@ impl StripeClient {
             message: format!("unparseable response: {e}"),
         })
     }
+
+    /// DELETE a Stripe resource, mapping a non-success status to a typed
+    /// [`CloudError::Stripe`]. A `404` is treated as success — the only
+    /// caller is subscription cancellation, where "already gone / already
+    /// canceled" is the desired end state (the same idempotency contract the
+    /// provisioning-key delete uses). The secret key rides in Basic-auth and
+    /// never appears in any error.
+    async fn delete(&self, path: &str, context: &'static str) -> Result<(), CloudError> {
+        let resp = self
+            .http
+            .delete(format!("{}{path}", self.base_url))
+            .basic_auth(&self.secret_key, None::<&str>)
+            .send()
+            .await
+            .map_err(|e| CloudError::Stripe {
+                context: context.to_string(),
+                message: e.to_string(),
+            })?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(CloudError::Stripe {
+            context: context.to_string(),
+            message: format!("HTTP {}: {}", status.as_u16(), bounded(&body)),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -261,6 +302,35 @@ impl BillingProvider for StripeClient {
             .await?;
         session_url(json, "portal")
     }
+
+    async fn cancel_subscription(&self, stripe_subscription_id: &str) -> Result<(), CloudError> {
+        // `DELETE /v1/subscriptions/{id}` cancels immediately. The id is
+        // interpolated into the path (Stripe ids can't be query/body params),
+        // so it is shape-guarded first — a Stripe subscription id is
+        // `[A-Za-z0-9_]+` and never URL-special, and a corrupted
+        // control-plane value must not path-splice into the request.
+        if !is_stripe_id(stripe_subscription_id) {
+            return Err(CloudError::Stripe {
+                context: "canceling subscription".to_string(),
+                message: format!("malformed subscription id {stripe_subscription_id:?}"),
+            });
+        }
+        self.delete(
+            &format!("/v1/subscriptions/{stripe_subscription_id}"),
+            "canceling subscription",
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Whether `id` has the safe shape of a Stripe object id — `[A-Za-z0-9_]+`,
+/// non-empty. Used to guard an id before it is interpolated into a request
+/// path (ids can't be bound as params). Stripe ids (`sub_…`, `cus_…`) match
+/// by construction; anything else is a corrupted control-plane value and is
+/// rejected rather than spliced into the URL.
+fn is_stripe_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Pull the `url` field out of a Stripe session response.
@@ -687,5 +757,44 @@ mod tests {
             Err(CloudError::InvalidStripeConfig(_))
         ));
         assert!(StripeClient::new("sk_test_x").is_ok());
+    }
+
+    #[test]
+    fn stripe_id_shape_guard() {
+        // Real Stripe ids pass.
+        for ok in ["sub_1MqL0", "cus_NffrFeUfNV2Hib", "sub_ABC123_xyz"] {
+            assert!(is_stripe_id(ok), "{ok:?} should be a valid id");
+        }
+        // Empty and anything with URL-special / path characters is rejected,
+        // so a corrupted control-plane value can't path-splice the request.
+        for bad in [
+            "",
+            "sub_1/../accounts",
+            "sub 1",
+            "sub_1?expand=customer",
+            "sub_1%2e",
+            "sub_1#frag",
+        ] {
+            assert!(!is_stripe_id(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_subscription_rejects_a_malformed_id_before_any_request() {
+        // A corrupted id never reaches the network — the guard short-circuits
+        // with a typed Stripe error (the base URL points nowhere reachable, so
+        // a request would error differently if one were made).
+        let client =
+            StripeClient::with_base_url("sk_test_x", "http://127.0.0.1:1").expect("construct");
+        let err = client
+            .cancel_subscription("sub_1/../oops")
+            .await
+            .expect_err("malformed id");
+        match err {
+            CloudError::Stripe { message, .. } => {
+                assert!(message.contains("malformed subscription id"), "{message}");
+            }
+            other => panic!("expected Stripe error, got {other:?}"),
+        }
     }
 }

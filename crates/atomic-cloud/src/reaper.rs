@@ -175,6 +175,22 @@ use crate::provision::{
     terminate_and_drop_database, ClusterConfig, NewAccount,
 };
 
+/// Maximum tenant databases the orphan arm (arm 2) will drop in a single
+/// pass. The orphan drop is irreversible, so a pass that suddenly believes
+/// dozens of live tenants are unreferenced — the signature of a misdirected
+/// `--control-url` after a failover or a half-restored control plane — must
+/// not be able to take the whole fleet down in one sweep. Surplus orphans
+/// are left for the next pass, which only proceeds if the control plane
+/// still disowns them; a genuine backlog drains a few passes later, but a
+/// misconfiguration is caught with at most this many casualties.
+const MAX_ORPHAN_DROPS_PER_PASS: usize = 10;
+
+/// Orphan-candidate count above which the arm logs a loud `warn!` even when
+/// the control plane is non-empty. A healthy fleet accrues orphans one at a
+/// time (a crashed signup, a rollback window); a count this high is debris
+/// worth an operator's attention regardless of the drop cap.
+const IMPLAUSIBLE_ORPHAN_COUNT: usize = 10;
+
 /// Tunables for a reaper pass. [`Default`] is the production configuration;
 /// tests shrink fields to drive specific arms. `Debug` is hand-written (the
 /// backup store is a trait object); see the impl below.
@@ -346,6 +362,16 @@ pub struct ReaperSummary {
     /// Orphan candidates skipped because another pass holds the lock for
     /// their embedded account id.
     pub orphan_dbs_skipped_locked: Vec<String>,
+    /// `true` when the orphan arm refused to reclaim anything this pass
+    /// because the control plane reported **zero** accounts while the
+    /// cluster held tenant databases — the signature of a misdirected
+    /// `--control-url` (failover / half-restored control plane), not of a
+    /// genuinely empty fleet. The arm warns and skips rather than dropping.
+    pub orphan_reclaim_refused: bool,
+    /// Orphan candidates left undropped this pass because the per-pass cap
+    /// ([`MAX_ORPHAN_DROPS_PER_PASS`]) was reached (database names). They are
+    /// reconsidered next pass — and only dropped if still disowned.
+    pub orphan_dbs_capped: Vec<String>,
     /// Interrupted deletions completed (account ids; rows gone, subdomains
     /// re-parked).
     pub deletions_completed: Vec<String>,
@@ -397,6 +423,8 @@ impl ReaperSummary {
             && self.stuck_deferred_provider_outage.is_empty()
             && self.orphan_dbs_dropped.is_empty()
             && self.orphan_dbs_skipped_locked.is_empty()
+            && !self.orphan_reclaim_refused
+            && self.orphan_dbs_capped.is_empty()
             && self.deletions_completed.is_empty()
             && self.deletions_skipped_locked.is_empty()
             && self.migrations_recovered.is_empty()
@@ -869,16 +897,68 @@ async fn scan_orphans(
     // `\_` keeps LIKE's underscore literal; is_tenant_db_name below is the
     // authoritative shape check either way (and the guard every drop
     // re-asserts before interpolating the name into DDL).
-    let candidates: Vec<String> =
-        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname LIKE 'acct\\_%'")
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(CloudError::db("listing tenant-shaped databases"))?;
+    let candidates: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT datname FROM pg_database WHERE datname LIKE 'acct\\_%'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(CloudError::db("listing tenant-shaped databases"))?
+    .into_iter()
+    .filter(|name| is_tenant_db_name(name))
+    .collect();
 
-    for db_name in candidates
-        .into_iter()
-        .filter(|name| is_tenant_db_name(name))
-    {
+    // Data-loss guardrail (REL-4). The under-lock re-check re-queries the
+    // SAME control plane that produced the unlocked pre-check, so a control
+    // plane that is wrong about *every* account — a `--control-url`
+    // misdirected after a failover, or one pointed at a half-restored /
+    // empty database — would have this arm disown the entire fleet and drop
+    // it within one pass. Before touching anything, ask the control plane how
+    // many accounts it knows about: a fleet with live tenant databases but
+    // ZERO accounts is implausible enough to be a misconfiguration, so we
+    // refuse the whole arm and warn rather than reclaim.
+    if !candidates.is_empty() {
+        let account_count = control_account_count(control).await?;
+        if account_count == 0 {
+            tracing::warn!(
+                tenant_databases = candidates.len(),
+                "reaper: orphan reclaim REFUSED — control plane reports zero \
+                 accounts but the cluster holds tenant databases; this is the \
+                 signature of a misdirected control-plane URL (failover / \
+                 half-restored control plane), not an empty fleet. Dropping \
+                 nothing this pass; verify --control-url points at the live \
+                 control plane"
+            );
+            summary.orphan_reclaim_refused = true;
+            return Ok(());
+        }
+        // A non-empty control plane can still accrue a few orphans (a crashed
+        // signup, a rollback crash window), but a pile this large is debris
+        // worth an operator's eyes regardless of the per-pass cap below.
+        if candidates.len() >= IMPLAUSIBLE_ORPHAN_COUNT {
+            tracing::warn!(
+                orphan_candidates = candidates.len(),
+                account_count,
+                cap = MAX_ORPHAN_DROPS_PER_PASS,
+                "reaper: implausibly high orphan-database count — dropping at \
+                 most the per-pass cap and deferring the rest; investigate \
+                 whether the control plane is healthy before assuming these \
+                 are genuine debris"
+            );
+        }
+    }
+
+    let mut dropped_this_pass = 0usize;
+    for db_name in candidates {
+        // Per-pass drop cap (REL-4): once we have dropped the cap's worth,
+        // every remaining disowned candidate is deferred — recorded, not
+        // dropped — so a single misconfigured pass can fell at most
+        // `MAX_ORPHAN_DROPS_PER_PASS` tenants before an operator can react. A
+        // genuine backlog drains over the following passes (each re-proving
+        // the orphan status), which is the safe direction to be slow in.
+        if dropped_this_pass >= MAX_ORPHAN_DROPS_PER_PASS {
+            summary.orphan_dbs_capped.push(db_name);
+            continue;
+        }
         let Some(account_uuid) = tenant_db_account_id(&db_name) else {
             continue; // unreachable post-filter; belt and braces
         };
@@ -931,6 +1011,7 @@ async fn scan_orphans(
                      account_databases row referenced it)"
                 );
                 summary.orphan_dbs_dropped.push(db_name);
+                dropped_this_pass += 1;
             }
             Ok(false) => {}
             Err(e) => record_error(
@@ -960,6 +1041,18 @@ async fn is_referenced(
     .fetch_one(control.pool())
     .await
     .map_err(CloudError::db("checking orphan candidate references"))
+}
+
+/// Total `accounts` rows the control plane knows about — every status, not
+/// just `'active'`, so an in-flight `'provisioning'` row counts. The orphan
+/// arm's zero-accounts refusal (REL-4) keys on this: a cluster holding
+/// tenant databases while the control plane reports *no* accounts at all is
+/// the fingerprint of a misdirected control-plane URL, not an empty fleet.
+async fn control_account_count(control: &ControlPlane) -> Result<i64, CloudError> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(control.pool())
+        .await
+        .map_err(CloudError::db("counting control-plane accounts"))
 }
 
 /// Arm 3 — interrupted deletions: active accounts with no
@@ -1056,6 +1149,12 @@ async fn complete_interrupted_deletions(
                 control,
                 cluster,
                 managed,
+                // The reaper carries no billing provider, so it cannot fire a
+                // Stripe cancel here (the DEL-1 `billing` is `None`); a
+                // subscription left by an interrupted deletion is reconciled
+                // from the Stripe dashboard, the same best-effort discipline the
+                // CLI path follows.
+                None,
                 backup_policy,
                 crate::provision::DeleteLock::AlreadyHeld,
                 &account_id,

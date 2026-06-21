@@ -79,7 +79,9 @@
 //!   same dimension pin applies — a write whose effective embedding
 //!   dimension differs from the platform's is rejected before anything is
 //!   stored. A same-dimension embedding-model change returns a loud
-//!   `reembed_warning` — every stored vector is invalidated by it.
+//!   `reembed_warning` — existing vectors were produced by the old model and
+//!   are NOT re-embedded automatically, so search over existing content stays
+//!   degraded until the operator manually re-embeds.
 //!
 //! **Live rotation** (plan steps 1-6): after any successful write the fresh
 //! [`ProviderConfig`] is applied to the account's cached entry via
@@ -200,6 +202,7 @@ use serde_json::{json, Value};
 
 use crate::account_cache::AccountCache;
 use crate::auth::{CloudAuth, ResolvedTenant};
+use crate::billing::BillingProvider;
 use crate::control_plane::ControlPlane;
 use crate::curated_models::{
     merge_managed_model_config, validate_managed_model_config, PINNED_EMBEDDING_DIMENSION,
@@ -229,9 +232,6 @@ const VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Usage is decoration on a status response; the response must never block
 /// on the provisioning API (plan: "Audit / visibility" — best-effort).
 const USAGE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Bound provider error bodies before they enter responses and logs.
-const PROVIDER_ERROR_MAX_CHARS: usize = 500;
 
 /// The owned form of [`crate::BackupPolicy`] the tenant plane holds across
 /// workers (adversarial-review issue 3). `serve` installs
@@ -304,6 +304,13 @@ struct PlaneState {
     /// [`TenantPlane::with_billing_configured`]; tests that don't exercise
     /// billing leave the default.
     billing_configured: bool,
+    /// The configured Stripe billing provider, threaded so the active-deletion
+    /// route (`DELETE /api/account`) can fire a best-effort subscription cancel
+    /// before the accounts-row CASCADE sweeps the `stripe_subscriptions`
+    /// pointer (DEL-1). `None` when billing is unconfigured (dev/tests, or a
+    /// deployment with no Stripe key); `serve` wires it from
+    /// [`crate::billing_routes::Billing::provider`].
+    billing_provider: Option<Arc<dyn BillingProvider>>,
 }
 
 /// Per-account serialization of the provider-mutation routes (BYOK save,
@@ -373,6 +380,7 @@ impl TenantPlane {
                 backup_timeout: crate::backup::DEFAULT_BACKUP_TIMEOUT,
                 provider_locks: AccountLocks::default(),
                 billing_configured: false,
+                billing_provider: None,
             }),
         }
     }
@@ -398,6 +406,31 @@ impl TenantPlane {
             backup_timeout: state.backup_timeout,
             provider_locks: AccountLocks::default(),
             billing_configured: configured,
+            billing_provider: state.billing_provider.clone(),
+        });
+        self
+    }
+
+    /// Wire the Stripe billing provider so the active-deletion route fires a
+    /// best-effort subscription cancel before the accounts-row CASCADE destroys
+    /// the `stripe_subscriptions` pointer (DEL-1). `serve` calls this from
+    /// [`crate::billing_routes::Billing::provider`]; tests and unconfigured
+    /// deployments leave the `None` default (the cancel step is then skipped).
+    /// Like the other builders, this rebuilds the shared `web::Data`, so it must
+    /// be called before the plane is shared with workers.
+    pub fn with_billing_provider(mut self, provider: Option<Arc<dyn BillingProvider>>) -> Self {
+        let state = &*self.state;
+        self.state = web::Data::new(PlaneState {
+            control: state.control.clone(),
+            cluster: state.cluster.clone(),
+            managed: state.managed.clone(),
+            vault: state.vault.clone(),
+            cache: Arc::clone(&state.cache),
+            backup_policy: state.backup_policy.clone(),
+            backup_timeout: state.backup_timeout,
+            provider_locks: AccountLocks::default(),
+            billing_configured: state.billing_configured,
+            billing_provider: provider,
         });
         self
     }
@@ -426,6 +459,7 @@ impl TenantPlane {
             backup_timeout: timeout,
             provider_locks: AccountLocks::default(),
             billing_configured: state.billing_configured,
+            billing_provider: state.billing_provider.clone(),
         });
         self
     }
@@ -722,6 +756,12 @@ async fn delete_account_route(
             &task_state.control,
             &task_state.cluster,
             &task_state.managed,
+            // This is the canonical active-deletion path, so it MUST fire the
+            // best-effort Stripe subscription cancel before step 7's CASCADE
+            // sweeps the `stripe_subscriptions` pointer (DEL-1). `delete_account`
+            // treats `None` (unconfigured billing) and a missing subscription
+            // row as no-ops, so this is correct whether or not Stripe is wired.
+            task_state.billing_provider.as_ref(),
             task_state.backup_policy.as_policy(),
             crate::provision::DeleteLock::Acquire,
             &account_id,
@@ -1261,14 +1301,14 @@ async fn validate_openrouter_key(config: &ProviderConfig) -> Result<(), String> 
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().await.unwrap_or_default();
-    // Scrub the key out BEFORE truncating: the verbatim replace can only
-    // match the whole key, so truncating first could cut an echoed key in
-    // half and leave the surviving fragment unscrubbed.
-    let body = scrub_secret(&body, provider.api_key());
+    // Do NOT echo the upstream response body: this validation drives an
+    // outbound request to a tenant-supplied base URL, so reflecting the body
+    // turns a non-2xx into a read-oracle for whatever the URL points at
+    // (SEC-1). Report the status code only — enough for the tenant to fix a
+    // bad key, nothing about the upstream content.
     Err(format!(
-        "HTTP {status}: {}",
-        truncate_chars(&body, PROVIDER_ERROR_MAX_CHARS)
+        "the provider rejected the request (HTTP {})",
+        status.as_u16()
     ))
 }
 
@@ -1285,34 +1325,16 @@ async fn validate_openai_compat_key(config: &ProviderConfig) -> Result<(), Strin
         .await
         .map(|_| ())
         .map_err(|e| {
-            // Provider API errors carry the response body verbatim and
-            // unbounded; same discipline as the OpenRouter arm — scrub any
-            // key echo first, then bound the length.
-            let mut message = e.to_string();
-            if let Some(api_key) = &config.openai_compat_api_key {
-                message = scrub_secret(&message, api_key);
-            }
-            truncate_chars(&message, PROVIDER_ERROR_MAX_CHARS).to_string()
+            // Do NOT surface the provider error to the tenant: it carries the
+            // upstream response body verbatim, and this validation drives an
+            // outbound request to a tenant-supplied base URL — reflecting it
+            // turns the 400 into a read-oracle for whatever the URL points at
+            // (SEC-1). The verbatim error is logged server-side for the
+            // operator; the tenant gets a generic message, enough to fix a bad
+            // config.
+            tracing::warn!(error = %e, "openai-compatible BYOK validation failed");
+            "the provider rejected the request".to_string()
         })
-}
-
-/// Replace every occurrence of `secret` in `message` with `[redacted]`.
-/// Must run on the **untruncated** text (see the validation arms). An empty
-/// secret is a no-op — `str::replace("")` would interleave the marker
-/// between every character.
-fn scrub_secret(message: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return message.to_string();
-    }
-    message.replace(secret, "[redacted]")
-}
-
-/// Char-safe truncation for provider error bodies.
-fn truncate_chars(s: &str, max: usize) -> &str {
-    match s.char_indices().nth(max) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
 }
 
 /// Best-effort managed-key allowance usage for the status route. `null`
@@ -1356,12 +1378,22 @@ async fn managed_key_usage(managed: &ManagedKeys, credentials: &ProviderCredenti
 /// The loud re-embed warning (plan: "Model curation" — warn loudly on
 /// embedding-model switches). `Null` when the embedding model is unchanged
 /// or there was no previous config to change from.
+///
+/// Changing the embedding model does **not** trigger an automatic re-embed:
+/// the write only swaps the active config (see [`apply_live_config`]). Every
+/// already-stored vector was produced by the old model and now lives in a
+/// different vector space from anything embedded by the new one, so search
+/// quality degrades and stays degraded until the operator manually re-embeds
+/// the affected atoms. The copy says exactly that — it must not promise a
+/// re-embed nothing here enqueues.
 fn reembed_warning(previous: Option<&ProviderConfig>, next: &ProviderConfig) -> Value {
     match previous {
         Some(previous) if previous.embedding_model() != next.embedding_model() => json!(format!(
-            "Embedding model changed from {:?} to {:?}. Every stored embedding is now \
-             invalid: all atoms must be re-embedded, and semantic search, related atoms, \
-             and tag suggestions will degrade until the re-embed completes.",
+            "Embedding model changed from {:?} to {:?}. Existing atoms are NOT re-embedded \
+             automatically: their vectors were produced by the old model and now occupy a \
+             different vector space from anything embedded by the new one. Semantic search, \
+             related atoms, and tag suggestions over existing content will be degraded until \
+             you manually re-embed the affected atoms.",
             previous.embedding_model(),
             next.embedding_model(),
         )),

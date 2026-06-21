@@ -49,6 +49,7 @@
 //!   a dead account.
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use atomic_core::DatabaseManager;
@@ -57,6 +58,7 @@ use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 use crate::backups::BackupPolicy;
+use crate::billing::BillingProvider;
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 use crate::managed_keys::ManagedKeys;
@@ -191,6 +193,33 @@ pub(crate) fn email_format_ok(email: &str) -> bool {
     }
     matches!(email.split_once('@'),
         Some((local, domain)) if !local.is_empty() && domain.contains('.'))
+}
+
+/// The managed-key monthly allowance, in cents, for an account's current
+/// plan — `plans.ai_credits_monthly_cents` resolved through the account's
+/// live `plan_id` FK (free=50, pro=2000 per migration 010). Used to size a
+/// freshly minted managed key to the tier the account is on.
+///
+/// Returns `None` (→ the configured fleet fallback) when the plan can't be
+/// resolved: a NULL `plan_id` (a row written before migration 010's
+/// backfill), or a `plan_id` that names no `plans` row. This stays
+/// fail-soft rather than fail-closed — the worst case is a key minted at the
+/// fleet default instead of the plan number, which the dunning reconcile
+/// corrects on the next transition; an absent plan must not block a signup.
+async fn plan_allowance_cents(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Result<Option<u32>, CloudError> {
+    let cents: Option<i32> = sqlx::query_scalar(
+        "SELECT p.ai_credits_monthly_cents \
+           FROM accounts a JOIN plans p ON p.id = a.plan_id \
+          WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("resolving plan AI-credit allowance"))?;
+    Ok(cents.map(|c| c.max(0) as u32))
 }
 
 /// Provision a new account end-to-end: claim the subdomain, create the
@@ -371,8 +400,19 @@ pub async fn provision_account(
     // retries or rolls it back (no half state). The returned id is held
     // locally for the lost-race cleanup paths below, where the accounts-row
     // CASCADE has already swept the credentials row that referenced it.
+    //
+    // Mint the key with the account's *plan* allowance
+    // (`plans.ai_credits_monthly_cents`), not the fleet-wide
+    // `--managed-key-allowance-cents` fallback: provisioning always lands
+    // 'free' (50¢ per migration 010), so a free signup is correctly sized,
+    // and the per-plan number is the single source of truth that the
+    // dunning transitions ([`crate::billing::dunning::reconcile_managed_key_limit`])
+    // re-apply when the account moves tiers. A NULL/absent `ai_credits_monthly_cents`
+    // (a row written before migration 010, or no plan join) leaves the
+    // allowance `None`, falling back to the configured fleet default.
+    let allowance_cents = plan_allowance_cents(control, &account_id.to_string()).await?;
     let managed_key_id = managed
-        .ensure_managed_key(control, &account_id.to_string())
+        .ensure_managed_key(control, &account_id.to_string(), allowance_cents)
         .await?;
 
     // Step 10 — record the account → tenant-database mapping, stamped with
@@ -662,8 +702,9 @@ async fn acquire_delete_lock(
     }
 }
 
-/// Hard-delete an account: revoke its tokens, delete its sessions, take a
-/// final logical dump of its tenant database, drop that database, remove its
+/// Hard-delete an account: revoke its tokens, delete its sessions, cancel its
+/// Stripe subscription, delete its managed provider key(s), take a final
+/// logical dump of its tenant database, drop that database, remove its
 /// control-plane rows, and park the freed subdomain in `subdomains_reserved`
 /// for 90 days.
 ///
@@ -692,6 +733,17 @@ async fn acquire_delete_lock(
 ///   reaper's stuck-provision rollback and orphan-database reclaim, which
 ///   don't call this function at all) hold no real user data and correctly
 ///   take no final dump.
+/// - **Stripe subscription cancellation (step 2½), best-effort and BEFORE the
+///   accounts-row CASCADE** — the CASCADE on the accounts delete sweeps the
+///   `stripe_subscriptions` row (and with it the only stored
+///   `stripe_subscription_id`), so the cancel must read and fire before then
+///   or the platform keeps billing a destroyed workspace with no local pointer
+///   left to cancel it (the DEL-1 finding). `billing` is `None` on deployments
+///   with Stripe unconfigured (dev, the CLI) and for accounts that never
+///   subscribed — both skip the step. A provider error is logged and
+///   swallowed: a Stripe outage must never wedge a deletion (an operator
+///   reconciles a leaked subscription from the Stripe dashboard), exactly the
+///   best-effort discipline the managed-key delete already follows.
 /// - AccountCache eviction (step 5) — the serving composition layer owns
 ///   the cache. Its HTTP deletion route ([`crate::tenant_plane`]) evicts
 ///   *after* this returns: once the account rows are gone nothing can
@@ -717,6 +769,7 @@ pub async fn delete_account(
     control: &ControlPlane,
     cluster: &ClusterConfig,
     managed: &ManagedKeys,
+    billing: Option<&Arc<dyn BillingProvider>>,
     policy: BackupPolicy<'_>,
     lock: DeleteLock,
     account_id: &str,
@@ -751,6 +804,40 @@ pub async fn delete_account(
         .execute(control.pool())
         .await
         .map_err(CloudError::db("deleting account sessions"))?;
+
+    // 2½ — cancel the Stripe subscription, strictly BEFORE step 7's
+    // accounts-row CASCADE sweeps `stripe_subscriptions` (which holds the only
+    // stored `stripe_subscription_id`). Best-effort with loud logging: a
+    // billing-provider outage must never wedge a deletion, and a destroyed
+    // workspace that keeps billing is the worse failure (the DEL-1 finding).
+    // Skipped when billing is unconfigured (`None`) or the account never
+    // subscribed (no `stripe_subscriptions` row).
+    if let Some(billing) = billing {
+        let subscription_id: Option<String> = sqlx::query_scalar(
+            "SELECT stripe_subscription_id FROM stripe_subscriptions WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(control.pool())
+        .await
+        .map_err(CloudError::db("reading subscription for cancellation"))?;
+        if let Some(subscription_id) = subscription_id {
+            match billing.cancel_subscription(&subscription_id).await {
+                Ok(()) => tracing::info!(
+                    account_id,
+                    subscription_id,
+                    "canceled Stripe subscription on account deletion"
+                ),
+                Err(e) => tracing::error!(
+                    account_id,
+                    subscription_id,
+                    error = %e,
+                    "failed to cancel Stripe subscription on account deletion; the \
+                     deletion proceeds (must not wedge on a provider outage) — cancel \
+                     it manually from the Stripe dashboard"
+                ),
+            }
+        }
+    }
 
     // 3 — delete the managed runtime key(s) via the provisioning API,
     // strictly BEFORE anything destroys the rows holding `external_key_id`
@@ -841,15 +928,15 @@ pub async fn delete_account(
 
     // 7 — reserve the freed subdomain for 90 days (stale RSS readers and
     // MCP configs pointing at the old name must not silently reach a
-    // stranger), then hard-delete the account row, cascading any remaining
-    // token rows away.
-    let subdomain: Option<String> =
-        sqlx::query_scalar("SELECT subdomain FROM accounts WHERE id = $1")
+    // stranger), purge the account's magic links, then hard-delete the
+    // account row, cascading any remaining token rows away.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT subdomain, email FROM accounts WHERE id = $1")
             .bind(account_id)
             .fetch_optional(control.pool())
             .await
             .map_err(CloudError::db("reading subdomain for reservation"))?;
-    if let Some(subdomain) = subdomain {
+    if let Some((subdomain, email)) = row {
         // Re-upping `created_at` on conflict marks "a deletion is touching
         // this subdomain right now" — the reaper's self-reservation arm
         // only clears reservations older than its settle grace, so a
@@ -864,6 +951,17 @@ pub async fn delete_account(
         .execute(control.pool())
         .await
         .map_err(CloudError::db("reserving freed subdomain"))?;
+
+        // 7½ — purge the deleted user's magic links. `magic_links` is keyed on
+        // `token_hash` with no FK to `accounts`, so the accounts CASCADE does
+        // NOT sweep it; without this the deleted user's email (and request IP)
+        // lingers in pending links for up to the link TTL (the DEL-2 finding).
+        // Matched case-insensitively, the crate's email convention.
+        sqlx::query("DELETE FROM magic_links WHERE LOWER(email) = LOWER($1)")
+            .bind(&email)
+            .execute(control.pool())
+            .await
+            .map_err(CloudError::db("purging account magic links"))?;
 
         sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(account_id)

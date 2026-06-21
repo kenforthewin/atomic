@@ -101,6 +101,14 @@ pub enum ProviderFailureClass {
     /// expired, revoked, or mis-scoped API key). Like billing failures,
     /// these are environmental: no retry succeeds until the key is fixed.
     AuthFailed,
+    /// The provider was transiently unavailable (HTTP 5xx, a connection or
+    /// timeout error) — a server-side or network fault, not a permanent
+    /// rejection of the request. Like a rate limit, the same call may
+    /// succeed on a later attempt, so a scheduler should back off and retry
+    /// rather than terminally fail the work. Mirrors the retryable set of
+    /// [`ProviderError::is_retryable`] that isn't already a more specific
+    /// class above.
+    Transient,
     /// Anything else (including messages this classifier doesn't recognize).
     Other,
 }
@@ -118,10 +126,11 @@ pub enum ProviderFailureClass {
 /// tests below — rather than rotting in some caller.
 ///
 /// Matching is substring-based and deliberately conservative: rate-limit
-/// first (its rendering never embeds a response body), then the 402 status
-/// marker. A response body that *contains* one of these markers can
-/// misclassify, but only on a call that already failed — the cost is a
-/// gentler retry schedule, never a dropped result.
+/// first (its rendering never embeds a response body), then the 402/401/403
+/// status markers, and finally the transient 5xx / network markers. A
+/// response body that *contains* one of these markers can misclassify, but
+/// only on a call that already failed — the cost is a gentler retry
+/// schedule, never a dropped result.
 pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     // `ProviderError::RateLimited` renders as "Rate limited" or
     // "Rate limited, retry after {N} seconds".
@@ -140,6 +149,15 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     // `ProviderError::Api { status: 401 | 403, .. }` — credential rejections.
     if message.contains("API error (401)") || message.contains("API error (403)") {
         return ProviderFailureClass::AuthFailed;
+    }
+    // Transient server-side / network faults: a 5xx upstream error or a
+    // connection/timeout failure. These are the retryable-but-not-yet-classified
+    // members of `ProviderError::is_retryable` (everything `is_retryable`
+    // covers that the rate-limit / payment / auth arms above don't already
+    // claim). The same call may succeed on a later attempt, so a scheduler
+    // backs off rather than terminally failing the work.
+    if message.contains("API error (5") || message.contains("Network error:") {
+        return ProviderFailureClass::Transient;
     }
     ProviderFailureClass::Other
 }
@@ -232,12 +250,31 @@ mod classification_tests {
         );
     }
 
-    /// Unrelated failures stay `Other` — the conservative default.
+    /// Server-side and network faults classify as `Transient` so a
+    /// scheduler backs off and retries rather than terminally failing —
+    /// these mirror the retryable members of [`ProviderError::is_retryable`]
+    /// not already claimed by the rate-limit / payment / auth arms.
+    #[test]
+    fn classify_recognizes_transient_failures() {
+        for message in [
+            "API error (500): upstream exploded",
+            "API error (502): bad gateway",
+            "API error (503): service unavailable",
+            "Embedding error: Provider error: Network error: connection refused",
+            "Network error: timed out",
+        ] {
+            assert_eq!(
+                classify_provider_failure(message),
+                ProviderFailureClass::Transient,
+                "{message:?} must classify as Transient"
+            );
+        }
+    }
+
+    /// Genuinely unrelated failures stay `Other` — the conservative default.
     #[test]
     fn classify_leaves_unrelated_errors_alone() {
         for message in [
-            "API error (500): upstream exploded",
-            "Network error: connection refused",
             "Parse error: bad JSON",
             "Model not found: gpt-nonexistent",
             "",

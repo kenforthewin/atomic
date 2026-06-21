@@ -128,6 +128,20 @@ enum Command {
         )]
         tenant_pool_idle_timeout_secs: u64,
 
+        /// Max connections in the control-plane pool. This single pool fronts
+        /// both the auth path (every request runs ≥2 control queries) and all
+        /// of serve's background loops, so under concurrency it must be sized
+        /// for the pod's request volume — too small and the 10s acquire
+        /// timeout surfaces as spurious 500s to healthy tenants. Keep below
+        /// the cluster's per-pod connection budget (pgbouncer fronts it in
+        /// production).
+        #[arg(
+            long,
+            env = "ATOMIC_CLOUD_CONTROL_POOL_MAX_CONNECTIONS",
+            default_value_t = atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS
+        )]
+        control_pool_max_connections: u32,
+
         /// How often the periodic idle sweep of the account cache runs, in
         /// seconds. Defaults to a quarter of the cache idle TTL.
         #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
@@ -334,6 +348,12 @@ enum EmailMode {
     Mailgun,
 }
 
+/// Default name of the environment variable holding the Mailgun API key.
+/// Matches the master-key / provisioning-key / Stripe-secret custody rule:
+/// `serve` takes only the variable NAME on argv and reads the secret VALUE
+/// from the environment, so the key never surfaces in process listings.
+const MAILGUN_API_KEY_ENV: &str = "ATOMIC_CLOUD_MAILGUN_API_KEY";
+
 /// Email delivery selection for `serve`. Mailgun mode requires all three
 /// credentials; the API key is env-only by convention (it's a secret).
 #[derive(Args)]
@@ -342,8 +362,18 @@ struct EmailArgs {
     #[arg(long, env = "ATOMIC_CLOUD_EMAIL_MODE", default_value = "log")]
     email_mode: EmailMode,
 
-    /// Mailgun API key (required with --email-mode mailgun).
-    #[arg(long, env = "ATOMIC_CLOUD_MAILGUN_API_KEY", hide_env_values = true)]
+    /// Name of the environment variable holding the Mailgun API key
+    /// (required with --email-mode mailgun). The key VALUE is only ever read
+    /// from the environment — argv leaks into process listings (`ps`,
+    /// `/proc/<pid>/cmdline`).
+    #[arg(long, default_value = MAILGUN_API_KEY_ENV)]
+    mailgun_api_key_env: String,
+
+    /// DEPRECATED, INSECURE. Pass the Mailgun API key VALUE directly on
+    /// argv. The key leaks into process listings; use --mailgun-api-key-env
+    /// (the default reads `ATOMIC_CLOUD_MAILGUN_API_KEY` from the
+    /// environment) instead. Boot warns loudly when set.
+    #[arg(long, hide_env_values = true)]
     mailgun_api_key: Option<String>,
 
     /// Mailgun sending domain, e.g. `mg.atomic.cloud` (required with
@@ -572,6 +602,15 @@ struct BillingArgs {
 /// rather than enabling billing with an empty key.
 fn read_secret_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.is_empty())
+}
+
+/// Whether the configured base domain looks like a local/dev host, used to
+/// scope boot warnings to deployments that are plausibly production. Treats
+/// `localhost` and any `*.localhost` subdomain as local (the dev/test
+/// convention this crate already uses for cookies and host matching).
+fn base_domain_is_localhost(base_domain: &str) -> bool {
+    let host = base_domain.split(':').next().unwrap_or(base_domain);
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 impl BillingArgs {
@@ -1046,9 +1085,27 @@ impl EmailArgs {
                 let missing = |flag: &str| {
                     format!("--email-mode mailgun requires {flag} (or its environment variable)")
                 };
-                let api_key = self
-                    .mailgun_api_key
-                    .ok_or_else(|| missing("--mailgun-api-key"))?;
+                // The key VALUE comes from the named environment variable
+                // (never argv). The deprecated --mailgun-api-key still works
+                // for compatibility, but warns loudly: it leaks the secret
+                // into process listings.
+                let api_key = if let Some(argv_key) = self.mailgun_api_key {
+                    tracing::warn!(
+                        "DANGER: --mailgun-api-key passes the Mailgun API key on argv, where it \
+                         leaks into process listings (ps, /proc/<pid>/cmdline). Set the key in \
+                         the environment and use --mailgun-api-key-env (default reads {}) instead.",
+                        MAILGUN_API_KEY_ENV
+                    );
+                    argv_key
+                } else {
+                    read_secret_env(&self.mailgun_api_key_env).ok_or_else(|| {
+                        format!(
+                            "--email-mode mailgun requires the Mailgun API key in the environment \
+                             variable {:?} (set --mailgun-api-key-env to read a different one)",
+                            self.mailgun_api_key_env
+                        )
+                    })?
+                };
                 let domain = self
                     .mailgun_domain
                     .ok_or_else(|| missing("--mailgun-domain"))?;
@@ -1245,8 +1302,15 @@ async fn main() -> std::process::ExitCode {
 
 /// Connect to the control plane and bring its schema current — the shared
 /// preamble of every subcommand, so each one works against a fresh cluster.
-async fn connect_control(control_url: &str) -> Result<ControlPlane, Box<dyn std::error::Error>> {
-    let control = ControlPlane::connect(control_url).await?;
+///
+/// `max_connections` sizes the control pool: `serve` passes its tuned
+/// `--control-pool-max-connections`; short-lived CLI subcommands pass the
+/// default.
+async fn connect_control(
+    control_url: &str,
+    max_connections: u32,
+) -> Result<ControlPlane, Box<dyn std::error::Error>> {
+    let control = ControlPlane::connect(control_url, max_connections).await?;
     let applied = control.initialize().await?;
     if applied > 0 {
         tracing::info!(applied, "applied control-plane migrations");
@@ -1255,7 +1319,17 @@ async fn connect_control(control_url: &str) -> Result<ControlPlane, Box<dyn std:
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let control = connect_control(&cli.control_url).await?;
+    // Only `serve` carries long-lived background loops + the auth path that
+    // contend for the control pool; every other subcommand is a short-lived
+    // operator command, so a small default pool is ample for them.
+    let control_pool_max_connections = match &cli.command {
+        Command::Serve {
+            control_pool_max_connections,
+            ..
+        } => *control_pool_max_connections,
+        _ => atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+    };
+    let control = connect_control(&cli.control_url, control_pool_max_connections).await?;
 
     match cli.command {
         Command::Migrate => {
@@ -1270,6 +1344,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             bind,
             tenant_pool_max_connections,
             tenant_pool_idle_timeout_secs,
+            // Consumed by the `run` preamble to size the control pool.
+            control_pool_max_connections: _,
             cache_sweep_interval_secs,
             reaper_interval_secs,
             email,
@@ -1334,6 +1410,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      in production."
                 );
             }
+            // Boot warnings for operator footguns that are catastrophic on a
+            // production pod but harmless in dev. Scoped (where it makes
+            // sense) to a non-localhost base domain so dev runs stay quiet.
+            let base_is_localhost = base_domain_is_localhost(&base_domain);
+            if matches!(backup.backup_store, BackupStoreKind::Local) {
+                tracing::warn!(
+                    "DANGER: --backup-store local writes backups — including the final \
+                     pre-DROP dump taken when an account is hard-deleted — to a local \
+                     directory. On a pod with ephemeral storage that disk evaporates on \
+                     restart, so a tenant deletion's only undo is lost. This is for \
+                     local/self-hosted dev only; use --backup-store s3 in production.{}",
+                    if base_is_localhost {
+                        ""
+                    } else {
+                        " The base domain is not localhost, so this looks like a real \
+                         deployment."
+                    }
+                );
+            }
+            if !trust_proxy_header && !base_is_localhost {
+                tracing::warn!(
+                    "--trust-proxy-header is off but the base domain is not localhost: if a \
+                     reverse proxy fronts this process, every client shares the proxy's IP \
+                     and per-IP rate limits collapse onto a single bucket. Enable \
+                     --trust-proxy-header when, and only when, a trusted proxy sets \
+                     X-Forwarded-For."
+                );
+            }
             let plane_config = AccountPlaneConfig {
                 app_public_url: app_public_url.clone(),
                 trust_proxy_header,
@@ -1352,7 +1456,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let billing_plane = Billing::new(
                 control.clone(),
                 billing.into_config(base_domain.clone(), app_public_url)?,
-            )?;
+            )?
+            // Thread the managed-key handle so the webhook reconciles a tenant's
+            // managed-AI allowance to its plan after a subscription transition
+            // commits (MAI-1).
+            .with_managed_keys(managed.clone());
             let quota_billing = QuotaBilling {
                 plan_registry,
                 rate_limiter: DataPlaneRateLimiter::new(DataPlaneRateLimits::default()),
@@ -1465,6 +1573,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &control,
                     &cluster.into_config(),
                     &ManagedKeys::Disabled,
+                    // The CLI runs no Stripe client, so a subscription cancel is
+                    // skipped (the DEL-1 `billing` is `None` on the CLI, per
+                    // `delete_account`'s docs); an operator reconciles any leaked
+                    // subscription from the Stripe dashboard.
+                    None,
                     atomic_cloud::BackupPolicy::Required(&backup_store),
                     atomic_cloud::DeleteLock::Acquire,
                     &account_id,
@@ -1957,7 +2070,11 @@ async fn serve(
     // (a Stripe key is configured) so the billing page enables or explains its
     // actions instead of bouncing the browser onto a `billing_not_configured`
     // 503.
-    .with_billing_configured(quota_billing.billing.is_configured());
+    .with_billing_configured(quota_billing.billing.is_configured())
+    // Thread the Stripe provider so the active-deletion route fires a
+    // best-effort subscription cancel before the tenant's `stripe_subscriptions`
+    // row is CASCADE-deleted (DEL-1).
+    .with_billing_provider(quota_billing.billing.provider().cloned());
 
     // The reaper loop runs concurrently with the server below via select!,
     // not tokio::spawn: spawn's Send bound trips rustc's
@@ -2024,6 +2141,10 @@ async fn serve(
         app_public_url,
     );
 
+    // The trial sweep below re-sizes a downgraded account's managed key to the
+    // free allowance, so it needs its own handle to the managed-key plane;
+    // clone before `managed` is moved into the account plane.
+    let trial_managed = managed.clone();
     let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
@@ -2065,6 +2186,7 @@ async fn serve(
     tokio::spawn({
         let control = control.clone();
         let cache = Arc::clone(&cache);
+        let managed = trial_managed;
         async move {
             let mut ticker = tokio::time::interval(DEFAULT_DUNNING_SWEEP_INTERVAL);
             ticker.tick().await; // first tick fires immediately
@@ -2101,7 +2223,7 @@ async fn serve(
                             })
                     }
                 };
-                match advance_expired_trials(&control, now, over_free_limits).await {
+                match advance_expired_trials(&control, &managed, now, over_free_limits).await {
                     Ok(advance) if !advance.is_quiet() => {
                         tracing::info!(?advance, "trial sweep")
                     }

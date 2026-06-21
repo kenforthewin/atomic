@@ -454,6 +454,10 @@ impl ProviderBreaker {
 ///   horizon — [`BreakerConfig::credits_recheck`]); the matching tenant
 ///   pause holds dispatch anyway, and a provider mutation re-arms both
 ///   (see `AtomicCore::rearm_provider_blocked_task_runs`).
+/// - **Transient** (5xx / timeout) → defer to [`RATE_LIMIT_REQUEUE_DELAY`]:
+///   a server-side or network outage recovers on its own, so the run waits
+///   it out without consuming retry budget rather than terminally failing a
+///   wiki/report run on a passing provider hiccup.
 /// - **Anything else** → [`FailureDisposition::Fail`]: logic failures keep
 ///   consuming retry budget exactly as before.
 ///
@@ -476,6 +480,15 @@ pub fn provider_failure_policy(
                 Utc::now() + chrono::Duration::from_std(pause_recheck).unwrap_or_default(),
             )
         }
+        // A transient provider outage (5xx/timeout) recovers on its own, so
+        // defer to the base re-dispatch delay rather than burning a
+        // `max_attempts` slot — a sustained outage must not terminally
+        // abandon wiki/report runs (nothing but a ledger scan re-fires them).
+        // No `Retry-After` accompanies a 5xx/network fault, so the fixed base
+        // horizon applies, matching the pipeline ledger's transient re-enqueue.
+        ProviderFailureClass::Transient => FailureDisposition::DeferUntil(
+            Utc::now() + chrono::Duration::from_std(RATE_LIMIT_REQUEUE_DELAY).unwrap_or_default(),
+        ),
         ProviderFailureClass::Other => FailureDisposition::Fail,
     })
 }
@@ -711,6 +724,15 @@ mod tests {
                 (3595..=3605).contains(&secs),
                 "got {secs}s for {environmental:?}"
             );
+        }
+        // Transient 5xx/timeout faults defer to the base delay (no
+        // Retry-After hint accompanies them) rather than burning budget.
+        for transient in [
+            "Embedding error: API error (503): service unavailable",
+            "Wiki error: Network error: timed out",
+        ] {
+            let secs = until(policy(transient));
+            assert!((55..=65).contains(&secs), "got {secs}s for {transient:?}");
         }
         // Logic failures keep consuming retry budget.
         assert_eq!(

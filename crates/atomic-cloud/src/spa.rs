@@ -159,6 +159,27 @@ impl SpaServer {
                 // prompting for a server URL + token. Self-hosted/Tauri builds
                 // never go through here, so their placeholder stays unreplaced
                 // (and reads as "not a cloud tenant").
+                if !raw.contains(PRODUCT_CLOUD_PLACEHOLDER) {
+                    // The marker the client reads (`isCloudTenant()`) is gone,
+                    // so the `true` injection below is a no-op and every tenant
+                    // will land on the self-hosted setup screen instead of
+                    // authenticating by the session cookie — tenant login is
+                    // silently broken. This is the same failure mode a
+                    // misconfigured reverse proxy hits when it serves the
+                    // product bundle without injecting the marker (see
+                    // DEPLOY.md → "Product-app tenant marker"); shout about it
+                    // at boot rather than 404-ing a confused user's login.
+                    tracing::warn!(
+                        product_dir = %root.display(),
+                        placeholder = PRODUCT_CLOUD_PLACEHOLDER,
+                        "product app index.html is missing the cloud-tenant \
+                         marker placeholder: tenant auth will silently fall \
+                         back to the self-hosted setup screen. The product \
+                         bundle must carry `<meta name=\"atomic-cloud-tenant\" \
+                         content=\"{PRODUCT_CLOUD_PLACEHOLDER}\">` for the \
+                         server (or a reverse proxy) to rewrite to `true`."
+                    );
+                }
                 let index_html = raw.replace(PRODUCT_CLOUD_PLACEHOLDER, "true");
                 self.product = Some(ProductApp {
                     root: root.into(),
@@ -652,5 +673,62 @@ mod tests {
             .await
             .expect("probe");
         assert!(spa.is_none(), "no index.html → no SPA server");
+    }
+
+    /// Build a minimal account SPA in a temp dir, to attach a product app to.
+    async fn account_spa() -> (tempfile::TempDir, SpaServer) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join("index.html"), "<html>account</html>")
+            .await
+            .expect("write account index");
+        let spa = SpaServer::load(dir.path(), "atomic.cloud")
+            .await
+            .expect("load account spa");
+        (dir, spa)
+    }
+
+    #[tokio::test]
+    async fn with_product_dir_injects_tenant_marker() {
+        let (_account_dir, spa) = account_spa().await;
+        let product = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(
+            product.path().join("index.html"),
+            format!(r#"<meta name="atomic-cloud-tenant" content="{PRODUCT_CLOUD_PLACEHOLDER}" />"#),
+        )
+        .await
+        .expect("write product index");
+
+        let spa = spa
+            .with_product_dir(product.path())
+            .await
+            .expect("attach product");
+        let product_html = &spa.product.expect("product attached").index_html;
+        assert!(
+            product_html.contains(r#"content="true""#),
+            "tenant marker injected: {product_html}"
+        );
+        assert!(
+            !product_html.contains(PRODUCT_CLOUD_PLACEHOLDER),
+            "placeholder fully replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_product_dir_attaches_even_without_marker() {
+        // A product bundle whose marker placeholder was stripped (e.g. a proxy
+        // that already rewrote it, or a stale build) still attaches — the
+        // server warns at serve time (OPS-2) rather than refusing to boot, so
+        // the operator sees the misconfiguration instead of a hard crash.
+        let (_account_dir, spa) = account_spa().await;
+        let product = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(product.path().join("index.html"), "<html>no marker</html>")
+            .await
+            .expect("write product index");
+
+        let spa = spa
+            .with_product_dir(product.path())
+            .await
+            .expect("attach product despite missing marker");
+        assert!(spa.product.is_some(), "product still attached");
     }
 }

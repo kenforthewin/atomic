@@ -35,6 +35,14 @@ use crate::error::CloudError;
 /// doesn't specify one.
 pub const DEFAULT_CONTROL_DB_NAME: &str = "atomic_cloud_control";
 
+/// Default maximum connections in the control-plane pool. The pool fronts
+/// both the auth path (every request does ≥2 control queries) and the
+/// serve process's background loops; under concurrency the original cap of
+/// 5 could saturate and turn the 10s acquire timeout into spurious 500s for
+/// healthy tenants. Operators tune this via `--control-pool-max-connections`
+/// (CLI subcommands other than `serve` use this default unchanged).
+pub const DEFAULT_CONTROL_POOL_MAX_CONNECTIONS: u32 = 25;
+
 /// Embedded migration registry: `(version, sql)`. Each migration's SQL is
 /// responsible for inserting its own `schema_version` row, matching the
 /// tenant-migration convention in atomic-core.
@@ -99,12 +107,17 @@ impl ControlPlane {
     ///
     /// This only establishes the pool — call [`initialize`](Self::initialize)
     /// to run pending migrations.
-    pub async fn connect(control_db_url: &str) -> Result<Self, CloudError> {
+    ///
+    /// `max_connections` caps the pool. The auth path and `serve`'s
+    /// background loops share it, so under load it must be tuned via
+    /// `--control-pool-max-connections`; short-lived CLI subcommands pass
+    /// [`DEFAULT_CONTROL_POOL_MAX_CONNECTIONS`].
+    pub async fn connect(control_db_url: &str, max_connections: u32) -> Result<Self, CloudError> {
         let opts = control_options(control_db_url)?;
         ensure_database_exists(&opts).await?;
 
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(10))
             .connect_with(opts)
             .await

@@ -185,7 +185,7 @@ use crate::provision::{
 };
 use crate::rate_limit::SlidingWindow;
 use crate::reserved_subdomains;
-use crate::tokens::create_session;
+use crate::tokens::{create_session, sha256_hex};
 
 /// Web-session lifetime, which is also the cookie's `Max-Age`. Thirty days
 /// balances "don't make magic-link users log in weekly" against bounded
@@ -457,6 +457,13 @@ impl AccountPlane {
                 .wrap(no_referrer())
                 .route("/request-link", web::post().to(login_request_link))
                 .route("/complete", web::get().to(login_complete)),
+        );
+        cfg.service(
+            web::scope("/account")
+                .guard(app_host_guard(self.state.base_domain.clone()))
+                .app_data(self.state.clone())
+                .wrap(no_referrer())
+                .route("/logout", web::post().to(logout)),
         );
     }
 }
@@ -819,7 +826,7 @@ async fn signup_complete(
             // it sits on free instead of the paid trial, which the user can
             // remedy by upgrading. Log and continue.
             if state.trial.enabled {
-                if let Err(e) = start_trial(
+                match start_trial(
                     &state.control,
                     &account.account_id,
                     &state.trial.plan_id,
@@ -827,11 +834,37 @@ async fn signup_complete(
                 )
                 .await
                 {
-                    tracing::error!(
-                        account_id = account.account_id,
-                        error = %e,
-                        "starting free trial failed; account remains on free"
-                    );
+                    // A trial actually started — move the managed runtime key's
+                    // cap from the free 50¢ allowance to the trial tier's
+                    // allowance, or the trial account's AI dies at the free cap
+                    // (the MAI-1 finding). Best-effort: a reconcile failure must
+                    // not fail signup (the account is provisioned and serving);
+                    // it self-heals on the next plan transition.
+                    Ok(true) => {
+                        if let Err(e) = crate::billing::dunning::reconcile_managed_key_limit(
+                            &state.control,
+                            &state.managed,
+                            &account.account_id,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                account_id = account.account_id,
+                                error = %e,
+                                "reconciling managed key limit after trial start failed; \
+                                 the key stays at the free allowance until the next \
+                                 plan transition"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            account_id = account.account_id,
+                            error = %e,
+                            "starting free trial failed; account remains on free"
+                        );
+                    }
                 }
             }
             tracing::info!(
@@ -946,12 +979,7 @@ async fn session_redirect(
         }
     };
 
-    let cookie = Cookie::build(SESSION_COOKIE, session)
-        .domain(format!(".{}", state.base_domain))
-        .path("/")
-        .secure(state.cookie_secure)
-        .http_only(true)
-        .same_site(SameSite::Lax)
+    let cookie = session_cookie(state, session)
         .max_age(
             actix_web::cookie::time::Duration::try_from(state.session_ttl)
                 .unwrap_or(actix_web::cookie::time::Duration::MAX),
@@ -970,6 +998,72 @@ async fn session_redirect(
         .insert_header((header::LOCATION, location))
         .cookie(cookie)
         .finish()
+}
+
+/// The session cookie's identity attributes — `Domain`, `Path`, and the
+/// `Secure; HttpOnly; SameSite=Lax` flags — without a value-lifetime
+/// (`Max-Age`) decision. Issuance ([`session_redirect`]) caps it at the
+/// session TTL; logout ([`logout`]) zeroes it. Sharing one builder is what
+/// guarantees the clearing cookie matches the issued one attribute-for-
+/// attribute: a browser only overwrites a stored cookie when `Domain` and
+/// `Path` line up, so a drift here would silently leave the old cookie in
+/// place. See [`session_redirect`] for the rationale behind each attribute.
+fn session_cookie(state: &PlaneState, value: String) -> actix_web::cookie::CookieBuilder<'static> {
+    Cookie::build(SESSION_COOKIE, value)
+        .domain(format!(".{}", state.base_domain))
+        .path("/")
+        .secure(state.cookie_secure)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+}
+
+/// `POST /account/logout` (app host only). Revoke the presented session and
+/// clear its cookie.
+///
+/// The session cookie carries `Domain=.<base>`, so it reaches the app host
+/// as readily as any tenant subdomain — logout therefore lives here, on the
+/// account plane, where one call invalidates the single cross-subdomain
+/// session. No `CloudAuth` runs on the app host (module docs), so this
+/// handler authenticates itself: it reads the cookie, hashes the presented
+/// secret, and deletes the row whose `hash` matches. Only that one session
+/// is revoked — other devices' sessions, keyed by their own hashes, are
+/// untouched (standard "sign out of this browser" semantics).
+///
+/// The response is the same regardless of what the cookie held — present,
+/// absent, already-expired, or never a real session. A `Set-Cookie` clearing
+/// `atomic_session` (`Max-Age=0`, same `Domain`/`Path`/flags as issuance via
+/// [`session_cookie`]) goes out unconditionally, so a stale cookie never
+/// survives a logout, and the endpoint hands out no oracle over the
+/// `sessions` table. A failed delete is the one exception: the cookie is
+/// still cleared client-side, but a 500 tells the caller the server row may
+/// linger, rather than falsely reporting success.
+async fn logout(state: web::Data<PlaneState>, req: HttpRequest) -> HttpResponse {
+    if let Some(secret) = req.cookie(SESSION_COOKIE).map(|c| c.value().to_string()) {
+        if let Err(e) = sqlx::query("DELETE FROM sessions WHERE hash = $1")
+            .bind(sha256_hex(&secret))
+            .execute(state.control.pool())
+            .await
+        {
+            tracing::error!(error = %e, "deleting session on logout failed");
+            // The cookie is cleared anyway — a leftover server row is the
+            // lesser evil than a browser that still believes it's signed in.
+            return HttpResponse::InternalServerError()
+                .cookie(cleared_session_cookie(&state))
+                .json(serde_json::json!({ "error": "internal_error" }));
+        }
+    }
+    HttpResponse::Ok()
+        .cookie(cleared_session_cookie(&state))
+        .json(serde_json::json!({ "status": "ok" }))
+}
+
+/// The session cookie reduced to a removal: every issuance attribute via
+/// [`session_cookie`], `Max-Age=0` and an expiry in the past so the browser
+/// drops it immediately.
+fn cleared_session_cookie(state: &PlaneState) -> Cookie<'static> {
+    let mut cookie = session_cookie(state, String::new()).finish();
+    cookie.make_removal();
+    cookie
 }
 
 // --- Responses --------------------------------------------------------------

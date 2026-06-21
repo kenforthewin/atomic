@@ -38,6 +38,7 @@ use sqlx::PgConnection;
 use crate::billing::SubscriptionState;
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
+use crate::managed_keys::ManagedKeys;
 use crate::plans::DEFAULT_PLAN_ID;
 
 /// Days past_due before writes are blocked (`past_due → read_only`).
@@ -539,6 +540,12 @@ pub async fn apply_payment_failed_on_conn(
 }
 
 /// Set `accounts.plan_id`. Used by the subscription/checkout arms.
+///
+/// This moves only the control-plane plan FK; the account's managed runtime
+/// key must be re-sized to the new plan's allowance separately, *after* the
+/// webhook transaction commits, via [`reconcile_managed_key_limit`] (the
+/// reconcile issues an outbound provider call that must not ride inside the
+/// claim+apply transaction — see its docs).
 async fn set_plan(
     conn: &mut PgConnection,
     account_id: &str,
@@ -551,6 +558,55 @@ async fn set_plan(
         .await
         .map_err(CloudError::db("setting account plan"))?;
     Ok(())
+}
+
+/// Re-size the account's managed runtime key to its *current* plan's AI
+/// allowance (`plans.ai_credits_monthly_cents`; free=50, pro=2000 per
+/// migration 010), best-effort. The companion to the plan-changing
+/// transitions: a managed key is minted at signup with the free allowance,
+/// so without re-applying the cap on every transition a paid/trial account's
+/// key stays pinned at 50¢ and its AI dies the moment it spends the free
+/// tier (the MAI-1 finding). Call this *after* a transition lands
+/// (`set_plan` via the webhook, [`start_trial`], [`finish_expired_trial`]),
+/// reading the now-current `plan_id`.
+///
+/// **Deliberately outside any webhook transaction.** This issues an outbound
+/// provider HTTP PATCH; running it inside the webhook's claim+apply
+/// transaction would let a Stripe-side timeout roll back the committed plan
+/// change (and re-trigger redelivery). The plan transition is authoritative
+/// on its own; the key cap is reconciled separately and best-effort
+/// ([`ManagedKeys::reconcile_key_limit`] logs-and-continues on a provider
+/// error). A control-plane *read* failure (resolving the plan) is the only
+/// error surfaced.
+///
+/// Resolves the allowance via the account's live `plan_id` FK; a NULL/absent
+/// plan (a pre-migration-010 row) is logged and skipped rather than guessed.
+/// `Disabled` mode and keyless/BYOK accounts are silent no-ops.
+pub async fn reconcile_managed_key_limit(
+    control: &ControlPlane,
+    managed: &ManagedKeys,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    let allowance_cents: Option<i32> = sqlx::query_scalar(
+        "SELECT p.ai_credits_monthly_cents \
+           FROM accounts a JOIN plans p ON p.id = a.plan_id \
+          WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("resolving plan AI-credit allowance"))?;
+    let Some(allowance_cents) = allowance_cents else {
+        tracing::warn!(
+            account_id,
+            "no plan AI-credit allowance resolved (NULL/absent plan_id); \
+             leaving managed key limit unchanged"
+        );
+        return Ok(());
+    };
+    managed
+        .reconcile_key_limit(control, account_id, allowance_cents.max(0) as u32)
+        .await
 }
 
 /// The account's current `plan_id`, for the audit-log `from_plan` field.
@@ -709,6 +765,12 @@ pub const DEFAULT_TRIAL_DAYS: i64 = 14;
 /// bring-up that the reaper also re-runs. Keeping the trial out of
 /// `provision_account` leaves every resume/recovery path free of trial side
 /// effects. Auto-downgrade is the time-driven [`advance_expired_trials`] arm.
+///
+/// This promotes the account's plan but does not touch its managed runtime
+/// key; the caller (signup completion) must follow a `true` return with
+/// [`reconcile_managed_key_limit`] so the key cap moves from the free
+/// allowance to the trial tier's — otherwise the trial account's AI dies at
+/// the free 50¢ cap (the MAI-1 finding).
 pub async fn start_trial(
     control: &ControlPlane,
     account_id: &str,
@@ -789,6 +851,11 @@ pub async fn expired_trials(
 /// live atom/KB count vs the free plan's limits). Guarded to only act on a
 /// row still `trialing` (so a converted/already-finished trial is a no-op),
 /// which keeps it idempotent under a concurrent sweep on another pod.
+///
+/// This downgrades the plan but does not touch the managed runtime key; the
+/// sweep ([`advance_expired_trials`]) follows a `true` return with
+/// [`reconcile_managed_key_limit`] so the key cap drops back to the free
+/// allowance (sized correctly for a now-free account).
 pub async fn finish_expired_trial(
     control: &ControlPlane,
     account_id: &str,
@@ -848,8 +915,17 @@ pub async fn finish_expired_trial(
 /// one account is logged and that account is left `trialing` for the next
 /// sweep — better than fail-open (downgrading without knowing the limit) or
 /// fail-closed (read_only-ing a possibly-under-limit account).
+///
+/// `managed` lets the sweep re-size each downgraded account's managed
+/// runtime key back to the free allowance ([`reconcile_managed_key_limit`],
+/// best-effort) the moment its plan drops — without it the key would stay
+/// pinned at the (larger) trial-tier cap. Reconciliation runs only after the
+/// `finish_expired_trial` UPDATE actually moved a row, and a provider error
+/// is logged-and-swallowed inside the reconcile, so a reconcile failure can
+/// never abort the rest of the pass.
 pub async fn advance_expired_trials<F, Fut>(
     control: &ControlPlane,
+    managed: &ManagedKeys,
     now: DateTime<Utc>,
     mut over_free_limits: F,
 ) -> Result<TrialAdvance, CloudError>
@@ -867,6 +943,9 @@ where
             }
         };
         if finish_expired_trial(control, &account_id, over).await? {
+            // The plan just dropped to free; re-size the managed key to the
+            // free allowance (best-effort — see reconcile_managed_key_limit).
+            reconcile_managed_key_limit(control, managed, &account_id).await?;
             if over {
                 advance.downgraded_to_read_only += 1;
             } else {

@@ -123,6 +123,13 @@ enum QuotaTarget {
     IngestUrls,
     /// `POST /api/databases` — one knowledge base.
     Kb,
+    /// `POST /mcp` — a JSON-RPC envelope whose resource cost can only be known
+    /// from the body: a `tools/call` for the `create_atom` tool creates one
+    /// atom, everything else (`initialize`, `tools/list`, a read tool, …)
+    /// creates nothing. The body is peeked+replayed to classify, then it rides
+    /// the single-atom delta like the other atom-creating routes. See
+    /// [`mcp_creates_atom`].
+    Mcp,
 }
 
 /// Classify a `(method, path)` into the resource it consumes, or `None` if
@@ -158,8 +165,37 @@ fn quota_target(method: &Method, path: &str) -> Option<QuotaTarget> {
         // these admit only while the tenant is at least one atom under the ceiling.
         _ if path.starts_with("/api/reports/") && path.ends_with("/run") => Some(QuotaTarget::Atom),
         _ if path.starts_with("/api/feeds/") && path.ends_with("/poll") => Some(QuotaTarget::Atom),
+        // The per-tenant MCP Streamable HTTP surface (`POST /mcp`). Every
+        // JSON-RPC call is a POST to this one path; only a `tools/call` for
+        // `create_atom` actually creates a resource, so the body is inspected
+        // in the guard to decide whether the atom delta applies (the path
+        // alone can't tell a `create_atom` from an `initialize`). Without this,
+        // an MCP client could create atoms past the plan ceiling that the REST
+        // gate enforces — the same atom-creating work, a different transport.
+        "/mcp" => Some(QuotaTarget::Mcp),
         _ => None,
     }
+}
+
+/// Whether an MCP JSON-RPC request body is a `tools/call` invoking the
+/// `create_atom` tool — the one MCP method that creates an atom and so must
+/// charge the atom quota. Returns `false` for any other method, a batch
+/// (JSON-RPC array) the SDK doesn't issue for tool calls, or an unparseable
+/// body (the MCP transport will surface its own error; we simply don't charge
+/// quota for something we can't confirm creates an atom).
+///
+/// The tool name mirrors `atomic-server`'s `create_atom` MCP tool. Counting is
+/// shape-based, not field-materializing — the `arguments` object is ignored.
+fn mcp_creates_atom(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    value.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && value
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("create_atom")
 }
 
 /// Data-plane middleware enforcing plan-tier resource limits (module docs).
@@ -221,7 +257,34 @@ pub async fn quota_guard(
             Ok(n) => n as i64,
             Err(()) => 0,
         },
+        // The MCP JSON-RPC body is peeked+replayed: a `create_atom` tool call
+        // charges one atom; every other method (handshake, listing, a read
+        // tool) charges nothing and passes straight through. A body we can't
+        // read isn't ours to reject — the MCP transport surfaces its own
+        // error.
+        //
+        // TODO: this charges the single-atom delta per `create_atom` call. If
+        // the MCP surface ever grows a *batch* create tool (or per-tool
+        // metering beyond the atom ceiling — e.g. managed-AI credits for a
+        // tool that calls the LLM), this is the seam to read the per-tool
+        // delta from `params.arguments` rather than assuming 1.
+        QuotaTarget::Mcp => {
+            if peek_and_replay_creates_atom(&mut req).await {
+                1
+            } else {
+                0
+            }
+        }
     };
+
+    // A zero delta creates nothing, so it can never exceed a limit — admit it
+    // without reading the (account-wide) count. This keeps non-creating MCP
+    // traffic (every handshake, `tools/list`, and read tool) and empty batches
+    // off the count hot path, and means an already-over-limit tenant's reads
+    // are never spuriously 402'd by `current > limit`.
+    if delta == 0 {
+        return next.call(req).await.map(|res| res.map_into_boxed_body());
+    }
 
     match check_resource(target, &plan, &manager, &req, delta).await {
         Ok(None) => next.call(req).await.map(|res| res.map_into_boxed_body()),
@@ -321,7 +384,7 @@ async fn check_resource(
     delta: i64,
 ) -> Result<Option<HttpResponse>, atomic_core::AtomicCoreError> {
     let (metric, limit) = match target {
-        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls => {
+        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls | QuotaTarget::Mcp => {
             ("atoms", plan.atom_limit)
         }
         QuotaTarget::Kb => ("knowledge_bases", plan.kb_limit),
@@ -333,7 +396,7 @@ async fn check_resource(
     let limit = i64::from(limit);
 
     let current: i64 = match target {
-        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls => {
+        QuotaTarget::Atom | QuotaTarget::AtomBulk | QuotaTarget::IngestUrls | QuotaTarget::Mcp => {
             // The atom limit is an account-wide ceiling, so the gate sums
             // atoms across EVERY knowledge base — not just the one this
             // request targets. Counting a single KB would let a tenant on a
@@ -381,6 +444,26 @@ async fn peek_and_replay_batch_len(
     let len = batch_len(&bytes, field);
     req.set_payload(Payload::from(bytes));
     len
+}
+
+/// Buffer the MCP JSON-RPC body, classify whether it is a `create_atom` tool
+/// call ([`mcp_creates_atom`]), and **re-inject the exact bytes** so the MCP
+/// transport reads an untouched payload. A body that can't be read replays as
+/// empty and classifies as non-creating — the transport will surface its own
+/// error; we don't charge quota for something we can't confirm creates an atom.
+async fn peek_and_replay_creates_atom(req: &mut ServiceRequest) -> bool {
+    // Clone the (cheap, Arc-backed) HttpRequest so the immutable `request()`
+    // borrow doesn't overlap the mutable `take_payload()` borrow, exactly like
+    // the batch peek above.
+    let http_req = req.request().clone();
+    let bytes = match Bytes::from_request(&http_req, &mut req.take_payload()).await {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let creates = mcp_creates_atom(&bytes);
+    // Always replay the exact bytes so the handler reads an untouched payload.
+    req.set_payload(Payload::from(bytes));
+    creates
 }
 
 /// Count the batch length in `bytes`: a top-level array when `field` is
@@ -475,6 +558,9 @@ mod tests {
             quota_target(&post, "/api/feeds/abc/poll"),
             Some(QuotaTarget::Atom)
         );
+        // The per-tenant MCP surface is a single POST path; the body decides
+        // whether it actually creates an atom (classified in the guard).
+        assert_eq!(quota_target(&post, "/mcp"), Some(QuotaTarget::Mcp));
         // Updates, reads, and nested paths are not resource creates.
         for ignored in [
             "/api/atoms/abc",
@@ -494,6 +580,32 @@ mod tests {
         assert_eq!(quota_target(&Method::GET, "/api/atoms"), None);
         assert_eq!(quota_target(&Method::PUT, "/api/atoms"), None);
         assert_eq!(quota_target(&Method::GET, "/api/ingest/urls"), None);
+        // The MCP GET (SSE stream) and DELETE (session teardown) aren't POSTs,
+        // so they never reach the body classifier.
+        assert_eq!(quota_target(&Method::GET, "/mcp"), None);
+        assert_eq!(quota_target(&Method::DELETE, "/mcp"), None);
+    }
+
+    #[test]
+    fn mcp_creates_atom_only_for_create_atom_tool_call() {
+        // A `tools/call` for `create_atom` charges one atom.
+        assert!(mcp_creates_atom(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_atom","arguments":{"content":"hi"}}}"#
+        ));
+        // Other tool calls create no atom.
+        assert!(!mcp_creates_atom(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_atoms","arguments":{"query":"x"}}}"#
+        ));
+        // Non-tool methods (handshake, listing) create nothing.
+        assert!(!mcp_creates_atom(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        ));
+        assert!(!mcp_creates_atom(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+        ));
+        // An unparseable / wrong-shaped body isn't ours to charge.
+        assert!(!mcp_creates_atom(b"not json"));
+        assert!(!mcp_creates_atom(br#"{"method":"tools/call"}"#));
     }
 
     #[test]
