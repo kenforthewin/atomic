@@ -1,6 +1,7 @@
 import type { Transport, HttpTransportConfig } from './types';
 import { COMMAND_MAP } from './command-map';
 import { normalizeServerEvent } from './event-normalizer';
+import { parseCloudGuardError } from '../cloudErrors';
 
 export class HttpTransport implements Transport {
   readonly mode = 'http' as const;
@@ -266,14 +267,31 @@ export class HttpTransport implements Transport {
         throw new Error('Authentication expired. Please reconnect with a valid token.');
       }
       const text = await resp.text();
-      let errorMsg: string;
+      let errJson: unknown;
       try {
-        const errJson = JSON.parse(text);
-        errorMsg = errJson.error || text;
+        errJson = JSON.parse(text);
       } catch {
-        errorMsg = text;
+        errJson = undefined;
       }
-      throw errorMsg;
+
+      // Cloud-tenant data-plane guards answer with a structured 402/429 body
+      // (human message + upgrade_url + optional retry hint). Surface those as a
+      // typed error so the UI can show the friendly sentence and an upgrade CTA
+      // instead of the bare machine code. Non-cloud modes keep the raw-text
+      // path below unchanged.
+      if (this.config.cookieAuth && (resp.status === 402 || resp.status === 429)) {
+        const guardError = parseCloudGuardError(
+          resp.status,
+          errJson,
+          resp.headers.get('Retry-After'),
+        );
+        if (guardError) throw guardError;
+      }
+
+      // Legacy path: prefer the machine `error` code, falling back to raw text.
+      throw (errJson && typeof errJson === 'object' && 'error' in errJson
+        ? (errJson as { error?: unknown }).error || text
+        : text);
     }
 
     // Some endpoints return no body (204 or empty)

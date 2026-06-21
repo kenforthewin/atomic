@@ -57,15 +57,21 @@ export function AccountShell() {
   }
 
   if (state.status === 'suspended') {
+    // The server usually hands us an `upgrade_url` straight into Stripe. When
+    // it doesn't (billing not configured, or the field was omitted), fall back
+    // to the in-dashboard billing page rather than dead-ending the screen — it
+    // loads under the suspended state too and offers the manage/upgrade actions.
     return (
       <HoldScreen
         title="Your account is suspended."
         action={
-          state.upgradeUrl ? (
-            <Button onClick={() => window.location.assign(state.upgradeUrl!)}>
-              Update billing
-            </Button>
-          ) : undefined
+          <Button
+            onClick={() =>
+              window.location.assign(state.upgradeUrl ?? '/account/billing')
+            }
+          >
+            Update billing
+          </Button>
         }
       >
         <p>
