@@ -281,6 +281,8 @@ impl OpenRouterProvisioning {
         tracing::debug!(%status, context, body = %truncate(&body, 500), "provisioning API returned a non-success status");
         Err(CloudError::ProviderProvisioning {
             context: context.to_string(),
+            // The `(HTTP <code>)` suffix is load-bearing: `delete_key` keys its
+            // idempotent-404 tolerance off it. Keep them in sync.
             message: format!(
                 "the provider rejected the request (HTTP {})",
                 status.as_u16()
@@ -359,9 +361,10 @@ impl ProvisioningApi for OpenRouterProvisioning {
             Ok(_) => Ok(()),
             // 404 = already gone = the caller's success condition (see the
             // trait contract). Matching on the formatted status keeps `send`
-            // single-shaped; the string is ours, not the provider's.
+            // single-shaped; the string is ours, not the provider's — it's the
+            // `(HTTP 404)` suffix `send` writes above.
             Err(CloudError::ProviderProvisioning { message, .. })
-                if message.starts_with("HTTP 404") =>
+                if message.ends_with("(HTTP 404)") =>
             {
                 tracing::info!(
                     external_key_id,
