@@ -25,9 +25,11 @@ import {
   getLocalServerConfig,
   getMcpBridgePath,
   getTransport,
+  isCloudTenant,
   isDesktopApp,
   isLocalServer,
 } from '../../lib/transport';
+import { CloudDashboardNotice } from '../ui/CloudDashboardNotice';
 import { isMacOS, openExternalUrl, pickDirectory } from '../../lib/platform';
 import { copyToClipboard } from '../../lib/clipboard';
 import { useAtomsStore } from '../../stores/atoms';
@@ -415,6 +417,12 @@ function McpBody() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Cloud tenants manage MCP clients via OAuth from the account dashboard; the
+  // self-hosted token/url flow below has no reachable server URL or token API.
+  if (isCloudTenant()) {
+    return <CloudDashboardNotice />;
+  }
 
   const loadLocal = async () => {
     setError(null);

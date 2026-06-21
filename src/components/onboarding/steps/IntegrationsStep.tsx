@@ -13,8 +13,9 @@ import {
   type ImportResult,
   type IngestionResult,
 } from '../../../lib/api';
-import { isDesktopApp, getLocalServerConfig, getTransport, isLocalServer, getMcpBridgePath } from '../../../lib/transport';
+import { isDesktopApp, getLocalServerConfig, getTransport, isLocalServer, getMcpBridgePath, isCloudTenant } from '../../../lib/transport';
 import type { HttpTransport } from '../../../lib/transport/http';
+import { CloudDashboardNotice } from '../../ui/CloudDashboardNotice';
 import { pickDirectory } from '../../../lib/platform';
 import type { OnboardingState, OnboardingAction } from '../useOnboardingState';
 
@@ -197,6 +198,11 @@ function McpRemoteContent() {
 }
 
 function McpContent() {
+  // Cloud tenants connect MCP clients via OAuth from the account dashboard; the
+  // self-hosted token/url config has no reachable server URL or token API.
+  if (isCloudTenant()) {
+    return <CloudDashboardNotice />;
+  }
   if (isDesktopApp() && isLocalServer()) {
     return <McpLocalContent />;
   }
@@ -215,6 +221,12 @@ function MobileContent({
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Cloud tenants pair the mobile app via the account dashboard; QR-pairing
+  // here would encode an empty server URL and 404 on token creation.
+  if (isCloudTenant()) {
+    return <CloudDashboardNotice />;
+  }
 
   const { url } = getServerInfo();
 
@@ -283,6 +295,13 @@ function MobileContent({
 function ExtensionContent() {
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [copiedToken, setCopiedToken] = useState(false);
+
+  // Cloud tenants configure the browser extension via the account dashboard;
+  // the self-hosted URL/token below are empty and unusable on cloud.
+  if (isCloudTenant()) {
+    return <CloudDashboardNotice />;
+  }
+
   const serverInfo = getServerInfo();
 
   return (

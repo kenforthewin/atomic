@@ -19,6 +19,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { CloudDashboardNotice } from '../ui/CloudDashboardNotice';
 import { CustomSelect } from '../ui/CustomSelect';
 import { SearchableSelect } from '../ui/SearchableSelect';
 import { ConnectionStatus } from '../ui/ConnectionStatus';
@@ -384,6 +385,9 @@ function PipelineDetailCounts({ status }: { status: DatabasePipelineStatus['stat
 }
 
 function DatabasesTab() {
+  // Markdown archive export streams from the local/self-hosted server; on the
+  // cloud data plane that endpoint 404s, so the per-DB Export button is hidden.
+  const isCloud = isCloudTenant();
   const { databases, activeId, fetchDatabases, renameDatabase, deleteDatabase, setDefaultDatabase, getDatabaseStats } = useDatabasesStore();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
@@ -657,6 +661,7 @@ function DatabasesTab() {
                         {isExpanded ? 'Hide' : 'Details'}
                       </button>
                     )}
+                    {!isCloud && (
                     <button
                       onClick={() => handleExportMarkdown(db)}
                       disabled={!!exportingDb}
@@ -668,6 +673,7 @@ function DatabasesTab() {
                         ? `${Math.round((exportJob.processed_atoms / exportJob.total_atoms) * 100)}%`
                         : 'Export'}
                     </button>
+                    )}
                     {!db.is_default && (
                       <button
                         onClick={() => handleSetDefault(db.id)}
@@ -1807,7 +1813,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                       schedule and prompt are editable via
                       `PUT /api/reports/:id`. */}
 
-                  {/* Troubleshooting */}
+                  {/* Troubleshooting — log export hits the local/self-hosted
+                      server log endpoint, which 404s on the cloud data plane. */}
+                  {!isCloud && (
                   <div className="space-y-2 pt-4 border-t border-[var(--color-border)]">
                     <label className="block text-sm font-medium text-[var(--color-text-primary)]">
                       Troubleshooting
@@ -1837,6 +1845,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                       Export Logs
                     </Button>
                   </div>
+                  )}
                 </>
               )}
 
@@ -3215,7 +3224,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
 
                       {showMcpSetup && (
                         <div className="space-y-4 pl-6 border-l-2 border-[var(--color-border)]">
-                          {isDesktopApp() && isLocalServer() ? (
+                          {isCloud ? (
+                            <CloudDashboardNotice />
+                          ) : isDesktopApp() && isLocalServer() ? (
                             <>
                               <p className="text-xs text-[var(--color-text-secondary)]">
                                 The Atomic MCP bridge is bundled with the desktop app. It connects to the local server automatically — no token configuration needed.
