@@ -70,7 +70,8 @@ Routing is split by `Host`:
 
 A `cloud_plane_guard` ([`server.rs`](src/server.rs)) **fail-closes** routes that
 bind atomic-server's process-global state and have no per-tenant story yet —
-`/api/auth/*`, `/api/exports/*`, `/api/logs` all return 404 under cloud.
+`/api/auth/*`, the export-job routes (`/api/exports/*`,
+`/api/databases/{id}/exports/*`), and `/api/logs` all return 404 under cloud.
 
 ### OAuth + MCP on the tenant subdomain
 
@@ -92,7 +93,12 @@ journey works per account:
   a session-based approving identity. atomic-server's self-hosted OAuth
   handlers are untouched.
 - **`/mcp`** sits **behind** CloudAuth (it carries the bearer MCP token the
-  OAuth flow mints). CloudAuth injects the tenant's `DatabaseManager` as a
+  OAuth flow mints) and, like the REST `api_scope`, is wrapped with the
+  **data-plane guards** — its `create_atom` tool is charged against the plan's
+  atom quota, write-blocked under a `read_only` / storage-`restricted` billing
+  hold, and rate-limited (the `quota_guard` peeks the JSON-RPC body to charge
+  only atom-creating calls, so the handshake and read tools stay free). CloudAuth
+  injects the tenant's `DatabaseManager` as a
   `RequestDatabaseManager` extension; atomic-server's MCP transport resolves
   its manager from that extension per-request (falling back to its baked-in
   manager when none is installed — exactly how self-hosted runs). An
@@ -120,14 +126,14 @@ deferred.
 - [`auth.rs`](src/auth.rs) — `CloudAuth` middleware, `AuthPrincipal`, `ResolvedTenant`
 - [`account_cache.rs`](src/account_cache.rs) — per-account `DatabaseManager` cache (idle TTL, hard cap, WS-receiver eviction pinning, generation-checked refresh)
 - [`tenant_plane.rs`](src/tenant_plane.rs) — cloud-owned tenant routes (`DELETE /api/account`, the provider routes)
-- [`account_plane.rs`](src/account_plane.rs) — signup/login request-link + complete
+- [`account_plane.rs`](src/account_plane.rs) — signup/login request-link + complete, and `POST /account/logout` (session revocation + cookie clear)
 - [`oauth_routes.rs`](src/oauth_routes.rs) — cloud's per-account OAuth flow (DCR + Auth Code + PKCE), public discovery/register/token + session-authenticated approve; the `/mcp` mount is wired in `server.rs`
 - [`oauth_store.rs`](src/oauth_store.rs) — control-plane `oauth_clients`/`oauth_codes` storage (per-account, hash-only secrets, single-use codes)
 - [`spa.rs`](src/spa.rs) — serves the account-plane SPA ([`frontend/`](frontend)): the base-domain-injected `index.html`, the traversal-guarded asset/shell fallback (`default_service`), and the tenant dashboard **session gate** (an unauthenticated tenant `GET /account/*` → `302` to the app-host login; a valid session → the shell)
 
 **Control plane & provisioning**
 - [`control_plane.rs`](src/control_plane.rs) — `ControlPlane` handle, connect-or-create, the hardened migration runner
-- [`provision.rs`](src/provision.rs) — `provision_account` / `delete_account` (idempotent, race-guarded)
+- [`provision.rs`](src/provision.rs) — `provision_account` / `delete_account` (idempotent, race-guarded; the active-deletion path best-effort cancels the tenant's Stripe subscription and purges its magic links before the drop)
 - [`tokens.rs`](src/tokens.rs) — `atm_`/`ats_` token & session issuance (hash-only storage)
 - [`reserved_subdomains.rs`](src/reserved_subdomains.rs) — the vanity-slug blocklist
 
@@ -162,11 +168,11 @@ deferred.
 - [`dispatcher.rs`](src/dispatcher.rs) — the per-pod dispatcher loop (hint scan → N+1 poll → round-robin drain)
 - [`pools.rs`](src/pools.rs) — four bounded worker pools with per-tenant caps
 - [`dispatch_hints.rs`](src/dispatch_hints.rs) — the `dispatch_hints` pending-work bit
-- [`backpressure.rs`](src/backpressure.rs) — provider 429/402/401 classification + per-tenant circuit breaker
+- [`backpressure.rs`](src/backpressure.rs) — provider 429/402/401 + transient (5xx/timeout) failure classification + per-tenant circuit breaker (transient faults defer-and-retry rather than terminal-fail)
 - [`chat_streams.rs`](src/chat_streams.rs) — per-tenant streaming-chat semaphore (not pooled)
 
 **Lifecycle & ops**
-- [`reaper.rs`](src/reaper.rs) — periodic recovery: stuck provisions, orphan DBs, self-reservations, expiry, lagging migrations
+- [`reaper.rs`](src/reaper.rs) — periodic recovery: stuck provisions, orphan DBs, self-reservations, expiry, lagging migrations. Orphan reclaim is data-loss-guarded: it refuses outright when the control plane reports zero accounts but the cluster holds tenant DBs (the misdirected-`--control-url` signature) and caps drops per pass
 - [`fleet_migration.rs`](src/fleet_migration.rs) — boot-time fleet migration over lagging tenants
 - [`deploy.rs`](src/deploy.rs) — readiness state machine + failure-rate policy + `deploy_runs` history
 
@@ -227,6 +233,11 @@ component map, the typed API client, and the dashboard's state handling.
 > in a browser? See **[TESTING.md](TESTING.md)** — it covers the host routing,
 > the SSH tunnel, and the `--dangerously-insecure-cookies` dev flag the
 > plain-HTTP session cookie needs.
+>
+> Standing up a **production** deployment? See **[DEPLOY.md](DEPLOY.md)** — the
+> host-split reverse proxy (and the tenant-app cloud-marker it must inject),
+> wildcard DNS/TLS, `--trust-proxy-header`, the single-pod LISTEN/NOTIFY
+> constraint, the required-env/secret checklist, and the accepted-risk register.
 
 Cloud is Postgres-only. A dev cluster (superuser, can `CREATE/DROP DATABASE`)
 is the only prerequisite — the repo's test compose file works:
@@ -276,11 +287,21 @@ runs, but the embedding/LLM steps report a structured "provider not configured"
 error. To make AI work:
 
 - **BYOK** — `PUT /api/account/provider` with an OpenRouter key, or an
-  `openai_compat` key pointed at any OpenAI-compatible endpoint (handy for local
-  models). Validated before storage; takes effect live without a cache evict.
+  `openai_compat` key pointed at any OpenAI-compatible endpoint. Validated
+  before storage; takes effect live without a cache evict. The base URL is
+  **SSRF-gated**: it must be `https` to a public host — private / loopback /
+  link-local / cloud-metadata addresses are rejected so a tenant can't aim our
+  outbound client at internal services, and a rejected validation never echoes
+  the upstream body back (no read-oracle). To point at a **local** model
+  (Ollama / LM Studio on `http://127.0.0.1:…`) set
+  `ATOMIC_CLOUD_ALLOW_PRIVATE_PROVIDER_URLS=1` — a dev/test-only escape that
+  reopens the gate (`serve` warns loudly if it finds it set on a non-localhost
+  deployment).
 - **Managed** — `--provisioning-mode openrouter` + a provisioning key in
   `ATOMIC_CLOUD_OPENROUTER_PROVISIONING_KEY` mints a per-account runtime key at
-  signup.
+  signup, sized to the account's **plan** allowance (`ai_credits_monthly_cents`;
+  `--managed-key-allowance-cents` is the fleet fallback) and re-sized on every
+  plan transition.
 
 ## CLI
 
@@ -300,7 +321,7 @@ atomic-cloud --control-url <URL> <command>
 `--control-url` is global; `serve` and `account` also take `--cluster-url`. Run
 any subcommand with `--help` for the full flag set. Notable `serve` groups:
 
-- **Routing**: `--base-domain`, `--port`, `--bind`, `--app-public-url`
+- **Routing & control plane**: `--base-domain`, `--port`, `--bind`, `--app-public-url`, `--trust-proxy-header` (per-IP limits behind a proxy), `--control-pool-max-connections` (control-plane pool size, default 25)
 - **Email**: `--email-mode log|mailgun` (+ `--mailgun-*`)
 - **Providers**: `--provisioning-mode`, `--managed-key-allowance-cents`, `--master-key-env`
 - **Billing (Stripe, optional)**: `--stripe-secret-key-env`, `--stripe-webhook-secret-env`, `--stripe-price plan=price_…` (secret *values* are env-only, never argv)
@@ -444,7 +465,7 @@ WAL archiving is deferred** — recovery granularity is one day.
 
 ## Testing
 
-~198 test functions across [`tests/`](tests) and inline `#[cfg(test)]` modules.
+~410 test functions across [`tests/`](tests) and inline `#[cfg(test)]` modules.
 Tests are **Postgres-gated**: they skip cleanly when `ATOMIC_TEST_DATABASE_URL`
 is unset, and create + drop their own uniquely-named databases (control plane and
 tenant) with guard-based cleanup.
