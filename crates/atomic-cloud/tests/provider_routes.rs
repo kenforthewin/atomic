@@ -614,9 +614,11 @@ async fn byok_validation_failure_stores_nothing() {
         assert_eq!(body["error"], "provider_validation_failed");
         let message = body["message"].as_str().expect("message");
         assert!(message.contains("401"), "carries the status: {message}");
+        // SEC-1: the provider's upstream error body is never echoed — the
+        // message is the fixed generic rejection, not the provider detail.
         assert!(
-            message.contains("mock says no"),
-            "carries the provider's error verbatim: {message}"
+            !message.contains("mock says no"),
+            "the provider's upstream body must not be echoed: {message}"
         );
 
         // Nothing stored, active pointer untouched, no plaintext anywhere.
@@ -1114,17 +1116,22 @@ async fn byok_validation_error_scrubs_echoed_key() {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"], "provider_validation_failed");
             let message = body["message"].as_str().expect("message");
+            // SEC-1: the upstream body is never echoed to the client — the
+            // message is a fixed generic rejection carrying only the status.
             assert!(
-                message.contains("[redacted]"),
-                "the echo is scrubbed to a marker: {message}"
+                message.contains("rejected") && message.contains("401"),
+                "the message is the generic rejection carrying the status: {message}"
             );
+            // The security property the test exists for: a secret planted in
+            // the upstream body never reaches the client. Now proven by
+            // absence — neither the key nor the upstream body marker leak.
             assert!(
                 !message.contains(ECHOED_KEY),
-                "the submitted key must not survive the scrub: {message}"
+                "the submitted key must not reach the client: {message}"
             );
             assert!(
-                message.contains("rejected by hostile endpoint"),
-                "the provider's error context survives around the scrub: {message}"
+                !message.contains("hostile endpoint"),
+                "the upstream body must not be echoed to the client: {message}"
             );
 
             // Belt and braces: not in any body this harness has read, and the
@@ -1657,11 +1664,14 @@ async fn byok_model_config_rejects_unknown_keys() {
     .await;
 }
 
-/// The scrub-before-truncate ordering, both provider arms: a hostile
-/// endpoint that echoes the submitted key right at the truncation boundary
-/// must still produce a fully scrubbed message. Scrubbing after truncation
-/// would cut the echoed key mid-way and leave the surviving fragment
-/// unmatched by the verbatim replace.
+/// SEC-1, both provider arms: a hostile endpoint that echoes the submitted
+/// key in its error body leaks NOTHING to the client. The upstream body is no
+/// longer echoed at all (it goes only to a debug log), so the message is the
+/// fixed generic rejection carrying just the status — and no fragment of the
+/// submitted key, on EITHER arm, can survive into it. (Originally this test
+/// pinned a scrub-before-truncate ordering of the echoed body; with the echo
+/// removed entirely there is nothing to scrub, so it now asserts the stronger
+/// no-leak property directly, keeping both-arms coverage.)
 #[actix_web::test]
 async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
     with_control_db(
@@ -1670,22 +1680,15 @@ async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
             let h = ProviderHarness::spawn_managed(&url).await;
             let (_account, token) = h.provision("alpha").await;
 
-            // 44-char keys positioned so the 500-char truncation lands
-            // INSIDE the echoed key — scrub-after-truncate would leave the
-            // leading fragment — while the scrub marker itself stays inside
-            // the bound, keeping both properties observable. Each arm's
-            // filler accounts for its fixed prefixes (the JSON wrapper; the
-            // compat arm's "API error (401): ").
             const OR_KEY: &str = "sk-or-boundary-echo-victim-0123456789abcdef0";
             const COMPAT_KEY: &str = "sk-cm-boundary-echo-victim-0123456789abcdef0";
 
             // OpenRouter arm: GET {base}/v1/auth/key answers 401 echoing the
-            // key straddling the boundary (truncation applies to the body;
-            // its JSON wrapper is ~21 chars, so the key spans ~481..525).
+            // submitted key verbatim in its body.
             let hostile_or = openrouter_auth_endpoint(
                 OR_KEY,
                 401,
-                json!({ "error": { "message": format!("{}{OR_KEY} rejected", "x".repeat(460)) } }),
+                json!({ "error": { "message": format!("{OR_KEY} rejected by hostile endpoint") } }),
             )
             .await;
             let resp = h
@@ -1703,28 +1706,27 @@ async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             let message = body["message"].as_str().expect("message");
             assert!(
-                message.contains("[redacted]"),
-                "the echo is scrubbed to the marker: {message}"
+                message.contains("rejected") && message.contains("401"),
+                "openrouter arm returns the generic rejection with the status: {message}"
             );
             for fragment in [OR_KEY, &OR_KEY[..12], &OR_KEY[OR_KEY.len() - 12..]] {
                 assert!(
                     !message.contains(fragment),
-                    "no fragment of the key may survive the boundary: {message}"
+                    "no fragment of the key may leak on the openrouter arm: {message}"
                 );
             }
+            assert!(
+                !message.contains("hostile endpoint"),
+                "the upstream body must not be echoed on the openrouter arm: {message}"
+            );
 
             // OpenAI-compat arm: the validation embedding call hits
-            // POST {base}/v1/embeddings; answer 401 echoing the key at the
-            // boundary. This arm's error body was previously unbounded as
-            // well — pin the bound alongside the scrub.
+            // POST {base}/v1/embeddings; answer 401 echoing the key in its body.
             let hostile_compat = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/embeddings"))
                 .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-                    // Truncation applies to the whole "API error (401): "-
-                    // prefixed message (~38 fixed chars before the filler),
-                    // so the key spans ~478..522.
-                    "error": { "message": format!("{}{COMPAT_KEY} rejected", "x".repeat(440)) }
+                    "error": { "message": format!("{COMPAT_KEY} rejected by hostile endpoint") }
                 })))
                 .mount(&hostile_compat)
                 .await;
@@ -1745,9 +1747,12 @@ async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
             let (status, body) = h.read(resp).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             let message = body["message"].as_str().expect("message");
+            // The compat arm's validation runs through the embedding provider,
+            // whose generic rejection carries no status code (see
+            // validate_openai_compat_key) — assert the generic message only.
             assert!(
-                message.contains("[redacted]"),
-                "compat echo is scrubbed: {message}"
+                message.contains("rejected"),
+                "compat arm returns the generic rejection: {message}"
             );
             for fragment in [
                 COMPAT_KEY,
@@ -1756,13 +1761,12 @@ async fn echoed_key_at_truncation_boundary_is_scrubbed_on_both_arms() {
             ] {
                 assert!(
                     !message.contains(fragment),
-                    "no fragment of the key may survive on the compat arm: {message}"
+                    "no fragment of the key may leak on the compat arm: {message}"
                 );
             }
             assert!(
-                message.chars().count() <= 600,
-                "the compat arm's provider error must be length-bounded, got {} chars",
-                message.chars().count()
+                !message.contains("hostile endpoint"),
+                "the upstream body must not be echoed on the compat arm: {message}"
             );
 
             // Belt and braces: neither key in any body, nothing stored.

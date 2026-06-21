@@ -62,6 +62,34 @@ async fn account_status(control: &ControlPlane, account_id: &str) -> Option<Stri
         .expect("read account status")
 }
 
+/// Seed a healthy, fully-provisioned live account: an `active` accounts row
+/// plus its `account_databases` mapping row. This puts the control plane in
+/// the production "fleet WITH accounts" shape so the orphan arm's
+/// zero-accounts data-loss guard (REL-4) does not fire; the mapping row keeps
+/// this account from being mistaken for an orphan itself.
+async fn seed_live_account(control: &ControlPlane, subdomain: &str) -> Uuid {
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan) \
+         VALUES ($1, $2, 'live@example.com', 'active', 'free')",
+    )
+    .bind(account_id.to_string())
+    .bind(subdomain)
+    .execute(control.pool())
+    .await
+    .expect("seed live account row");
+    sqlx::query(
+        "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
+         VALUES ($1, 'test-cluster-1', $2, 'active')",
+    )
+    .bind(account_id.to_string())
+    .bind(format!("acct_{}", account_id.simple()))
+    .execute(control.pool())
+    .await
+    .expect("seed live account mapping row");
+    account_id
+}
+
 async fn active_provider(control: &ControlPlane, account_id: &str) -> Option<(String, String)> {
     sqlx::query_as(
         "SELECT active_provider, active_origin FROM accounts \
@@ -703,6 +731,12 @@ async fn lost_race_after_key_creation_deletes_the_key() {
                 .expect("create_key saw the account id");
             let orphan_db =
                 tenant_db_name(Uuid::parse_str(&account_id).expect("account id is a UUID"));
+            // A live account so the control plane is NOT empty: the yanked
+            // provision left its own accounts row deleted, and with zero
+            // accounts the orphan arm's REL-4 data-loss guard would refuse the
+            // whole arm. Production reclaims this orphan precisely because the
+            // fleet still HAS accounts alongside the one stray database.
+            seed_live_account(&control, "live-tenant").await;
             let summary = run_reaper_pass(
                 &control,
                 &cluster,

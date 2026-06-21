@@ -70,6 +70,35 @@ async fn seed_provisioning_row(
     .expect("seed provisioning row");
 }
 
+/// Seed a healthy, fully-provisioned live account: an `active` accounts row
+/// plus its `account_databases` mapping row. This is the production shape of
+/// a fleet that *has* accounts — it makes `control_account_count > 0` so the
+/// orphan arm's zero-accounts data-loss guard (REL-4) does not fire, and the
+/// mapping row keeps this account from being mistaken for an orphan itself.
+/// Returns the seeded account id.
+async fn seed_live_account(control: &ControlPlane, subdomain: &str) -> Uuid {
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO accounts (id, subdomain, email, status, plan) \
+         VALUES ($1, $2, 'live@example.com', 'active', 'free')",
+    )
+    .bind(account_id.to_string())
+    .bind(subdomain)
+    .execute(control.pool())
+    .await
+    .expect("seed live account row");
+    sqlx::query(
+        "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
+         VALUES ($1, 'test-cluster-1', $2, 'active')",
+    )
+    .bind(account_id.to_string())
+    .bind(format!("acct_{}", account_id.simple()))
+    .execute(control.pool())
+    .await
+    .expect("seed live account mapping row");
+    account_id
+}
+
 async fn database_exists(base_url: &str, db_name: &str) -> bool {
     let mut conn = PgConnection::connect(base_url)
         .await
@@ -828,6 +857,12 @@ async fn contended_lock_skips_row_and_next_pass_recovers() {
 async fn contended_lock_defers_orphan_reclaim() {
     with_control_db("contended_lock_defers_orphan_reclaim", |url| async move {
         let (control, cluster) = setup(&url).await;
+        // A live account so the control plane is NOT empty — otherwise the
+        // orphan arm's zero-accounts data-loss guard (REL-4) refuses the whole
+        // arm before reaching the per-database lock skip this test asserts.
+        // This mirrors production: a fleet WITH accounts that also holds one
+        // orphan to reclaim.
+        seed_live_account(&control, "live-tenant").await;
         let orphan_uuid = Uuid::new_v4();
         let orphan_db = tenant_db_name(orphan_uuid);
         create_database(&cluster.cluster_url, &orphan_db).await;
@@ -871,6 +906,53 @@ async fn contended_lock_defers_orphan_reclaim() {
         })
         .await;
     })
+    .await;
+}
+
+/// The REL-4 data-loss guard itself: a control plane reporting ZERO accounts
+/// while the cluster still holds tenant-shaped databases is the fingerprint of
+/// a misdirected `--control-url` (a failover or a half-restored / empty
+/// control plane), not an empty fleet. In that state the orphan arm must
+/// REFUSE — flag `orphan_reclaim_refused` and drop nothing — rather than
+/// disown and reclaim the whole fleet in one pass.
+#[tokio::test]
+async fn zero_accounts_with_tenant_dbs_refuses_orphan_reclaim() {
+    with_control_db(
+        "zero_accounts_with_tenant_dbs_refuses_orphan_reclaim",
+        |url| async move {
+            let (control, cluster) = setup(&url).await;
+            // An orphan candidate exists on the cluster, but the control plane
+            // knows of NO accounts at all — the misdirected-URL signature.
+            let orphan_uuid = Uuid::new_v4();
+            let orphan_db = tenant_db_name(orphan_uuid);
+            create_database(&cluster.cluster_url, &orphan_db).await;
+
+            with_db_guard(&cluster.cluster_url, &orphan_db, || async {
+                let summary = run_reaper_pass(
+                    &control,
+                    &cluster,
+                    &ManagedKeys::Disabled,
+                    &ReaperPolicy::default(),
+                )
+                .await;
+                assert_no_errors(&summary);
+                assert!(
+                    summary.orphan_reclaim_refused,
+                    "zero-account control plane with tenant databases must trip \
+                     the REL-4 guard: {summary:?}"
+                );
+                assert!(
+                    summary.orphan_dbs_dropped.is_empty(),
+                    "the guard must drop nothing: {summary:?}"
+                );
+                assert!(
+                    database_exists(&cluster.cluster_url, &orphan_db).await,
+                    "the orphan candidate must survive the refused pass"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 

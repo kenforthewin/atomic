@@ -202,10 +202,12 @@ async fn provider_errors_map_typed_and_never_leak_the_provisioning_key() {
         panic!("expected ProviderProvisioning, got {err:?}");
     };
     assert_eq!(context, "creating runtime key");
+    // SEC-1: the upstream body is never echoed — the message is the fixed
+    // generic rejection carrying only the status, not the provider detail.
     assert!(message.contains("402"), "status surfaces: {message}");
     assert!(
-        message.contains("Insufficient credits"),
-        "provider detail surfaces: {message}"
+        !message.contains("Insufficient credits"),
+        "the provider's upstream body must not surface: {message}"
     );
     // SECRET HYGIENE: the rendered error never carries the bearer token.
     let rendered = format!("{err} / {err:?}");
