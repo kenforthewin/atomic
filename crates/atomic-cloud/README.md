@@ -6,10 +6,6 @@ not modification** — it wraps atomic-server's routes under its own middleware
 and adds the account, auth, provisioning, and background-execution machinery a
 hosted service needs.
 
-The design lives in [`docs/plans/atomic-cloud.md`](../../docs/plans/atomic-cloud.md);
-that document is the source of truth for *why*. This README is the source of
-truth for *what's here and how to run it*.
-
 ---
 
 ## The one rule that shapes everything
