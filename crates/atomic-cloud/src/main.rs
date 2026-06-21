@@ -613,6 +613,22 @@ fn base_domain_is_localhost(base_domain: &str) -> bool {
     host == "localhost" || host.ends_with(".localhost")
 }
 
+/// Whether a Postgres connection URL asks for a TLS-negotiating `sslmode`
+/// (`require` / `verify-ca` / `verify-full`). A missing or weaker mode
+/// (`disable` / `allow` / `prefer`) can silently fall back to plaintext. Used
+/// only for a boot-time advisory — sqlx performs the actual TLS handshake from
+/// the URL; this just inspects the operator's stated intent.
+fn pg_url_requires_tls(pg_url: &str) -> bool {
+    url::Url::parse(pg_url)
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "sslmode")
+                .map(|(_, v)| matches!(v.as_ref(), "require" | "verify-ca" | "verify-full"))
+        })
+        .unwrap_or(false)
+}
+
 impl BillingArgs {
     /// Parse the `plan=price` pairs into a map.
     fn plan_prices(&self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
@@ -1447,6 +1463,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      production.",
                     atomic_cloud::provider_config::ALLOW_PRIVATE_PROVIDER_URLS_ENV,
                 );
+            }
+            // Tenant content and the encrypted-credential ciphertexts travel the
+            // app↔Postgres link; on a real deployment that link must be TLS.
+            // sqlx negotiates TLS from the URL's sslmode, so warn when neither
+            // connection URL requires it (the operator may still terminate TLS
+            // via a trusted local proxy/socket, hence a warning, not a refusal).
+            if !base_is_localhost {
+                for (flag, pg_url) in [
+                    ("--control-url", cli.control_url.as_str()),
+                    ("--cluster-url", cluster.cluster_url.as_str()),
+                ] {
+                    if !pg_url_requires_tls(pg_url) {
+                        tracing::warn!(
+                            "{flag} does not require TLS (no sslmode=require/verify-ca/verify-full): \
+                             tenant content and encrypted credentials may cross the network in \
+                             plaintext. Set sslmode=require (verify-full preferred) on {flag}, or \
+                             ensure TLS is terminated by a trusted local proxy/socket (e.g. the \
+                             Cloud SQL Auth Proxy). See DEPLOY.md §2."
+                        );
+                    }
+                }
             }
             let plane_config = AccountPlaneConfig {
                 app_public_url: app_public_url.clone(),

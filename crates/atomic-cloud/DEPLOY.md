@@ -55,7 +55,7 @@ isolation model — get it wrong and a tenant request can be misrouted.
 
 ---
 
-## 2. DNS and TLS
+## 2. DNS, TLS, and encryption at rest
 
 You need two DNS records and a TLS cert that covers both the app host and every
 tenant subdomain:
@@ -81,6 +81,52 @@ never sent and login appears to "do nothing".
 that produces the `*.<base>` + `app.<base>` cert (e.g. cert-manager with a
 DNS-01 solver, or a managed LB cert). Wildcard certs generally require DNS-01,
 not HTTP-01.
+
+### App ↔ Postgres TLS (required)
+
+The cert above protects the **client ↔ proxy** leg. The **app ↔ Postgres** leg
+carries tenant content *and* the encrypted-credential ciphertexts, so it must be
+TLS too. The server negotiates TLS from each connection URL's `sslmode`; set
+`sslmode=require` — or `verify-full`, which additionally checks the server
+certificate — on **both** `--control-url` and `--cluster-url`:
+
+```
+postgres://USER:PASS@HOST:5432/atomic_cloud_control?sslmode=verify-full
+postgres://USER:PASS@HOST:5432/postgres?sslmode=verify-full          # cluster
+```
+
+`serve` emits a boot **warning** when a non-localhost deployment's URL doesn't
+ask for a TLS-negotiating mode. It's a warning, not a hard failure, because some
+setups terminate TLS out of band — e.g. the Cloud SQL Auth Proxy / a sidecar
+over a local socket. If that's you, the link is already encrypted and the
+warning is expected; otherwise, treat it as a must-fix.
+
+### Encryption at rest
+
+Atomic's at-rest posture is **per-account database isolation + infrastructure
+volume encryption + app-encrypted secrets** — *not* application-level content
+encryption. Two layers, and the infrastructure one is yours to enable:
+
+- **Secrets** — provider API keys (managed runtime keys + BYOK) are encrypted by
+  the app with **AES-256-GCM**, each ciphertext AEAD-bound to its
+  `(account, provider, origin)` row, under `ATOMIC_CLOUD_MASTER_KEY` (env-only;
+  see [`keyvault.rs`](src/keyvault.rs)). A stolen database dump alone cannot
+  decrypt them — the key lives out of band.
+- **Tenant content** — atoms, embeddings, wiki, chat live as ordinary rows in
+  each tenant database; their at-rest encryption is the **cluster's volume
+  encryption**, which is an infra setting you must turn on:
+  - **[CONFIRM] Enable volume/disk encryption** on the Postgres cluster (every
+    managed PG offers AES-256 at the storage layer).
+  - **[CONFIRM] Enable bucket encryption (SSE)** on the backup bucket —
+    `pg_dump` artifacts hold the same plaintext content.
+- **Master-key custody** — back `ATOMIC_CLOUD_MASTER_KEY` up **out of band,
+  separate from the database backups** (a bundle holding both the ciphertexts
+  and the key is plaintext with extra steps). Losing it makes every stored
+  provider credential unrecoverable.
+
+> Because tenant content is not app-encrypted, an operator with database access
+> can read it. Describe the product as **isolated + encrypted at rest (infra)**,
+> never as zero-knowledge or end-to-end encrypted.
 
 ---
 
@@ -309,15 +355,19 @@ Keep that discipline: pass secrets via env, not flags.
 - [ ] `pg_dump`/`pg_restore` are on the pod image `PATH`.
 - [ ] `--backup-store s3` with a durable bucket; `AWS_*` creds present; no
       `local` store in prod. (§7, MIG-1)
-- [ ] `ATOMIC_CLOUD_MASTER_KEY` present, valid, and backed up off-pod (loss =
-      unrecoverable credentials).
+- [ ] `ATOMIC_CLOUD_MASTER_KEY` present, valid, and backed up off-pod **separate
+      from the database backups** (loss = unrecoverable credentials). (§2)
+- [ ] `--control-url` and `--cluster-url` carry `sslmode=require`/`verify-full`
+      (or TLS is terminated by a trusted proxy/socket) — no app↔Postgres TLS
+      boot warning. (§2)
+- [ ] Volume/disk encryption is enabled on the Postgres cluster. **[CONFIRM]** (§2)
+- [ ] Server-side encryption (SSE) is enabled on the backup bucket. **[CONFIRM]** (§2)
 - [ ] Stripe keys + webhook secret + price map set (if a paid tier is live);
       webhook endpoint reachable at `app.<base>/billing/webhook`.
 - [ ] Mailgun configured (`--email-mode mailgun`); `log` mode is **not** in use.
 - [ ] `--dangerously-insecure-cookies` is **not** set (no boot warning for it).
-- [ ] BILL-1 (MCP guard bypass) fix is deployed before exposing `/mcp` to
-      tenants — see the ship-readiness report. (Out of scope for this runbook,
-      but a launch gate.)
+- [ ] `ATOMIC_CLOUD_ALLOW_PRIVATE_PROVIDER_URLS` is **not** set (no boot warning;
+      the BYOK SSRF gate is active).
 
 ---
 
