@@ -57,15 +57,15 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("ollama_timeout_secs", "120"), // 2 minutes default for Ollama (local models can be slow)
     ("ollama_context_length", "65536"),
     ("openrouter_context_length", ""),
-    ("embedding_model", "qwen/qwen3-embedding-8b"),
-    ("tagging_model", "openai/gpt-4o-mini"),
+    ("embedding_model", crate::providers::DEFAULT_EMBEDDING_MODEL),
+    ("tagging_model", crate::providers::DEFAULT_TAGGING_MODEL),
     // Pipeline strategy defaults. These are intentionally conservative: whole-atom
     // rechunking and cost-bounded full-content tagging with truncation.
     ("embedding_strategy", "rechunk_whole_atom"),
     ("tagging_strategy", "truncated_full_content"),
-    ("wiki_model", "anthropic/claude-sonnet-4.6"),
+    ("wiki_model", crate::providers::DEFAULT_AGENTIC_MODEL),
     ("wiki_strategy", "centroid"),
-    ("chat_model", "anthropic/claude-sonnet-4.6"),
+    ("chat_model", crate::providers::DEFAULT_AGENTIC_MODEL),
     ("auto_tagging_enabled", "true"),
     ("openai_compat_base_url", ""),
     ("openai_compat_embedding_model", ""),

@@ -1866,7 +1866,7 @@ impl AtomicCore {
             ProviderType::OpenRouter => settings_map
                 .get("wiki_model")
                 .cloned()
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string()),
+                .unwrap_or_else(|| crate::providers::DEFAULT_AGENTIC_MODEL.to_string()),
         };
         let strategy = wiki::WikiStrategy::from_string(
             settings_map
@@ -3015,7 +3015,7 @@ impl AtomicCore {
             ProviderType::OpenRouter => settings_map
                 .get("tagging_model")
                 .cloned()
-                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+                .unwrap_or_else(|| crate::providers::DEFAULT_TAGGING_MODEL.to_string()),
         };
 
         // OpenRouter needs the model's supported sampling params so the request
@@ -5608,8 +5608,16 @@ mod tests {
     async fn test_settings_mode_model_change_marks_space_changed() {
         let (_registry, cores, _dir) = make_workspace(0);
 
+        // Pin a concrete starting model so this asserts a *same-width* model
+        // swap regardless of the default embedding width: both custom ids are
+        // unknown to the registry and fall back to the same dimension.
+        cores[0]
+            .set_setting("embedding_model", "custom/space-a")
+            .await
+            .unwrap();
+
         let result = cores[0]
-            .set_setting_with_reembed("embedding_model", "custom/other-space", |_| {})
+            .set_setting_with_reembed("embedding_model", "custom/space-b", |_| {})
             .await
             .unwrap();
 
@@ -5628,7 +5636,7 @@ mod tests {
     async fn test_explicit_mode_embedding_space_writes_are_inert() {
         let (_registry, cores, _dir) = make_workspace(0);
         // Promote to explicit mode with the default config (OpenRouter,
-        // 1536-dim embedding model).
+        // 1024-dim Qwen embedding model).
         cores[0].update_provider_config(ProviderConfig::from_settings(
             &std::collections::HashMap::new(),
         ));
@@ -5651,9 +5659,9 @@ mod tests {
             assert_eq!(result.retried_failed_count, 0, "{key} must retry nothing");
         }
 
-        // The vector index was never touched: still at the 1536 dimension the
+        // The vector index was never touched: still at the 1024 dimension the
         // explicit config produces, not the 3072 the settings rows now claim.
-        assert_vec_chunks_dimension(&cores[0], 1536);
+        assert_vec_chunks_dimension(&cores[0], 1024);
 
         // The writes themselves landed — explicit mode stores values, it only
         // keeps them from steering the embedding space.

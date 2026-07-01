@@ -63,6 +63,17 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen/qwen3-embedding-8b";
 /// vector search — with negligible retrieval loss for an 8B embedder.
 pub const DEFAULT_EMBEDDING_DIMENSION: usize = 1024;
 
+/// Default **utility** model for single-shot structured tasks (tagging). Cheap
+/// and fast — no agent loop runs on it, so a nano-tier model is the right tool.
+pub const DEFAULT_TAGGING_MODEL: &str = "openai/gpt-5-nano";
+
+/// Default **agentic** model for tool-using loops — wiki synthesis, the chat
+/// agent, and reports. These run multi-step agent loops and must be on an
+/// agent-capable model (a proven pattern in Atomic); the nano utility tier
+/// belongs on tagging, never here. Kept distinct from [`DEFAULT_TAGGING_MODEL`]
+/// so cheap tagging and capable reasoning don't collapse onto one model.
+pub const DEFAULT_AGENTIC_MODEL: &str = "anthropic/claude-sonnet-5";
+
 /// Provider configuration extracted from settings
 ///
 /// `Debug` is implemented manually to redact API keys — configs get logged
@@ -78,7 +89,15 @@ pub struct ProviderConfig {
     /// the OpenRouter API.
     pub openrouter_base_url: String,
     pub openrouter_embedding_model: String,
+    /// The **utility** LLM for single-shot tagging (cheap; no agent loop).
     pub openrouter_llm_model: String,
+    /// The **agentic** LLM for tool-using loops — wiki, chat, reports. Distinct
+    /// from [`openrouter_llm_model`](Self::openrouter_llm_model) so cloud
+    /// managed keys can run tagging cheaply while wiki/chat/reports use an
+    /// agent-capable model. Single-model providers (Ollama, OpenAI-compat) have
+    /// no such split; their [`agentic_model`](Self::agentic_model) coincides
+    /// with [`llm_model`](Self::llm_model).
+    pub openrouter_agentic_model: String,
     /// User-specified context length override. None = use model default from API cache.
     pub openrouter_context_length: Option<usize>,
     // Ollama settings
@@ -114,6 +133,7 @@ impl std::fmt::Debug for ProviderConfig {
                 &self.openrouter_embedding_model,
             )
             .field("openrouter_llm_model", &self.openrouter_llm_model)
+            .field("openrouter_agentic_model", &self.openrouter_agentic_model)
             .field("openrouter_context_length", &self.openrouter_context_length)
             .field("ollama_host", &self.ollama_host)
             .field("ollama_embedding_model", &self.ollama_embedding_model)
@@ -170,7 +190,11 @@ impl ProviderConfig {
             openrouter_llm_model: settings
                 .get("tagging_model")
                 .cloned()
-                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+                .unwrap_or_else(|| DEFAULT_TAGGING_MODEL.to_string()),
+            openrouter_agentic_model: settings
+                .get("chat_model")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_AGENTIC_MODEL.to_string()),
             openrouter_context_length: settings.get("openrouter_context_length").and_then(|s| {
                 if s.is_empty() {
                     None
@@ -276,10 +300,11 @@ impl ProviderConfig {
             "tagging_model".to_string(),
             self.openrouter_llm_model.clone(),
         );
-        // The per-task model keys (doc comment above): one explicit LLM
-        // selection governs tagging, wiki, chat, and reports alike.
-        settings.insert("wiki_model".to_string(), self.llm_model().to_string());
-        settings.insert("chat_model".to_string(), self.llm_model().to_string());
+        // The per-task model keys (doc comment above): tagging rides the
+        // utility model, while wiki/chat/reports ride the agentic model — the
+        // split this overlay must preserve, not collapse.
+        settings.insert("wiki_model".to_string(), self.agentic_model().to_string());
+        settings.insert("chat_model".to_string(), self.agentic_model().to_string());
         match self.openrouter_context_length {
             Some(len) => settings.insert("openrouter_context_length".to_string(), len.to_string()),
             None => settings.remove("openrouter_context_length"),
@@ -342,10 +367,25 @@ impl ProviderConfig {
         }
     }
 
-    /// Get the LLM model for the current provider
+    /// The utility LLM for the current provider — single-shot tasks (tagging).
+    /// For OpenRouter this is the cheap [`openrouter_llm_model`](Self::openrouter_llm_model);
+    /// single-model providers use their one LLM.
     pub fn llm_model(&self) -> &str {
         match self.provider_type {
             ProviderType::OpenRouter => &self.openrouter_llm_model,
+            ProviderType::Ollama => &self.ollama_llm_model,
+            ProviderType::OpenAICompat => &self.openai_compat_llm_model,
+        }
+    }
+
+    /// The agentic LLM for the current provider — tool-using loops (wiki, chat,
+    /// reports). For OpenRouter this is the distinct
+    /// [`openrouter_agentic_model`](Self::openrouter_agentic_model); Ollama and
+    /// OpenAI-compat have a single LLM, so it coincides with
+    /// [`llm_model`](Self::llm_model).
+    pub fn agentic_model(&self) -> &str {
+        match self.provider_type {
+            ProviderType::OpenRouter => &self.openrouter_agentic_model,
             ProviderType::Ollama => &self.ollama_llm_model,
             ProviderType::OpenAICompat => &self.openai_compat_llm_model,
         }
@@ -809,6 +849,7 @@ mod tests {
         config.openrouter_base_url = "http://proxy.internal/api/v1".to_string();
         config.openrouter_embedding_model = "mock/embed".to_string();
         config.openrouter_llm_model = "mock/llm".to_string();
+        config.openrouter_agentic_model = "mock/agentic".to_string();
         config.openrouter_context_length = Some(8192);
         config.ollama_host = "http://ollama:11434".to_string();
         config.ollama_embedding_model = "embed-x".to_string();
@@ -840,17 +881,23 @@ mod tests {
 
         config.apply_to_settings(&mut settings);
         assert_eq!(ProviderConfig::from_settings(&settings), config);
-        // Model selection is provider config: the per-task model keys are
-        // pinned to the explicit config's LLM, so a settings write can never
-        // route wiki/chat/report traffic on the configured credential to a
-        // model the config didn't choose.
+        // Model selection is provider config: wiki/chat/report traffic is
+        // pinned to the explicit config's *agentic* model (not the cheaper
+        // tagging model), so a settings write can never reroute it to a model
+        // the config didn't choose, and the tagging/agentic split survives.
         for key in ["wiki_model", "chat_model"] {
             assert_eq!(
                 settings.get(key).map(|s| s.as_str()),
-                Some(config.llm_model()),
-                "{key} must be pinned to the explicit config's LLM"
+                Some(config.agentic_model()),
+                "{key} must be pinned to the explicit config's agentic LLM"
             );
         }
+        // Tagging rides the cheaper utility model, kept distinct.
+        assert_eq!(
+            settings.get("tagging_model").map(|s| s.as_str()),
+            Some(config.llm_model()),
+            "tagging_model must stay on the utility LLM, not the agentic one"
+        );
         assert_eq!(
             settings.get("wiki_generation_prompt").map(|s| s.as_str()),
             Some("keep this prompt"),

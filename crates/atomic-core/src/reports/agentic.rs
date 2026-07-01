@@ -524,7 +524,7 @@ async fn resolve_model(core: &AtomicCore) -> Result<(ProviderConfig, String), At
         ProviderType::OpenRouter => settings
             .get("wiki_model")
             .cloned()
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string()),
+            .unwrap_or_else(|| crate::providers::DEFAULT_AGENTIC_MODEL.to_string()),
     };
     Ok((config, model))
 }

@@ -35,6 +35,7 @@ fn mock_openrouter_config(mock: &MockAiServer) -> ProviderConfig {
     // (matches the mock's EMBED_DIM and the SQLite vec_chunks schema).
     config.openrouter_embedding_model = "openai/text-embedding-3-small".to_string();
     config.openrouter_llm_model = "mock-llm".to_string();
+    config.openrouter_agentic_model = "mock-agentic".to_string();
     config
 }
 
@@ -277,11 +278,23 @@ async fn explicit_config_pins_per_task_models_sqlite() {
         models.len() >= 2,
         "expected tagging and chat LLM traffic, got {models:?}"
     );
+    // The explicit config pins each task to its own model and the settings
+    // write can't reroute either: tagging rides the utility model, the chat
+    // agent rides the agentic model, and neither ever becomes the
+    // settings-written `frontier/expensive`.
+    assert!(
+        models.iter().any(|m| m == "mock-llm"),
+        "tagging must carry the config's utility model: {models:?}"
+    );
+    assert!(
+        models.iter().any(|m| m == "mock-agentic"),
+        "the chat agent must carry the config's agentic model: {models:?}"
+    );
     for model in &models {
-        assert_eq!(
-            model, "mock-llm",
-            "every LLM call must carry the explicit config's model, \
-             never the settings-written one: {models:?}"
+        assert!(
+            model == "mock-llm" || model == "mock-agentic",
+            "every LLM call must carry an explicit-config model (utility or \
+             agentic), never the settings-written one: {models:?}"
         );
     }
 }
