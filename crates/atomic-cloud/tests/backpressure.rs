@@ -727,7 +727,7 @@ async fn credit_exhaustion_pauses_and_guards_interactive_routes() {
             );
             assert_eq!(
                 body["upgrade_url"],
-                format!("https://app.{BASE_DOMAIN}/billing"),
+                format!("https://app.{BASE_DOMAIN}/account/billing"),
                 "upgrade_url placeholder derives from the tenant's base domain"
             );
 

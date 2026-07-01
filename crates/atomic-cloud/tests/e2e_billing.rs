@@ -11,7 +11,7 @@
 //! - The full lifecycle in one test: provision → trial → trial-expiry
 //!   auto-downgrade (manufactured clock) → over-limit read-only → signed
 //!   checkout webhook widens the plan → writes resume → payment_failed → past_due
-//!   → dunning reaper 3d → read_only → payment_succeeded → active recovered.
+//!   → dunning reaper 7d → read_only → payment_succeeded → active recovered.
 //! - **Cross-tenant isolation**: a second tenant (`beta`) stays on its own
 //!   plan and serving state untouched throughout `alpha`'s entire journey.
 //! - **Storage enforcement, no-delete**: the recompute arm drives an
@@ -454,8 +454,8 @@ async fn full_billing_lifecycle_with_cross_tenant_isolation() {
             "past_due is full-access grace"
         );
 
-        // === Dunning reaper at 3d → read_only ===
-        backdate_past_due(&harness.control, &alpha.account_id, 4).await;
+        // === Dunning reaper at 7d → read_only ===
+        backdate_past_due(&harness.control, &alpha.account_id, 8).await;
         let adv = advance_dunning_with(
             &harness.control,
             chrono::Utc::now(),

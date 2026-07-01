@@ -14,3 +14,6 @@ UPDATE plans
    SET ai_credits_monthly_cents = 1000,
        feature_flags = '{}'::jsonb
  WHERE id = 'pro';
+
+-- Record this migration in the version table (the runner reads MAX(version)).
+INSERT INTO schema_version (version) VALUES (17);
