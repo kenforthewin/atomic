@@ -109,7 +109,8 @@ impl EmailSender for MailgunSender {
         let (subject, lead, button) = copy_for(purpose);
         let text = format!(
             "{lead}\n\n{link}\n\nThis link expires in 15 minutes. \
-             If you didn't request it, you can ignore this email."
+             If you didn't request it, you can ignore this email.\n\n\
+             — Atomic · https://atomicapp.ai · Community & support: https://discord.gg/fT4vTERhz3"
         );
         let html = format!(
             r#"<div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
@@ -117,6 +118,7 @@ impl EmailSender for MailgunSender {
   <p style="color: #4a4540; line-height: 1.6; margin-bottom: 32px;">{lead} This link expires in 15 minutes.</p>
   <a href="{link}" style="display: inline-block; background: #7c3aed; color: white; text-decoration: none; padding: 12px 32px; border-radius: 8px; font-weight: 500;">{button}</a>
   <p style="color: #8a8580; font-size: 13px; margin-top: 32px;">If you didn't request this, you can ignore this email.</p>
+  <p style="color: #b3aea8; font-size: 12px; margin-top: 24px; border-top: 1px solid #eee7df; padding-top: 16px;">Atomic · <a href="https://atomicapp.ai" style="color: #8a8580;">atomicapp.ai</a> · <a href="https://discord.gg/fT4vTERhz3" style="color: #8a8580;">Community &amp; support</a></p>
 </div>"#
         );
 

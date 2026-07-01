@@ -88,13 +88,13 @@
 //!   "current": 100,
 //!   "limit": 100,
 //!   "resets_at": null,
-//!   "upgrade_url": "https://app.<base>/billing" }
+//!   "upgrade_url": "https://app.<base>/account/billing" }
 //! ```
 //!
 //! `resets_at` is `null` for resource limits — they don't reset on a clock,
 //! they clear when the user deletes data or upgrades (plan: "Downgrade …
 //! over-limit usage retained but writes blocked until under"). `upgrade_url`
-//! is derived from the request host (`<sub>.<base>` → `https://app.<base>/billing`),
+//! is derived from the request host (`<sub>.<base>` → `https://app.<base>/account/billing`),
 //! the same derivation the out-of-credits guard uses.
 
 use actix_web::body::{BoxBody, MessageBody};
@@ -488,7 +488,7 @@ fn batch_len(bytes: &[u8], field: Option<&str>) -> Result<usize, ()> {
 }
 
 /// Placeholder upgrade link, derived from the request host
-/// (`<sub>.<base>` → `https://app.<base>/billing`) — the same derivation the
+/// (`<sub>.<base>` → `https://app.<base>/account/billing`) — the same derivation the
 /// out-of-credits guard uses (plan: `upgrade_url` =
 /// `https://app.<base-domain>/billing`).
 fn upgrade_url(req: &ServiceRequest) -> String {
@@ -500,7 +500,7 @@ fn upgrade_url(req: &ServiceRequest) -> String {
         .unwrap_or_default();
     let host = host.split(':').next().unwrap_or(host);
     let base = host.split_once('.').map(|(_, base)| base).unwrap_or(host);
-    format!("https://app.{base}/billing")
+    format!("https://app.{base}/account/billing")
 }
 
 /// The plan's quota-exceeded response shape, verbatim. `resets_at` is always

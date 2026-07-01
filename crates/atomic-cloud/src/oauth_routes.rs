@@ -855,7 +855,7 @@ fn consent_page_html(
 <body>
 <div class="card">
   <h1>Authorize <span class="app-name">{client_name}</span></h1>
-  <p>This application wants to access your Atomic knowledge base. It will be able to search, read, and create atoms.</p>
+  <p>This application wants to access your Atomic knowledge base. It will be able to search, read, create, and edit atoms, and ingest web pages on your behalf.</p>
   <form method="POST" action="/oauth/authorize">
     <input type="hidden" name="client_id" value="{client_id}">
     <input type="hidden" name="redirect_uri" value="{redirect_uri}">

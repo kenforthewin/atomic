@@ -537,13 +537,13 @@ pub fn ai_interactive_route(method: &Method, path: &str) -> bool {
 }
 
 /// Placeholder upgrade link for the `out_of_ai_credits` body, derived from
-/// the request's host (`<sub>.<base>` → `https://app.<base>/billing`). The
+/// the request's host (`<sub>.<base>` → `https://app.<base>/account/billing`). The
 /// billing slice owns the real destination; the *shape* of the response is
 /// this slice's contract.
 fn upgrade_url(host: &str) -> String {
     let host = host.split(':').next().unwrap_or(host);
     let base = host.split_once('.').map(|(_, base)| base).unwrap_or(host);
-    format!("https://app.{base}/billing")
+    format!("https://app.{base}/account/billing")
 }
 
 /// Data-plane middleware: while the tenant is paused with
@@ -792,12 +792,12 @@ mod tests {
     #[test]
     fn upgrade_url_derives_app_host() {
         assert_eq!(
-            upgrade_url("kenny.atomic.cloud"),
-            "https://app.atomic.cloud/billing"
+            upgrade_url("kenny.atomicapp.ai"),
+            "https://app.atomicapp.ai/account/billing"
         );
         assert_eq!(
             upgrade_url("kenny.cloudtest.local:8080"),
-            "https://app.cloudtest.local/billing"
+            "https://app.cloudtest.local/account/billing"
         );
     }
 }

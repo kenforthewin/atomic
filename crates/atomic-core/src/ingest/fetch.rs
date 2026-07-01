@@ -8,7 +8,7 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Mozilla/5.0 (compatible; Atomic/1.0; +https://github.com/atomic)")
+        .user_agent("Mozilla/5.0 (compatible; Atomic/1.0; +https://atomicapp.ai)")
         .build()
         .expect("Failed to build HTTP client")
 });
