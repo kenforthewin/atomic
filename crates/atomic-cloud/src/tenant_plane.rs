@@ -1141,6 +1141,26 @@ struct UpdateModelsRequest {
 /// Every write must keep the effective embedding dimension at the platform
 /// pin (rejected otherwise, before storing — module docs); a same-dimension
 /// embedding-model change carries the loud `reembed_warning`.
+/// Whether the account's plan unlocks the premium agentic model list — the
+/// `premium_models` flag on its `plans.feature_flags` (mirrors
+/// [`crate::plans::Plan::feature_enabled`]). A NULL `plan_id`, an unknown plan,
+/// or any read error resolves to `false` (free tier), so the fuller list is
+/// never handed out by accident. Read only on the rare provider-model write.
+async fn account_has_premium_models(control: &ControlPlane, account_id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE((p.feature_flags->>'premium_models')::boolean, false) \
+           FROM accounts a \
+           LEFT JOIN plans p ON p.id = COALESCE(a.plan_id, 'free') \
+          WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(control.pool())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 async fn update_models_route(
     req: HttpRequest,
     state: web::Data<PlaneState>,
@@ -1189,7 +1209,10 @@ async fn update_models_route(
     // having seeded them all at save time — but are still vocabulary-checked
     // (the plaintext-column rule; see the save route) before anything lands.
     let model_config = if active.origin == CredentialOrigin::Managed {
-        if let Err(violation) = validate_managed_model_config(&submitted) {
+        // The agentic model list is plan-gated: premium plans unlock the fuller
+        // set. Resolve the account's tier so curation checks the right list.
+        let premium = account_has_premium_models(&state.control, account_id).await;
+        if let Err(violation) = validate_managed_model_config(&submitted, premium) {
             return HttpResponse::BadRequest().json(json!({
                 "error": "model_not_curated",
                 "message": violation,

@@ -24,8 +24,8 @@ use atomic_cloud::{
     configure_cloud_app, issue_token, provision_account, AccountCache, AccountCacheConfig,
     AccountPlane, AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane,
     FallbackAppState, ManagedKeyConfig, ManagedKeys, NewAccount, ProvisionedAccount, QuotaBilling,
-    Readiness, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, MANAGED_LLM_MODELS,
-    SESSION_COOKIE,
+    Readiness, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT, FREE_AGENTIC_MODELS,
+    MANAGED_EMBEDDING_MODEL, SESSION_COOKIE,
 };
 use atomic_core::DatabaseManager;
 use atomic_test_support::MockAiServer;
@@ -878,12 +878,12 @@ async fn model_curation_managed_pinned_byok_free() {
             assert_eq!(stored, managed_model_config(&h.managed_mock));
 
             // A curated choice lands; same embedding model, so no warning.
-            let curated = MANAGED_LLM_MODELS[1];
+            let curated = FREE_AGENTIC_MODELS[1];
             let resp = h
                 .api(Method::PUT, "alpha", "/api/account/provider/models")
                 .bearer_auth(&token)
                 .json(&json!({ "model_config": {
-                    "embedding_model": "openai/text-embedding-3-small",
+                    "embedding_model": MANAGED_EMBEDDING_MODEL,
                     "llm_model": curated,
                 }}))
                 .send()

@@ -109,8 +109,9 @@ pub use chat_streams::{
 };
 pub use control_plane::ControlPlane;
 pub use curated_models::{
-    merge_managed_model_config, validate_managed_model_config, MANAGED_EMBEDDING_MODEL,
-    MANAGED_LLM_MODELS, PINNED_EMBEDDING_DIMENSION,
+    agentic_models_for_plan, merge_managed_model_config, validate_managed_model_config,
+    DEFAULT_AGENTIC_MODEL, FREE_AGENTIC_MODELS, MANAGED_EMBEDDING_MODEL, MANAGED_TAGGING_MODEL,
+    PINNED_EMBEDDING_DIMENSION, PRO_AGENTIC_MODELS,
 };
 pub use deploy::{
     abandoned_run_threshold, advance_deploy, deploy_run_status, evaluate_policy,

@@ -90,7 +90,14 @@ impl Default for ManagedKeyConfig {
 pub fn default_managed_model_config() -> serde_json::Value {
     serde_json::json!({
         "embedding_model": crate::curated_models::MANAGED_EMBEDDING_MODEL,
-        "llm_model": crate::curated_models::MANAGED_LLM_MODELS[0],
+        // The agentic model (wiki/chat/reports) — user-selectable within the
+        // plan's tier; seeded to the free-tier default.
+        "llm_model": crate::curated_models::DEFAULT_AGENTIC_MODEL,
+        // The tagging model — platform-owned and fixed. Seeded here (not
+        // user-writable), preserved across model writes by
+        // `merge_managed_model_config`, and read back by
+        // `build_provider_config` into the utility-model slot.
+        "tagging_model": crate::curated_models::MANAGED_TAGGING_MODEL,
     })
 }
 

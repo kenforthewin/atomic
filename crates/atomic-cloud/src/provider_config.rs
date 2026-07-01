@@ -27,7 +27,8 @@
 //! | key | meaning |
 //! |---|---|
 //! | `embedding_model` | embedding model id |
-//! | `llm_model` | the LLM for every task — tagging, wiki, chat, reports |
+//! | `llm_model` | the **agentic** LLM — wiki, chat, reports |
+//! | `tagging_model` | the **utility** LLM — single-shot tagging (managed: platform-owned) |
 //! | `openrouter_base_url` | OpenRouter API base override (proxies, gateways, test servers) |
 //! | `openai_compat_base_url` | OpenAI-compatible API base (required for that provider to function) |
 //! | `embedding_dimension` | embedding vector width (OpenAI-compat only; OpenRouter models carry known dimensions) |
@@ -40,15 +41,17 @@
 //! defaults, which keeps this builder a thin overlay rather than a second
 //! source of default truth.
 //!
-//! `llm_model` is the account's *entire* LLM selection: in explicit mode
-//! atomic-core pins the per-task `wiki_model`/`chat_model` settings keys to
-//! the config's LLM (`ProviderConfig::apply_to_settings`), so a tenant
-//! settings write can never route wiki/chat/report traffic to a model this
-//! column didn't choose — which is what makes managed curation
-//! ([`crate::curated_models`]) actually govern every LLM consumer, not just
-//! tagging. Distinct per-task models for BYOK accounts would be new
-//! vocabulary here *plus* per-task fields on `ProviderConfig`; deferred
-//! until someone asks.
+//! `llm_model` is the account's **agentic** selection (wiki, chat, reports)
+//! and `tagging_model` its **utility** selection (single-shot tagging), landing
+//! in the two distinct `ProviderConfig` OpenRouter slots. In explicit mode
+//! atomic-core pins the per-task settings keys to those slots
+//! (`ProviderConfig::apply_to_settings`: `wiki_model`/`chat_model` ← the
+//! agentic model, `tagging_model` ← the utility model), so a tenant settings
+//! write can never reroute either — which is what makes managed curation
+//! ([`crate::curated_models`]) govern every LLM consumer. This is the split
+//! that lets agent loops run on an agent-capable model while tagging stays on
+//! a cheap one; managed rows seed `tagging_model` platform-owned, so a user
+//! only ever chooses the agentic model.
 
 use std::collections::HashMap;
 
@@ -88,7 +91,14 @@ pub fn build_provider_config(
             if let Some(model) = string_field("embedding_model") {
                 config.openrouter_embedding_model = model;
             }
+            // `llm_model` is the agentic model (wiki/chat/reports).
             if let Some(model) = string_field("llm_model") {
+                config.openrouter_agentic_model = model;
+            }
+            // `tagging_model` is the platform-owned utility model (single-shot
+            // tagging). Absent (e.g. a BYOK row that never set it) leaves the
+            // ProviderConfig default in the utility slot.
+            if let Some(model) = string_field("tagging_model") {
                 config.openrouter_llm_model = model;
             }
             if let Some(base_url) = string_field("openrouter_base_url") {
@@ -289,7 +299,8 @@ mod tests {
             Some(&key),
             &json!({
                 "embedding_model": "openai/text-embedding-3-small",
-                "llm_model": "openai/gpt-4o-mini",
+                "llm_model": "anthropic/claude-haiku-4.5",
+                "tagging_model": "openai/gpt-5-nano",
                 "openrouter_base_url": "http://127.0.0.1:9999",
             }),
         );
@@ -300,7 +311,10 @@ mod tests {
         );
         assert_eq!(config.openai_compat_api_key, None, "wrong-slot key");
         assert_eq!(config.embedding_model(), "openai/text-embedding-3-small");
-        assert_eq!(config.llm_model(), "openai/gpt-4o-mini");
+        // The split: `llm_model` is the agentic model, `tagging_model` the
+        // utility model — they land in distinct slots, never collapsed.
+        assert_eq!(config.agentic_model(), "anthropic/claude-haiku-4.5");
+        assert_eq!(config.llm_model(), "openai/gpt-5-nano");
         assert_eq!(config.openrouter_base_url, "http://127.0.0.1:9999");
     }
 

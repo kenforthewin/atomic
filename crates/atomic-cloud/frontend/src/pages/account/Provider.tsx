@@ -24,8 +24,12 @@ import { originLabel, providerLabel, readModelConfig } from '../../lib/provider'
  * shell's overview (so the summary card and usage stay in sync).
  */
 export function Provider() {
-  const { reload: reloadOverview } = useAccount();
+  const { overview, reload: reloadOverview } = useAccount();
   const { state, reload: reloadStatus } = useProviderStatus();
+  // Paid plans unlock the premium agentic model list. The server is
+  // authoritative (it re-checks the plan's `premium_models` flag on write);
+  // this only picks which options the managed picker offers.
+  const isPremiumPlan = overview.plan.id !== 'free';
   const [notice, setNotice] = useState<{ tone: 'success' | 'warning'; message: string } | null>(
     null,
   );
@@ -213,6 +217,7 @@ function ProviderBody({
           <div className="mt-5">
             <ManagedModels
               currentLlmModel={config.llm_model ?? null}
+              premium={isPremiumPlan}
               onSaved={(result) => onWriteSucceeded(result, 'Updated your managed model.')}
             />
           </div>
