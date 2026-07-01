@@ -10,6 +10,7 @@ import {
   HoldScreen,
 } from '../../components/account/HoldScreen';
 import { Button } from '../../components/ui/Button';
+import { SUPPORT_URL } from '../../lib/links';
 
 /**
  * The authenticated tenant dashboard shell. Loads the account overview on
@@ -76,7 +77,11 @@ export function AccountShell() {
       >
         <p>
           Serving is paused for non-payment. Your data is retained in full —
-          update your billing to restore access.
+          update your billing to restore access. Need help?{' '}
+          <a href={SUPPORT_URL} className="text-accent hover:underline">
+            Reach out on Discord
+          </a>
+          .
         </p>
       </HoldScreen>
     );

@@ -1,7 +1,5 @@
 import { Logo } from './ui/Logo';
-
-const PRODUCT_URL = 'https://atomicapp.ai';
-const GITHUB_URL = 'https://github.com/kenforthewin/atomic';
+import { PRODUCT_URL, GITHUB_URL, SUPPORT_URL } from '../lib/links';
 
 /**
  * The public footer, echoing the marketing site: the wordmark, a one-line
@@ -59,6 +57,14 @@ export function SiteFooter() {
                   className="hover:text-text-primary transition-colors"
                 >
                   GitHub
+                </a>
+              </li>
+              <li>
+                <a
+                  href={SUPPORT_URL}
+                  className="hover:text-text-primary transition-colors"
+                >
+                  Community &amp; support
                 </a>
               </li>
             </ul>

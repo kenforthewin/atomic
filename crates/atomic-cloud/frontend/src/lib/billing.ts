@@ -171,7 +171,7 @@ async function billingErrorMessage(response: Response): Promise<string> {
 
   switch (code) {
     case 'unknown_plan':
-      return 'That plan isn’t available for checkout on this deployment. Please contact support.';
+      return 'That plan isn’t available for checkout on this deployment. Please reach out to us on Discord.';
     case 'billing_not_configured':
       return 'Billing isn’t enabled on this deployment, so there’s nothing to set up.';
     default:

@@ -17,7 +17,7 @@ import { configuredBaseDomain } from '../lib/host';
 
 /** The base shown in the live `<slug>.<base>` preview. */
 function previewBaseDomain(): string {
-  return configuredBaseDomain() ?? 'atomic.cloud';
+  return configuredBaseDomain() ?? 'atomicapp.ai';
 }
 
 interface FieldErrors {
