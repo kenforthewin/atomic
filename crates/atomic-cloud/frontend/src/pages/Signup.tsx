@@ -220,6 +220,18 @@ export function Signup() {
           <Button type="submit" loading={submitting} disabled={!clientValid} fullWidth>
             {submitting ? 'Sending link…' : 'Send my sign-up link'}
           </Button>
+
+          <p className="text-center text-xs text-text-muted">
+            By signing up, you agree to our{' '}
+            <TextLink to="/terms" className="text-xs">
+              Terms
+            </TextLink>{' '}
+            and{' '}
+            <TextLink to="/privacy" className="text-xs">
+              Privacy Policy
+            </TextLink>
+            .
+          </p>
         </form>
       </AuthLayout>
     </PublicLayout>

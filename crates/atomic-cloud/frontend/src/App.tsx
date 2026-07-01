@@ -3,6 +3,7 @@ import { isAppHost } from './lib/host';
 import { Landing } from './pages/Landing';
 import { Signup } from './pages/Signup';
 import { Login } from './pages/Login';
+import { Legal } from './pages/Legal';
 import { NotFound } from './pages/NotFound';
 import { AccountShell } from './pages/account/AccountShell';
 import { Overview } from './pages/account/Overview';
@@ -39,6 +40,8 @@ function AppHostRoutes() {
       <Route path="/" element={<Landing />} />
       <Route path="/signup" element={<Signup />} />
       <Route path="/login" element={<Login />} />
+      <Route path="/terms" element={<Legal kind="terms" />} />
+      <Route path="/privacy" element={<Legal kind="privacy" />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
   );
