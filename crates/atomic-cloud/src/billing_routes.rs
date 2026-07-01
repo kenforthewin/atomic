@@ -269,7 +269,7 @@ async fn portal(state: web::Data<BillingState>, req: HttpRequest) -> HttpRespons
         }
     };
 
-    let return_url = format!("{}/billing", state.app_public_url);
+    let return_url = format!("{}/account/billing", state.app_public_url);
     match provider.create_portal_session(&customer, &return_url).await {
         Ok(session) => redirect(&session.url),
         Err(e) => {
@@ -319,8 +319,8 @@ async fn checkout(
         .get::<ResolvedTenant>()
         .map(|t| t.subdomain.clone())
         .unwrap_or_default();
-    let success_url = format!("{}/billing?status=success", state.app_public_url);
-    let cancel_url = format!("{}/billing?status=cancel", state.app_public_url);
+    let success_url = format!("{}/account/billing?status=success", state.app_public_url);
+    let cancel_url = format!("{}/account/billing?status=cancel", state.app_public_url);
     match provider
         .create_checkout_session(price_id, &email, &subdomain, &success_url, &cancel_url)
         .await

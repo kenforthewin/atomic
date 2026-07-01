@@ -123,11 +123,12 @@ impl WriteBlock {
     }
 }
 
-/// `<sub>.<base>` → `https://app.<base>/billing` (plan: `upgrade_url`).
+/// `<sub>.<base>` → `https://app.<base>/account/billing` (the dashboard billing
+/// route; the app-host billing page a suspended/blocked tenant can still reach).
 fn upgrade_url(host: &str) -> String {
     let host = host.split(':').next().unwrap_or(host);
     let base = host.split_once('.').map(|(_, base)| base).unwrap_or(host);
-    format!("https://app.{base}/billing")
+    format!("https://app.{base}/account/billing")
 }
 
 #[cfg(test)]
@@ -169,8 +170,8 @@ mod tests {
     #[test]
     fn upgrade_url_derives_app_host() {
         assert_eq!(
-            upgrade_url("kenny.atomic.cloud"),
-            "https://app.atomic.cloud/billing"
+            upgrade_url("kenny.atomicapp.ai"),
+            "https://app.atomicapp.ai/account/billing"
         );
     }
 }

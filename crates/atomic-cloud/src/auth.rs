@@ -667,12 +667,12 @@ fn account_suspended(host: &str) -> HttpResponse {
     }))
 }
 
-/// `<sub>.<base>` → `https://app.<base>/billing` (plan: `upgrade_url`). Same
-/// derivation the out-of-credits and quota guards use.
+/// `<sub>.<base>` → `https://app.<base>/account/billing` (the dashboard billing
+/// route). Same derivation the out-of-credits and quota guards use.
 fn app_billing_url(host: &str) -> String {
     let host = host.split(':').next().unwrap_or(host);
     let base = host.split_once('.').map(|(_, base)| base).unwrap_or(host);
-    format!("https://app.{base}/billing")
+    format!("https://app.{base}/account/billing")
 }
 
 /// The account exists and the credential verified, but its tenant database

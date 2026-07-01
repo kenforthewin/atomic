@@ -372,7 +372,7 @@ async fn full_billing_lifecycle_with_cross_tenant_isolation() {
         assert_eq!(body["error"], "account_read_only");
         assert_eq!(
             body["upgrade_url"],
-            format!("https://app.{BASE_DOMAIN}/billing")
+            format!("https://app.{BASE_DOMAIN}/account/billing")
         );
         // The trial-era atom survives the downgrade (never auto-deleted).
         let atoms: Value = harness
@@ -619,7 +619,7 @@ async fn storage_recompute_restricts_writes_without_deleting_then_clears() {
         assert_eq!(body["error"], "account_storage_restricted");
         assert_eq!(
             body["upgrade_url"],
-            format!("https://app.{BASE_DOMAIN}/billing")
+            format!("https://app.{BASE_DOMAIN}/account/billing")
         );
 
         // NEVER-DELETE: the tenant's data survives the restriction.

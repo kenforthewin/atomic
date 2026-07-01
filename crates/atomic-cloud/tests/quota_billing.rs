@@ -272,7 +272,7 @@ async fn plans_are_seeded_and_account_plan_id_is_an_fk() {
         .fetch_one(control.pool())
         .await
         .expect("free plan row");
-        assert_eq!(free, (Some(100), 50, Some(1)), "free-tier defaults");
+        assert_eq!(free, (Some(250), 50, Some(1)), "free-tier defaults");
 
         // The FK is real: an account can't reference a non-existent plan.
         let bad = sqlx::query(
@@ -286,7 +286,7 @@ async fn plans_are_seeded_and_account_plan_id_is_an_fk() {
         // The registry loads and resolves the free plan.
         let registry = PlanRegistry::load(control.clone()).await.expect("load");
         let free = registry.get("free").expect("free plan present");
-        assert_eq!(free.atom_limit, Some(100));
+        assert_eq!(free.atom_limit, Some(250));
         assert_eq!(free.kb_limit, Some(1));
     })
     .await;
@@ -336,7 +336,7 @@ async fn atom_limit_blocks_with_exact_quota_body() {
         assert!(body["resets_at"].is_null(), "resource limits don't reset");
         assert_eq!(
             body["upgrade_url"],
-            format!("https://app.{BASE_DOMAIN}/billing")
+            format!("https://app.{BASE_DOMAIN}/account/billing")
         );
 
         harness.stop().await;
@@ -1167,13 +1167,13 @@ async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
         control.initialize().await.expect("migrate");
         let account_id = seed_account(&control, "alpha").await;
 
-        // Enter past_due, then backdate past_due_since by 4 days: a sweep at
-        // "now" must advance past_due → read_only (3-day threshold) but NOT
-        // yet suspended (14-day threshold).
+        // Enter past_due, then backdate past_due_since by 8 days: a sweep at
+        // "now" must advance past_due → read_only (7-day threshold) but NOT
+        // yet suspended (21-day threshold).
         apply_payment_failed(&control, &account_id)
             .await
             .expect("payment failed");
-        backdate_past_due(&control, &account_id, 4).await;
+        backdate_past_due(&control, &account_id, 8).await;
         let advance = advance_dunning(&control, chrono::Utc::now())
             .await
             .expect("advance");
@@ -1181,8 +1181,8 @@ async fn dunning_advances_read_only_then_suspended_on_a_manufactured_clock() {
         assert_eq!(advance.moved_to_suspended, 0);
         assert_eq!(billing_state(&control, &account_id).await, "read_only");
 
-        // Backdate to 15 days: the next sweep suspends (data retained).
-        backdate_past_due(&control, &account_id, 15).await;
+        // Backdate to 22 days: the next sweep suspends (data retained).
+        backdate_past_due(&control, &account_id, 22).await;
         let advance = advance_dunning(&control, chrono::Utc::now())
             .await
             .expect("advance");
