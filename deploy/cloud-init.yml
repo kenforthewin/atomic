@@ -1,0 +1,33 @@
+#cloud-config
+# First-boot setup for the Atomic Cloud droplet (passed by scripts/provision.sh).
+# Installs Docker, adds swap (the backup pass + Rust image builds want the
+# headroom on 8 GB), and formats + mounts the DO block-storage volume that
+# holds the Postgres data directory.
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - rsync
+
+swap:
+  filename: /swapfile
+  size: 4G
+  maxsize: 4G
+
+runcmd:
+  # Docker Engine + compose plugin
+  - curl -fsSL https://get.docker.com | sh
+  # The DO volume attaches at a stable by-id path (name: atomic-data).
+  # Format only if blank, then mount at /mnt/atomic-data.
+  - |
+    DEV=/dev/disk/by-id/scsi-0DO_Volume_atomic-data
+    if [ -b "$DEV" ]; then
+      blkid "$DEV" >/dev/null || mkfs.ext4 "$DEV"
+      mkdir -p /mnt/atomic-data
+      grep -q atomic-data /etc/fstab || echo "$DEV /mnt/atomic-data ext4 defaults,nofail,discard 0 2" >> /etc/fstab
+      mount -a
+      mkdir -p /mnt/atomic-data/postgres
+    fi
+  - mkdir -p /opt/atomic

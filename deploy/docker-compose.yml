@@ -1,0 +1,83 @@
+# Atomic Cloud — production single-box stack (DEPLOY.md's single-pod topology).
+#
+# Three services on one droplet:
+#   caddy        TLS termination (wildcard via Cloudflare DNS-01) + reverse proxy
+#   postgres     the tenant cluster + control plane (pgvector), data on the
+#                encrypted DO volume
+#   atomic-cloud the pod image (cloud.dockerfile)
+#
+# The app connects to Postgres DIRECTLY, no pgbouncer: the provisioning /
+# migration / backup paths hold session advisory locks, which transaction
+# pooling breaks (verified: provisioning hangs — see DEPLOY.md §6). At
+# single-box launch scale the connection budget is handled by
+# max_connections=200 + the app's own pool caps instead.
+#
+# Config comes from ./.env (copy .env.example) — never commit it.
+
+name: atomic-cloud
+
+services:
+  caddy:
+    build:
+      context: .
+      dockerfile: caddy.dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${ATOMIC_CLOUD_BASE_DOMAIN:?set in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set in .env}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?set in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - atomic-cloud
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    shm_size: 256mb
+    # max_connections must cover the §6 fan-out (cached tenants × tenant pool
+    # size + control pool + pg_dump); 200 is ample headroom for launch scale.
+    command: >-
+      postgres
+      -c max_connections=200
+      -c shared_buffers=1GB
+      -c effective_cache_size=3GB
+    environment:
+      POSTGRES_USER: atomic
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: postgres
+    volumes:
+      # The DO block-storage volume (encrypted at rest) mounted by cloud-init.
+      - ${POSTGRES_DATA_DIR:-/mnt/atomic-data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atomic -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  atomic-cloud:
+    # CI publishes this from cloud.dockerfile (.github/workflows/cloud-image.yml);
+    # scripts/deploy.sh --build builds it on the box instead when the registry
+    # image isn't available.
+    image: ${ATOMIC_CLOUD_IMAGE:-ghcr.io/kenforthewin/atomic-cloud:latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Composed here (not in .env) because env_file values are passed
+      # verbatim — only the compose file interpolates ${POSTGRES_PASSWORD}.
+      # Direct to Postgres (see header note); no sslmode on a same-host bridge.
+      ATOMIC_CLOUD_CONTROL_URL: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/atomic_cloud_control
+      ATOMIC_CLOUD_CLUSTER_URL: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,25 @@
+# Caddy fronting the atomic-cloud pod (DEPLOY.md §1/§2/§4).
+#
+# - One site block covers the apex + every subdomain; the wildcard cert is
+#   issued via DNS-01 against Cloudflare (wildcards can't use HTTP-01), which
+#   also covers app.<domain> and every tenant subdomain.
+# - reverse_proxy passes Host through unmodified (required — the server routes
+#   by Host) and sets X-Forwarded-For from the real peer, ignoring any
+#   client-supplied value — exactly the "rightmost entry is trustworthy"
+#   property --trust-proxy-header assumes.
+# - WebSocket upgrades (/ws) proxy transparently.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN}, *.{$DOMAIN} {
+	tls {
+		dns cloudflare {$CLOUDFLARE_API_TOKEN}
+		resolvers 1.1.1.1
+	}
+
+	encode zstd gzip
+
+	reverse_proxy atomic-cloud:8080
+}

@@ -44,3 +44,6 @@ plugins/obsidian-plugin/data.json
 
 # Local backup-store output from the cloud dev stack (--backup-store local)
 backups/
+
+# Cloud deploy secrets (deploy/README.md)
+deploy/.env
