@@ -33,7 +33,7 @@ outside this repo (DNS provider, k8s manifests, S3 bucket policy), it is marked
                           │  --trust-proxy-header     │
                           └──────┬─────────────┬──────┘
                                  │             │
-                    control plane (PG)   tenant cluster (PG, via pgbouncer)
+                    control plane (PG)   tenant cluster (PG, budgeted — §6)
                     atomic_cloud_control   acct_<base32(uuid)> × N
 ```
 
@@ -182,7 +182,7 @@ etc.) therefore collapse to a single bucket — the proxy's IP — unless you te
 the server to read the client IP from `X-Forwarded-For`:
 
 ```
---trust-proxy-header           # or ATOMIC_CLOUD_TRUST_PROXY_HEADER=1
+--trust-proxy-header           # or ATOMIC_CLOUD_TRUST_PROXY_HEADER=true
 ```
 
 Enable this **if and only if** a trusted proxy fronts the process and that
@@ -224,7 +224,7 @@ correct live progress.
 
 ---
 
-## 6. pgbouncer is required (REL-3)
+## 6. The cluster connection budget (REL-3)
 
 Each cached active tenant holds its own Postgres pool against the **shared**
 tenant cluster (`--tenant-pool-max-connections`, default 5). At fleet scale the
@@ -237,21 +237,38 @@ max worst-case backend connections ≈ account_cache_max_entries
 ```
 
 A single pod with ~1000 cached tenants × 5 connections is ~5000 backend
-connections — far past a bare Postgres `max_connections`. **A connection pooler
-(pgbouncer, in transaction-pooling mode) in front of the tenant cluster is a
-hard prerequisite**, not an optimization. Size the cluster's real
-`max_connections` and pgbouncer's `default_pool_size` against your launch
-fleet, plus headroom for:
+connections — far past a bare Postgres `max_connections`. At fleet scale
+that demands a pooler; at launch scale it demands a sized budget (see the
+limitation box below for why the pooler can't be transaction-mode yet).
+Whichever you run, size the cluster's real `max_connections` against your
+launch fleet, plus headroom for:
 
 - the control-plane pool (`--control-pool-max-connections`, default 25),
 - the nightly backup pass (`pg_dump` opens its own connections),
 - the reaper and other background loops.
 
-**[CONFIRM]** pgbouncer deployment + pool sizing, and that the
-`--cluster-url`/`--control-url` you hand the pod point **through** pgbouncer
-(not at the raw Postgres port). Note transaction-pooling mode disallows session
-features (prepared statements, `LISTEN/NOTIFY`); the code is written to tolerate
-this, but verify against your pooler config.
+> **Verified limitation (2026-07): transaction pooling does not work today.**
+> The provisioning, migration, and backup paths hold **session-scoped advisory
+> locks**, and transaction pooling migrates a client between server connections
+> across statements — provisioning hangs within seconds (reproduced against
+> pgbouncer 1.24 in `pool_mode = transaction`). Until the advisory-lock usage
+> is made transaction-scoped, the realistic options are:
+>
+> - **Direct connections + a sized connection budget** — what the single-box
+>   [`deploy/`](../../deploy) stack does: `max_connections = 200` on the
+>   cluster, bounded by the app's per-tenant pool caps and idle TTLs. Fine
+>   through soft-launch scale; the fan-out math above says when it stops
+>   being fine.
+> - **Session-pooling mode** — safe, but sqlx holds its pool connections open,
+>   so multiplexing gains are minimal; it mostly buys connection-storm
+>   shielding.
+>
+> Treat "make the pool paths transaction-pooling-safe" as the prerequisite for
+> the fleet-scale pgbouncer topology this section describes.
+
+**[CONFIRM]** the connection budget: either a sized direct `max_connections`
+(single-box) or a session-mode pooler — and if you ever switch to transaction
+pooling, re-verify provisioning end-to-end first (see the limitation box).
 
 `pg_dump`/`pg_restore` must be on `PATH` in the pod image — backups and account
 deletion's final dump shell out to them. The shipped image (§7) bakes them in;
@@ -312,8 +329,8 @@ Keep that discipline: pass secrets via env, not flags.
 
 | Setting | Env var | Notes |
 |---|---|---|
-| Control-plane DB URL | `ATOMIC_CLOUD_CONTROL_URL` | Postgres URL of `atomic_cloud_control`. Through pgbouncer in prod. |
-| Tenant cluster URL | `ATOMIC_CLOUD_CLUSTER_URL` | Shared cluster; the role must be able to `CREATE`/`DROP DATABASE`. Through pgbouncer in prod. |
+| Control-plane DB URL | `ATOMIC_CLOUD_CONTROL_URL` | Postgres URL of `atomic_cloud_control`. Direct or session-pooled — never transaction-pooled (§6). |
+| Tenant cluster URL | `ATOMIC_CLOUD_CLUSTER_URL` | Shared cluster; the role must be able to `CREATE`/`DROP DATABASE`. Direct or session-pooled — never transaction-pooled (§6). |
 | Base domain | `ATOMIC_CLOUD_BASE_DOMAIN` | e.g. `atomic.cloud`. Drives host-split routing, cookie scope, redirect URLs. |
 | Master key | `ATOMIC_CLOUD_MASTER_KEY` (name overridable via `--master-key-env`) | 32 bytes, hex or base64. Encrypts provider credentials at rest. **Loss of this key = unrecoverable tenant credentials** (see `keyvault` custody runbook). `serve` refuses to boot without a valid key. |
 
@@ -395,8 +412,9 @@ Keep that discipline: pass secrets via env, not flags.
       `--product-dir` with no boot warning). (§3)
 - [ ] Exactly **one** `serve`/dispatcher pod is running (no cross-pod WS relay
       in v1). (§5)
-- [ ] pgbouncer fronts the tenant cluster; pool budget covers the launch fleet;
-      `--cluster-url`/`--control-url` point through it. **[CONFIRM]** (§6)
+- [ ] The connection budget covers the launch fleet: sized `max_connections`
+      for direct connections (single-box), or a session-mode pooler —
+      **transaction pooling is currently incompatible**. **[CONFIRM]** (§6)
 - [ ] `pg_dump`/`pg_restore` are on the pod image `PATH` (baked into
       `cloud.dockerfile`; `PG_CLIENT_MAJOR` ≥ the cluster's major). (§7)
 - [ ] `--backup-store s3` with a durable bucket; `AWS_*` creds present; no
@@ -426,7 +444,7 @@ fast-follows.
 
 | ID | Risk | Why accepted for soft launch | Follow-up |
 |---|---|---|---|
-| **REL-3** | Tenant pool fan-out (`max_entries × pool × pods`) assumes pgbouncer is present and sized. | Prerequisite, not a code bug — §6 documents it as required. | Add a boot sanity check relating the fan-out to the cluster's connection budget. |
+| **REL-3** | Tenant pool fan-out (`max_entries × pool × pods`) can exceed the cluster's connection budget at fleet scale. | §6 documents the budget math; single-box launch runs direct with sized `max_connections` (transaction-mode pgbouncer is currently incompatible — session advisory locks). | Make the pool paths transaction-pooling-safe, then add a boot sanity check relating fan-out to the budget. |
 | **OPS-3** | Logs are human-text only — no JSON, no request-correlation id. | `account_id` is logged in hot paths, so an operator can grep by tenant + timestamp. | Add `--log-format json` + an `X-Request-Id` correlation id as the observability floor. |
 | **OPS-4** | `--trust-proxy-header` is off by default with no boot warning → per-IP limits collapse to the proxy IP behind a proxy. | Per-email and per-account limiters still apply. §4 documents it as required-behind-proxy. | Emit a boot `warn!` when no proxy-trust is configured but the bind looks proxied. |
 | **OPS-5** | `panic = "abort"` in the server profile → any panic aborts the whole pod (all tenants), not just the failing request. | Defensible fail-fast: durable state always recovers and the orchestrator restarts the pod. | Consider `panic = "unwind"` for the server profile later, accepting the larger binary. |
