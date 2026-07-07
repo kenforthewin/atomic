@@ -280,14 +280,28 @@ async fn complete_internal(
         None
     };
 
-    // Filter parameters based on model support
-    let temperature = if config.params.is_param_supported("temperature") {
+    // Filter parameters based on model support. Under `require_parameters`
+    // (structured output), sampling preferences ride ONLY when positively
+    // known supported: OpenRouter routes strict requests exclusively to
+    // endpoints supporting every sent parameter, so an assumed-universal
+    // param (temperature on the GPT-5 reasoning family) yields a routing 404
+    // rather than being ignored. A preference must never constrain routing.
+    let strict_routing = provider_prefs.is_some();
+    let param_ok = |name: &str| {
+        if strict_routing {
+            config.params.is_param_known_supported(name)
+        } else {
+            config.params.is_param_supported(name)
+        }
+    };
+
+    let temperature = if param_ok("temperature") {
         config.params.temperature
     } else {
         None
     };
 
-    let max_tokens = if config.params.is_param_supported("max_tokens") {
+    let max_tokens = if param_ok("max_tokens") {
         config.params.max_tokens
     } else {
         None

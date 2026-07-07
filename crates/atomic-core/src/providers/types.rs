@@ -223,6 +223,19 @@ impl GenerationParams {
                 "temperature" | "max_tokens" | "json_schema"
             ))
     }
+
+    /// Positively-known support only: `true` iff capabilities were loaded AND
+    /// include `param`. Use instead of [`Self::is_param_supported`] wherever
+    /// over-sending is harmful rather than ignorable — OpenRouter's
+    /// `require_parameters` routing filters to endpoints supporting EVERY sent
+    /// parameter, so an optional param assumed "universal" (temperature, which
+    /// the GPT-5 reasoning family rejects) empties the endpoint pool into a
+    /// 404 instead of being dropped.
+    pub fn is_param_known_supported(&self, param: &str) -> bool {
+        self.supported_parameters
+            .as_ref()
+            .is_some_and(|params| params.iter().any(|p| p == param))
+    }
 }
 
 /// LLM completion response
