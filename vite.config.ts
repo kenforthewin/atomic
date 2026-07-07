@@ -74,10 +74,20 @@ export default defineConfig({
               navigateFallbackDenylist: [
                 /^\/api\//,
                 /^\/health/,
+                /^\/ready/,
                 /^\/ws/,
                 /^\/oauth\//,
                 /^\/\.well-known\//,
                 /^\/mcp(\/|$)/,
+                // Atomic Cloud server-owned pages on the same origin. The
+                // account dashboard and auth pages are a different SPA — if
+                // the product SW answers these navigations it serves the
+                // wrong app's shell (and on tenant hosts, hijacks the
+                // dashboard entirely).
+                /^\/account(\/|$)/,
+                /^\/signup(\/|$)/,
+                /^\/login(\/|$)/,
+                /^\/billing(\/|$)/,
               ],
               runtimeCaching: [
                 {

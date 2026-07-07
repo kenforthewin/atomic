@@ -437,6 +437,16 @@ async fn serve_spa(req: HttpRequest, spa: web::Data<SpaServer>) -> HttpResponse 
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "not_found" }));
     }
 
+    // `index.html` is NEVER served from disk. Both shells carry boot-time
+    // rewrites — the account SPA's base-domain meta, the product app's
+    // cloud-tenant marker — so the raw build file is always wrong. Concretely:
+    // the product PWA's service worker precaches `/index.html` as its
+    // navigation fallback, and serving the account dist's raw file here (it
+    // matched first) poisoned every tenant navigation with the dashboard
+    // document. An explicit `index.html` request falls through to the same
+    // host-appropriate in-memory shell as any deep link.
+    let wants_index = req.path().ends_with("/index.html");
+
     // Try to serve an existing build file. Check the account dist first, then
     // the product dist (when attached): the two share the `/assets/` path but
     // Vite content-hashes filenames, so a given asset lives in exactly one of
@@ -444,6 +454,9 @@ async fn serve_spa(req: HttpRequest, spa: web::Data<SpaServer>) -> HttpResponse 
     // a real file (a deep link) falls through to a shell below.
     let product_root = spa.product.as_ref().map(|p| p.root.as_ref());
     for root in std::iter::once(spa.root.as_ref()).chain(product_root) {
+        if wants_index {
+            break;
+        }
         if let Some(resolved) = resolve_asset_path(root, req.path()) {
             match tokio::fs::read(&resolved).await {
                 Ok(bytes) => return asset_response(&resolved, bytes),

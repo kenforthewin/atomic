@@ -284,4 +284,39 @@ async fn product_app_serves_at_tenant_root_account_on_app_host() {
         body_of(resp).await.contains("\"ok\":true"),
         "/health not shadowed"
     );
+
+    // REGRESSION: `/index.html` is a shell navigation, never the raw disk
+    // file. Both raw files are always wrong (unreplaced placeholders), and
+    // the account dist's copy matched the real-file loop first, so a tenant
+    // `/index.html` served the DASHBOARD document — which the product PWA's
+    // service worker then precached as its navigation fallback, hijacking
+    // every tenant navigation to the account page.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/index.html")
+            .insert_header(("host", tenant.as_str()))
+            .to_request(),
+    )
+    .await;
+    let text = body_of(resp).await;
+    assert!(
+        text.contains("product-root") && text.contains(r#"content="true""#),
+        "tenant /index.html serves the marked product shell, got: {text}"
+    );
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/index.html")
+            .insert_header(("host", app_host.as_str()))
+            .to_request(),
+    )
+    .await;
+    let text = body_of(resp).await;
+    assert!(
+        text.contains(r#"content="cloudtest.local""#)
+            && !text.contains("__ATOMIC_CLOUD_BASE_DOMAIN__")
+            && !text.contains("product-root"),
+        "app-host /index.html serves the injected account shell, got: {text}"
+    );
 }
