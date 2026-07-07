@@ -94,6 +94,7 @@ export function Provider() {
       {state.status === 'ready' && (
         <ProviderBody
           provider={state.provider}
+          premiumPlan={isPremiumPlan}
           onWriteSucceeded={onWriteSucceeded}
           onActivateError={(message) => setNotice({ tone: 'warning', message })}
           reloadStatus={reloadStatus}
@@ -106,12 +107,14 @@ export function Provider() {
 
 function ProviderBody({
   provider,
+  premiumPlan,
   onWriteSucceeded,
   onActivateError,
   reloadStatus,
   reloadOverview,
 }: {
   provider: ProviderStatus;
+  premiumPlan: boolean;
   onWriteSucceeded: (result: ProviderWriteResult, fallback: string) => void;
   onActivateError: (message: string) => void;
   reloadStatus: () => void;
@@ -217,7 +220,7 @@ function ProviderBody({
           <div className="mt-5">
             <ManagedModels
               currentLlmModel={config.llm_model ?? null}
-              premium={isPremiumPlan}
+              premium={premiumPlan}
               onSaved={(result) => onWriteSucceeded(result, 'Updated your managed model.')}
             />
           </div>

@@ -23,11 +23,11 @@ describe('Signup', () => {
     renderSignup();
 
     // Before any input, the help text shows a placeholder slug.
-    expect(screen.getByText(/your-name\.atomic\.cloud/)).toBeInTheDocument();
+    expect(screen.getByText(/your-name\.atomicapp\.ai/)).toBeInTheDocument();
 
     await user.type(screen.getByLabelText(/subdomain/i), 'my-team');
 
-    expect(screen.getByText(/my-team\.atomic\.cloud/)).toBeInTheDocument();
+    expect(screen.getByText(/my-team\.atomicapp\.ai/)).toBeInTheDocument();
   });
 
   it('normalizes disallowed characters out of the subdomain field', async () => {
