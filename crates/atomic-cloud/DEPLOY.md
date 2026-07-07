@@ -2,8 +2,8 @@
 
 This is the operator's checklist for standing up a production Atomic Cloud pod.
 It documents the host-split routing model, the reverse-proxy and DNS/TLS
-requirements, the single-pod constraint v1 ships with, and the full
-env/secret checklist `serve` expects.
+requirements, the single-pod constraint v1 ships with, the pod image
+(`cloud.dockerfile`), and the full env/secret checklist `serve` expects.
 
 `README.md` is the source of truth for *what the crate is and how it's wired*;
 this file is the source of truth for *what an operator must provide to run it
@@ -154,7 +154,8 @@ marker:
    product bundle (`npm run build:web` → `dist-web`). The server rewrites the
    placeholder to `true` once at boot when it loads the product
    `index.html`. This is the simplest correct option and is recommended for the
-   single-pod v1 topology.
+   single-pod v1 topology — and it is what the pod image (§7) wires up out of
+   the box.
 2. **Have the reverse proxy / build inject it.** If the proxy serves the
    product bundle directly at the tenant root (the classic prod topology), the
    bundle it serves **must** already have the marker rewritten to
@@ -190,7 +191,7 @@ proxy appends (does not pass through) the client IP as the **rightmost**
 the header and sidestep per-IP limits; with the flag off behind a proxy, every
 client shares the proxy's bucket. (Per-email and per-account limiters still
 apply either way, which is why OPS-4 is an accepted risk rather than a blocker —
-see §8.)
+see §10.)
 
 **[CONFIRM]** that your proxy strips any client-supplied `X-Forwarded-For` and
 appends the real peer, so the rightmost entry is trustworthy.
@@ -253,11 +254,55 @@ features (prepared statements, `LISTEN/NOTIFY`); the code is written to tolerate
 this, but verify against your pooler config.
 
 `pg_dump`/`pg_restore` must be on `PATH` in the pod image — backups and account
-deletion's final dump shell out to them.
+deletion's final dump shell out to them. The shipped image (§7) bakes them in;
+match its client major to the cluster's.
 
 ---
 
-## 7. Required env / secret checklist
+## 7. The pod image (`cloud.dockerfile`)
+
+The repo ships the pod as a single multi-stage image. Build it from the repo
+root:
+
+```bash
+docker build -f cloud.dockerfile -t atomic-cloud .
+```
+
+One image carries everything §1's pod needs:
+
+- **The `atomic-cloud` binary.** The server and the operator CLI are the same
+  binary, so `docker run … atomic-cloud migrate|account|token|backup …` runs
+  operator commands against the same image the pod serves from.
+- **Both frontends, pre-wired.** The account-plane SPA is baked at `/srv/spa`
+  and the product knowledge-base app at `/srv/product`, with
+  `ATOMIC_CLOUD_SPA_DIR`/`ATOMIC_CLOUD_PRODUCT_DIR` pre-set. The §3 tenant
+  marker is handled by the server's boot-time rewrite (option 1) — and the
+  image build fails outright if the `__ATOMIC_CLOUD_TENANT__` placeholder ever
+  goes missing from the product bundle, so a marker regression can't reach a
+  running pod.
+- **`pg_dump`/`pg_restore`** (PGDG `postgresql-client`), for the nightly
+  backups and the fail-closed final dump (§6).
+
+Two operational notes:
+
+- **Match the client major to the cluster.** `pg_dump` refuses to dump from a
+  server newer than itself. The image defaults to PostgreSQL 17 client tools;
+  build with `--build-arg PG_CLIENT_MAJOR=<major>` at least your tenant
+  cluster's major.
+- **No separate migrate step is required.** `serve` connects to (creating if
+  absent) and migrates the control plane at boot, then runs the boot fleet
+  migration over lagging tenants behind `/ready`. `atomic-cloud migrate`
+  exists to run the control-plane step explicitly ahead of a deploy.
+
+The container listens on `0.0.0.0:8080` (override via the CMD's
+`--bind`/`--port`), runs as a non-root user, and health-checks `GET /health`
+(liveness — pair it with `GET /ready` for deploy gating). All configuration is
+env-only (§8). The §5 constraint applies to this image like any other
+packaging: exactly one `serve` replica.
+
+---
+
+## 8. Required env / secret checklist
 
 `serve` takes the **NAME** of an env var on argv for every secret and reads the
 VALUE from the environment, so secrets never appear in `ps` / `/proc/<pid>/cmdline`.
@@ -339,7 +384,7 @@ Keep that discipline: pass secrets via env, not flags.
 
 ---
 
-## 8. Pre-launch checklist
+## 9. Pre-launch checklist
 
 - [ ] Wildcard DNS `*.<base>` + `app.<base>` resolve to the proxy. **[CONFIRM]**
 - [ ] Wildcard TLS cert covers `*.<base>` **and** `app.<base>`. **[CONFIRM]**
@@ -352,9 +397,10 @@ Keep that discipline: pass secrets via env, not flags.
       in v1). (§5)
 - [ ] pgbouncer fronts the tenant cluster; pool budget covers the launch fleet;
       `--cluster-url`/`--control-url` point through it. **[CONFIRM]** (§6)
-- [ ] `pg_dump`/`pg_restore` are on the pod image `PATH`.
+- [ ] `pg_dump`/`pg_restore` are on the pod image `PATH` (baked into
+      `cloud.dockerfile`; `PG_CLIENT_MAJOR` ≥ the cluster's major). (§7)
 - [ ] `--backup-store s3` with a durable bucket; `AWS_*` creds present; no
-      `local` store in prod. (§7, MIG-1)
+      `local` store in prod. (§8, MIG-1)
 - [ ] `ATOMIC_CLOUD_MASTER_KEY` present, valid, and backed up off-pod **separate
       from the database backups** (loss = unrecoverable credentials). (§2)
 - [ ] `--control-url` and `--cluster-url` carry `sslmode=require`/`verify-full`
@@ -371,7 +417,7 @@ Keep that discipline: pass secrets via env, not flags.
 
 ---
 
-## 9. Accepted Risks (residual, accepted for soft launch)
+## 10. Accepted Risks (residual, accepted for soft launch)
 
 These are the items the ship-readiness review explicitly accepted for the soft
 launch. They are documented here so an operator knows the edge each one lives
@@ -404,6 +450,6 @@ fast-follows.
 > The **non-accepted** majors (BILL-1 MCP guard bypass, MAI-1/DEL-1/DISP-1
 > billing, MIG-1 local backup store, REL-4 orphan reaper, the data-safety
 > footguns) are tracked in the ship-readiness report and are launch gates, not
-> accepted risks. MIG-1 and REL-4 are partially mitigated here by the §7/§8
+> accepted risks. MIG-1 and REL-4 are partially mitigated here by the §8/§9
 > checklist items (S3 backup store; verify the control URL before deploy) —
 > follow those to neutralize the operator footgun until the code guards land.

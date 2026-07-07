@@ -2,12 +2,19 @@
 target/
 src-tauri/target/
 
-# Node
+# Node (dockerignore patterns don't recurse — `**/` catches the nested
+# crates/atomic-cloud/frontend/node_modules that `COPY crates/` would sweep in)
 node_modules/
+**/node_modules
 
 # Build outputs
 dist/
 dist-web/
+**/dist
+**/*.tsbuildinfo
+
+# Local backup-store output from the cloud dev stack
+backups/
 
 # Database files
 *.db
