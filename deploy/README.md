@@ -10,6 +10,10 @@ The app connects to Postgres **directly** — no pgbouncer. Transaction pooling
 breaks the app's session advisory locks (verified; DEPLOY.md §6), and at
 single-box scale the budget is `max_connections=200` + the app's pool caps.
 
+DNS: only the **wildcard** `*.atomicapp.ai` points at the droplet (it covers
+`app.` and every tenant). The **apex stays on the marketing site** — served
+through Cloudflare, untouched by provision.sh unless `APEX_DNS=1`.
+
 ```
 deploy/
   docker-compose.yml   caddy + postgres + atomic-cloud

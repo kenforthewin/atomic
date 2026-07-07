@@ -93,8 +93,11 @@ upsert_record() { # name
     log "created A ${name} -> ${ip}"
   fi
 }
-upsert_record "$DOMAIN"       # apex (app plane; app.<domain> rides the wildcard)
-upsert_record "*.${DOMAIN}"   # every tenant subdomain + app.<domain>
+# The wildcard covers app.<domain> and every tenant subdomain. The apex is
+# opt-in (APEX_DNS=1): atomicapp.ai's apex serves the marketing site through
+# Cloudflare and must not also resolve to the droplet.
+[ "${APEX_DNS:-0}" = 1 ] && upsert_record "$DOMAIN"
+upsert_record "*.${DOMAIN}"
 
 log "done. next: fill deploy/.env (see .env.example), then:"
 log "  deploy/scripts/deploy.sh root@${ip}"

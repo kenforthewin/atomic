@@ -50,11 +50,15 @@ if [ "$MODE" = "--build" ]; then
     if [ -d /opt/atomic/src/.git ]; then git -C /opt/atomic/src fetch --depth 1 origin '$REPO_REF' && git -C /opt/atomic/src checkout -f FETCH_HEAD
     else git clone --depth 1 --branch '$REPO_REF' '$REPO_URL' /opt/atomic/src; fi
     sed -i 's|^ATOMIC_CLOUD_IMAGE=.*|ATOMIC_CLOUD_IMAGE=atomic-cloud:local|' /opt/atomic/deploy/.env
-    if pgrep -f 'docker build.*cloud.dockerfile' >/dev/null; then
+    # In-flight detection via pidfile — NOT pgrep: any cmdline pattern would
+    # match this ssh session's own shell, whose command string contains the
+    # docker build invocation below.
+    if [ -f /opt/atomic/build.pid ] && kill -0 \$(cat /opt/atomic/build.pid) 2>/dev/null; then
       echo 'build already in flight — waiting on it'
     else
       rm -f /opt/atomic/build.exit
       nohup sh -c 'docker build -f /opt/atomic/src/cloud.dockerfile -t atomic-cloud:local /opt/atomic/src; echo \$? > /opt/atomic/build.exit' >/opt/atomic/build.log 2>&1 &
+      echo \$! > /opt/atomic/build.pid
     fi"
   log "waiting for the build (tail: ssh $HOST tail -f /opt/atomic/build.log)"
   while :; do
@@ -63,6 +67,10 @@ if [ "$MODE" = "--build" ]; then
     if [ -n "$status" ]; then
       ssh "$HOST" 'tail -30 /opt/atomic/build.log' >&2
       echo "image build failed (exit $status)" >&2; exit 1
+    fi
+    if ! ssh "$HOST" 'kill -0 $(cat /opt/atomic/build.pid 2>/dev/null) 2>/dev/null'; then
+      ssh "$HOST" 'tail -30 /opt/atomic/build.log' >&2
+      echo "build process died without writing an exit code" >&2; exit 1
     fi
     sleep 20
   done
