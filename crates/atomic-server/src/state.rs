@@ -1,6 +1,7 @@
 //! Application state and server event types
 
 use crate::export_jobs::ExportJobManager;
+use crate::migration_jobs::MigrationJobManager;
 use crate::log_buffer::LogBuffer;
 use atomic_core::{AtomicCore, DatabaseManager};
 use serde::Serialize;
@@ -86,6 +87,8 @@ pub struct AppState {
     pub log_buffer: LogBuffer,
     /// Background database export jobs and temporary artifacts.
     pub export_jobs: ExportJobManager,
+    /// Background SQLite→Postgres migration jobs (import + push).
+    pub migration_jobs: MigrationJobManager,
     /// Optional setup token required for first-run claims.
     pub setup_token: Option<SetupToken>,
     /// Explicit unsafe opt-out from requiring ATOMIC_SETUP_TOKEN for setup claims.

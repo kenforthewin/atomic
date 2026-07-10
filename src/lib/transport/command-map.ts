@@ -743,6 +743,26 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     method: 'DELETE',
     path: (a) => `/api/exports/${encodeURIComponent(a.id as string)}`,
   },
+  start_migration_push: {
+    method: 'POST',
+    path: '/api/migrations/push',
+    argsMode: 'body',
+    transformArgs: (a) => ({
+      target_url: a.targetUrl,
+      target_token: a.targetToken,
+      database_id: a.databaseId,
+      name: a.name,
+      pause_feeds: a.pauseFeeds,
+    }),
+  },
+  get_migration_job: {
+    method: 'GET',
+    path: (a) => `/api/migrations/${encodeURIComponent(a.id as string)}`,
+  },
+  cancel_migration_job: {
+    method: 'DELETE',
+    path: (a) => `/api/migrations/${encodeURIComponent(a.id as string)}`,
+  },
 
   // ==================== Logs ====================
   get_logs: {

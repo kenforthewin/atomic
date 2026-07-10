@@ -159,6 +159,7 @@ mod tests {
     use super::*;
     use crate::{
         export_jobs::ExportJobManager,
+    migration_jobs::MigrationJobManager,
         log_buffer::LogBuffer,
         state::{SetupClaimLimiter, SetupToken},
     };
@@ -179,6 +180,7 @@ mod tests {
             public_url: None,
             log_buffer: LogBuffer::new(16),
             export_jobs: ExportJobManager::for_tests(temp.path().join("exports")),
+            migration_jobs: MigrationJobManager::for_tests(temp.path().join("migrations")),
             setup_token: setup_token.map(|token| SetupToken::from_raw(token.to_string()).unwrap()),
             dangerously_skip_setup_token,
             setup_claim_lock: Mutex::new(()),

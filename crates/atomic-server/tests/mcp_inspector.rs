@@ -8,6 +8,7 @@
 use actix_web::{web, App, HttpServer};
 use atomic_server::{
     export_jobs::ExportJobManager,
+    migration_jobs::MigrationJobManager,
     log_buffer::LogBuffer,
     mcp::AtomicMcpTransport,
     mcp_auth::McpAuth,
@@ -43,6 +44,7 @@ impl TestServer {
             public_url: None,
             log_buffer: LogBuffer::new(16),
             export_jobs: ExportJobManager::for_tests(temp.path().join("exports")),
+            migration_jobs: MigrationJobManager::for_tests(temp.path().join("migrations")),
             setup_token: None,
             dangerously_skip_setup_token: false,
             setup_claim_lock: tokio::sync::Mutex::new(()),

@@ -205,6 +205,81 @@ function defaultExportFilename(job: ExportJob): string {
   return `atomic-${dbName}-markdown.zip`;
 }
 
+export type MigrationJobStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled';
+
+export interface MigrationTableReport {
+  table: string;
+  source_rows: number;
+  copied_rows: number;
+}
+
+export interface MigrationReport {
+  db_id: string | null;
+  db_name: string;
+  dry_run: boolean;
+  tables: MigrationTableReport[];
+  skipped_feed_urls: string[];
+  duration_ms: number;
+}
+
+export interface MigrationJob {
+  id: string;
+  kind: 'import' | 'push';
+  status: MigrationJobStatus;
+  phase: string;
+  db_name: string;
+  total_rows: number;
+  processed_rows: number;
+  db_id: string | null;
+  report: MigrationReport | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface MigrationPushParams {
+  targetUrl: string;
+  targetToken: string;
+  databaseId: string;
+  name?: string;
+  pauseFeeds?: boolean;
+}
+
+export async function startMigrationPush(params: MigrationPushParams): Promise<MigrationJob> {
+  return getTransport().invoke('start_migration_push', { ...params });
+}
+
+export async function getMigrationJob(id: string): Promise<MigrationJob> {
+  return getTransport().invoke('get_migration_job', { id });
+}
+
+export async function cancelMigrationJob(id: string): Promise<MigrationJob> {
+  return getTransport().invoke('cancel_migration_job', { id });
+}
+
+/// Push a local database to a remote Atomic server, polling the local push
+/// job (which mirrors the remote import job) until it reaches a terminal
+/// state. Mirrors the exportDatabaseMarkdownArchive polling pattern.
+export async function pushDatabaseToCloud(
+  params: MigrationPushParams,
+  onProgress?: (job: MigrationJob) => void,
+): Promise<MigrationJob> {
+  let job = await startMigrationPush(params);
+  onProgress?.(job);
+
+  while (job.status === 'queued' || job.status === 'running') {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    job = await getMigrationJob(job.id);
+    onProgress?.(job);
+  }
+
+  if (job.status !== 'complete') {
+    throw new Error(job.error || `Migration ${job.status}`);
+  }
+  return job;
+}
+
 // Reset atoms stuck in 'processing' state (call on app startup)
 export async function resetStuckProcessing(): Promise<number> {
   return getTransport().invoke('reset_stuck_processing');
