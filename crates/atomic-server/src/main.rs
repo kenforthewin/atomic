@@ -11,12 +11,14 @@ use atomic_server::{
     auth, event_bridge,
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
-    mcp, mcp_auth, routes,
+    mcp, mcp_auth,
+    migration_jobs::MigrationJobManager,
+    routes,
     state::{AppState, ServerEvent, SetupClaimLimiter, SetupToken},
     ws, Scalar, Servable,
 };
 use clap::Parser;
-use config::{Cli, Command, TokenAction};
+use config::{Cli, Command, MigrateAction, TokenAction};
 use std::sync::Arc;
 use std::time::Duration;
 use utoipa::OpenApi;
@@ -63,6 +65,12 @@ async fn main() -> std::io::Result<()> {
                 .await
                 .expect("Failed to get active database");
             run_token_command(&core, action).await;
+            Ok(())
+        }
+
+        // Migration subcommands (no server needed)
+        Some(Command::Migrate { action }) => {
+            run_migrate_command(&data_dir, action).await;
             Ok(())
         }
 
@@ -140,6 +148,101 @@ async fn create_manager(
         _ => {
             tracing::info!(backend = "sqlite", path = %data_dir.display(), "storage backend selected");
             atomic_core::DatabaseManager::new(data_dir).expect("Failed to open database manager")
+        }
+    }
+}
+
+async fn run_migrate_command(data_dir: &std::path::Path, action: MigrateAction) {
+    use atomic_core::migrate::{MigrationEvent, MigrationOptions};
+
+    match action {
+        MigrateAction::Sqlite {
+            source,
+            database_url,
+            name,
+            dry_run,
+            pause_feeds,
+        } => {
+            let manager = atomic_core::DatabaseManager::new_postgres(data_dir, &database_url)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to connect to Postgres: {e}");
+                    std::process::exit(1);
+                });
+
+            let result = manager
+                .migrate_sqlite_to_postgres(
+                    std::path::Path::new(&source),
+                    MigrationOptions {
+                        db_name: name,
+                        dry_run,
+                        pause_feeds,
+                    },
+                    |event| match event {
+                        MigrationEvent::Started {
+                            table_count,
+                            total_rows,
+                        } => eprintln!("Copying {total_rows} rows across {table_count} tables..."),
+                        MigrationEvent::TableCompleted { table, copied_rows } => {
+                            eprintln!("  {table}: {copied_rows} rows");
+                        }
+                        _ => {}
+                    },
+                    || false,
+                )
+                .await;
+
+            match result {
+                Ok(report) => {
+                    if report.dry_run {
+                        println!("Dry run — nothing was written. Source contains:");
+                    } else {
+                        println!(
+                            "Migration complete in {:.1}s. New database \"{}\" ({}).",
+                            report.duration_ms as f64 / 1000.0,
+                            report.db_name,
+                            report.db_id.as_deref().unwrap_or("-"),
+                        );
+                    }
+                    let width = report
+                        .tables
+                        .iter()
+                        .map(|t| t.table.len())
+                        .max()
+                        .unwrap_or(0);
+                    for t in &report.tables {
+                        if report.dry_run {
+                            println!("  {:width$}  {:>8}", t.table, t.source_rows);
+                        } else {
+                            let skipped = t.source_rows - t.copied_rows;
+                            if skipped > 0 {
+                                println!(
+                                    "  {:width$}  {:>8}  ({skipped} skipped)",
+                                    t.table, t.copied_rows
+                                );
+                            } else {
+                                println!("  {:width$}  {:>8}", t.table, t.copied_rows);
+                            }
+                        }
+                    }
+                    if !report.skipped_feed_urls.is_empty() {
+                        println!(
+                            "Skipped feeds already subscribed on the destination: {}",
+                            report.skipped_feed_urls.join(", ")
+                        );
+                    }
+                    if !report.dry_run {
+                        println!(
+                            "Embeddings and semantic edges will rebuild in the background \
+                             once the destination server processes the new database."
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Migration failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -256,6 +359,9 @@ async fn run_server(
     let (event_tx, _) = tokio::sync::broadcast::channel(4096);
     let export_jobs = ExportJobManager::new(std::path::Path::new(data_dir).join("exports"))
         .expect("Failed to initialize export job manager");
+    let migration_jobs =
+        MigrationJobManager::new(std::path::Path::new(data_dir).join("migrations"))
+            .expect("Failed to initialize migration job manager");
 
     let app_state = web::Data::new(AppState {
         manager: Arc::clone(&manager),
@@ -263,6 +369,7 @@ async fn run_server(
         public_url: public_url.clone(),
         log_buffer,
         export_jobs,
+        migration_jobs,
         setup_token: setup_token.and_then(SetupToken::from_raw),
         dangerously_skip_setup_token,
         setup_claim_lock: tokio::sync::Mutex::new(()),

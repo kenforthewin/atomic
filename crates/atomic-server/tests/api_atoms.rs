@@ -40,6 +40,9 @@ impl TestCtx {
             export_jobs: atomic_server::export_jobs::ExportJobManager::for_tests(
                 temp.path().join("exports"),
             ),
+            migration_jobs: atomic_server::migration_jobs::MigrationJobManager::for_tests(
+                temp.path().join("migrations"),
+            ),
             setup_token: None,
             dangerously_skip_setup_token: false,
             setup_claim_lock: tokio::sync::Mutex::new(()),

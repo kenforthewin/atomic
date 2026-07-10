@@ -14,6 +14,7 @@ pub mod graph;
 pub mod import;
 pub mod ingest;
 pub mod logs;
+pub mod migrations;
 pub mod oauth;
 pub mod ollama;
 pub mod reports;
@@ -359,6 +360,24 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route(
         "/import/obsidian",
         web::post().to(import::import_obsidian_vault),
+    );
+
+    // SQLite → Postgres migrations (fixed paths before the {id} routes)
+    cfg.route(
+        "/migrations/sqlite",
+        web::post().to(migrations::upload_sqlite_migration),
+    );
+    cfg.route(
+        "/migrations/push",
+        web::post().to(migrations::push_migration),
+    );
+    cfg.route(
+        "/migrations/{id}",
+        web::get().to(migrations::get_migration_job),
+    );
+    cfg.route(
+        "/migrations/{id}",
+        web::delete().to(migrations::cancel_or_delete_migration_job),
     );
 
     // Ingestion

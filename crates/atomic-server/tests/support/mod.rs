@@ -174,6 +174,9 @@ impl TestCtx {
             public_url: opts.public_url,
             log_buffer: LogBuffer::new(16),
             export_jobs: ExportJobManager::for_tests(temp_for_exports.join("exports")),
+            migration_jobs: atomic_server::migration_jobs::MigrationJobManager::for_tests(
+                temp_for_exports.join("migrations"),
+            ),
             setup_token: opts.setup_token,
             dangerously_skip_setup_token: opts.dangerously_skip_setup_token,
             setup_claim_lock: tokio::sync::Mutex::new(()),

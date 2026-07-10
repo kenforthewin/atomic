@@ -49,8 +49,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# HTTP client (for OpenRouter proxy calls)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (for OpenRouter proxy calls + migration push uploads)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 # MCP server
 rmcp = { version = "0.15", features = ["server", "macros", "transport-streamable-http-server"] }

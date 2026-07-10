@@ -95,6 +95,42 @@ pub enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+
+    /// Migrate data between storage backends
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MigrateAction {
+    /// Copy a local SQLite database file into a Postgres instance as a new
+    /// logical database. Embeddings are not copied — the destination re-embeds
+    /// with its own provider; chunk text is copied so keyword search works
+    /// immediately.
+    Sqlite {
+        /// Path to the source SQLite database file (e.g. databases/default.db)
+        #[arg(long)]
+        source: String,
+
+        /// Postgres connection string for the destination
+        #[arg(long, env = "ATOMIC_DATABASE_URL")]
+        database_url: String,
+
+        /// Display name for the new database on the destination
+        #[arg(long)]
+        name: String,
+
+        /// Validate and count rows without writing anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Land migrated feeds paused so the destination doesn't start
+        /// polling while the source instance may still be running
+        #[arg(long, default_value_t = false)]
+        pause_feeds: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -19,6 +19,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { MigrateToCloudTab } from './MigrateToCloudTab';
 import { CustomSelect } from '../ui/CustomSelect';
 import { SearchableSelect } from '../ui/SearchableSelect';
 import { ConnectionStatus } from '../ui/ConnectionStatus';
@@ -78,7 +79,7 @@ import { getBrowserTimeZone, getSupportedTimeZones } from '../../lib/tz';
 import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../stores/databases';
 import { OverrideControls } from './OverrideControls';
 
-export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts';
+export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts' | 'migrate';
 
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
@@ -88,6 +89,7 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'connection', label: 'Connection' },
   { id: 'integrations', label: 'Integrations' },
   { id: 'databases', label: 'Databases' },
+  { id: 'migrate', label: 'Migrate to Cloud' },
 ];
 
 function TagCategoriesTab() {
@@ -3294,6 +3296,10 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
               {/* ===== DATABASES TAB ===== */}
               {activeTab === 'databases' && (
                 <DatabasesTab />
+              )}
+
+              {activeTab === 'migrate' && (
+                <MigrateToCloudTab />
               )}
           </div>
         </div>

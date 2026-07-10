@@ -11,6 +11,7 @@ pub mod export_jobs;
 pub mod log_buffer;
 pub mod mcp;
 pub mod mcp_auth;
+pub mod migration_jobs;
 pub mod routes;
 pub mod state;
 pub mod ws;
@@ -141,6 +142,11 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::exports::get_export_job,
         routes::exports::cancel_or_delete_export_job,
         routes::exports::download_export,
+        // Migrations
+        routes::migrations::upload_sqlite_migration,
+        routes::migrations::push_migration,
+        routes::migrations::get_migration_job,
+        routes::migrations::cancel_or_delete_migration_job,
         // Setup
         routes::setup::setup_status,
         routes::setup::claim_instance,
@@ -262,6 +268,8 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::setup::ClaimResponse,
         routes::logs::LogsResponse,
         routes::exports::DownloadQuery,
+        routes::migrations::UploadQuery,
+        migration_jobs::PushRequest,
         routes::oauth::OAuthProtectedResourceMetadata,
         routes::oauth::OAuthAuthorizationServerMetadata,
         routes::oauth::RegisterRequest,

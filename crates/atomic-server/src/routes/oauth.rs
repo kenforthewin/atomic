@@ -729,6 +729,9 @@ mod tests {
             export_jobs: crate::export_jobs::ExportJobManager::for_tests(
                 temp.path().join("exports"),
             ),
+            migration_jobs: crate::migration_jobs::MigrationJobManager::for_tests(
+                temp.path().join("migrations"),
+            ),
             setup_token: None,
             dangerously_skip_setup_token: false,
             setup_claim_lock: tokio::sync::Mutex::new(()),
@@ -749,6 +752,9 @@ mod tests {
             log_buffer: crate::log_buffer::LogBuffer::new(16),
             export_jobs: crate::export_jobs::ExportJobManager::for_tests(
                 temp.path().join("exports"),
+            ),
+            migration_jobs: crate::migration_jobs::MigrationJobManager::for_tests(
+                temp.path().join("migrations"),
             ),
             setup_token: None,
             dangerously_skip_setup_token: false,
