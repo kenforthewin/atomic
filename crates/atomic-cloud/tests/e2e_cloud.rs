@@ -1612,3 +1612,199 @@ async fn spa_serves_app_gates_tenant_dashboard_and_never_shadows_json() {
     )
     .await;
 }
+
+// ==================== Migration imports ====================
+
+/// POST an upload to `/api/migrations/sqlite` for `tenant` under `token`.
+async fn send_import(
+    h: &CloudHarness,
+    subdomain: &str,
+    token: &str,
+    name: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    h.api(Method::POST, subdomain, "/api/migrations/sqlite")
+        .query(&[("name", name)])
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .expect("send migration upload")
+}
+
+/// Poll a migration job until it reaches a terminal state.
+async fn poll_migration_job(h: &CloudHarness, tenant: &Tenant, job_id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + EVENT_DEADLINE;
+    loop {
+        let resp = h
+            .api(
+                Method::GET,
+                &tenant.subdomain,
+                &format!("/api/migrations/{job_id}"),
+            )
+            .bearer_auth(&tenant.token)
+            .send()
+            .await
+            .expect("poll migration job");
+        assert_eq!(resp.status(), StatusCode::OK, "poll migration job");
+        let job: Value = resp.json().await.expect("migration job json");
+        match job["status"].as_str() {
+            Some("complete") | Some("failed") | Some("cancelled") => return job,
+            _ if tokio::time::Instant::now() > deadline => {
+                panic!("migration job never reached a terminal state: {job}")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// The full tenant-aware import path: an account-scoped upload lands as a new
+/// knowledge base in the uploader's tenant database (and nowhere else), the
+/// job is invisible to other accounts, a database-pinned token may not
+/// import, and re-importing the same source fails on the PK collision.
+#[actix_web::test]
+async fn tenant_migration_import_end_to_end() {
+    with_control_db("migration_import_e2e", |url| async move {
+        // `QuotaBilling::for_tests` (inside the harness) widens every plan
+        // to unlimited, so this test exercises the transport; the plan
+        // ceilings are pinned by tests/quota_billing.rs.
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+        let bravo = h.provision("bravo").await;
+        let snapshot =
+            support::sqlite_snapshot_fixture(&["First note about ownership.", "Second note."])
+                .await;
+
+        // A database-pinned token mints no new KBs.
+        let pinned = issue_token(
+            &h.control,
+            &alpha.account_id,
+            TokenScope::Database,
+            Some("default"),
+            "pinned",
+        )
+        .await
+        .expect("issue db-pinned token");
+        let resp = send_import(
+            &h,
+            &alpha.subdomain,
+            &pinned,
+            "Imported KB",
+            snapshot.clone(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "db-scoped tokens cannot import"
+        );
+
+        // Account-scoped upload → background import job → complete.
+        let resp = send_import(
+            &h,
+            &alpha.subdomain,
+            &alpha.token,
+            "Imported KB",
+            snapshot.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "upload accepted");
+        let job: Value = resp.json().await.expect("job json");
+        let job_id = job["id"].as_str().expect("job id").to_string();
+
+        // Another account cannot even confirm the job exists.
+        let foreign = h
+            .api(
+                Method::GET,
+                &bravo.subdomain,
+                &format!("/api/migrations/{job_id}"),
+            )
+            .bearer_auth(&bravo.token)
+            .send()
+            .await
+            .expect("foreign job poll");
+        assert_eq!(
+            foreign.status(),
+            StatusCode::NOT_FOUND,
+            "jobs are tenant-scoped"
+        );
+
+        let done = poll_migration_job(&h, &alpha, &job_id).await;
+        assert_eq!(done["status"], "complete", "import completes: {done}");
+        let new_db = done["db_id"].as_str().expect("imported db id").to_string();
+
+        // The KB exists for alpha with the imported atoms — and not for bravo.
+        let dbs: Value = h
+            .api(Method::GET, &alpha.subdomain, "/api/databases")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("list alpha dbs")
+            .json()
+            .await
+            .expect("alpha dbs json");
+        assert!(
+            dbs["databases"]
+                .as_array()
+                .expect("databases array")
+                .iter()
+                .any(|d| d["name"] == "Imported KB"),
+            "imported KB appears in alpha's catalog: {dbs}"
+        );
+        let bravo_dbs: Value = h
+            .api(Method::GET, &bravo.subdomain, "/api/databases")
+            .bearer_auth(&bravo.token)
+            .send()
+            .await
+            .expect("list bravo dbs")
+            .json()
+            .await
+            .expect("bravo dbs json");
+        assert!(
+            !bravo_dbs["databases"]
+                .as_array()
+                .expect("databases array")
+                .iter()
+                .any(|d| d["name"] == "Imported KB"),
+            "imported KB never leaks into bravo's catalog"
+        );
+
+        let atoms: Value = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .header("X-Atomic-Database", new_db.as_str())
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("list imported atoms")
+            .json()
+            .await
+            .expect("imported atoms json");
+        assert_eq!(atoms["total_count"], 2, "imported atoms visible: {atoms}");
+
+        // Re-importing the same source aborts on the PK collision.
+        let resp = send_import(
+            &h,
+            &alpha.subdomain,
+            &alpha.token,
+            "Duplicate",
+            snapshot.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let dup: Value = resp.json().await.expect("dup job json");
+        let dup_id = dup["id"].as_str().expect("dup job id").to_string();
+        let failed = poll_migration_job(&h, &alpha, &dup_id).await;
+        assert_eq!(failed["status"], "failed", "duplicate import fails");
+        assert!(
+            failed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already exist"),
+            "collision is reported: {failed}"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}

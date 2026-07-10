@@ -54,6 +54,29 @@ pub fn request_manager(req: &HttpRequest, state: &AppState) -> Arc<DatabaseManag
         .unwrap_or_else(|| Arc::clone(&state.manager))
 }
 
+/// Per-request ownership scope for background jobs (migrations, and any
+/// future job registry).
+///
+/// Job managers are process-global registries keyed by job id — fine on a
+/// single-tenant server, but a cross-tenant leak under a multi-tenant
+/// composition: any authenticated principal that learns a job id could poll
+/// or cancel another tenant's job. A composing layer inserts this extension
+/// (e.g. with an account id); job routes stamp it onto every job they create,
+/// lookups require the same scope, and a mismatch reads as not-found rather
+/// than confirming the job exists.
+///
+/// When absent (the standalone server), jobs are created and looked up with
+/// no scope, preserving single-tenant behavior.
+#[derive(Clone)]
+pub struct RequestJobScope(pub String);
+
+/// The job-ownership scope governing `req`, if a composing layer set one.
+pub fn job_scope(req: &HttpRequest) -> Option<String> {
+    req.extensions()
+        .get::<RequestJobScope>()
+        .map(|s| s.0.clone())
+}
+
 /// Extractor that resolves the correct AtomicCore for the current request.
 pub struct Db(pub AtomicCore);
 

@@ -490,6 +490,28 @@ async fn verify_copy(
     Ok(())
 }
 
+/// Count the atoms in a SQLite database file without upgrading or copying
+/// anything — used by upload admission to enforce an atom budget before an
+/// import starts. Errors with `Validation` when the file has no `atoms`
+/// table (a valid SQLite database that is not an Atomic knowledge base).
+pub async fn count_source_atoms(path: &Path) -> Result<i64, AtomicCoreError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.query_row("SELECT COUNT(*) FROM atoms", [], |row| row.get(0))
+            .map_err(|_| {
+                AtomicCoreError::Validation(
+                    "Upload is not an Atomic database (no atoms table)".to_string(),
+                )
+            })
+    })
+    .await
+    .map_err(|e| AtomicCoreError::DatabaseOperation(format!("atom count task failed: {e}")))?
+}
+
 /// A read-only SQLite connection shuttled in and out of `spawn_blocking` so
 /// reads never block the async runtime. `Connection` is `Send` but not
 /// `Sync`, hence the move-and-return dance.

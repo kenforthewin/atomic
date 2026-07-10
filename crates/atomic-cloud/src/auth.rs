@@ -80,7 +80,7 @@ use actix_web::body::EitherBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::http::header::{self, HeaderName, HeaderValue};
 use actix_web::{Error, HttpMessage, HttpResponse};
-use atomic_server::db_extractor::RequestDatabaseManager;
+use atomic_server::db_extractor::{RequestDatabaseManager, RequestJobScope};
 use atomic_server::event_channel::RequestEventChannel;
 use futures::future::{ok, LocalBoxFuture, Ready};
 
@@ -457,6 +457,11 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
         .insert(RequestDatabaseManager(handle.manager));
     req.extensions_mut()
         .insert(RequestEventChannel(handle.event_tx));
+    // Background-job ownership: jobs created by this request (migration
+    // imports) are stamped with the account id, and lookups from another
+    // account read as not-found. See `RequestJobScope`'s docs.
+    req.extensions_mut()
+        .insert(RequestJobScope(principal.account_id.clone()));
     req.extensions_mut().insert(ResolvedTenant {
         principal,
         subdomain,

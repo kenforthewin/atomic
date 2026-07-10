@@ -8,10 +8,19 @@
 //!   mirroring the remote job's progress locally.
 //!
 //! Both are polled via `GET /api/migrations/{id}` and cancelled via DELETE.
+//!
+//! Composition contract: every handler resolves the manager through
+//! [`request_manager`] and stamps jobs with [`job_scope`], so a multi-tenant
+//! layer that installs `RequestDatabaseManager` + `RequestJobScope` gets
+//! tenant-correct imports and tenant-isolated job lookups without touching
+//! these handlers. An installed [`RequestImportBudget`] caps how many atoms
+//! an upload may add (the count lives inside the file, so it is enforced
+//! here after the upload rather than in request-time middleware).
 
-use crate::migration_jobs::{max_upload_bytes, PushRequest};
+use crate::db_extractor::{job_scope, request_manager};
+use crate::migration_jobs::{max_upload_bytes, PushRequest, RequestImportBudget};
 use crate::state::AppState;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use atomic_core::AtomicCoreError;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -37,23 +46,28 @@ pub struct UploadQuery {
     request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "Raw SQLite database file"),
     responses(
         (status = 202, description = "Import job started"),
-        (status = 400, description = "Server is not running on Postgres storage, or the upload is not a SQLite file"),
+        (status = 400, description = "Server is not running on Postgres storage, or the upload is not an Atomic SQLite database"),
+        (status = 402, description = "Import would exceed the account's atom budget"),
         (status = 413, description = "Upload exceeds the size limit")
     ),
     tag = "migrations"
 )]
 pub async fn upload_sqlite_migration(
+    req: HttpRequest,
     state: web::Data<AppState>,
     query: web::Query<UploadQuery>,
     mut payload: web::Payload,
 ) -> HttpResponse {
-    if !state.manager.is_postgres() {
+    let manager = request_manager(&req, &state);
+    if !manager.is_postgres() {
         return crate::error::error_response(AtomicCoreError::Configuration(
             "This server runs on SQLite storage; migration import requires a Postgres-backed \
              server"
                 .to_string(),
         ));
     }
+    let budget = req.extensions().get::<RequestImportBudget>().copied();
+    let scope = job_scope(&req);
 
     let (job_id, upload_path) = match state.migration_jobs.new_upload_path() {
         Ok(reserved) => reserved,
@@ -101,13 +115,38 @@ pub async fn upload_sqlite_migration(
         ));
     }
 
+    // Count the atoms inside the upload: validates this is an Atomic
+    // database (any SQLite file passes the magic check) and enforces the
+    // composing layer's atom budget, which no request-time middleware can —
+    // the number only exists inside the file.
+    let atom_count = match atomic_core::migrate::count_source_atoms(&upload_path).await {
+        Ok(count) => count,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&upload_path).await;
+            return crate::error::error_response(e);
+        }
+    };
+    if let Some(budget) = budget {
+        if atom_count > budget.max_atoms {
+            let _ = tokio::fs::remove_file(&upload_path).await;
+            return HttpResponse::PaymentRequired().json(serde_json::json!({
+                "error": "quota_exceeded",
+                "message": format!(
+                    "Import contains {atom_count} atoms but the account has room for only {}",
+                    budget.max_atoms.max(0)
+                ),
+            }));
+        }
+    }
+
     let query = query.into_inner();
     match state.migration_jobs.start_import(
-        state.manager.clone(),
+        manager,
         job_id,
         upload_path,
         query.name,
         query.pause_feeds.unwrap_or(false),
+        scope,
     ) {
         Ok(job) => HttpResponse::Accepted().json(job),
         Err(e) => crate::error::error_response(e),
@@ -126,17 +165,19 @@ pub async fn upload_sqlite_migration(
     tag = "migrations"
 )]
 pub async fn push_migration(
+    req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<PushRequest>,
 ) -> HttpResponse {
-    if state.manager.is_postgres() {
+    let manager = request_manager(&req, &state);
+    if manager.is_postgres() {
         return crate::error::error_response(AtomicCoreError::Configuration(
             "Migration push runs on the local SQLite instance, not the Postgres server".to_string(),
         ));
     }
 
     let request = body.into_inner();
-    let local_db_name = match state.manager.list_databases().await {
+    let local_db_name = match manager.list_databases().await {
         Ok((databases, _)) => match databases
             .into_iter()
             .find(|db| db.id == request.database_id)
@@ -151,14 +192,14 @@ pub async fn push_migration(
         },
         Err(e) => return crate::error::error_response(e),
     };
-    let core = match state.manager.get_core(&request.database_id).await {
+    let core = match manager.get_core(&request.database_id).await {
         Ok(core) => core,
         Err(e) => return crate::error::error_response(e),
     };
 
     match state
         .migration_jobs
-        .start_push(core, request, local_db_name)
+        .start_push(core, request, local_db_name, job_scope(&req))
     {
         Ok(job) => HttpResponse::Accepted().json(job),
         Err(e) => crate::error::error_response(e),
@@ -167,10 +208,14 @@ pub async fn push_migration(
 
 #[utoipa::path(get, path = "/api/migrations/{id}", params(("id" = String, Path, description = "Migration job ID")), responses((status = 200, description = "Migration job status")), tag = "migrations")]
 pub async fn get_migration_job(
+    req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    match state.migration_jobs.status(&path.into_inner()) {
+    match state
+        .migration_jobs
+        .status(&path.into_inner(), job_scope(&req).as_deref())
+    {
         Ok(job) => HttpResponse::Ok().json(job),
         Err(e) => crate::error::error_response(e),
     }
@@ -178,10 +223,14 @@ pub async fn get_migration_job(
 
 #[utoipa::path(delete, path = "/api/migrations/{id}", params(("id" = String, Path, description = "Migration job ID")), responses((status = 200, description = "Migration job cancelled or deleted")), tag = "migrations")]
 pub async fn cancel_or_delete_migration_job(
+    req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    match state.migration_jobs.cancel_or_delete(&path.into_inner()) {
+    match state
+        .migration_jobs
+        .cancel_or_delete(&path.into_inner(), job_scope(&req).as_deref())
+    {
         Ok(job) => HttpResponse::Ok().json(job),
         Err(e) => crate::error::error_response(e),
     }

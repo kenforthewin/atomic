@@ -2170,3 +2170,91 @@ async fn set_credits_paused(control: &ControlPlane, account_id: &str) {
     .await
     .expect("set credits pause");
 }
+
+// ==================== Migration-import admission ====================
+
+/// POST a SQLite upload to `/api/migrations/sqlite` for `tenant`.
+async fn send_import(
+    harness: &Harness,
+    tenant: &Tenant,
+    name: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    harness
+        .api(Method::POST, &tenant.subdomain, "/api/migrations/sqlite")
+        .query(&[("name", name)])
+        .bearer_auth(&tenant.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .expect("send migration upload")
+}
+
+/// The atom ceiling gates imports twice: at the guard when the account has
+/// no room at all, and in the upload handler when the file holds more atoms
+/// than the remaining budget (a number only the file can reveal).
+#[actix_web::test]
+async fn migration_import_respects_atom_ceiling() {
+    with_control_db("migration_import_atom_ceiling", |url| async move {
+        set_free_limits(&url, Some(1), Some(10)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+        let snapshot = support::sqlite_snapshot_fixture(&["one", "two"]).await;
+
+        // Room for 1 atom, the file holds 2 → rejected after the upload is
+        // counted, before any copy starts.
+        let resp = send_import(&harness, &tenant, "Over budget", snapshot.clone()).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "over budget");
+        let body: Value = resp.json().await.expect("budget denial json");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("room for only 1"),
+            "budget denial explains the arithmetic: {body}"
+        );
+
+        // At the ceiling exactly → denied in the guard, before any upload.
+        let created = harness.create_atom(&tenant, "the one allowed atom").await;
+        assert_eq!(created.status(), StatusCode::CREATED, "one atom fits");
+        let resp = send_import(&harness, &tenant, "No room", snapshot.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "no room at all"
+        );
+        let body: Value = resp.json().await.expect("guard denial json");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["metric"], "atoms", "guard-shaped denial: {body}");
+
+        harness.stop().await;
+    })
+    .await;
+}
+
+/// An import mints a knowledge base, so the KB ceiling applies — on the
+/// seeded free tier (`kb_limit = 1`, already spent on the default KB)
+/// imports are blocked outright.
+#[actix_web::test]
+async fn migration_import_respects_kb_ceiling() {
+    with_control_db("migration_import_kb_ceiling", |url| async move {
+        set_free_limits(&url, Some(250), Some(1)).await;
+        let harness = Harness::spawn(&url, DataPlaneRateLimits::default()).await;
+        let tenant = harness.provision("alpha").await;
+        let snapshot = support::sqlite_snapshot_fixture(&["one"]).await;
+
+        let resp = send_import(&harness, &tenant, "Second KB", snapshot).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED, "kb ceiling");
+        let body: Value = resp.json().await.expect("kb denial json");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(
+            body["metric"], "knowledge_bases",
+            "kb-shaped denial: {body}"
+        );
+
+        harness.stop().await;
+    })
+    .await;
+}

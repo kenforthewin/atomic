@@ -142,9 +142,9 @@ use atomic_server::app::{api_scope, health, mcp_scope};
 use atomic_server::db_extractor::RequestDatabaseManager;
 use atomic_server::event_channel::EventChannel;
 use atomic_server::export_jobs::ExportJobManager;
-use atomic_server::migration_jobs::MigrationJobManager;
 use atomic_server::log_buffer::LogBuffer;
 use atomic_server::mcp::AtomicMcpTransport;
+use atomic_server::migration_jobs::MigrationJobManager;
 use atomic_server::state::{AppState, SetupClaimLimiter};
 use atomic_server::ws;
 use std::time::Duration;
@@ -195,10 +195,12 @@ impl FallbackAppState {
             .map_err(CloudError::core("opening fallback scratch database"))?;
         let export_jobs = ExportJobManager::new(scratch.path().join("exports"))
             .map_err(CloudError::core("initializing export job manager"))?;
-        // Inert like everything else here: migration import requires a
-        // Postgres-backed `state.manager`, and this fallback's is the
-        // scratch SQLite one, so the route fails closed with a 400 on the
-        // cloud pod. Tenant-aware cloud imports need their own wiring.
+        // The migration job registry IS live on the cloud pod — the routes
+        // resolve the tenant manager from the request extensions and stamp
+        // jobs with the account id (`RequestJobScope`, installed by
+        // CloudAuth), so this one process-global registry is tenant-safe:
+        // a foreign account's job id reads as not-found. Rooted in the
+        // scratch dir purely for artifact storage.
         let migration_jobs = MigrationJobManager::new(scratch.path().join("migrations"))
             .map_err(CloudError::core("initializing migration job manager"))?;
         let (event_tx, _) = broadcast::channel(16);

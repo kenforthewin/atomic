@@ -36,6 +36,18 @@ pub fn max_upload_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_UPLOAD_BYTES)
 }
 
+/// Per-request atom budget for an import, installed by a composing layer
+/// (the cloud's quota guard) as a request extension. The upload handler
+/// counts the atoms inside the uploaded file — a number no request-time
+/// middleware can see — and rejects the import when it exceeds this budget.
+/// Absent on the standalone server: imports are unbudgeted there.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestImportBudget {
+    /// How many atoms the account may still add before hitting its plan
+    /// ceiling.
+    pub max_atoms: i64,
+}
+
 #[derive(Clone)]
 pub struct MigrationJobManager {
     work_dir: Arc<PathBuf>,
@@ -91,6 +103,10 @@ struct MigrationJob {
     kind: &'static str,
     db_name: String,
     dir: PathBuf,
+    /// Ownership scope stamped at creation (see
+    /// [`crate::db_extractor::RequestJobScope`]). Lookups must present the
+    /// same scope; `None` (standalone server) matches only `None`.
+    scope: Option<String>,
     cancel: AtomicBool,
     state: Mutex<MigrationJobState>,
 }
@@ -145,9 +161,16 @@ impl MigrationJobManager {
         upload_path: PathBuf,
         db_name: String,
         pause_feeds: bool,
+        scope: Option<String>,
     ) -> Result<MigrationJobResponse, AtomicCoreError> {
         let dir = self.work_dir.join(&job_id);
-        let job = Arc::new(MigrationJob::new(job_id.clone(), "import", db_name, dir));
+        let job = Arc::new(MigrationJob::new(
+            job_id.clone(),
+            "import",
+            db_name,
+            dir,
+            scope.clone(),
+        ));
         self.register(job_id.clone(), Arc::clone(&job))?;
 
         let jobs = self.clone();
@@ -157,7 +180,7 @@ impl MigrationJobManager {
                 .await;
             jobs.finish(job, result);
         });
-        self.status(&job_id)
+        self.status(&job_id, scope.as_deref())
     }
 
     /// Start a push job (SQLite mode): snapshot → upload → poll remote.
@@ -166,6 +189,7 @@ impl MigrationJobManager {
         core: AtomicCore,
         request: PushRequest,
         local_db_name: String,
+        scope: Option<String>,
     ) -> Result<MigrationJobResponse, AtomicCoreError> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let dir = self.work_dir.join(&job_id);
@@ -175,7 +199,13 @@ impl MigrationJobManager {
             .clone()
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| local_db_name.clone());
-        let job = Arc::new(MigrationJob::new(job_id.clone(), "push", db_name, dir));
+        let job = Arc::new(MigrationJob::new(
+            job_id.clone(),
+            "push",
+            db_name,
+            dir,
+            scope.clone(),
+        ));
         self.register(job_id.clone(), Arc::clone(&job))?;
 
         let jobs = self.clone();
@@ -184,15 +214,23 @@ impl MigrationJobManager {
             job.remove_snapshot_files();
             jobs.finish(job, result);
         });
-        self.status(&job_id)
+        self.status(&job_id, scope.as_deref())
     }
 
-    pub fn status(&self, job_id: &str) -> Result<MigrationJobResponse, AtomicCoreError> {
-        Ok(self.get_job(job_id)?.response())
+    pub fn status(
+        &self,
+        job_id: &str,
+        scope: Option<&str>,
+    ) -> Result<MigrationJobResponse, AtomicCoreError> {
+        Ok(self.get_job_scoped(job_id, scope)?.response())
     }
 
-    pub fn cancel_or_delete(&self, job_id: &str) -> Result<MigrationJobResponse, AtomicCoreError> {
-        let job = self.get_job(job_id)?;
+    pub fn cancel_or_delete(
+        &self,
+        job_id: &str,
+        scope: Option<&str>,
+    ) -> Result<MigrationJobResponse, AtomicCoreError> {
+        let job = self.get_job_scoped(job_id, scope)?;
         let status = job.status();
         if matches!(
             status,
@@ -228,6 +266,24 @@ impl MigrationJobManager {
             .get(job_id)
             .cloned()
             .ok_or_else(|| AtomicCoreError::NotFound(format!("Migration job '{}'", job_id)))
+    }
+
+    /// Like [`get_job`](Self::get_job), but the caller's scope must match the
+    /// scope stamped at creation. A mismatch reads as not-found so a foreign
+    /// principal can't even confirm the job id exists.
+    fn get_job_scoped(
+        &self,
+        job_id: &str,
+        scope: Option<&str>,
+    ) -> Result<Arc<MigrationJob>, AtomicCoreError> {
+        let job = self.get_job(job_id)?;
+        if job.scope.as_deref() != scope {
+            return Err(AtomicCoreError::NotFound(format!(
+                "Migration job '{}'",
+                job_id
+            )));
+        }
+        Ok(job)
     }
 
     fn finish(&self, job: Arc<MigrationJob>, result: Result<(), AtomicCoreError>) {
@@ -403,13 +459,20 @@ impl MigrationJobManager {
 }
 
 impl MigrationJob {
-    fn new(id: String, kind: &'static str, db_name: String, dir: PathBuf) -> Self {
+    fn new(
+        id: String,
+        kind: &'static str,
+        db_name: String,
+        dir: PathBuf,
+        scope: Option<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id,
             kind,
             db_name,
             dir,
+            scope,
             cancel: AtomicBool::new(false),
             state: Mutex::new(MigrationJobState {
                 status: MigrationJobStatus::Queued,

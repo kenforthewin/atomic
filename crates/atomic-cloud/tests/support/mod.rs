@@ -489,3 +489,31 @@ pub async fn control_db_contains(control_url: &str, needle: &str) -> bool {
     let _ = conn.close().await;
     found
 }
+
+/// Build a local SQLite knowledge base holding `contents` as atoms and
+/// return the slim migration-snapshot bytes — the exact artifact the desktop
+/// push flow uploads to `/api/migrations/sqlite`.
+pub async fn sqlite_snapshot_fixture(contents: &[&str]) -> Vec<u8> {
+    let dir = tempfile::TempDir::new().expect("fixture dir");
+    let core = atomic_core::AtomicCore::open_or_create(dir.path().join("fixture.db"))
+        .expect("open fixture core");
+    for content in contents {
+        core.create_atom(
+            atomic_core::CreateAtomRequest {
+                content: content.to_string(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await
+        .expect("create fixture atom")
+        .expect("fixture atom inserted");
+    }
+    let snapshot = dir.path().join("upload.db");
+    core.create_migration_snapshot(&snapshot)
+        .await
+        .expect("create fixture snapshot");
+    tokio::fs::read(&snapshot)
+        .await
+        .expect("read fixture snapshot")
+}

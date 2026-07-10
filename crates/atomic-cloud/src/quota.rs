@@ -105,9 +105,11 @@ use actix_web::web::{self, Bytes};
 use actix_web::{FromRequest, HttpMessage, HttpResponse};
 use atomic_core::DatabaseManager;
 use atomic_server::db_extractor::RequestDatabaseManager;
+use atomic_server::migration_jobs::RequestImportBudget;
 
 use crate::auth::ResolvedTenant;
 use crate::plans::{Plan, PlanRegistry};
+use crate::tokens::TokenScope;
 
 /// Which resource a mutating data-plane route consumes — the unit a quota
 /// check is denominated in. `None` for routes the guard ignores.
@@ -130,6 +132,13 @@ enum QuotaTarget {
     /// the single-atom delta like the other atom-creating routes. See
     /// [`mcp_creates_atom`].
     Mcp,
+    /// `POST /api/migrations/sqlite` — a whole uploaded SQLite database that
+    /// becomes one new knowledge base holding N atoms. N lives *inside the
+    /// file*, which no request-time middleware can read, so admission splits:
+    /// the KB ceiling and credential scope are checked here, and the atom
+    /// ceiling is handed to the upload handler as a [`RequestImportBudget`]
+    /// it enforces once it can count the file. See [`admit_import`].
+    Import,
 }
 
 /// Classify a `(method, path)` into the resource it consumes, or `None` if
@@ -155,6 +164,10 @@ fn quota_target(method: &Method, path: &str) -> Option<QuotaTarget> {
         "/api/atoms/bulk" => Some(QuotaTarget::AtomBulk),
         "/api/ingest/urls" => Some(QuotaTarget::IngestUrls),
         "/api/databases" => Some(QuotaTarget::Kb),
+        // A migration import mints a new KB and lands the uploaded file's
+        // atoms in it — both ceilings apply, split between guard and handler
+        // (see the `Import` variant).
+        "/api/migrations/sqlite" => Some(QuotaTarget::Import),
         // Manual-trigger routes carry a dynamic `{id}` segment, so they fall
         // through the exact-path arm. `POST /api/reports/{id}/run` writes a
         // finding atom and `POST /api/feeds/{id}/poll` ingests feed-entry
@@ -237,6 +250,13 @@ pub async fn quota_guard(
         }
     };
 
+    // Migration imports are admitted by their own three-part check (scope,
+    // KB ceiling, atom budget) rather than the generic delta accounting —
+    // the atom cost lives inside the uploaded file.
+    if target == QuotaTarget::Import {
+        return admit_import(&account_id, &plan, &manager, req, next).await;
+    }
+
     // The bulk route's batch size must be read before the limit branch so
     // the body is buffered+replayed regardless of whether the plan is
     // unlimited (a one-shot read; replaying keeps the handler whole).
@@ -275,6 +295,8 @@ pub async fn quota_guard(
                 0
             }
         }
+        // Routed to `admit_import` above, before the delta accounting.
+        QuotaTarget::Import => unreachable!("imports are admitted by admit_import"),
     };
 
     // A zero delta creates nothing, so it can never exceed a limit — admit it
@@ -388,6 +410,9 @@ async fn check_resource(
             ("atoms", plan.atom_limit)
         }
         QuotaTarget::Kb => ("knowledge_bases", plan.kb_limit),
+        // Imports never reach the generic path — `quota_guard` routes them
+        // to [`admit_import`] before the delta accounting.
+        QuotaTarget::Import => unreachable!("imports are admitted by admit_import"),
     };
     // NULL limit = unlimited: never read the count, never block.
     let Some(limit) = limit else {
@@ -408,6 +433,7 @@ async fn check_resource(
             count_account_atoms(manager).await?
         }
         QuotaTarget::Kb => manager.list_databases().await?.0.len() as i64,
+        QuotaTarget::Import => unreachable!("imports are admitted by admit_import"),
     };
 
     // Admit only if the request keeps the tenant at-or-under the limit.
@@ -503,6 +529,79 @@ fn upgrade_url(req: &ServiceRequest) -> String {
     format!("https://app.{base}/account/billing")
 }
 
+/// Admit or deny a migration import (`POST /api/migrations/sqlite`).
+///
+/// Three checks, in cheap-first order:
+/// 1. **Credential scope** — an import mints a brand-new knowledge base,
+///    outside anything a database-pinned token is scoped to, so only
+///    account-scoped credentials (sessions, account tokens) may import.
+/// 2. **KB ceiling** — the import creates exactly one knowledge base, so it
+///    is gated like `POST /api/databases`.
+/// 3. **Atom ceiling** — the number of atoms the upload adds lives inside
+///    the file, so this guard can only compute the *remaining budget*
+///    (`limit - account-wide count`) and hand it to the upload handler as a
+///    [`RequestImportBudget`] extension; the handler counts the file after
+///    streaming it and rejects an over-budget import before any copy starts.
+///    An account already at its ceiling is denied here without an upload.
+///
+/// Same soft-ceiling semantics as the rest of the guard: the budget is a
+/// snapshot, not a reservation.
+async fn admit_import(
+    account_id: &str,
+    plan: &Plan,
+    manager: &DatabaseManager,
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    let account_scoped = req
+        .extensions()
+        .get::<ResolvedTenant>()
+        .is_some_and(|t| t.principal.scope == TokenScope::Account);
+    if !account_scoped {
+        return Ok(
+            req.into_response(HttpResponse::Forbidden().json(serde_json::json!({
+                "error": "account_scope_required",
+                "message": "Importing a database requires an account-scoped credential",
+            }))),
+        );
+    }
+
+    if let Some(kb_limit) = plan.kb_limit {
+        let limit = i64::from(kb_limit);
+        let current = match manager.list_databases().await {
+            Ok((databases, _)) => databases.len() as i64,
+            Err(e) => {
+                tracing::error!(account_id, error = %e, "reading KB count for import admission failed");
+                return Ok(req.into_response(internal_error()));
+            }
+        };
+        if current + 1 > limit {
+            let denial = quota_exceeded("knowledge_bases", current, limit, &req);
+            return Ok(req.into_response(denial));
+        }
+    }
+
+    if let Some(atom_limit) = plan.atom_limit {
+        let limit = i64::from(atom_limit);
+        let current = match count_account_atoms(manager).await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::error!(account_id, error = %e, "reading atom count for import admission failed");
+                return Ok(req.into_response(internal_error()));
+            }
+        };
+        if current >= limit {
+            let denial = quota_exceeded("atoms", current, limit, &req);
+            return Ok(req.into_response(denial));
+        }
+        req.extensions_mut().insert(RequestImportBudget {
+            max_atoms: limit - current,
+        });
+    }
+
+    next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
 /// The plan's quota-exceeded response shape, verbatim. `resets_at` is always
 /// `null` for resource limits (module docs).
 fn quota_exceeded(metric: &str, current: i64, limit: i64, req: &ServiceRequest) -> HttpResponse {
@@ -523,6 +622,25 @@ fn internal_error() -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_imports_are_admission_gated() {
+        assert_eq!(
+            quota_target(&Method::POST, "/api/migrations/sqlite"),
+            Some(QuotaTarget::Import),
+            "imports consume a KB and the file's atoms"
+        );
+        assert_eq!(
+            quota_target(&Method::GET, "/api/migrations/sqlite"),
+            None,
+            "job polling is free"
+        );
+        assert_eq!(
+            quota_target(&Method::POST, "/api/migrations/push"),
+            None,
+            "push runs on SQLite instances; on cloud the handler 400s"
+        );
+    }
 
     #[test]
     fn quota_target_matches_only_creating_posts() {
