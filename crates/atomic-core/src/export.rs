@@ -69,6 +69,50 @@ impl AtomicCore {
         .map_err(|e| AtomicCoreError::DatabaseOperation(format!("snapshot task failed: {e}")))?
     }
 
+    /// Create a slimmed SQLite snapshot for cloud migration.
+    ///
+    /// Like [`Self::create_sqlite_snapshot`], but strips everything the
+    /// migration deliberately leaves behind — chunk embeddings, tag
+    /// centroids, the vector index tables, semantic edges, clusters, and
+    /// transient pipeline/scheduler state — so the upload is a fraction of
+    /// the source size (embeddings dominate the file). Chunk text stays:
+    /// the destination serves keyword search from it while embeddings
+    /// rebuild.
+    ///
+    /// Returns `Ok(false)` for non-SQLite storage backends.
+    pub async fn create_migration_snapshot(
+        &self,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<bool, AtomicCoreError> {
+        let snapshot_path = snapshot_path.as_ref().to_path_buf();
+        if !self.create_sqlite_snapshot(&snapshot_path).await? {
+            return Ok(false);
+        }
+
+        tokio::task::spawn_blocking(move || -> Result<bool, AtomicCoreError> {
+            // sqlite-vec is process-globally registered (this core already
+            // opened a Database), so dropping the vec0 virtual tables works
+            // on this plain connection.
+            let conn = rusqlite::Connection::open(&snapshot_path)?;
+            conn.execute_batch(
+                "UPDATE atom_chunks SET embedding = NULL;
+                 DELETE FROM tag_embeddings;
+                 DELETE FROM semantic_edges;
+                 DELETE FROM atom_clusters;
+                 DELETE FROM atom_pipeline_jobs;
+                 DELETE FROM task_runs;
+                 DROP TABLE IF EXISTS vec_chunks;
+                 DROP TABLE IF EXISTS vec_tags;
+                 VACUUM;",
+            )?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("snapshot slim task failed: {e}"))
+        })?
+    }
+
     /// Export every atom in this database as markdown files in a ZIP archive.
     ///
     /// Each atom becomes `atoms/<title>--<short-id>.md`. The markdown body is
@@ -441,5 +485,74 @@ mod tests {
     fn sanitize_path_component_keeps_paths_portable() {
         assert_eq!(sanitize_path_component("A/B: C? * D.md"), "ab-c-d-md");
         assert_eq!(sanitize_path_component("   "), "");
+    }
+
+    #[tokio::test]
+    async fn migration_snapshot_strips_derived_data_but_keeps_content() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let core = AtomicCore::open_or_create(&db_path).unwrap();
+
+        // Seed directly so the fixture is deterministic (no pipeline race):
+        // an atom with an embedded chunk, a tag centroid, and a semantic edge.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO atoms (id, content, created_at, updated_at)
+                 VALUES ('a1', 'ownership note', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                        ('a2', 'borrowing note', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO atom_chunks (id, atom_id, chunk_index, content, embedding)
+                 VALUES ('c1', 'a1', 0, 'ownership note', x'0011223344556677');
+                 INSERT INTO tags (id, name, created_at) VALUES ('t1', 'Rust', '2026-01-01T00:00:00Z');
+                 INSERT INTO tag_embeddings (tag_id, embedding, atom_count, updated_at)
+                 VALUES ('t1', x'0011223344556677', 1, '2026-01-01T00:00:00Z');
+                 INSERT INTO semantic_edges (id, source_atom_id, target_atom_id, similarity_score, created_at)
+                 VALUES ('e1', 'a1', 'a2', 0.8, '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let snapshot_path = dir.path().join("migration-snapshot.db");
+        let created = core
+            .create_migration_snapshot(&snapshot_path)
+            .await
+            .unwrap();
+        assert!(created);
+
+        let snap = rusqlite::Connection::open(&snapshot_path).unwrap();
+        let chunks: i64 = snap
+            .query_row("SELECT COUNT(*) FROM atom_chunks", [], |r| r.get(0))
+            .unwrap();
+        let stripped: i64 = snap
+            .query_row(
+                "SELECT COUNT(*) FROM atom_chunks WHERE embedding IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (chunks, stripped),
+            (1, 1),
+            "chunk text kept, embedding nulled"
+        );
+
+        for table in ["tag_embeddings", "semantic_edges", "atom_clusters"] {
+            let n: i64 = snap
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} should be emptied");
+        }
+        let vec_tables: i64 = snap
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('vec_chunks', 'vec_tags')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_tables, 0, "vector index tables dropped");
+        let atoms: i64 = snap
+            .query_row("SELECT COUNT(*) FROM atoms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(atoms, 2, "user content intact");
     }
 }

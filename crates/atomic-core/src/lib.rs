@@ -45,6 +45,8 @@ pub mod graph_maintenance;
 pub mod import;
 pub mod ingest;
 pub mod manager;
+#[cfg(feature = "postgres")]
+pub mod migrate;
 pub mod models;
 pub mod pipeline_task;
 pub mod projection;

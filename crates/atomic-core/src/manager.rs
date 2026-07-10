@@ -98,8 +98,39 @@ impl DatabaseManager {
 
     /// Returns true if this manager is using Postgres storage.
     #[cfg(feature = "postgres")]
-    fn is_postgres(&self) -> bool {
+    pub fn is_postgres(&self) -> bool {
         self.database_url.is_some()
+    }
+
+    /// Migrate a local SQLite database file into this manager's Postgres
+    /// backend as a brand-new logical database. See [`crate::migrate`] for
+    /// what is copied, what is regenerated, and the failure semantics.
+    ///
+    /// Errors with `Configuration` when the manager runs on SQLite storage.
+    #[cfg(feature = "postgres")]
+    pub async fn migrate_sqlite_to_postgres<F, C>(
+        &self,
+        source_db: &Path,
+        options: crate::migrate::MigrationOptions,
+        on_event: F,
+        is_cancelled: C,
+    ) -> Result<crate::migrate::MigrationReport, AtomicCoreError>
+    where
+        F: Fn(crate::migrate::MigrationEvent) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        if !self.is_postgres() {
+            return Err(AtomicCoreError::Configuration(
+                "SQLite migration import requires this server to run on Postgres storage"
+                    .to_string(),
+            ));
+        }
+        let storage = self.any_storage()?;
+        let pg = storage.as_postgres().ok_or_else(|| {
+            AtomicCoreError::Configuration("Postgres storage unavailable".to_string())
+        })?;
+        crate::migrate::migrate_sqlite_to_postgres(source_db, pg, options, on_event, is_cancelled)
+            .await
     }
 
     /// SQLite-only paths assume a registry is present. Centralizing the unwrap

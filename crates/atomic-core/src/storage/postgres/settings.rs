@@ -437,6 +437,11 @@ impl DatabaseStore for PostgresStorage {
     async fn purge_database_data(&self, db_id: &str) -> StorageResult<()> {
         // Delete from all per-database tables in dependency order (children first).
         // Tables with FKs to other per-db tables are deleted first to avoid constraint violations.
+        //
+        // The legacy briefings tables are intentionally absent: they are DROPped
+        // at runtime by `reports::seed::migrate_briefings_to_findings`, so
+        // referencing them here would fail on any instance where that teardown
+        // has already run.
         let tables = [
             "chat_citations",
             "chat_tool_calls",
@@ -446,17 +451,21 @@ impl DatabaseStore for PostgresStorage {
             "wiki_citations",
             "wiki_links",
             "wiki_article_versions",
+            "wiki_proposals",
             "wiki_articles",
             "feed_items",
             "feed_tags",
             "feeds",
+            "report_finding_citations",
+            "report_findings",
+            "reports",
+            "task_runs",
             "semantic_edges",
             "atom_clusters",
             "tag_embeddings",
             "atom_positions",
-            // briefings before atoms (briefing_citations FK references atoms)
-            "briefing_citations",
-            "briefings",
+            "atom_links",
+            "atom_pipeline_jobs",
             "atom_chunks",
             "atom_tags",
             "atoms",
