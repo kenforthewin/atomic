@@ -339,7 +339,7 @@ Keep that discipline: pass secrets via env, not flags.
 | Setting | Env var | Notes |
 |---|---|---|
 | Provisioning mode | `ATOMIC_CLOUD_PROVISIONING_MODE` | Set to `openrouter` to mint a managed key per account at signup. `disabled` (default) = keyless accounts (dev only). |
-| OpenRouter provisioning key | `ATOMIC_CLOUD_PROVISIONING_KEY` (name overridable via `--openrouter-provisioning-key-env`) | Mints runtime keys against the master OpenRouter account's balance — crown-jewel custody. Required with `provisioning-mode=openrouter`. |
+| OpenRouter provisioning key | `ATOMIC_CLOUD_OPENROUTER_PROVISIONING_KEY` (name overridable via `--openrouter-provisioning-key-env`) | Mints runtime keys against the master OpenRouter account's balance — crown-jewel custody. Required with `provisioning-mode=openrouter`. |
 
 ### Required for billing (Stripe) — omit to run billing-disabled
 
