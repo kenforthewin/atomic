@@ -357,6 +357,14 @@ pub struct TenantPlane {
 }
 
 impl TenantPlane {
+    /// The managed-key lifecycle handle — an accessor (like
+    /// [`CloudAuth::base_domain`](crate::auth::CloudAuth)) so the admin
+    /// plane composes from the same inputs without a new
+    /// `configure_cloud_app` argument.
+    pub(crate) fn managed(&self) -> ManagedKeys {
+        self.state.managed.clone()
+    }
+
     /// Build the plane over the same control plane, cluster, vault, and
     /// cache the rest of the composition serves from.
     pub fn new(

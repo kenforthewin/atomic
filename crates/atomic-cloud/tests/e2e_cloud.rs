@@ -1993,3 +1993,207 @@ async fn tenant_token_management_plane() {
     })
     .await;
 }
+
+/// The admin plane: existence-hidden to everyone but an is_admin session,
+/// and the plan-override path end to end — catalogue-validated, ledgered
+/// as trigger='admin', audited, and pinned against the trial sweep.
+#[actix_web::test]
+async fn admin_plane_gates_and_plan_override() {
+    with_control_db("admin_plane_gates_and_plan_override", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+        let bravo = h.provision("bravo").await;
+
+        let app_host = format!("app.{BASE_DOMAIN}");
+        let admin_get = |path: &str, cookie: Option<String>| {
+            let mut req = h
+                .client
+                .get(format!("{}{path}", h.base_url))
+                .header(HOST, app_host.as_str());
+            if let Some(cookie) = cookie {
+                req = req.header("Cookie", format!("{SESSION_COOKIE}={cookie}"));
+            }
+            req
+        };
+
+        // No cookie, a bogus cookie, and a real-but-not-admin session all
+        // read identically: the plane does not exist for you.
+        let alpha_session = create_session(
+            &h.control,
+            &alpha.account_id,
+            Duration::from_secs(3600),
+            None,
+            None,
+        )
+        .await
+        .expect("alpha session");
+        for cookie in [
+            None,
+            Some("ats_bogus".to_string()),
+            Some(alpha_session.clone()),
+        ] {
+            let resp = admin_get("/admin/api/accounts", cookie)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "non-admin must read the admin plane as not-found"
+            );
+        }
+
+        // Promote alpha (the CLI path) — the same session now reads the plane.
+        atomic_cloud::admin::set_admin_flag(&h.control, "alpha", true)
+            .await
+            .expect("promote alpha");
+        let resp = admin_get("/admin/api/accounts", Some(alpha_session.clone()))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing: Value = resp.json().await.expect("listing json");
+        assert!(
+            listing
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|a| a["subdomain"] == "bravo"),
+            "admin listing shows every account: {listing}"
+        );
+
+        // The plan picker's source of truth: the catalogue, comp included.
+        let resp = admin_get("/admin/api/plans", Some(alpha_session.clone()))
+            .send()
+            .await
+            .expect("send");
+        let plans: Value = resp.json().await.expect("plans json");
+        assert!(
+            plans
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|p| p["id"] == "comp"),
+            "comp tier seeded and listed: {plans}"
+        );
+
+        // Comp bravo through the route (defaults to pinned).
+        let resp = h
+            .client
+            .put(format!(
+                "{}/admin/api/accounts/{}/plan",
+                h.base_url, bravo.account_id
+            ))
+            .header(HOST, app_host.as_str())
+            .header("Cookie", format!("{SESSION_COOKIE}={alpha_session}"))
+            .json(&json!({ "plan_id": "comp" }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut conn = PgConnection::connect(&url).await.expect("connect");
+        let (plan_id, pinned): (Option<String>, bool) = sqlx::query_as(
+            "SELECT plan_id, plan_pinned FROM accounts WHERE id = $1",
+        )
+        .bind(&bravo.account_id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("read account");
+        assert_eq!(plan_id.as_deref(), Some("comp"));
+        assert!(pinned, "admin plan override pins by default");
+        let ledgered: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM plan_transitions \
+             WHERE account_id = $1 AND trigger = 'admin' AND to_plan_id = 'comp'",
+        )
+        .bind(&bravo.account_id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("count transitions");
+        assert_eq!(ledgered, 1, "override rides the plan_transitions ledger");
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM admin_actions \
+             WHERE action = 'set_plan' AND target_account_id = $1 AND actor = $2",
+        )
+        .bind(&bravo.account_id)
+        .bind(&alpha.account_id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("count audits");
+        assert_eq!(audited, 1, "override writes the admin audit ledger");
+
+        // The pin holds against the trial sweep: manufacture an expired
+        // trial on the comped account and run the sweep — the plan stays.
+        sqlx::query(
+            "UPDATE accounts SET billing_state = 'trialing', \
+             trial_ends_at = NOW() - interval '1 day' WHERE id = $1",
+        )
+        .bind(&bravo.account_id)
+        .execute(&mut conn)
+        .await
+        .expect("manufacture expired trial");
+        atomic_cloud::billing::dunning::advance_expired_trials(
+            &h.control,
+            &ManagedKeys::Disabled,
+            chrono::Utc::now(),
+            |_| async { Ok(false) },
+        )
+        .await
+        .expect("sweep");
+        let plan_after: Option<String> =
+            sqlx::query_scalar("SELECT plan_id FROM accounts WHERE id = $1")
+                .bind(&bravo.account_id)
+                .fetch_one(&mut conn)
+                .await
+                .expect("read plan after sweep");
+        assert_eq!(
+            plan_after.as_deref(),
+            Some("comp"),
+            "a pinned plan holds against the trial-expiry sweep"
+        );
+
+        // An unknown plan id is a structured 400, and nothing changes.
+        let resp = h
+            .client
+            .put(format!(
+                "{}/admin/api/accounts/{}/plan",
+                h.base_url, bravo.account_id
+            ))
+            .header(HOST, app_host.as_str())
+            .header("Cookie", format!("{SESSION_COOKIE}={alpha_session}"))
+            .json(&json!({ "plan_id": "platinum-sparkle" }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // The admin plane never exists on a tenant subdomain, even for the
+        // admin's own session: the host guard excludes it from the route
+        // table, so the path falls through to the SPA fallback like any
+        // unknown tenant path — an HTML shell, never JSON, never data.
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/admin/api/accounts")
+            .header("Cookie", format!("{SESSION_COOKIE}={alpha_session}"))
+            .send()
+            .await
+            .expect("send");
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.contains("text/html"),
+            "tenant-host /admin/api/* is the SPA shell, not the admin plane: {content_type}"
+        );
+        let body = resp.text().await.expect("body");
+        assert!(
+            !body.contains(&bravo.account_id) && !body.contains("bravo"),
+            "no admin data on a tenant host"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}

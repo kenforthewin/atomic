@@ -414,3 +414,105 @@ export function deleteAccount(
 
 /** Low-level escape hatch for any route without a typed helper. */
 export const api = { request };
+
+// --- Admin plane (app host, is_admin sessions; 404 to everyone else) ---------
+
+/** One row of `GET /admin/api/accounts`. */
+export interface AdminAccount {
+  id: string;
+  subdomain: string;
+  email: string;
+  status: string;
+  plan_id: string | null;
+  plan_pinned: boolean;
+  is_admin: boolean;
+  billing_state: string;
+  trial_ends_at: string | null;
+  created_at: string;
+  last_backup_at: string | null;
+}
+
+/** One `plans` catalogue row (`GET /admin/api/plans`) — the picker's source. */
+export interface AdminPlan {
+  id: string;
+  name: string;
+  monthly_price_cents: number;
+  atom_limit: number | null;
+  kb_limit: number | null;
+  storage_bytes_limit: number | null;
+  ai_credits_monthly_cents: number;
+}
+
+/** `GET /admin/api/accounts/{id}` — the detail drawer's read. */
+export interface AdminAccountDetail {
+  id: string;
+  subdomain: string;
+  email: string;
+  status: string;
+  plan_id: string | null;
+  plan_pinned: boolean;
+  billing_state: string;
+  recent_transitions: {
+    from: string | null;
+    to: string | null;
+    trigger: string;
+    at: string;
+  }[];
+}
+
+/**
+ * The admin plane answers 404 to non-admins by design — callers treat a 404
+ * as "this page does not exist for you", never as a data error, so none of
+ * these redirect on unauthorized.
+ */
+export function adminListAccounts(signal?: AbortSignal): Promise<AdminAccount[]> {
+  return request<AdminAccount[]>('/admin/api/accounts', {
+    method: 'GET',
+    redirectOnUnauthorized: false,
+    signal,
+  });
+}
+
+export function adminGetAccount(
+  id: string,
+  signal?: AbortSignal,
+): Promise<AdminAccountDetail> {
+  return request<AdminAccountDetail>(`/admin/api/accounts/${encodeURIComponent(id)}`, {
+    method: 'GET',
+    redirectOnUnauthorized: false,
+    signal,
+  });
+}
+
+export function adminListPlans(signal?: AbortSignal): Promise<AdminPlan[]> {
+  return request<AdminPlan[]>('/admin/api/plans', {
+    method: 'GET',
+    redirectOnUnauthorized: false,
+    signal,
+  });
+}
+
+export function adminSetPlan(
+  id: string,
+  planId: string,
+  pinned: boolean,
+): Promise<{ plan_id: string; pinned: boolean }> {
+  return request<{ plan_id: string; pinned: boolean }>(
+    `/admin/api/accounts/${encodeURIComponent(id)}/plan`,
+    {
+      method: 'PUT',
+      body: { plan_id: planId, pinned },
+      redirectOnUnauthorized: false,
+    },
+  );
+}
+
+export function adminEvict(id: string): Promise<{ evicted: boolean }> {
+  return request<{ evicted: boolean }>(
+    `/admin/api/accounts/${encodeURIComponent(id)}/evict`,
+    {
+      method: 'POST',
+      redirectOnUnauthorized: false,
+    },
+  );
+}

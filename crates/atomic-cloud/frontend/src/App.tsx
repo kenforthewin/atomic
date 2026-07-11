@@ -5,6 +5,7 @@ import { Signup } from './pages/Signup';
 import { Login } from './pages/Login';
 import { Legal } from './pages/Legal';
 import { NotFound } from './pages/NotFound';
+import { Admin } from './pages/Admin';
 import { AccountShell } from './pages/account/AccountShell';
 import { Overview } from './pages/account/Overview';
 import { Provider } from './pages/account/Provider';
@@ -42,6 +43,8 @@ function AppHostRoutes() {
       <Route path="/login" element={<Login />} />
       <Route path="/terms" element={<Legal kind="terms" />} />
       <Route path="/privacy" element={<Legal kind="privacy" />} />
+      {/* Operator portal — server-side 404 to non-admins; the page mirrors it. */}
+      <Route path="/admin" element={<Admin />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
   );
