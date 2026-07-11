@@ -156,19 +156,23 @@ impl CloudHarness {
             .expect("load fixture SPA");
 
         let server = HttpServer::new(move || {
-            App::new().configure(configure_cloud_app(
-                state.clone(),
-                auth.clone(),
-                account_plane.clone(),
-                tenant_plane.clone(),
-                oauth_plane.clone(),
-                mcp_transport.clone(),
-                control_for_app.clone(),
-                chat_streams.clone(),
-                readiness.clone(),
-                quota_billing.clone(),
-                Some(spa.clone()),
-            ))
+            App::new()
+                .configure(configure_cloud_app(
+                    state.clone(),
+                    auth.clone(),
+                    account_plane.clone(),
+                    tenant_plane.clone(),
+                    oauth_plane.clone(),
+                    mcp_transport.clone(),
+                    control_for_app.clone(),
+                    chat_streams.clone(),
+                    readiness.clone(),
+                    quota_billing.clone(),
+                    Some(spa.clone()),
+                ))
+                // Mirrors `serve`: the CORS edge answers extension/local-app
+                // preflights before CloudAuth (see extension_cors_preflight).
+                .wrap(atomic_server::cors::build_cors(None))
         })
         .workers(1)
         .listen(listener)
@@ -608,6 +612,86 @@ async fn cross_tenant_credentials_rejected() {
 /// subdomain without credentials → 401; `/health` is public; and the
 /// self-hosted token plane (`/api/auth/*`) is unrouted in cloud — proving
 /// `cloud_plane_guard` is wired into the live composition.
+/// The CORS edge for browser-extension clients. The web clipper ships from
+/// the Chrome Web Store without `host_permissions` (activeTab-only), so its
+/// fetches are ordinary CORS-governed requests: the browser preflights them
+/// with NO Authorization header. The CORS middleware must therefore answer
+/// preflights *before* CloudAuth (which would 401 them), allow extension
+/// origins without credentials support (the session-cookie plane stays
+/// same-origin), and give foreign web origins nothing.
+#[actix_web::test]
+async fn extension_cors_preflight() {
+    with_control_db("extension_cors_preflight", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+
+        const EXT_ORIGIN: &str = "chrome-extension://bknijbafnefbaklndpglcmlhaglikccf";
+
+        // Preflight, unauthenticated, exactly as a browser sends it.
+        let resp = h
+            .api(Method::OPTIONS, &alpha.subdomain, "/api/atoms")
+            .header("Origin", EXT_ORIGIN)
+            .header("Access-Control-Request-Method", "GET")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization,content-type,x-atomic-database",
+            )
+            .send()
+            .await
+            .expect("send preflight");
+        assert!(
+            resp.status().is_success(),
+            "preflight must be answered by the CORS edge, not CloudAuth: {}",
+            resp.status()
+        );
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some(EXT_ORIGIN)
+        );
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "cookie credentials must stay unsupported for extension origins"
+        );
+
+        // The real request: extension origin + Bearer token → 200 with the
+        // origin echoed (without it the browser discards the response).
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .header("Origin", EXT_ORIGIN)
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("send get");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some(EXT_ORIGIN)
+        );
+
+        // A foreign web origin is outside the policy: no CORS headers.
+        let resp = h
+            .api(Method::OPTIONS, &alpha.subdomain, "/api/atoms")
+            .header("Origin", "https://evil.example")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .expect("send foreign preflight");
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "foreign web origins must get no CORS allowance"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}
+
 #[actix_web::test]
 async fn unknown_subdomain_and_unauthenticated_requests() {
     with_control_db(

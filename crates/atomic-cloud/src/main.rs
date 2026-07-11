@@ -2488,19 +2488,28 @@ async fn serve(
     tracing::info!(bind, port, "health: http://{bind}:{port}/health");
 
     let server = HttpServer::new(move || {
-        App::new().configure(configure_cloud_app(
-            state.clone(),
-            auth.clone(),
-            account_plane.clone(),
-            tenant_plane.clone(),
-            oauth_plane.clone(),
-            mcp_transport.clone(),
-            control.clone(),
-            chat_streams.clone(),
-            readiness.clone(),
-            quota_billing.clone(),
-            spa.clone(),
-        ))
+        App::new()
+            .configure(configure_cloud_app(
+                state.clone(),
+                auth.clone(),
+                account_plane.clone(),
+                tenant_plane.clone(),
+                oauth_plane.clone(),
+                mcp_transport.clone(),
+                control.clone(),
+                chat_streams.clone(),
+                readiness.clone(),
+                quota_billing.clone(),
+                spa.clone(),
+            ))
+            // Same browser-origin policy as the self-hosted server: local app
+            // shells and browser-extension pages (the web clipper) may call
+            // the API cross-origin with a Bearer token. Answers preflights
+            // before CloudAuth sees them (an OPTIONS carries no Authorization
+            // and would otherwise 401). No public origin: same-origin pages
+            // need no CORS, and credentials stay unsupported so the
+            // session-cookie plane remains same-origin.
+            .wrap(atomic_server::cors::build_cors(None))
     })
     .workers(4)
     .bind((bind.as_str(), port))?

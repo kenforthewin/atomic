@@ -5,10 +5,10 @@
 
 mod config;
 
-use actix_cors::Cors;
-use actix_web::{http::header, middleware, web, App, HttpServer};
+use actix_web::{middleware, web, App, HttpServer};
 use atomic_server::{
     app::configure_app,
+    cors::build_cors,
     event_bridge,
     export_jobs::ExportJobManager,
     log_buffer::LogBuffer,
@@ -989,119 +989,4 @@ async fn backfill_setup_claimed_at(
         .min()
         .expect("tokens is non-empty");
     core.set_setting(SETUP_CLAIMED_AT_KEY, claimed_at).await
-}
-
-fn build_cors(public_url: Option<&str>) -> Cors {
-    let public_origin = public_url.and_then(origin_from_url);
-    Cors::default()
-        .allowed_origin_fn(move |origin, _req_head| {
-            let Ok(origin) = origin.to_str() else {
-                return false;
-            };
-            is_local_origin(origin) || public_origin.as_deref() == Some(origin)
-        })
-        .allowed_methods(vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
-        .allow_any_header()
-        .expose_headers(vec![header::HeaderName::from_static("mcp-session-id")])
-        .max_age(3600)
-}
-
-fn origin_from_url(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let scheme = parsed.scheme();
-    let host = parsed.host_str()?;
-    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-    Some(format!("{scheme}://{host}{port}"))
-}
-
-fn is_local_origin(origin: &str) -> bool {
-    if matches!(
-        origin,
-        "tauri://localhost" | "capacitor://localhost" | "ionic://localhost"
-    ) {
-        return true;
-    }
-
-    let Ok(url) = reqwest::Url::parse(origin) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host == "localhost"
-        || host == "tauri.localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host.ends_with(".localhost")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_web::test as actix_test;
-    use atomic_server::app::health;
-
-    #[actix_web::test]
-    async fn cors_allows_mcp_session_headers_from_local_origins() {
-        let app = actix_test::init_service(
-            App::new()
-                .wrap(build_cors(None))
-                .route("/health", web::get().to(health)),
-        )
-        .await;
-
-        let req = actix_test::TestRequest::default()
-            .method(actix_web::http::Method::OPTIONS)
-            .uri("/health")
-            .insert_header((header::ORIGIN, "http://localhost:5173"))
-            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
-            .insert_header((
-                header::ACCESS_CONTROL_REQUEST_HEADERS,
-                "authorization,content-type,mcp-session-id,mcp-protocol-version",
-            ))
-            .to_request();
-
-        let response = actix_test::call_service(&app, req).await;
-
-        assert!(response.status().is_success());
-        let allowed_headers = response
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
-            .and_then(|value| value.to_str().ok())
-            .expect("preflight response should include allowed headers");
-
-        assert!(allowed_headers.contains("authorization"));
-        assert!(allowed_headers.contains("content-type"));
-        assert!(allowed_headers.contains("mcp-session-id"));
-        assert!(allowed_headers.contains("mcp-protocol-version"));
-    }
-
-    #[actix_web::test]
-    async fn cors_exposes_mcp_session_id_to_browser_clients() {
-        let app = actix_test::init_service(
-            App::new()
-                .wrap(build_cors(None))
-                .route("/health", web::get().to(health)),
-        )
-        .await;
-
-        let req = actix_test::TestRequest::get()
-            .uri("/health")
-            .insert_header((header::ORIGIN, "http://localhost:5173"))
-            .to_request();
-
-        let response = actix_test::call_service(&app, req).await;
-
-        assert!(response.status().is_success());
-        let exposed_headers = response
-            .headers()
-            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
-            .and_then(|value| value.to_str().ok())
-            .expect("CORS response should expose MCP session header");
-
-        assert!(exposed_headers.contains("mcp-session-id"));
-    }
 }

@@ -1,4 +1,4 @@
-import { getConfig, setConfig, authHeaders } from '../lib/config.js';
+import { getConfig, setConfig, authHeaders, normalizeServerUrl } from '../lib/config.js';
 
 const urlInput = document.getElementById('server-url');
 const tokenInput = document.getElementById('api-token');
@@ -11,7 +11,7 @@ const messageEl = document.getElementById('message');
 
 function readForm() {
   return {
-    serverUrl: urlInput.value.trim().replace(/\/+$/, ''),
+    serverUrl: normalizeServerUrl(urlInput.value),
     apiToken: tokenInput.value.trim(),
     database: databaseSelect.value.trim(),
   };
@@ -74,6 +74,7 @@ saveBtn.addEventListener('click', async () => {
     return;
   }
   await setConfig(form);
+  urlInput.value = form.serverUrl;
   showMessage('Settings saved', 'success');
 });
 
