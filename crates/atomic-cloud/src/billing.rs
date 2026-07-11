@@ -514,13 +514,22 @@ fn parse_subscription(
         .ok_or_else(|| err("no status"))?
         .to_string();
     let cancel_at_period_end = sub["cancel_at_period_end"].as_bool().unwrap_or(false);
-    let current_period_start =
-        parse_epoch(&sub["current_period_start"]).ok_or_else(|| err("no current_period_start"))?;
-    let current_period_end =
-        parse_epoch(&sub["current_period_end"]).ok_or_else(|| err("no current_period_end"))?;
+    // Billing-period fields: subscription-level on older Stripe API versions;
+    // API 2025-03-31 ("billing mode") moved them to the line items — an
+    // account created after that sends webhooks with ONLY the item-level
+    // fields, so the fallback is load-bearing, not defensive (first observed
+    // as every `customer.subscription.created` 400ing in production while
+    // the payment itself succeeded).
+    let item = &sub["items"]["data"][0];
+    let current_period_start = parse_epoch(&sub["current_period_start"])
+        .or_else(|| parse_epoch(&item["current_period_start"]))
+        .ok_or_else(|| err("no current_period_start"))?;
+    let current_period_end = parse_epoch(&sub["current_period_end"])
+        .or_else(|| parse_epoch(&item["current_period_end"]))
+        .ok_or_else(|| err("no current_period_end"))?;
 
     // First line item's price → plan.
-    let price = &sub["items"]["data"][0]["price"];
+    let price = &item["price"];
     let plan_id = price["metadata"]["plan_id"]
         .as_str()
         .map(str::to_string)
@@ -748,6 +757,39 @@ mod tests {
             parse_event(&other, &map).unwrap(),
             WebhookEvent::Ignored { .. }
         ));
+    }
+
+    /// Stripe API 2025-03-31 moved `current_period_{start,end}` from the
+    /// subscription to its line items; accounts created after that send
+    /// webhooks with ONLY the item-level fields. Regression for the launch
+    /// failure where every `customer.subscription.created` 400ed (payment
+    /// succeeded, account never converted).
+    #[test]
+    fn parse_subscription_reads_item_level_period_fields() {
+        let sub = serde_json::json!({
+            "type": "customer.subscription.created",
+            "data": { "object": {
+                "id": "sub_new_api",
+                "customer": "cus_new_api",
+                "status": "active",
+                "cancel_at_period_end": false,
+                "metadata": { "subdomain": "alpha" },
+                // No subscription-level current_period_* at all.
+                "items": { "data": [ {
+                    "current_period_start": 1_783_811_116_i64,
+                    "current_period_end": 1_786_489_516_i64,
+                    "price": { "id": "price_x", "metadata": { "plan_id": "pro" } }
+                } ] }
+            }}
+        });
+        match parse_event(&sub, &std::collections::HashMap::new()).unwrap() {
+            WebhookEvent::SubscriptionUpserted(s) => {
+                assert_eq!(s.current_period_start.timestamp(), 1_783_811_116);
+                assert_eq!(s.current_period_end.timestamp(), 1_786_489_516);
+                assert_eq!(s.plan_id, "pro");
+            }
+            other => panic!("expected upsert, got {other:?}"),
+        }
     }
 
     #[test]

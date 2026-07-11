@@ -235,6 +235,25 @@ struct CheckoutQuery {
     plan: String,
 }
 
+/// Where Stripe sends the browser back after checkout/portal: the account
+/// dashboard's billing page. The dashboard lives on the TENANT host
+/// (`https://<subdomain>.<base>/account/billing`) — `/account/*` does not
+/// exist on the app host, so building this from `app_public_url` 404s the
+/// user right after a successful payment (the launch-day finding). Falls
+/// back to the app host only if the tenant somehow didn't resolve, where
+/// the login redirect can still rescue the navigation.
+fn billing_return_url(state: &BillingState, req: &HttpRequest) -> String {
+    match req
+        .extensions()
+        .get::<ResolvedTenant>()
+        .map(|t| t.subdomain.clone())
+        .filter(|s| !s.is_empty())
+    {
+        Some(subdomain) => format!("https://{}.{}/account/billing", subdomain, state.base_domain),
+        None => format!("{}/account/billing", state.app_public_url),
+    }
+}
+
 /// `GET /api/billing/portal` — 302 into the Stripe Customer Portal.
 async fn portal(state: web::Data<BillingState>, req: HttpRequest) -> HttpResponse {
     let Some(provider) = state.provider.as_ref() else {
@@ -269,7 +288,7 @@ async fn portal(state: web::Data<BillingState>, req: HttpRequest) -> HttpRespons
         }
     };
 
-    let return_url = format!("{}/account/billing", state.app_public_url);
+    let return_url = billing_return_url(&state, &req);
     match provider.create_portal_session(&customer, &return_url).await {
         Ok(session) => redirect(&session.url),
         Err(e) => {
@@ -319,8 +338,9 @@ async fn checkout(
         .get::<ResolvedTenant>()
         .map(|t| t.subdomain.clone())
         .unwrap_or_default();
-    let success_url = format!("{}/account/billing?status=success", state.app_public_url);
-    let cancel_url = format!("{}/account/billing?status=cancel", state.app_public_url);
+    let billing_page = billing_return_url(&state, &req);
+    let success_url = format!("{billing_page}?status=success");
+    let cancel_url = format!("{billing_page}?status=cancel");
     match provider
         .create_checkout_session(price_id, &email, &subdomain, &success_url, &cancel_url)
         .await
