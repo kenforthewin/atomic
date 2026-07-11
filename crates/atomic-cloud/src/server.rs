@@ -272,7 +272,15 @@ pub const DEFAULT_MCP_SSE_KEEP_ALIVE: Duration = Duration::from_secs(30);
 ///   tenant's export by id.
 /// - `/api/logs` — the process-wide log ring buffer (`state.log_buffer`).
 fn fallback_bound_plane(path: &str) -> bool {
-    if path.starts_with("/api/auth/") || path.starts_with("/api/exports/") || path == "/api/logs" {
+    if path.starts_with("/api/auth/") {
+        // The token subtree has a cloud-owned, per-tenant implementation
+        // (tenant_plane's `/api/auth/tokens*`, backed by `cloud_tokens`)
+        // registered ahead of `api_scope` — those requests must pass this
+        // guard. Everything else under the self-hosted auth plane stays
+        // unrouted.
+        return !(path == "/api/auth/tokens" || path.starts_with("/api/auth/tokens/"));
+    }
+    if path.starts_with("/api/exports/") || path == "/api/logs" {
         return true;
     }
     // `/api/databases/{id}/exports/...` — the export-start route lives under
@@ -598,8 +606,10 @@ mod tests {
     #[test]
     fn fallback_bound_planes_are_matched() {
         for unrouted in [
-            "/api/auth/tokens",
-            "/api/auth/tokens/some-id",
+            // The rest of the self-hosted auth plane stays fallback-bound —
+            // only the token subtree is cloud-owned (tenant_plane).
+            "/api/auth/setup",
+            "/api/auth/whoami",
             "/api/exports/job-1",
             "/api/exports/job-1/download",
             "/api/databases/default/exports/markdown",
@@ -615,6 +625,9 @@ mod tests {
         for routed in [
             "/api/atoms",
             "/api/databases",
+            // The token subtree is cloud-owned now (tenant_plane serves it).
+            "/api/auth/tokens",
+            "/api/auth/tokens/some-id",
             "/api/databases/default/stats",
             "/api/databases/default/activate",
             // Only the exact /api/logs path is the log plane.

@@ -1808,3 +1808,162 @@ async fn tenant_migration_import_end_to_end() {
     })
     .await;
 }
+
+/// The tenant token-management plane (`/api/auth/tokens*`): mint → list →
+/// use → revoke → dead, with the scope-escalation and cross-tenant
+/// chokepoints asserted along the way. This is the surface the product
+/// app's settings UI drives, and the token source for the desktop
+/// "Migrate to Cloud" flow.
+#[actix_web::test]
+async fn tenant_token_management_plane() {
+    with_control_db("tenant_token_management_plane", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+        let bravo = h.provision("bravo").await;
+
+        // Mint through the route; the plaintext appears exactly once.
+        let resp = h
+            .api(Method::POST, &alpha.subdomain, "/api/auth/tokens")
+            .bearer_auth(&alpha.token)
+            .json(&json!({ "name": "migration-laptop" }))
+            .send()
+            .await
+            .expect("create token");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: Value = resp.json().await.expect("created json");
+        let minted = created["token"].as_str().expect("plaintext").to_string();
+        let minted_id = created["id"].as_str().expect("id").to_string();
+        assert!(minted.starts_with("atm_"), "cloud token prefix");
+        assert_eq!(
+            created["prefix"].as_str().expect("prefix"),
+            &minted[..10],
+            "display prefix is the plaintext's first 10 chars"
+        );
+
+        // It lists — metadata only, prefix present, never the plaintext.
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/auth/tokens")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("list tokens");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing: Value = resp.json().await.expect("list json");
+        let entries = listing.as_array().expect("array");
+        assert!(
+            entries.iter().any(|t| t["name"] == "migration-laptop"
+                && t["token_prefix"] == created["prefix"]
+                && t["is_revoked"] == false),
+            "minted token appears with its metadata: {listing}"
+        );
+        assert!(
+            !listing.to_string().contains(&minted),
+            "the plaintext must never appear in a listing"
+        );
+
+        // The minted token is a working data-plane credential.
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .bearer_auth(&minted)
+            .send()
+            .await
+            .expect("use minted token");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Escalation chokepoint: a db-pinned credential may not mint an
+        // account-scope token (nor list or revoke).
+        let pinned = issue_token(
+            &h.control,
+            &alpha.account_id,
+            TokenScope::Database,
+            Some("default"),
+            "kb-pinned",
+        )
+        .await
+        .expect("issue pinned token");
+        for (method, path) in [
+            (Method::POST, "/api/auth/tokens".to_string()),
+            (Method::GET, "/api/auth/tokens".to_string()),
+            (Method::DELETE, format!("/api/auth/tokens/{minted_id}")),
+        ] {
+            let mut req = h.api(method.clone(), &alpha.subdomain, &path).bearer_auth(&pinned);
+            if method == Method::POST {
+                req = req.json(&json!({ "name": "escalation" }));
+            }
+            let resp = req.send().await.expect("scoped request");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} must 403 for a db-pinned credential"
+            );
+        }
+
+        // Cross-tenant chokepoint: bravo can neither see nor revoke alpha's
+        // token — the foreign id reads as not-found.
+        let resp = h
+            .api(
+                Method::DELETE,
+                &bravo.subdomain,
+                &format!("/api/auth/tokens/{minted_id}"),
+            )
+            .bearer_auth(&bravo.token)
+            .send()
+            .await
+            .expect("cross-tenant revoke");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = h
+            .api(Method::GET, &bravo.subdomain, "/api/auth/tokens")
+            .bearer_auth(&bravo.token)
+            .send()
+            .await
+            .expect("bravo list");
+        let bravo_listing: Value = resp.json().await.expect("bravo json");
+        assert!(
+            bravo_listing
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|t| t["name"] != "migration-laptop"),
+            "alpha's token must never appear in bravo's listing"
+        );
+
+        // Revoke for real: the route confirms, the credential dies, and the
+        // listing no longer shows it.
+        let resp = h
+            .api(
+                Method::DELETE,
+                &alpha.subdomain,
+                &format!("/api/auth/tokens/{minted_id}"),
+            )
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("revoke");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/atoms")
+            .bearer_auth(&minted)
+            .send()
+            .await
+            .expect("use revoked token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = h
+            .api(Method::GET, &alpha.subdomain, "/api/auth/tokens")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("list after revoke");
+        let after: Value = resp.json().await.expect("json");
+        assert!(
+            after
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|t| t["id"] != minted_id.as_str()),
+            "revoked token must leave the listing"
+        );
+
+        h.stop().await;
+    })
+    .await;
+}

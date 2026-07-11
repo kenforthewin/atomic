@@ -80,7 +80,7 @@ import { getBrowserTimeZone, getSupportedTimeZones } from '../../lib/tz';
 import { useDatabasesStore, type DatabaseInfo, type DatabaseStats } from '../../stores/databases';
 import { OverrideControls } from './OverrideControls';
 
-export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts' | 'migrate';
+export type SettingsTab = 'general' | 'ai' | 'tag-categories' | 'connection' | 'integrations' | 'databases' | 'prompts' | 'migrate' | 'tokens';
 
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'general', label: 'General' },
@@ -1053,15 +1053,23 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const localServerConfig = isDesktopApp() ? getLocalServerConfig() : null;
 
   // On Atomic Cloud the provider/models and the connection itself are owned by
-  // the control plane (managed key or dashboard BYOK; fixed cookie-auth origin;
-  // account-scoped tokens live in the dashboard). Those tabs would only mislead
-  // — and their fetches (provider models, /api/auth/tokens) 404 — so a cloud
-  // tenant never sees them.
+  // the control plane (managed key or dashboard BYOK; fixed cookie-auth
+  // origin), and "Migrate to Cloud" is where you already are. Those tabs
+  // would only mislead, so a cloud tenant never sees them. Token management
+  // IS tenant-facing on cloud (the tenant-plane serves /api/auth/tokens
+  // against the account's control-plane tokens), but it lives inside the
+  // hidden Connection tab — so cloud gets a dedicated API Tokens tab that
+  // renders the same section.
   const isCloud = isCloudTenant();
   const visibleTabs = useMemo(
     () =>
       isCloud
-        ? SETTINGS_TABS.filter(tab => tab.id !== 'ai' && tab.id !== 'connection')
+        ? [
+            ...SETTINGS_TABS.filter(
+              tab => tab.id !== 'ai' && tab.id !== 'connection' && tab.id !== 'migrate',
+            ),
+            { id: 'tokens' as SettingsTab, label: 'API Tokens' },
+          ]
         : SETTINGS_TABS,
     [isCloud],
   );
@@ -1173,6 +1181,15 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   };
 
   // Revoke an API token
+  // The dedicated API Tokens tab (cloud) renders the section expanded and
+  // freshly loaded; the Connection tab keeps its collapsed-by-default state.
+  useEffect(() => {
+    if (isOpen && activeTab === 'tokens') {
+      setShowTokenSection(true);
+      loadApiTokens();
+    }
+  }, [isOpen, activeTab, loadApiTokens]);
+
   const handleRevokeToken = async (tokenId: string) => {
     // Check if revoking the current token
     const currentPrefix = serverToken.substring(0, 10);
@@ -1365,9 +1382,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
         }
       }
       // Load API tokens when connected to a non-local server. Cloud tenants
-      // manage account-scoped tokens in the dashboard, not here (the data-plane
-      // /api/auth/tokens route is not exposed), so skip it.
-      if (!isLocalServer() && !isCloud && transport.isConnected()) {
+      // included: the tenant plane serves /api/auth/tokens against the
+      // account's control-plane tokens.
+      if (!isLocalServer() && transport.isConnected()) {
         loadApiTokens();
       }
       // Reset token creation state
@@ -1699,6 +1716,154 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const ollamaLlmModels: AvailableModel[] = ollamaModels
     .filter(m => !m.is_embedding)
     .map(m => ({ id: m.id, name: m.name }));
+
+  // The API-token management section, rendered in two places: inside the
+  // Connection tab (self-hosted remote/web mode) and as the cloud tenants'
+  // dedicated API Tokens tab. All state/handlers live at component scope.
+  const apiTokensSection = (
+    <div className="space-y-3 pt-4 border-t border-[var(--color-border)]">
+      <button
+        type="button"
+        onClick={() => setShowTokenSection(!showTokenSection)}
+        className="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)] hover:text-white transition-colors w-full"
+      >
+        <ChevronRight
+          className={`w-4 h-4 transition-transform ${showTokenSection ? 'rotate-90' : ''}`}
+          strokeWidth={2}
+        />
+        API Tokens
+        {apiTokens.filter(t => !t.is_revoked).length > 0 && (
+          <span className="text-xs text-[var(--color-text-secondary)]">
+            ({apiTokens.filter(t => !t.is_revoked).length} active)
+          </span>
+        )}
+      </button>
+
+      {showTokenSection && (
+        <div className="space-y-4 pl-6 border-l-2 border-[var(--color-border)]">
+          <p className="text-xs text-[var(--color-text-secondary)]">
+            Manage API tokens for accessing this server. Each device or integration should use its own token.
+          </p>
+
+          {/* Token list */}
+          {isLoadingTokens ? (
+            <div className="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
+              <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
+              Loading tokens...
+            </div>
+          ) : apiTokens.length === 0 ? (
+            <div className="text-sm text-[var(--color-text-secondary)]">No tokens found.</div>
+          ) : (
+            <div className="space-y-2">
+              {apiTokens.filter(t => !t.is_revoked).map((token) => {
+                // Guarded on both sides: cloud (cookie-auth) has no
+                // serverToken, and legacy cloud tokens minted before the
+                // prefix column have an empty prefix — neither may match.
+                const isCurrentToken =
+                  serverToken.length > 0 &&
+                  token.token_prefix.length > 0 &&
+                  token.token_prefix === serverToken.substring(0, 10);
+                return (
+                  <div
+                    key={token.id}
+                    className={`p-3 bg-[var(--color-bg-card)] border rounded-md text-sm ${
+                      isCurrentToken ? 'border-green-500/50' : 'border-[var(--color-border)]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-[var(--color-text-primary)]">{token.name}</span>
+                        {isCurrentToken && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">current</span>
+                        )}
+                      </div>
+                      {confirmRevokeId === token.id ? (
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-amber-400">
+                            {isCurrentToken ? 'This will log you out!' : 'Revoke?'}
+                          </span>
+                          <button
+                            onClick={() => handleRevokeToken(token.id)}
+                            className="text-xs px-2 py-1 rounded bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            onClick={() => setConfirmRevokeId(null)}
+                            className="text-xs px-2 py-1 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmRevokeId(token.id)}
+                          className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                        >
+                          Revoke
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 mt-1 text-xs text-[var(--color-text-secondary)]">
+                      {token.token_prefix && <span className="font-mono">{token.token_prefix}...</span>}
+                      <span>Created {new Date(token.created_at).toLocaleDateString()}</span>
+                      {token.last_used_at && (
+                        <span>Last used {new Date(token.last_used_at).toLocaleDateString()}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Created token display (shown once after creation) */}
+          {createdToken && (
+            <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-md space-y-2">
+              <div className="text-sm font-medium text-amber-400">
+                Token created — save it now, it won't be shown again
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-xs font-mono bg-[var(--color-bg-main)] px-2 py-1.5 rounded border border-[var(--color-border)] text-[var(--color-text-primary)] break-all select-all">
+                  {createdToken.token}
+                </code>
+                <button
+                  onClick={handleCopyToken}
+                  className="p-1.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors flex-shrink-0"
+                  title="Copy to clipboard"
+                >
+                  {tokenCopied ? (
+                    <Check className="w-4 h-4 text-green-500" strokeWidth={2} />
+                  ) : (
+                    <Copy className="w-4 h-4" strokeWidth={2} />
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Create new token */}
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={newTokenName}
+              onChange={(e) => setNewTokenName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleCreateToken(); }}
+              placeholder="Token name (e.g. laptop, phone)"
+              className="flex-1 px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150 text-sm"
+            />
+            <Button
+              variant="secondary"
+              onClick={handleCreateToken}
+              disabled={!newTokenName.trim() || isCreatingToken}
+            >
+              {isCreatingToken ? 'Creating...' : 'Create'}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   if (!isOpen) return null;
 
@@ -2712,146 +2877,22 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                   )}
 
                   {/* API Tokens Section — remote/web only (auto-managed for local sidecar) */}
-                  {!isLocalServer() && getTransport().isConnected() && (
-                    <div className="space-y-3 pt-4 border-t border-[var(--color-border)]">
-                      <button
-                        type="button"
-                        onClick={() => setShowTokenSection(!showTokenSection)}
-                        className="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)] hover:text-white transition-colors w-full"
-                      >
-                        <ChevronRight
-                          className={`w-4 h-4 transition-transform ${showTokenSection ? 'rotate-90' : ''}`}
-                          strokeWidth={2}
-                        />
-                        API Tokens
-                        {apiTokens.filter(t => !t.is_revoked).length > 0 && (
-                          <span className="text-xs text-[var(--color-text-secondary)]">
-                            ({apiTokens.filter(t => !t.is_revoked).length} active)
-                          </span>
-                        )}
-                      </button>
-
-                      {showTokenSection && (
-                        <div className="space-y-4 pl-6 border-l-2 border-[var(--color-border)]">
-                          <p className="text-xs text-[var(--color-text-secondary)]">
-                            Manage API tokens for accessing this server. Each device or integration should use its own token.
-                          </p>
-
-                          {/* Token list */}
-                          {isLoadingTokens ? (
-                            <div className="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
-                              <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
-                              Loading tokens...
-                            </div>
-                          ) : apiTokens.length === 0 ? (
-                            <div className="text-sm text-[var(--color-text-secondary)]">No tokens found.</div>
-                          ) : (
-                            <div className="space-y-2">
-                              {apiTokens.filter(t => !t.is_revoked).map((token) => {
-                                const isCurrentToken = token.token_prefix === serverToken.substring(0, 10);
-                                return (
-                                  <div
-                                    key={token.id}
-                                    className={`p-3 bg-[var(--color-bg-card)] border rounded-md text-sm ${
-                                      isCurrentToken ? 'border-green-500/50' : 'border-[var(--color-border)]'
-                                    }`}
-                                  >
-                                    <div className="flex items-center justify-between">
-                                      <div className="flex items-center gap-2">
-                                        <span className="font-medium text-[var(--color-text-primary)]">{token.name}</span>
-                                        {isCurrentToken && (
-                                          <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">current</span>
-                                        )}
-                                      </div>
-                                      {confirmRevokeId === token.id ? (
-                                        <div className="flex items-center gap-2">
-                                          <span className="text-xs text-amber-400">
-                                            {isCurrentToken ? 'This will log you out!' : 'Revoke?'}
-                                          </span>
-                                          <button
-                                            onClick={() => handleRevokeToken(token.id)}
-                                            className="text-xs px-2 py-1 rounded bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
-                                          >
-                                            Confirm
-                                          </button>
-                                          <button
-                                            onClick={() => setConfirmRevokeId(null)}
-                                            className="text-xs px-2 py-1 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
-                                          >
-                                            Cancel
-                                          </button>
-                                        </div>
-                                      ) : (
-                                        <button
-                                          onClick={() => setConfirmRevokeId(token.id)}
-                                          className="text-xs text-red-400 hover:text-red-300 transition-colors"
-                                        >
-                                          Revoke
-                                        </button>
-                                      )}
-                                    </div>
-                                    <div className="flex items-center gap-3 mt-1 text-xs text-[var(--color-text-secondary)]">
-                                      <span className="font-mono">{token.token_prefix}...</span>
-                                      <span>Created {new Date(token.created_at).toLocaleDateString()}</span>
-                                      {token.last_used_at && (
-                                        <span>Last used {new Date(token.last_used_at).toLocaleDateString()}</span>
-                                      )}
-                                    </div>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-
-                          {/* Created token display (shown once after creation) */}
-                          {createdToken && (
-                            <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-md space-y-2">
-                              <div className="text-sm font-medium text-amber-400">
-                                Token created — save it now, it won't be shown again
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <code className="flex-1 text-xs font-mono bg-[var(--color-bg-main)] px-2 py-1.5 rounded border border-[var(--color-border)] text-[var(--color-text-primary)] break-all select-all">
-                                  {createdToken.token}
-                                </code>
-                                <button
-                                  onClick={handleCopyToken}
-                                  className="p-1.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors flex-shrink-0"
-                                  title="Copy to clipboard"
-                                >
-                                  {tokenCopied ? (
-                                    <Check className="w-4 h-4 text-green-500" strokeWidth={2} />
-                                  ) : (
-                                    <Copy className="w-4 h-4" strokeWidth={2} />
-                                  )}
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Create new token */}
-                          <div className="flex gap-2">
-                            <input
-                              type="text"
-                              value={newTokenName}
-                              onChange={(e) => setNewTokenName(e.target.value)}
-                              onKeyDown={(e) => { if (e.key === 'Enter') handleCreateToken(); }}
-                              placeholder="Token name (e.g. laptop, phone)"
-                              className="flex-1 px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150 text-sm"
-                            />
-                            <Button
-                              variant="secondary"
-                              onClick={handleCreateToken}
-                              disabled={!newTokenName.trim() || isCreatingToken}
-                            >
-                              {isCreatingToken ? 'Creating...' : 'Create'}
-                            </Button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  {!isLocalServer() && getTransport().isConnected() && apiTokensSection}
 
                 </>
+              )}
+
+              {/* ===== API TOKENS TAB (cloud tenants; same section, own tab) ===== */}
+              {activeTab === 'tokens' && (
+                <div className="space-y-4">
+                  <p className="text-sm text-[var(--color-text-secondary)]">
+                    Tokens grant full API access to your account — for the desktop
+                    app&apos;s &quot;Migrate to Cloud&quot; flow, scripts, and other
+                    integrations. Treat them like passwords: each one is shown once
+                    at creation and can be revoked here at any time.
+                  </p>
+                  {apiTokensSection}
+                </div>
               )}
 
               {/* ===== INTEGRATIONS TAB ===== */}

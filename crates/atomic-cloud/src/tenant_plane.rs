@@ -505,6 +505,27 @@ impl TenantPlane {
                 .app_data(self.state.clone())
                 .route(web::put().to(update_models_route))
                 .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth.clone()),
+        );
+        // The tenant token-management plane, at the SAME paths as
+        // atomic-server's self-hosted token routes so the product app's
+        // existing settings UI works unchanged. Registered here (ahead of
+        // `api_scope`) these exact-path resources win the match; the
+        // self-hosted handlers behind them stay unreachable, and the rest
+        // of `/api/auth/*` stays unrouted by `fallback_bound_plane`.
+        cfg.service(
+            web::resource("/api/auth/tokens")
+                .app_data(self.state.clone())
+                .route(web::get().to(list_tokens_route))
+                .route(web::post().to(create_token_route))
+                .wrap(from_fn(cloud_plane_guard))
+                .wrap(auth.clone()),
+        );
+        cfg.service(
+            web::resource("/api/auth/tokens/{id}")
+                .app_data(self.state.clone())
+                .route(web::delete().to(revoke_token_route))
+                .wrap(from_fn(cloud_plane_guard))
                 .wrap(auth),
         );
     }
@@ -1527,6 +1548,140 @@ async fn rearm_provider_held_work(state: &PlaneState, account_id: &str) {
 /// authorization posture). CloudAuth installs the extension on every
 /// request it passes; like `cloud_plane_guard`, its absence is a
 /// composition bug and fails closed rather than guessing at an identity.
+// --- Tenant token management (`/api/auth/tokens*`) ---------------------------
+//
+// Cloud's per-tenant implementation of the self-hosted token plane: same
+// paths, same response shapes (the product settings UI consumes both), but
+// backed by the account's control-plane `cloud_tokens` rows — the store
+// CloudAuth actually verifies against. Account-scope only, like every route
+// in this module: a db-pinned or MCP-scoped credential minting an
+// account-scope token would be privilege escalation.
+
+/// Body of `POST /api/auth/tokens` — mirrors atomic-server's `CreateTokenBody`.
+#[derive(Deserialize)]
+struct CreateCloudTokenBody {
+    name: String,
+}
+
+/// `POST /api/auth/tokens`: mint an account-scope token, returning its
+/// plaintext exactly once (only the hash is stored). Response shape matches
+/// the self-hosted route: `{id, name, token, prefix, created_at}`.
+async fn create_token_route(
+    req: HttpRequest,
+    state: web::Data<PlaneState>,
+    body: web::Json<CreateCloudTokenBody>,
+) -> HttpResponse {
+    let tenant = match require_account_scope(&req) {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
+    };
+    let name = body.into_inner().name;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 100 {
+        return bad_request(
+            "invalid_token_name",
+            "Token name must be 1-100 characters.",
+        );
+    }
+
+    match crate::tokens::issue_token(
+        &state.control,
+        &tenant.principal.account_id,
+        TokenScope::Account,
+        None,
+        name,
+    )
+    .await
+    {
+        Ok(plaintext) => HttpResponse::Created().json(json!({
+            "id": crate::tokens::sha256_hex(&plaintext),
+            "name": name,
+            "token": plaintext,
+            "prefix": crate::tokens::display_prefix(&plaintext),
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "scope": "account",
+        })),
+        Err(e) => {
+            tracing::error!(error = %e, "minting tenant token failed");
+            HttpResponse::InternalServerError().json(json!({
+                "error": "token_create_failed",
+                "message": "Could not create the token.",
+            }))
+        }
+    }
+}
+
+/// `GET /api/auth/tokens`: the account's live tokens, metadata only —
+/// shaped like atomic-core's `ApiTokenInfo` so the settings UI renders it
+/// unchanged. Includes OAuth-minted MCP tokens: listing (and revoking) them
+/// is how a user audits and severs MCP-client access.
+async fn list_tokens_route(req: HttpRequest, state: web::Data<PlaneState>) -> HttpResponse {
+    let tenant = match require_account_scope(&req) {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
+    };
+    match crate::tokens::list_account_tokens(&state.control, &tenant.principal.account_id).await {
+        Ok(tokens) => HttpResponse::Ok().json(
+            tokens
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "name": t.name,
+                        "token_prefix": t.token_prefix.unwrap_or_default(),
+                        "created_at": t.created_at.to_rfc3339(),
+                        "last_used_at": t.last_used_at.map(|ts| ts.to_rfc3339()),
+                        "is_revoked": false,
+                        "scope": t.scope,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "listing tenant tokens failed");
+            HttpResponse::InternalServerError().json(json!({
+                "error": "token_list_failed",
+                "message": "Could not list tokens.",
+            }))
+        }
+    }
+}
+
+/// `DELETE /api/auth/tokens/{id}`: revoke one of the account's tokens.
+/// The id is the stored hash; the account scoping inside the UPDATE is the
+/// cross-tenant chokepoint, so an id from another tenant reads as 404.
+async fn revoke_token_route(
+    req: HttpRequest,
+    state: web::Data<PlaneState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let tenant = match require_account_scope(&req) {
+        Ok(tenant) => tenant,
+        Err(denial) => return denial,
+    };
+    let token_id = path.into_inner();
+    match crate::tokens::revoke_account_token(
+        &state.control,
+        &tenant.principal.account_id,
+        &token_id,
+    )
+    .await
+    {
+        Ok(true) => HttpResponse::Ok().json(json!({ "revoked": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({
+            "error": "not_found",
+            "message": "No such token.",
+        })),
+        Err(e) => {
+            tracing::error!(error = %e, "revoking tenant token failed");
+            HttpResponse::InternalServerError().json(json!({
+                "error": "token_revoke_failed",
+                "message": "Could not revoke the token.",
+            }))
+        }
+    }
+}
+
 fn require_account_scope(req: &HttpRequest) -> Result<ResolvedTenant, HttpResponse> {
     let Some(tenant) = req.extensions().get::<ResolvedTenant>().cloned() else {
         tracing::error!(
