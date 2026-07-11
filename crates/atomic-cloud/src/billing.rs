@@ -55,6 +55,7 @@
 //! via SQL — no real waits (the slice-2/5 reaper-test idiom).
 
 pub mod dunning;
+pub mod trial_emails;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

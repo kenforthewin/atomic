@@ -1341,7 +1341,10 @@ async fn trial_sweep_downgrades_only_expired_and_never_deletes() {
         let due = expired_trials(&control, chrono::Utc::now())
             .await
             .expect("expired trials");
-        assert_eq!(due, vec![expired.clone()]);
+        assert_eq!(
+            due.iter().map(|t| t.account_id.clone()).collect::<Vec<_>>(),
+            vec![expired.clone()]
+        );
 
         // Drive the sweep with an over-limit predicate (so the downgrade lands
         // read_only) and assert it only touched the expired account.

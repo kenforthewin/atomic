@@ -93,10 +93,12 @@ pub use billing::dunning::{
     apply_subscription_deleted, apply_subscription_deleted_on_conn, apply_subscription_event,
     apply_subscription_event_on_conn, billing_state_from_column, claim_webhook_event,
     claim_webhook_event_on_conn, expired_trials, finish_expired_trial, link_stripe_customer,
-    reconcile_managed_key_limit, release_webhook_event, start_trial, BillingState, DunningAdvance,
-    DunningThresholds, TrialAdvance, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS,
-    READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
+    claim_trial_warnings, reconcile_managed_key_limit, release_webhook_event, reset_trial_warning,
+    start_trial, BillingState, DunningAdvance, DunningThresholds, TrialAdvance, TrialDowngraded,
+    TrialWarning, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS,
+    DEFAULT_TRIAL_WARNING_LEAD_DAYS, READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
 };
+pub use billing::trial_emails::{notify_trial_downgrades, send_trial_warnings};
 pub use billing::{
     now_unix, parse_event, verify_webhook, BillingProvider, StripeClient, StripeSession,
     SubscriptionState, WebhookEvent, STRIPE_SECRET_KEY_ENV, STRIPE_WEBHOOK_SECRET_ENV,
@@ -126,7 +128,7 @@ pub use dispatcher::{
     CoreExecutor, Dispatcher, DispatcherConfig, ExecOutcome, TenantQueue, TickOutcome,
     WorkExecutor, WorkItem, PROVIDER_BACKOFF_REASON, RATE_LIMIT_REQUEUE_DELAY,
 };
-pub use email::{EmailSender, LogSender, MailgunSender};
+pub use email::{BillingNotice, EmailSender, LogSender, MailgunSender};
 pub use error::CloudError;
 pub use fleet_migration::{
     list_failed_migrations, list_retryable_failures, list_unmigrated, migration_backoff_horizon,

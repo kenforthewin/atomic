@@ -983,3 +983,122 @@ async fn expire_trial(control: &ControlPlane, account_id: &str, days_ago: i64) {
     .await
     .expect("expire trial_ends_at");
 }
+
+/// Pull a trialing account's `trial_ends_at` to `days` from now, so the
+/// warning sweep at the real `now` sees it inside (or outside) the lead
+/// window (no-real-waits idiom).
+async fn trial_ends_in_days(control: &ControlPlane, account_id: &str, days: i64) {
+    sqlx::query(
+        "UPDATE accounts SET trial_ends_at = NOW() + make_interval(days => $2) WHERE id = $1",
+    )
+    .bind(account_id)
+    .bind(days as i32)
+    .execute(control.pool())
+    .await
+    .expect("set trial_ends_at");
+}
+
+/// Trial lifecycle emails (decision 2026-07-11: expiry comms are email-only).
+/// The warning goes out exactly once inside the 3-day lead window, re-arms on
+/// a failed send, skips pinned accounts, and the downgrade pass yields the
+/// accounts for the "trial ended" notice.
+#[actix_web::test]
+async fn trial_lifecycle_emails() {
+    with_control_db("e2e_trial_emails", |url| async move {
+        let harness = Harness::spawn(&url).await;
+        let sender = support::CapturingSender::default();
+        let now = || chrono::Utc::now();
+
+        let alpha = harness.provision("alpha").await;
+        start_trial(&harness.control, &alpha.account_id, "pro", chrono::Duration::days(14))
+            .await
+            .expect("start alpha trial");
+
+        // 14 days out — outside the 3-day lead: nothing sent.
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 0, "no warning outside the lead window");
+
+        // 2 days out — one warning, correct recipient, tenant-host billing URL.
+        trial_ends_in_days(&harness.control, &alpha.account_id, 2).await;
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 1);
+        let notices = sender.notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].to, "alpha@example.com");
+        // Exact day-count copy is pinned by the trial_emails unit tests; the
+        // count here can be 2 or 3 depending on DB-vs-host clock skew.
+        assert!(
+            notices[0].notice.subject.starts_with("Your Atomic Pro trial ends"),
+            "{}",
+            notices[0].notice.subject
+        );
+        assert_eq!(
+            notices[0].notice.button_url,
+            format!("https://alpha.{BASE_DOMAIN}/account/billing")
+        );
+
+        // Claimed: a second sweep sends nothing.
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 0, "warning is once-only");
+
+        // A failed send re-arms the claim for the next sweep.
+        let tenanttwo = harness.provision("tenanttwo").await;
+        start_trial(&harness.control, &tenanttwo.account_id, "pro", chrono::Duration::days(2))
+            .await
+            .expect("start tenanttwo trial");
+        sender.fail_notices.store(true, std::sync::atomic::Ordering::SeqCst);
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 0, "failed send counts nothing");
+        sender.fail_notices.store(false, std::sync::atomic::Ordering::SeqCst);
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 1, "re-armed after the failure");
+
+        // An admin-pinned plan is never nagged.
+        let tenantthree = harness.provision("tenantthree").await;
+        start_trial(&harness.control, &tenantthree.account_id, "pro", chrono::Duration::days(2))
+            .await
+            .expect("start tenantthree trial");
+        sqlx::query("UPDATE accounts SET plan_pinned = TRUE WHERE id = $1")
+            .bind(&tenantthree.account_id)
+            .execute(harness.control.pool())
+            .await
+            .expect("pin plan");
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 0, "pinned account excluded from warnings");
+
+        // Expiry: the downgrade pass reports who dropped, and the ended
+        // notice goes to them (alpha holds no atoms → under free limits →
+        // the plain "you're on Free now" copy, not the read-only variant).
+        expire_trial(&harness.control, &alpha.account_id, 1).await;
+        let advance = harness.run_trial_sweep().await;
+        assert_eq!(advance.downgraded.len(), 1);
+        assert_eq!(advance.downgraded[0].account_id, alpha.account_id);
+        assert!(!advance.downgraded[0].read_only);
+        let sent =
+            atomic_cloud::notify_trial_downgrades(&sender, BASE_DOMAIN, &advance.downgraded).await;
+        assert_eq!(sent, 1);
+        let last = sender.notices().pop().expect("ended notice");
+        assert_eq!(last.to, "alpha@example.com");
+        assert!(last.notice.subject.contains("has ended"));
+        assert!(!last.notice.detail.as_deref().unwrap_or_default().contains("read-only"));
+
+        // And an expired trial never gets a late "ends soon" warning.
+        let sent = atomic_cloud::send_trial_warnings(&harness.control, &sender, BASE_DOMAIN, now())
+            .await
+            .expect("warning sweep");
+        assert_eq!(sent, 0);
+    })
+    .await;
+}

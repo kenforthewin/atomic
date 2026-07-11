@@ -224,6 +224,10 @@ pub struct SentEmail {
 #[derive(Clone, Default)]
 pub struct CapturingSender {
     sent: Arc<Mutex<Vec<SentEmail>>>,
+    notices: Arc<Mutex<Vec<SentNotice>>>,
+    /// When true, `send_billing_notice` fails (after recording nothing) —
+    /// for exercising the failed-send re-arm path in the warning sweep.
+    pub fail_notices: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CapturingSender {
@@ -231,6 +235,18 @@ impl CapturingSender {
     pub fn sent(&self) -> Vec<SentEmail> {
         self.sent.lock().expect("capture lock").clone()
     }
+
+    /// Snapshot of every billing notice "sent" so far.
+    pub fn notices(&self) -> Vec<SentNotice> {
+        self.notices.lock().expect("capture lock").clone()
+    }
+}
+
+/// A billing notice captured by [`CapturingSender`] — nothing was sent.
+#[derive(Debug, Clone)]
+pub struct SentNotice {
+    pub to: String,
+    pub notice: atomic_cloud::BillingNotice,
 }
 
 #[async_trait::async_trait]
@@ -245,6 +261,21 @@ impl EmailSender for CapturingSender {
             to: to.to_string(),
             link: link.to_string(),
             purpose,
+        });
+        Ok(())
+    }
+
+    async fn send_billing_notice(
+        &self,
+        to: &str,
+        notice: &atomic_cloud::BillingNotice,
+    ) -> Result<(), CloudError> {
+        if self.fail_notices.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CloudError::EmailSend("capturing sender told to fail".into()));
+        }
+        self.notices.lock().expect("capture lock").push(SentNotice {
+            to: to.to_string(),
+            notice: notice.clone(),
         });
         Ok(())
     }
@@ -269,6 +300,15 @@ impl EmailSender for DelayedSender {
     ) -> Result<(), CloudError> {
         tokio::time::sleep(self.delay).await;
         self.inner.send_magic_link(to, link, purpose).await
+    }
+
+    async fn send_billing_notice(
+        &self,
+        to: &str,
+        notice: &atomic_cloud::BillingNotice,
+    ) -> Result<(), CloudError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.send_billing_notice(to, notice).await
     }
 }
 

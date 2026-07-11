@@ -2262,6 +2262,9 @@ async fn serve(
     // free allowance, so it needs its own handle to the managed-key plane;
     // clone before `managed` is moved into the account plane.
     let trial_managed = managed.clone();
+    // The trial-email sweep shares the plane's sender (email-only expiry
+    // comms — see billing::trial_emails).
+    let sweep_email = Arc::clone(&email);
     let account_plane = AccountPlane::new(control.clone(), cluster, managed, email, plane_config)?;
 
     // Periodic idle sweep. The cache also sweeps inline when a load inserts
@@ -2304,6 +2307,8 @@ async fn serve(
         let control = control.clone();
         let cache = Arc::clone(&cache);
         let managed = trial_managed;
+        let email = sweep_email;
+        let base_domain = base_domain.clone();
         async move {
             let mut ticker = tokio::time::interval(DEFAULT_DUNNING_SWEEP_INTERVAL);
             ticker.tick().await; // first tick fires immediately
@@ -2341,11 +2346,29 @@ async fn serve(
                     }
                 };
                 match advance_expired_trials(&control, &managed, now, over_free_limits).await {
-                    Ok(advance) if !advance.is_quiet() => {
-                        tracing::info!(?advance, "trial sweep")
+                    Ok(advance) => {
+                        if !advance.is_quiet() {
+                            tracing::info!(?advance, "trial sweep");
+                        }
+                        // "Trial ended" notices for what this pass downgraded
+                        // (best-effort; see billing::trial_emails).
+                        atomic_cloud::notify_trial_downgrades(
+                            &*email,
+                            &base_domain,
+                            &advance.downgraded,
+                        )
+                        .await;
                     }
-                    Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "trial sweep failed"),
+                }
+
+                // "Trial ends soon" warnings (email-only expiry comms). The
+                // claim is the idempotency guard; an error here is the
+                // control plane misbehaving, never a send failure.
+                if let Err(e) =
+                    atomic_cloud::send_trial_warnings(&control, &*email, &base_domain, now).await
+                {
+                    tracing::error!(error = %e, "trial warning sweep failed");
                 }
             }
         }

@@ -88,6 +88,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("../migrations/019_cloud_token_prefix.sql"),
     ),
     (20, include_str!("../migrations/020_admin_portal.sql")),
+    (21, include_str!("../migrations/021_trial_warning_email.sql")),
 ];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks

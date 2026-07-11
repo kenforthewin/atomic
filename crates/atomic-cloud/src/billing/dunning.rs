@@ -799,6 +799,77 @@ impl DunningAdvance {
 /// constant; the actual duration is configurable on the account plane.
 pub const DEFAULT_TRIAL_DAYS: i64 = 14;
 
+/// How many days before `trial_ends_at` the "trial ends soon" email goes
+/// out (decision 2026-07-11: trial-expiry comms are email-only).
+pub const DEFAULT_TRIAL_WARNING_LEAD_DAYS: i64 = 3;
+
+/// One account claimed for the "trial ends soon" email — everything the
+/// sender needs, read in the claiming UPDATE itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrialWarning {
+    pub account_id: String,
+    pub email: String,
+    pub subdomain: String,
+    pub trial_ends_at: DateTime<Utc>,
+}
+
+/// Atomically claim every account due a "trial ends soon" email: still
+/// trialing, ending within `lead_days` (but not already ended — the expiry
+/// sweep owns that moment), never warned, and not admin-pinned. Claiming =
+/// setting `trial_warning_sent_at` in the same UPDATE that selects, so a
+/// concurrent sweep on another pod claims zero of the same rows. A failed
+/// send is compensated with [`reset_trial_warning`], which re-arms the row
+/// for the next sweep.
+pub async fn claim_trial_warnings(
+    control: &ControlPlane,
+    now: DateTime<Utc>,
+    lead_days: i64,
+) -> Result<Vec<TrialWarning>, CloudError> {
+    let rows: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "UPDATE accounts \
+            SET trial_warning_sent_at = $1 \
+          WHERE billing_state = 'trialing' \
+            AND trial_ends_at IS NOT NULL \
+            AND trial_ends_at > $1 \
+            AND trial_ends_at <= $1 + make_interval(days => $2::int) \
+            AND trial_warning_sent_at IS NULL \
+            AND NOT plan_pinned \
+      RETURNING id, email, subdomain, trial_ends_at",
+    )
+    .bind(now)
+    .bind(lead_days as i32)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("claiming trial warnings"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(account_id, email, subdomain, trial_ends_at)| TrialWarning {
+            account_id,
+            email,
+            subdomain,
+            trial_ends_at,
+        })
+        .collect())
+}
+
+/// Re-arm a claimed trial warning after a failed send so the next sweep
+/// retries it. Guarded on `trialing` — if the account converted or expired
+/// in the meantime, the warning is moot and stays consumed.
+pub async fn reset_trial_warning(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Result<(), CloudError> {
+    sqlx::query(
+        "UPDATE accounts SET trial_warning_sent_at = NULL \
+          WHERE id = $1 AND billing_state = 'trialing'",
+    )
+    .bind(account_id)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("resetting trial warning"))?;
+    Ok(())
+}
+
 /// Start a free trial for an account — the plan's "14 days of paid tier on
 /// signup, no card required" made executable (plan: "Trials"). Sets
 /// `billing_state = 'trialing'`, `trial_ends_at = now + duration`, and
@@ -878,11 +949,12 @@ pub async fn start_trial(
 pub async fn expired_trials(
     control: &ControlPlane,
     now: DateTime<Utc>,
-) -> Result<Vec<String>, CloudError> {
+) -> Result<Vec<ExpiredTrial>, CloudError> {
     // `NOT plan_pinned`: an admin-pinned plan holds — the sweep never even
     // considers a comped account, so no downgrade and no key resize.
-    sqlx::query_scalar(
-        "SELECT id FROM accounts \
+    // Email + subdomain ride along for the trial-ended notice.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, email, subdomain FROM accounts \
           WHERE billing_state = 'trialing' \
             AND trial_ends_at IS NOT NULL \
             AND trial_ends_at <= $1 \
@@ -891,7 +963,23 @@ pub async fn expired_trials(
     .bind(now)
     .fetch_all(control.pool())
     .await
-    .map_err(CloudError::db("listing expired trials"))
+    .map_err(CloudError::db("listing expired trials"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(account_id, email, subdomain)| ExpiredTrial {
+            account_id,
+            email,
+            subdomain,
+        })
+        .collect())
+}
+
+/// One trial the expiry sweep found due for downgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredTrial {
+    pub account_id: String,
+    pub email: String,
+    pub subdomain: String,
 }
 
 /// Finish one expired trial: drop to the free plan and clear the trialing
@@ -992,7 +1080,8 @@ where
     Fut: std::future::Future<Output = Result<bool, CloudError>>,
 {
     let mut advance = TrialAdvance::default();
-    for account_id in expired_trials(control, now).await? {
+    for trial in expired_trials(control, now).await? {
+        let account_id = trial.account_id.clone();
         let over = match over_free_limits(account_id.clone()).await {
             Ok(over) => over,
             Err(e) => {
@@ -1009,6 +1098,12 @@ where
             } else {
                 advance.downgraded_to_active += 1;
             }
+            advance.downgraded.push(TrialDowngraded {
+                account_id: trial.account_id,
+                email: trial.email,
+                subdomain: trial.subdomain,
+                read_only: over,
+            });
         }
     }
     if !advance.is_quiet() {
@@ -1017,19 +1112,45 @@ where
     Ok(advance)
 }
 
+/// One account the expiry sweep actually downgraded — the payload for the
+/// "trial ended" notice (decision 2026-07-11: email-only comms). The
+/// downgrade UPDATE (guarded on `trialing`) fires once per trial, so the
+/// once-only email needs no marker of its own.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrialDowngraded {
+    pub account_id: String,
+    pub email: String,
+    pub subdomain: String,
+    /// Whether the now-free account landed `read_only` (over the free
+    /// limits) rather than `active` — selects the notice copy.
+    pub read_only: bool,
+}
+
+// Manual: keep account emails out of the sweep's `?advance` info-log line.
+impl std::fmt::Debug for TrialDowngraded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrialDowngraded")
+            .field("account_id", &self.account_id)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What one [`advance_expired_trials`] pass changed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrialAdvance {
     /// Expired trials dropped to free, under the free limits (full access).
     pub downgraded_to_active: u64,
     /// Expired trials dropped to free but over the free limits (writes
     /// blocked until under; data retained).
     pub downgraded_to_read_only: u64,
+    /// The accounts behind those counters, for the trial-ended notices.
+    pub downgraded: Vec<TrialDowngraded>,
 }
 
 impl TrialAdvance {
     /// Whether the pass changed anything (for quiet logging).
-    pub fn is_quiet(self) -> bool {
+    pub fn is_quiet(&self) -> bool {
         self.downgraded_to_active == 0 && self.downgraded_to_read_only == 0
     }
 }
