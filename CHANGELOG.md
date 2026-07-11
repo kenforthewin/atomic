@@ -2,6 +2,10 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.42.1 — 2026-07-11
+
+- Fix text selection not being visible when drag-selecting inside code blocks in the editor
+
 ## v1.42.0 — 2026-07-11
 
 - Open atoms in read mode by default — fully rendered markdown with clickable links and no accidental edits (especially on mobile). Toggle to edit with Cmd/Ctrl+E, `i`, or the titlebar button; Escape steps back to read mode then closes. Checkboxes remain toggleable and autosave from read mode
