@@ -1171,6 +1171,37 @@ enum AccountAction {
         #[arg(long)]
         subdomain: String,
     },
+
+    /// Grant (or with --revoke, remove) admin-portal access for an account.
+    /// Admin is a control-plane flag, settable only here — never through a
+    /// tenant-facing route.
+    Promote {
+        /// Subdomain of the account.
+        #[arg(long)]
+        subdomain: String,
+
+        /// Remove admin access instead of granting it.
+        #[arg(long)]
+        revoke: bool,
+    },
+
+    /// Override an account's plan (and pin it against the automated plan
+    /// writers — the trial sweep and Stripe projection). The operator-side
+    /// twin of the admin portal's plan action; audits to `admin_actions`.
+    SetPlan {
+        /// Subdomain of the account.
+        #[arg(long)]
+        subdomain: String,
+
+        /// Plan id from the `plans` catalogue (e.g. free, pro, comp).
+        #[arg(long)]
+        plan: String,
+
+        /// Pin the plan (default true). --pin false re-exposes the account
+        /// to the automated writers.
+        #[arg(long, default_value_t = true)]
+        pin: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1632,6 +1663,45 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 println!("deleted account {account_id} ({subdomain})");
+                Ok(())
+            }
+
+            AccountAction::Promote { subdomain, revoke } => {
+                atomic_cloud::admin::set_admin_flag(&control, &subdomain, !revoke).await?;
+                println!(
+                    "{} admin access for {subdomain}",
+                    if revoke { "revoked" } else { "granted" }
+                );
+                Ok(())
+            }
+
+            AccountAction::SetPlan {
+                subdomain,
+                plan,
+                pin,
+            } => {
+                let account_id = control
+                    .account_id_by_subdomain(&subdomain)
+                    .await?
+                    .ok_or_else(|| format!("no account with subdomain {subdomain:?}"))?;
+                // Managed keys are disabled on CLI hosts (no provisioning
+                // key), so the allowance resize inside set_plan_override is
+                // a logged no-op here; it reconciles on the next transition
+                // a serve pod drives, or immediately when run through the
+                // admin portal instead.
+                atomic_cloud::admin::set_plan_override(
+                    &control,
+                    &ManagedKeys::Disabled,
+                    "cli",
+                    &account_id,
+                    &plan,
+                    pin,
+                )
+                .await?;
+                println!(
+                    "set {subdomain} to plan {plan} ({})",
+                    if pin { "pinned" } else { "unpinned" }
+                );
                 Ok(())
             }
         },

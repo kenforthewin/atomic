@@ -156,7 +156,7 @@ pub fn billing_state_from_column(value: &str) -> BillingState {
 /// Runs on whatever connection the caller threads — the webhook's apply path
 /// passes the same transaction the claim rode, so the audit row commits (or
 /// rolls back) atomically with the rest of the event's effects.
-async fn record_transition(
+pub(crate) async fn record_transition(
     conn: &mut PgConnection,
     account_id: &str,
     from_plan: Option<&str>,
@@ -358,31 +358,20 @@ pub async fn apply_subscription_event_on_conn(
     account_id: &str,
     state: &SubscriptionState,
 ) -> Result<(), CloudError> {
-    // Persist the subscription projection.
-    sqlx::query(
-        "INSERT INTO stripe_subscriptions \
-             (account_id, stripe_subscription_id, plan_id, status, \
-              current_period_start, current_period_end, cancel_at_period_end, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
-         ON CONFLICT (account_id) DO UPDATE SET \
-             stripe_subscription_id = EXCLUDED.stripe_subscription_id, \
-             plan_id = EXCLUDED.plan_id, \
-             status = EXCLUDED.status, \
-             current_period_start = EXCLUDED.current_period_start, \
-             current_period_end = EXCLUDED.current_period_end, \
-             cancel_at_period_end = EXCLUDED.cancel_at_period_end, \
-             updated_at = NOW()",
-    )
-    .bind(account_id)
-    .bind(&state.stripe_subscription_id)
-    .bind(&state.plan_id)
-    .bind(&state.status)
-    .bind(state.current_period_start)
-    .bind(state.current_period_end)
-    .bind(state.cancel_at_period_end)
-    .execute(&mut *conn)
-    .await
-    .map_err(CloudError::db("persisting Stripe subscription"))?;
+    // An admin-pinned plan holds against the projection: comped accounts
+    // must not be re-planned by a stray/legacy subscription event. The
+    // subscription row itself is still persisted below (billing history
+    // stays truthful) — only the plan/billing-state stamps are skipped.
+    if plan_pinned(conn, account_id).await? {
+        tracing::warn!(
+            account_id,
+            status = %state.status,
+            "subscription event for an admin-pinned account; \
+             persisting the subscription row but leaving the pinned plan untouched"
+        );
+        return persist_subscription_row(conn, account_id, state).await;
+    }
+    persist_subscription_row(conn, account_id, state).await?;
 
     let from_plan = current_plan(conn, account_id).await?;
 
@@ -427,6 +416,56 @@ pub async fn apply_subscription_event_on_conn(
     Ok(())
 }
 
+/// Persist the subscription projection row — the billing-history half of
+/// [`apply_subscription_event_on_conn`], shared with the admin-pinned early
+/// return (which records the event but never re-plans the account).
+async fn persist_subscription_row(
+    conn: &mut PgConnection,
+    account_id: &str,
+    state: &SubscriptionState,
+) -> Result<(), CloudError> {
+    sqlx::query(
+        "INSERT INTO stripe_subscriptions \
+             (account_id, stripe_subscription_id, plan_id, status, \
+              current_period_start, current_period_end, cancel_at_period_end, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+         ON CONFLICT (account_id) DO UPDATE SET \
+             stripe_subscription_id = EXCLUDED.stripe_subscription_id, \
+             plan_id = EXCLUDED.plan_id, \
+             status = EXCLUDED.status, \
+             current_period_start = EXCLUDED.current_period_start, \
+             current_period_end = EXCLUDED.current_period_end, \
+             cancel_at_period_end = EXCLUDED.cancel_at_period_end, \
+             updated_at = NOW()",
+    )
+    .bind(account_id)
+    .bind(&state.stripe_subscription_id)
+    .bind(&state.plan_id)
+    .bind(&state.status)
+    .bind(state.current_period_start)
+    .bind(state.current_period_end)
+    .bind(state.cancel_at_period_end)
+    .execute(&mut *conn)
+    .await
+    .map_err(CloudError::db("persisting Stripe subscription"))?;
+    Ok(())
+}
+
+/// Whether the account's plan is admin-pinned (see migration 020): pinned
+/// plans hold against every automated writer — the trial-expiry sweep and
+/// the Stripe subscription projection.
+pub(crate) async fn plan_pinned(
+    conn: &mut PgConnection,
+    account_id: &str,
+) -> Result<bool, CloudError> {
+    sqlx::query_scalar("SELECT plan_pinned FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(CloudError::db("reading plan pin"))
+        .map(|row| row.unwrap_or(false))
+}
+
 /// `customer.subscription.deleted`: drop the account to the free plan and
 /// clear the subscription row. Over-limit data is **retained** — the quota
 /// guard blocks new writes until the user is back under the free limits (no
@@ -448,6 +487,22 @@ pub async fn apply_subscription_deleted_on_conn(
     conn: &mut PgConnection,
     account_id: &str,
 ) -> Result<(), CloudError> {
+    // Admin-pinned plans hold here too: the subscription row is cleared
+    // (billing history stays truthful) but a comped account is never
+    // dropped to free by its old subscription winding down.
+    if plan_pinned(conn, account_id).await? {
+        tracing::warn!(
+            account_id,
+            "subscription deleted for an admin-pinned account; \
+             clearing the subscription row, keeping the pinned plan"
+        );
+        sqlx::query("DELETE FROM stripe_subscriptions WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(CloudError::db("clearing deleted subscription"))?;
+        return Ok(());
+    }
     let from_plan = current_plan(conn, account_id).await?;
     set_plan(conn, account_id, DEFAULT_PLAN_ID).await?;
     clear_billing_state(conn, account_id).await?;
@@ -546,7 +601,7 @@ pub async fn apply_payment_failed_on_conn(
 /// webhook transaction commits, via [`reconcile_managed_key_limit`] (the
 /// reconcile issues an outbound provider call that must not ride inside the
 /// claim+apply transaction — see its docs).
-async fn set_plan(
+pub(crate) async fn set_plan(
     conn: &mut PgConnection,
     account_id: &str,
     plan_id: &str,
@@ -610,7 +665,7 @@ pub async fn reconcile_managed_key_limit(
 }
 
 /// The account's current `plan_id`, for the audit-log `from_plan` field.
-async fn current_plan(
+pub(crate) async fn current_plan(
     conn: &mut PgConnection,
     account_id: &str,
 ) -> Result<Option<String>, CloudError> {
@@ -824,11 +879,14 @@ pub async fn expired_trials(
     control: &ControlPlane,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>, CloudError> {
+    // `NOT plan_pinned`: an admin-pinned plan holds — the sweep never even
+    // considers a comped account, so no downgrade and no key resize.
     sqlx::query_scalar(
         "SELECT id FROM accounts \
           WHERE billing_state = 'trialing' \
             AND trial_ends_at IS NOT NULL \
-            AND trial_ends_at <= $1",
+            AND trial_ends_at <= $1 \
+            AND NOT plan_pinned",
     )
     .bind(now)
     .fetch_all(control.pool())

@@ -283,6 +283,24 @@ pub async fn verify_token(
     row.map(TokenRecord::try_from).transpose()
 }
 
+/// Resolve a session plaintext to its live row WITHOUT knowing the account —
+/// the app-host case, where no subdomain names one (the admin plane; logout
+/// takes the even simpler delete-by-hash path). The hash lookup is the
+/// credential check: a 32-random-byte preimage is the only way to produce it.
+pub async fn resolve_session(
+    control: &ControlPlane,
+    plaintext: &str,
+) -> Result<Option<SessionRecord>, CloudError> {
+    sqlx::query_as(
+        "SELECT hash, account_id, created_at, expires_at, ip_first_seen, ua_first_seen \
+         FROM sessions WHERE hash = $1 AND expires_at > NOW()",
+    )
+    .bind(sha256_hex(plaintext))
+    .fetch_optional(control.pool())
+    .await
+    .map_err(CloudError::db("resolving session"))
+}
+
 /// Create a web session for `account_id`, expiring after `ttl`, and return
 /// its plaintext (the value the cookie will carry). Only the SHA-256 hash
 /// is stored. `ip_first_seen` / `ua_first_seen` are forensic breadcrumbs;

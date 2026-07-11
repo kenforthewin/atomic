@@ -252,6 +252,19 @@ impl CloudAuth {
     pub(crate) fn public_scheme(&self) -> &str {
         &self.ctx.public_scheme
     }
+
+    /// The control plane this middleware verifies against — like
+    /// [`base_domain`](Self::base_domain), an accessor so sibling planes
+    /// (admin) compose from the same inputs without new
+    /// `configure_cloud_app` arguments.
+    pub(crate) fn control(&self) -> ControlPlane {
+        self.ctx.control.clone()
+    }
+
+    /// The serving cache — see [`control`](Self::control).
+    pub(crate) fn cache(&self) -> Arc<AccountCache> {
+        self.ctx.cache.clone()
+    }
 }
 
 impl<S, B> Transform<S, ServiceRequest> for CloudAuth

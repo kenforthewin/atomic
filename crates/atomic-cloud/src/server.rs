@@ -475,6 +475,16 @@ pub fn configure_cloud_app(
                     .route(web::get().to(ready)),
             );
         account_plane.configure(cfg);
+        // The admin plane (app host only, is_admin sessions only — 404 to
+        // everyone else). Composed from the same inputs the auth middleware
+        // and tenant plane already carry — no new assembly arguments.
+        crate::admin::AdminPlane::new(
+            auth.control(),
+            auth.cache(),
+            tenant_plane.managed(),
+            auth.base_domain(),
+        )
+        .configure(cfg);
         // The signed Stripe webhook on the app host (unauthenticated — the
         // signature is the auth; guarded to the app host like the account
         // plane). Registered with the app plane, never on tenant subdomains.

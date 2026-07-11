@@ -25,6 +25,7 @@
 
 pub mod account_cache;
 pub mod account_plane;
+pub mod admin;
 pub mod auth;
 pub mod backpressure;
 pub mod backup;

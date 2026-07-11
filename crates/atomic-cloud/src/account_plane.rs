@@ -485,7 +485,7 @@ fn is_app_host(host: &str, base_domain: &str) -> bool {
 /// Route guard matching only app-host requests. Reads the same host source
 /// as `CloudAuth` (the `Host` header, falling back to the URI authority for
 /// HTTP/2 `:authority` requests); a request with neither matches nothing.
-fn app_host_guard(base_domain: String) -> impl Guard {
+pub(crate) fn app_host_guard(base_domain: String) -> impl Guard {
     guard::fn_guard(move |ctx: &GuardContext<'_>| {
         let head = ctx.head();
         head.headers()
