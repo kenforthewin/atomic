@@ -9,6 +9,7 @@ import {
   Library,
   Network,
   BookOpen,
+  Pencil,
   Search,
   Filter,
   Telescope,
@@ -315,6 +316,23 @@ export function MainView() {
           </div>
         </LayoutGroup>
 
+        {/* Read/edit mode toggle — visible whenever an atom tab is active.
+            Shows the action, not the state: pencil switches to edit, book
+            back to reading. Also the only mode affordance on touch, where
+            Cmd+E and `i` don't exist. */}
+        {readerState.atomId && (
+          <button
+            onClick={() => useUIStore.getState().setReaderEditing(!readerState.editing)}
+            className="p-1.5 rounded-md text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors shrink-0"
+            title={readerState.editing ? 'Reading view (⌘E)' : 'Edit note (⌘E)'}
+            aria-label={readerState.editing ? 'Switch to reading view' : 'Edit note'}
+          >
+            {readerState.editing
+              ? <BookOpen className="w-4 h-4" strokeWidth={2} />
+              : <Pencil className="w-4 h-4" strokeWidth={2} />}
+          </button>
+        )}
+
         {/* Save status — visible whenever an atom tab is active and saving */}
         {readerState.atomId && readerState.saveStatus !== 'idle' && (
           <span className={`text-xs shrink-0 ${
@@ -426,7 +444,7 @@ export function MainView() {
         {localGraph.isOpen && localGraph.centerAtomId ? (
           <LocalGraphView />
         ) : readerState.atomId ? (
-          <AtomReader atomId={readerState.atomId} highlightText={readerState.highlightText} initialEditing={readerState.editing} />
+          <AtomReader atomId={readerState.atomId} highlightText={readerState.highlightText} />
         ) : wikiReaderState.tagId && wikiReaderState.tagName ? (
           <WikiReader
             tagId={wikiReaderState.tagId}
