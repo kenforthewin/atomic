@@ -43,10 +43,9 @@ const AtomicCodeMirrorEditor = lazy(async () => {
 interface AtomReaderProps {
   atomId: string;
   highlightText?: string | null;
-  initialEditing?: boolean;
 }
 
-export function AtomReader({ atomId, highlightText, initialEditing }: AtomReaderProps) {
+export function AtomReader({ atomId, highlightText }: AtomReaderProps) {
   const deleteAtom = useAtomsStore(s => s.deleteAtom);
   const fetchTags = useTagsStore(s => s.fetchTags);
   const setSelectedTag = useUIStore(s => s.setSelectedTag);
@@ -146,7 +145,6 @@ export function AtomReader({ atomId, highlightText, initialEditing }: AtomReader
         <AtomReaderContent
           atom={atom}
           highlightText={highlightText}
-          initialEditing={initialEditing}
           onDismiss={overlayDismiss}
           onDelete={async () => {
             await deleteAtom(atomId);
@@ -166,7 +164,6 @@ export function AtomReader({ atomId, highlightText, initialEditing }: AtomReader
 interface AtomReaderContentProps {
   atom: AtomWithTags;
   highlightText?: string | null;
-  initialEditing?: boolean;
   onDismiss: () => void;
   onDelete: () => Promise<void>;
   onTagClick: (tagId: string) => void;
@@ -176,11 +173,13 @@ interface AtomReaderContentProps {
 }
 
 function AtomReaderContent({
-  atom, highlightText, initialEditing,
+  atom, highlightText,
   onDismiss, onDelete, onTagClick, onRelatedAtomClick, onViewGraph, onAtomUpdated,
 }: AtomReaderContentProps) {
   const readerTheme = useUIStore(s => s.readerTheme);
-  const setReaderEditState = useUIStore(s => s.setReaderEditState);
+  const isEditing = useUIStore(s => s.readerState.editing);
+  const setReaderEditing = useUIStore(s => s.setReaderEditing);
+  const setReaderSaveStatus = useUIStore(s => s.setReaderSaveStatus);
   const retryTagging = useAtomsStore(s => s.retryTagging);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorHandleRef = useRef<AtomicCodeMirrorEditorHandle | null>(null);
@@ -201,28 +200,54 @@ function AtomReaderContent({
   }, [retryTagging, atom, onAtomUpdated]);
 
   useEffect(() => {
-    setReaderEditState(Boolean(initialEditing), saveStatus);
-    return () => {
-      setReaderEditState(false, 'idle');
-    };
-  }, [initialEditing, saveStatus, setReaderEditState]);
+    setReaderSaveStatus(saveStatus);
+  }, [saveStatus, setReaderSaveStatus]);
 
   useEffect(() => {
     startEditing();
   }, [startEditing]);
 
+  // An empty atom has nothing to read — force edit mode so the surface is
+  // usable and the empty-atom delete-on-close flow stays reachable.
   useEffect(() => {
-    if (!initialEditing) return;
-    const id = requestAnimationFrame(() => {
-      editorHandleRef.current?.focus();
-    });
-    return () => cancelAnimationFrame(id);
-  }, [initialEditing]);
+    if (!atom.content.trim() && !useUIStore.getState().readerState.editing) {
+      setReaderEditing(true);
+    }
+    // Mode is captured per document, not re-derived as content changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atom.id, setReaderEditing]);
 
+  // `flushDraft` changes identity on every draft edit; the mode-transition
+  // effect below must not re-run (and steal focus) on keystrokes, so it
+  // reads the latest through a ref.
+  const flushDraftRef = useRef(flushDraft);
+  useEffect(() => { flushDraftRef.current = flushDraft; }, [flushDraft]);
+
+  // Mode transitions: entering edit focuses the editor; leaving edit
+  // finalizes the draft (save + embedding/tagging pipeline) and returns
+  // focus to the container so Escape and `i` keep working. On mount there
+  // is no transition — the effect just sets focus for the opening mode.
+  // A mode flip that coincides with navigation (`sameAtom` false) is not
+  // an edit→read transition of the new document, so nothing is flushed —
+  // the previous document's draft is handled by useInlineEditor.
+  const prevEditingRef = useRef(isEditing);
+  const prevAtomIdRef = useRef(atom.id);
   useEffect(() => {
-    if (initialEditing) return;
+    const wasEditing = prevEditingRef.current;
+    const sameAtom = prevAtomIdRef.current === atom.id;
+    prevEditingRef.current = isEditing;
+    prevAtomIdRef.current = atom.id;
+    if (isEditing) {
+      const id = requestAnimationFrame(() => {
+        editorHandleRef.current?.focus();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    if (wasEditing && sameAtom) {
+      void flushDraftRef.current();
+    }
     containerRef.current?.focus({ preventScroll: true });
-  }, [initialEditing, atom.id]);
+  }, [isEditing, atom.id]);
 
   useEffect(() => {
     readerEditorActions.current = {
@@ -260,8 +285,30 @@ function AtomReaderContent({
         editorHandleRef.current?.openSearch();
         return;
       }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') {
+        e.preventDefault();
+        setReaderEditing(!isEditing);
+        return;
+      }
+      // Vim-style: `i` enters edit mode from read mode (Escape steps back
+      // out). Only when the keystroke isn't destined for a real input.
+      if (
+        e.key === 'i' && !isEditing && !showDeleteModal &&
+        !e.metaKey && !e.ctrlKey && !e.altKey &&
+        !isTypingTarget(e.target)
+      ) {
+        e.preventDefault();
+        setReaderEditing(true);
+        return;
+      }
       if (e.key === 'Escape' && !showDeleteModal) {
         e.preventDefault();
+        // Step out gradually: edit → read (finalizing the draft), then
+        // read → close.
+        if (isEditing) {
+          setReaderEditing(false);
+          return;
+        }
         void (async () => {
           await flushDraft();
           onDismiss();
@@ -270,7 +317,7 @@ function AtomReaderContent({
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [flushDraft, onDismiss, saveNow, showDeleteModal]);
+  }, [flushDraft, isEditing, onDismiss, saveNow, setReaderEditing, showDeleteModal]);
 
   const [revealed, setRevealed] = useState(false);
   useEffect(() => {
@@ -371,7 +418,8 @@ function AtomReaderContent({
                 documentId={atom.id}
                 markdownSource={editContent}
                 initialRevealText={highlightText}
-                blurEditorOnMount={!initialEditing}
+                readOnly={!isEditing}
+                blurEditorOnMount={!isEditing}
                 onMarkdownChange={setEditContent}
                 onLinkClick={(url) => {
                   void openExternalUrl(url);
@@ -496,6 +544,14 @@ function AtomReaderContent({
       </Modal>
     </div>
   );
+}
+
+/// Whether a keystroke is destined for a real text input, so single-letter
+/// shortcuts (`i`) must not hijack it. The read-mode editor body is not
+/// contenteditable, so it never matches.
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
 }
 
 function searchResultsToAtomLinkSuggestions(

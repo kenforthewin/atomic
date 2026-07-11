@@ -83,10 +83,21 @@
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   --font-family-mono: var(--font-mono);
 
-  /* Map Atomic's theme tokens onto @atomic-editor/editor's custom properties.
-   * The editor package defines its own `--atomic-editor-*` namespace
-   * with dark-neutral fallbacks; this block is what makes the editor
-   * track our theme (including `data-theme`/`data-font` overrides). */
+}
+
+/* Map Atomic's theme tokens onto @atomic-editor/editor's custom properties.
+ * The editor package defines its own `--atomic-editor-*` namespace with
+ * dark-neutral fallbacks; this block is what makes the editor track our
+ * theme (including `data-theme`/`data-font` overrides).
+ *
+ * The mapping is declared on BOTH `:root` and the reader's
+ * `[data-reader-theme]` container. A `var()` inside a custom property is
+ * substituted where the property is *declared*, not where it's used — so
+ * the `:root` declaration bakes in root-level tokens, and a nested
+ * container that re-tunes `--color-*` (the reader's light mode) needs the
+ * mapping re-declared on itself to pick those up. */
+:root,
+[data-reader-theme] {
   --atomic-editor-font: var(--font-sans);
   --atomic-editor-font-mono: var(--font-mono);
   --atomic-editor-fg: var(--color-text-primary);
@@ -99,8 +110,8 @@
   --atomic-editor-accent: var(--color-accent);
   --atomic-editor-accent-bright: var(--color-accent-light);
   --atomic-editor-accent-soft: color-mix(in srgb, var(--color-accent) 72%, white 28%);
-  --atomic-editor-link: var(--atomic-prose-link, #60a5fa);
-  --atomic-editor-link-hover: var(--atomic-prose-link-hover, #93c5fd);
+  --atomic-editor-link: var(--color-accent-light);
+  --atomic-editor-link-hover: color-mix(in srgb, var(--color-accent-light) 80%, white 20%);
   --atomic-editor-code-bg: color-mix(in srgb, var(--color-bg-card) 88%, black 12%);
   --atomic-editor-selection-bg: color-mix(in srgb, var(--color-accent) 28%, var(--color-bg-main) 72%);
   --atomic-editor-search-bg: color-mix(in srgb, var(--color-accent) 26%, transparent 74%);
@@ -132,6 +143,33 @@
   --scrollbar-track: #fafafa;
   --scrollbar-thumb: #d0d0d0;
   --scrollbar-thumb-hover: #b0b0b0;
+}
+
+/* Pale editor surfaces. The editor package's code-syntax palette and
+ * reveal-highlight defaults are tuned for dark backdrops, and its own
+ * light re-tune only fires under `[data-theme="light"]` — an attribute
+ * value Atomic never sets (the reader's light mode is `data-reader-theme`,
+ * and liquid-glass is its own data-theme value). Re-map them here for our
+ * two pale surfaces. Syntax colors mirror the package's light palette
+ * (GitHub-light-derived; see @atomic-editor/editor styles.css
+ * `[data-theme="light"]`); the reveal tint derives from our accent. */
+[data-reader-theme="light"],
+[data-theme="liquid-glass"] {
+  --atomic-editor-hl-keyword: #cf222e;
+  --atomic-editor-hl-string: #0a3069;
+  --atomic-editor-hl-number: #0550ae;
+  --atomic-editor-hl-comment: #6e7781;
+  --atomic-editor-hl-type: #953800;
+  --atomic-editor-hl-function: #8250df;
+  --atomic-editor-hl-property: #0550ae;
+  --atomic-editor-hl-regexp: #116329;
+  --atomic-editor-hl-escape: #0550ae;
+  --atomic-editor-hl-tag: #116329;
+  --atomic-editor-hl-variable: #24292f;
+  --atomic-editor-hl-operator: #cf222e;
+  --atomic-editor-hl-invalid: #82071e;
+  --atomic-editor-initial-reveal-bg: color-mix(in srgb, var(--color-accent) 16%, transparent 84%);
+  --atomic-editor-initial-reveal-bg-strong: color-mix(in srgb, var(--color-accent) 30%, transparent 70%);
 }
 
 [data-font="satoshi"] { --font-sans: 'Satoshi', -apple-system, BlinkMacSystemFont, sans-serif; }
