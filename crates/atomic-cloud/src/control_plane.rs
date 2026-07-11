@@ -83,6 +83,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
         18,
         include_str!("../migrations/018_premium_models_flag.sql"),
     ),
+    (
+        19,
+        include_str!("../migrations/019_cloud_token_prefix.sql"),
+    ),
 ];
 
 /// Advisory lock key serializing control-plane migrations. Advisory locks

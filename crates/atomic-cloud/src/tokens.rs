@@ -176,18 +176,84 @@ pub async fn issue_token(
 ) -> Result<String, CloudError> {
     let (plaintext, hash) = generate_secret(TOKEN_PREFIX);
     sqlx::query(
-        "INSERT INTO cloud_tokens (hash, account_id, scope, allowed_db_id, name) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO cloud_tokens (hash, account_id, scope, allowed_db_id, name, token_prefix) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&hash)
     .bind(account_id)
     .bind(scope.as_str())
     .bind(allowed_db_id)
     .bind(name)
+    .bind(display_prefix(&plaintext))
     .execute(control.pool())
     .await
     .map_err(CloudError::db("inserting cloud token"))?;
     Ok(plaintext)
+}
+
+/// The stored display prefix: the plaintext's first 10 chars
+/// (`atm_` + 6). Enough to tell tokens apart in a list — and to match the
+/// self-hosted UI's "is this the token I'm using?" comparison — without
+/// meaningfully narrowing the 32-random-byte search space.
+pub(crate) fn display_prefix(plaintext: &str) -> &str {
+    &plaintext[..10.min(plaintext.len())]
+}
+
+/// Token metadata for the tenant token-management surface: everything a
+/// list view needs, never the hash's preimage. `id` is the hash itself —
+/// it identifies the row for revocation and is useless for authentication
+/// (verifying requires the plaintext preimage).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TokenMeta {
+    #[sqlx(rename = "hash")]
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub token_prefix: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// The account's live tokens (not revoked, not expired), oldest first.
+/// Includes OAuth-minted MCP tokens — surfacing them is how a user audits
+/// and severs MCP-client access.
+pub async fn list_account_tokens(
+    control: &ControlPlane,
+    account_id: &str,
+) -> Result<Vec<TokenMeta>, CloudError> {
+    sqlx::query_as(
+        "SELECT hash, name, scope, token_prefix, created_at, last_used_at \
+         FROM cloud_tokens \
+         WHERE account_id = $1 \
+           AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > NOW()) \
+         ORDER BY created_at",
+    )
+    .bind(account_id)
+    .fetch_all(control.pool())
+    .await
+    .map_err(CloudError::db("listing cloud tokens"))
+}
+
+/// Revoke one of the account's tokens by id (the hash). Returns `false`
+/// when the id names no live token of THIS account — the account scoping
+/// is the same cross-tenant chokepoint as verification, so one tenant's
+/// revoke can never touch another's row.
+pub async fn revoke_account_token(
+    control: &ControlPlane,
+    account_id: &str,
+    token_id: &str,
+) -> Result<bool, CloudError> {
+    let result = sqlx::query(
+        "UPDATE cloud_tokens SET revoked_at = NOW() \
+         WHERE account_id = $1 AND hash = $2 AND revoked_at IS NULL",
+    )
+    .bind(account_id)
+    .bind(token_id)
+    .execute(control.pool())
+    .await
+    .map_err(CloudError::db("revoking cloud token"))?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Verify a token plaintext against `account_id`.
