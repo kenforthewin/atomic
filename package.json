@@ -64,7 +64,7 @@
     "stress:wikipedia": "node scripts/stress-test-wikipedia.js"
   },
   "dependencies": {
-    "@atomic-editor/editor": "^0.6.0",
+    "@atomic-editor/editor": "^0.6.2",
     "@capacitor/android": "^8.3.1",
     "@capacitor/core": "^8.3.0",
     "@capacitor/ios": "^8.3.0",
