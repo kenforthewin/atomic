@@ -529,11 +529,17 @@ fn asset_response(path: &Path, bytes: Vec<u8>) -> HttpResponse {
         builder.insert_header((CONTENT_TYPE, content_type));
     }
     // Files under `assets/` carry a content hash in their name → immutable,
-    // cache hard. Everything else (favicon, logos) gets a short cache.
+    // cache hard. The service-worker machinery must never be cached: the
+    // browser's update check fetches `sw.js` by its fixed name, and any
+    // stale copy delays every client on the previous deploy (see
+    // `src/lib/pwa.ts` for the client half of the update flow). Everything
+    // else (favicon, logos) gets a short cache.
     let is_hashed_asset = path
         .components()
         .any(|c| matches!(c, Component::Normal(part) if part == "assets"));
-    if is_hashed_asset {
+    if is_service_worker_file(path) {
+        builder.insert_header(CacheControl(vec![CacheDirective::NoCache]));
+    } else if is_hashed_asset {
         builder.insert_header(CacheControl(vec![
             CacheDirective::Public,
             CacheDirective::MaxAge(ASSET_MAX_AGE_SECS),
@@ -546,6 +552,15 @@ fn asset_response(path: &Path, bytes: Vec<u8>) -> HttpResponse {
         ]));
     }
     builder.body(bytes)
+}
+
+/// Whether this build file is part of the PWA update machinery — served by a
+/// fixed name (no content hash), so its bytes change under the same URL on
+/// every deploy and it must be revalidated, never cached.
+fn is_service_worker_file(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+        matches!(name, "sw.js" | "registerSW.js" | "manifest.webmanifest")
+    })
 }
 
 /// The SPA shell (`index.html`) response: 200, HTML, explicitly **not**
@@ -609,6 +624,31 @@ mod tests {
             resolve_asset_path(root, "/favicon.svg"),
             Some(PathBuf::from("/srv/dist/favicon.svg"))
         );
+    }
+
+    #[test]
+    fn cache_headers_by_file_kind() {
+        use actix_web::http::header::CACHE_CONTROL;
+
+        let header = |path: &str| {
+            let resp = asset_response(Path::new(path), b"x".to_vec());
+            resp.headers()
+                .get(CACHE_CONTROL)
+                .expect("cache-control set")
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The SW update machinery is fetched by fixed name → never cached.
+        assert_eq!(header("/srv/dist/sw.js"), "no-cache");
+        assert_eq!(header("/srv/dist/manifest.webmanifest"), "no-cache");
+        // Hashed assets cache hard; other root files get the short cache.
+        assert!(header("/srv/dist/assets/index-abc123.js").contains("max-age=31536000"));
+        assert!(header("/srv/dist/favicon.svg").contains("max-age=3600"));
+        // A hashed asset that *contains* "sw.js" in its name is still an
+        // asset — only the exact fixed names are special.
+        assert!(header("/srv/dist/assets/sw.js-legacy-abc.js").contains("max-age=31536000"));
     }
 
     #[test]

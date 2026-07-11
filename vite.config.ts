@@ -77,8 +77,19 @@ export default defineConfig({
     ...(isWebBuild
       ? [
           VitePWA({
-            registerType: 'autoUpdate',
-            injectRegister: 'auto',
+            // `prompt`: a new worker installs in the background and *waits*;
+            // `src/lib/pwa.ts` surfaces a "Refresh" toast and applies it on
+            // click. Deliberately not `autoUpdate` — that mode activates the
+            // new worker mid-session, which both leaves the running page
+            // stale (nothing reloads it) and purges the old precache out
+            // from under it, so a lazy chunk request can 404 until the user
+            // happens to reload. Prompt keeps the old app fully consistent
+            // until the user opts into the update.
+            registerType: 'prompt',
+            // Registration is hand-wired in src/lib/pwa.ts (it needs the
+            // update-check loop and the refresh toast), so the plugin must
+            // not inject its own bare register call.
+            injectRegister: false,
             // We author the manifest in `public/manifest.webmanifest` so it's
             // readable without a build step. Tell the plugin not to generate
             // its own copy.
@@ -183,7 +194,14 @@ export default defineConfig({
             '@tauri-apps/plugin-fs': path.resolve(__dirname, 'src/lib/stubs/tauri-fs.ts'),
           },
         }
-      : {}),
+      : {
+          alias: {
+            // The VitePWA plugin (and its virtual module) only exists in web
+            // builds; Tauri gets a no-op stub, mirroring the tauri-api stubs
+            // used in the opposite direction above.
+            'virtual:pwa-register': path.resolve(__dirname, 'src/lib/stubs/pwa-register.ts'),
+          },
+        }),
   },
   build: {
     rollupOptions: {

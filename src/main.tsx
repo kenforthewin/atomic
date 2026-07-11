@@ -4,6 +4,9 @@ import App from './App'
 import { ErrorBoundary } from './components/ui/ErrorBoundary'
 import './index.css'
 import { initTransport } from './lib/transport'
+import { setupPwaUpdates } from './lib/pwa'
+
+setupPwaUpdates()
 
 initTransport()
   .catch((err) => console.error('Transport init failed:', err))
