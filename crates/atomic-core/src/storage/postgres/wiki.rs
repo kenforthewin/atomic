@@ -237,20 +237,23 @@ impl WikiStore for PostgresStorage {
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         }
 
-        // Insert wiki links (skip links with no resolved target_tag_id)
+        // Insert wiki links. A None target_tag_id is a *dangling* link (the
+        // tag it named no longer exists) — persisted like any other, exactly
+        // as the SQLite backend does; the read path resolves the display
+        // name from link_text. created_at is stamped here (same value the
+        // SQLite path writes) — the column is NOT NULL with no default, and
+        // omitting it made every non-empty link save fail.
+        let now = chrono::Utc::now().to_rfc3339();
         for link in links {
-            let target_tag_id = match &link.target_tag_id {
-                Some(id) => id,
-                None => continue, // Can't insert NULL into NOT NULL column
-            };
             sqlx::query(
-                "INSERT INTO wiki_links (id, source_article_id, link_text, target_tag_id, db_id)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO wiki_links (id, source_article_id, link_text, target_tag_id, created_at, db_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(&link.id)
             .bind(&article.id)
             .bind(&link.target_tag_name)
-            .bind(target_tag_id)
+            .bind(&link.target_tag_id)
+            .bind(&now)
             .bind(&self.db_id)
             .execute(&self.pool)
             .await

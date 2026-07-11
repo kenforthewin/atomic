@@ -1140,6 +1140,47 @@ async fn test_save_and_get_wiki(tag_store: &dyn TagStore, wiki_store: &dyn WikiS
     );
 }
 
+async fn test_wiki_dangling_link_persists(tag_store: &dyn TagStore, wiki_store: &dyn WikiStore) {
+    let source = tag_store.create_tag("Wiki Link Source", None).await.unwrap();
+    let target = tag_store.create_tag("Wiki Link Target", None).await.unwrap();
+    let saved = wiki_store
+        .save_wiki(&source.id, "See [[Wiki Link Target]] and [[Ghost]].", &[], 1)
+        .await
+        .unwrap();
+
+    let run = uuid::Uuid::new_v4();
+    let links = vec![
+        WikiLink {
+            id: format!("wl-resolved-{run}"),
+            source_article_id: saved.article.id.clone(),
+            target_tag_name: "Wiki Link Target".to_string(),
+            target_tag_id: Some(target.id.clone()),
+            has_article: false,
+        },
+        // A dangling link — its tag no longer exists (deleted after the
+        // article was written). Both backends must persist it; Postgres
+        // used to silently drop it (NOT NULL column, fixed in migration 023).
+        WikiLink {
+            id: format!("wl-ghost-{run}"),
+            source_article_id: saved.article.id.clone(),
+            target_tag_name: "Ghost".to_string(),
+            target_tag_id: None,
+            has_article: false,
+        },
+    ];
+    wiki_store
+        .save_wiki_with_links(&saved.article, &[], &links)
+        .await
+        .unwrap();
+
+    let mut fetched = wiki_store.get_wiki_links(&source.id).await.unwrap();
+    fetched.sort_by(|a, b| a.target_tag_name.cmp(&b.target_tag_name));
+    assert_eq!(fetched.len(), 2, "dangling link persisted alongside resolved");
+    assert_eq!(fetched[0].target_tag_name, "Ghost");
+    assert_eq!(fetched[0].target_tag_id, None);
+    assert_eq!(fetched[1].target_tag_id.as_deref(), Some(target.id.as_str()));
+}
+
 async fn test_delete_wiki(tag_store: &dyn TagStore, wiki_store: &dyn WikiStore) {
     let tag = tag_store.create_tag("Wiki Delete Tag", None).await.unwrap();
     wiki_store.save_wiki(&tag.id, "temp", &[], 1).await.unwrap();
@@ -1365,6 +1406,12 @@ async fn sqlite_save_and_get_wiki() {
 }
 
 #[tokio::test]
+async fn sqlite_wiki_dangling_link_persists() {
+    let (s, _dir) = sqlite_storage().await;
+    test_wiki_dangling_link_persists(&s, &s).await;
+}
+
+#[tokio::test]
 async fn sqlite_delete_wiki() {
     let (s, _dir) = sqlite_storage().await;
     test_delete_wiki(&s, &s).await;
@@ -1553,6 +1600,15 @@ mod postgres_tests {
             return;
         };
         test_save_and_get_wiki(s, s).await;
+    }
+
+    #[tokio::test]
+    async fn pg_wiki_dangling_link_persists() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        test_wiki_dangling_link_persists(s, s).await;
     }
 
     #[tokio::test]

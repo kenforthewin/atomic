@@ -123,7 +123,10 @@ fn seed_source_db(dir: &TempDir) -> PathBuf {
         VALUES ('wc-1', 'wa-1', 1, 'atom-1', 0, 'ownership and borrowing');
 
         INSERT INTO wiki_links (id, source_article_id, target_tag_name, target_tag_id, created_at)
-        VALUES ('wl-1', 'wa-1', 'Topics', 'tag-root', '2026-01-07T00:00:00Z');
+        VALUES ('wl-1', 'wa-1', 'Topics', 'tag-root', '2026-01-07T00:00:00Z'),
+               -- Dangling link: its tag was deleted (SQLite's ON DELETE SET
+               -- NULL). Must migrate as a NULL target, not fail or be dropped.
+               ('wl-dangling', 'wa-1', 'Deleted Topic', NULL, '2026-01-07T00:00:00Z');
 
         INSERT INTO wiki_article_versions (id, tag_id, content, citations_json, atom_count, version_number, created_at)
         VALUES ('wv-1', 'tag-child', 'old content', '[]', 1, 1, '2026-01-07T00:00:00Z');
@@ -252,7 +255,7 @@ async fn migrate_full_fidelity_roundtrip() {
     assert_eq!(copied(&report, "atom_links"), 1);
     assert_eq!(copied(&report, "wiki_articles"), 1);
     assert_eq!(copied(&report, "wiki_citations"), 1);
-    assert_eq!(copied(&report, "wiki_links"), 1);
+    assert_eq!(copied(&report, "wiki_links"), 2, "dangling link included");
     assert_eq!(copied(&report, "wiki_article_versions"), 1);
     assert_eq!(copied(&report, "wiki_proposals"), 1);
     assert_eq!(copied(&report, "conversations"), 1);
@@ -350,6 +353,15 @@ async fn migrate_full_fidelity_roundtrip() {
     .unwrap();
     assert_eq!(link_text, "Topics");
     assert_eq!(target_tag.as_deref(), Some("tag-root"));
+    let (dangling_text, dangling_target): (String, Option<String>) = sqlx::query_as(
+        "SELECT link_text, target_tag_id FROM wiki_links WHERE id = 'wl-dangling' AND db_id = $1",
+    )
+    .bind(&db_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(dangling_text, "Deleted Topic");
+    assert_eq!(dangling_target, None, "dangling link keeps its NULL target");
     let tool_result: String = sqlx::query_scalar(
         "SELECT tool_result FROM chat_tool_calls WHERE id = 'tc-1' AND db_id = $1",
     )

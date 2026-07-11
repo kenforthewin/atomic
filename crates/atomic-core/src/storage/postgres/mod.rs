@@ -161,6 +161,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
         22,
         include_str!("migrations/022_settings_db_id_backfill.sql"),
     ),
+    (
+        23,
+        include_str!("migrations/023_wiki_links_nullable_target.sql"),
+    ),
 ];
 
 /// Postgres-backed storage implementation using sqlx + pgvector.
