@@ -2,6 +2,13 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.41.0 — 2026-07-11
+
+- Add `migrate push` CLI command to push a local SQLite database to a remote Atomic server or Atomic Cloud tenant
+- Add API token management for Atomic Cloud users — create, list, and revoke account-scoped tokens from Settings without needing CLI access
+- Fix web app updates never reaching open browser tabs — new versions now prompt a "Refresh" toast instead of silently stalling behind stale service workers
+- Add admin portal for Atomic Cloud operators to manage user plans, apply comp overrides, and audit plan transitions
+
 ## v1.40.0 — 2026-07-10
 
 - Update default AI models: embedding now uses Qwen3-Embedding-8B (cheaper, top-tier retrieval quality), tagging uses GPT-5 Nano, and wiki/chat/reports use Claude Sonnet 5 — with tagging and agentic models now configured independently

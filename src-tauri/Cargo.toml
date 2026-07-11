@@ -1,6 +1,6 @@
 [package]
 name = "atomic"
-version = "1.40.0"
+version = "1.41.0"
 description = "Atomic — a semantically-connected, AI-augmented personal knowledge base"
 authors = ["Kenneth Bergquist"]
 license = "MIT"
