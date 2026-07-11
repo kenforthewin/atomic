@@ -644,8 +644,11 @@ async fn unknown_subdomain_and_unauthenticated_requests() {
                 .expect("send");
             assert_eq!(resp.status(), StatusCode::OK);
 
-            // The self-hosted token plane is unrouted in cloud, even for an
-            // authenticated tenant: cloud tokens live in the control plane.
+            // The token subtree is cloud-owned now (tenant_plane serves it
+            // against control-plane cloud_tokens; see
+            // tenant_token_management_plane), but the REST of the
+            // self-hosted auth plane stays unrouted even for an
+            // authenticated tenant.
             let resp = h
                 .api(Method::GET, &alpha.subdomain, "/api/auth/tokens")
                 .bearer_auth(&alpha.token)
@@ -654,8 +657,19 @@ async fn unknown_subdomain_and_unauthenticated_requests() {
                 .expect("send");
             assert_eq!(
                 resp.status(),
+                StatusCode::OK,
+                "the token subtree is cloud-owned and routed"
+            );
+            let resp = h
+                .api(Method::GET, &alpha.subdomain, "/api/auth/setup")
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status(),
                 StatusCode::NOT_FOUND,
-                "self-hosted token plane must be unrouted"
+                "the rest of the self-hosted auth plane must stay unrouted"
             );
 
             h.stop().await;
@@ -1233,9 +1247,21 @@ async fn fallback_state_fails_closed_without_tenant_extension() {
     .await;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-    // And the guard's other rule: the self-hosted token plane — the one
-    // /api family whose handlers bind the composition-time AppState manager
-    // (the fallback) directly — is unrouted.
+    // And the guard's other rule: the self-hosted auth plane — handlers
+    // that bind the composition-time AppState manager (the fallback)
+    // directly — is unrouted…
+    let resp = actix_test::call_service(
+        &app,
+        actix_test::TestRequest::get()
+            .uri("/api/auth/setup")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // …except the token subtree, which is cloud-owned (tenant_plane) and
+    // carved out of the unrouting — so with no resolved tenant it
+    // fail-closes through the guard's missing-extension rule instead.
     let resp = actix_test::call_service(
         &app,
         actix_test::TestRequest::get()
@@ -1243,7 +1269,7 @@ async fn fallback_state_fails_closed_without_tenant_extension() {
             .to_request(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 /// The data plane writes dispatch hints (plan: "Worker fairness & job
