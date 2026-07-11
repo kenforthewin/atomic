@@ -127,6 +127,11 @@ cargo run -p atomic-server -- token create --name "my-laptop"
 cargo run -p atomic-server -- token list
 cargo run -p atomic-server -- token revoke <token-id>
 
+# Migrations (see also `migrate sqlite` for direct SQLite → Postgres copies)
+# Push a local database to a remote Atomic server / cloud tenant; the token is
+# the destination's (account-scoped for cloud), env: ATOMIC_MIGRATE_TARGET_TOKEN
+cargo run -p atomic-server -- migrate push --target-url https://you.atomicapp.ai --target-token <token>
+
 # Capacitor mobile (shared React frontend packaged as a webview)
 npm run dev:mobile:ios         # Build, install, launch iOS Capacitor app with Vite HMR
 npm run dev:mobile:android     # Build, install, launch Android Capacitor app with Vite HMR

@@ -235,6 +235,185 @@ async fn run_migrate_command(data_dir: &std::path::Path, action: MigrateAction) 
                 }
             }
         }
+
+        MigrateAction::Push {
+            database,
+            target_url,
+            target_token,
+            name,
+            resume_feeds,
+        } => {
+            run_migrate_push(
+                data_dir,
+                database,
+                target_url,
+                target_token,
+                name,
+                resume_feeds,
+            )
+            .await;
+        }
+    }
+}
+
+/// `migrate push`: snapshot a local SQLite database, upload it to a remote
+/// Atomic server, and mirror the remote import job's progress to the
+/// terminal. This drives the same [`MigrationJobManager`] job as the desktop
+/// app's "Migrate to Cloud" tab and the `POST /api/migrations/push` route —
+/// just with stdout instead of a progress bar. Exits nonzero on failure so
+/// scripts can gate on it.
+async fn run_migrate_push(
+    data_dir: &std::path::Path,
+    database: Option<String>,
+    target_url: String,
+    target_token: String,
+    name: Option<String>,
+    resume_feeds: bool,
+) {
+    use atomic_server::migration_jobs::{MigrationJobStatus, PushRequest};
+
+    let manager = atomic_core::DatabaseManager::new(data_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to open databases at {}: {e}", data_dir.display());
+        std::process::exit(1);
+    });
+    let (databases, default_id) = manager.list_databases().await.unwrap_or_else(|e| {
+        eprintln!("Failed to list databases: {e}");
+        std::process::exit(1);
+    });
+    let source = resolve_source_database(&databases, &default_id, database.as_deref());
+    let core = manager.get_core(&source.id).await.unwrap_or_else(|e| {
+        eprintln!("Failed to open database \"{}\": {e}", source.name);
+        std::process::exit(1);
+    });
+
+    // A scratch dir of our own for the snapshot: `MigrationJobManager::new`
+    // wipes its work dir on creation, so pointing it at the serving
+    // `<data_dir>/migrations` dir would pull artifacts out from under a
+    // concurrently running server.
+    let work_dir =
+        std::env::temp_dir().join(format!("atomic-migrate-push-{}", uuid::Uuid::new_v4()));
+    let jobs = MigrationJobManager::new(&work_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create migration scratch dir: {e}");
+        std::process::exit(1);
+    });
+
+    let started = jobs
+        .start_push(
+            core,
+            PushRequest {
+                target_url: target_url.clone(),
+                target_token,
+                database_id: source.id.clone(),
+                name,
+                pause_feeds: Some(!resume_feeds),
+            },
+            source.name.clone(),
+            None,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to start the push: {e}");
+            std::process::exit(1);
+        });
+
+    println!("Pushing \"{}\" to {target_url} ...", started.db_name);
+
+    let mut last_phase = String::new();
+    let mut last_rows = 0;
+    let outcome = loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let job = jobs.status(&started.id, None).unwrap_or_else(|e| {
+            eprintln!("Lost track of the push job: {e}");
+            std::process::exit(1);
+        });
+        if job.phase != last_phase {
+            println!("  {}", job.phase);
+            last_phase = job.phase.clone();
+            last_rows = job.processed_rows;
+        } else if job.total_rows > 0
+            && job.processed_rows - last_rows >= (job.total_rows / 10).max(1)
+        {
+            println!("  {} / {} rows", job.processed_rows, job.total_rows);
+            last_rows = job.processed_rows;
+        }
+        if matches!(
+            job.status,
+            MigrationJobStatus::Complete
+                | MigrationJobStatus::Failed
+                | MigrationJobStatus::Cancelled
+        ) {
+            break job;
+        }
+    };
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    if outcome.status != MigrationJobStatus::Complete {
+        eprintln!(
+            "Migration failed: {}",
+            outcome.error.as_deref().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "Migration complete: \"{}\" ({}) — {} rows.",
+        outcome.db_name,
+        outcome.db_id.as_deref().unwrap_or("-"),
+        outcome.processed_rows,
+    );
+    if let Some(skipped) = outcome
+        .report
+        .as_ref()
+        .and_then(|r| r["skipped_feed_urls"].as_array())
+        .filter(|urls| !urls.is_empty())
+    {
+        let urls: Vec<&str> = skipped.iter().filter_map(|u| u.as_str()).collect();
+        println!(
+            "Skipped feeds already subscribed on the destination: {}",
+            urls.join(", ")
+        );
+    }
+    println!(
+        "The destination is re-embedding in the background — keyword search works \
+         immediately; semantic search fills in as embedding completes."
+    );
+}
+
+/// Resolve `--database` (matching id first, then unique name) or fall back to
+/// the default database. Prints the available databases and exits on a miss
+/// or an ambiguous name — this is CLI surface, not library code.
+fn resolve_source_database<'a>(
+    databases: &'a [atomic_core::DatabaseInfo],
+    default_id: &str,
+    selector: Option<&str>,
+) -> &'a atomic_core::DatabaseInfo {
+    let found = match selector {
+        None => databases.iter().find(|d| d.id == default_id),
+        Some(sel) => databases.iter().find(|d| d.id == sel).or_else(|| {
+            let mut by_name = databases.iter().filter(|d| d.name == sel);
+            match (by_name.next(), by_name.next()) {
+                (Some(one), None) => Some(one),
+                (Some(_), Some(_)) => {
+                    eprintln!("Database name \"{sel}\" is ambiguous — pass its id instead:");
+                    print_databases(databases);
+                    std::process::exit(1);
+                }
+                _ => None,
+            }
+        }),
+    };
+    found.unwrap_or_else(|| {
+        match selector {
+            Some(sel) => eprintln!("No database with id or name \"{sel}\". Available:"),
+            None => eprintln!("No default database found. Available:"),
+        }
+        print_databases(databases);
+        std::process::exit(1);
+    })
+}
+
+fn print_databases(databases: &[atomic_core::DatabaseInfo]) {
+    for db in databases {
+        eprintln!("  {}  {}", db.id, db.name);
     }
 }
 
