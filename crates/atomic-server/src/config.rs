@@ -131,6 +131,37 @@ pub enum MigrateAction {
         #[arg(long, default_value_t = false)]
         pause_feeds: bool,
     },
+
+    /// Push a local SQLite database to a remote Atomic server (e.g. an
+    /// Atomic Cloud tenant). The database is snapshotted and uploaded; the
+    /// destination imports it as a new knowledge base and re-embeds with its
+    /// own provider. The local database is left untouched.
+    Push {
+        /// Source database id or name; defaults to the default database
+        #[arg(long)]
+        database: Option<String>,
+
+        /// Base URL of the destination server
+        /// (e.g. https://you.atomicapp.ai)
+        #[arg(long)]
+        target_url: String,
+
+        /// API token for the destination server. For Atomic Cloud this must
+        /// be an account-scoped token (Settings → API tokens on your tenant).
+        #[arg(long, env = "ATOMIC_MIGRATE_TARGET_TOKEN", hide_env_values = true)]
+        target_token: String,
+
+        /// Display name for the new database on the destination; defaults to
+        /// the source database's name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Land migrated feeds active on the destination. By default they
+        /// arrive paused, so the destination doesn't start polling the same
+        /// feeds while this instance keeps running.
+        #[arg(long, default_value_t = false)]
+        resume_feeds: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
