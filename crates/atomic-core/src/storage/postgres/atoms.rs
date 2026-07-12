@@ -1764,10 +1764,16 @@ impl AtomStore for PostgresStorage {
     }
 
     async fn get_all_embedding_pairs(&self) -> StorageResult<Vec<(String, Vec<f32>)>> {
-        // Load all chunk embeddings, average per atom
+        // Average per atom inside Postgres (pgvector's avg aggregate) rather
+        // than shipping every chunk vector over the wire: at ~N chunks per
+        // atom this cuts the transfer by ~N× and the canvas rebuild scan from
+        // seconds to sub-second on large tenants. avg() requires uniform
+        // vector widths within the DB — already an invariant of the width
+        // reconcile flow (mixed widths would break `<=>` search the same way).
         let rows: Vec<(String, Vec<f32>)> = sqlx::query_as(
-            "SELECT atom_id, embedding::real[] FROM atom_chunks
+            "SELECT atom_id, AVG(embedding)::real[] FROM atom_chunks
              WHERE embedding IS NOT NULL AND db_id = $1
+             GROUP BY atom_id
              ORDER BY atom_id",
         )
         .bind(&self.db_id)
@@ -1775,44 +1781,7 @@ impl AtomStore for PostgresStorage {
         .await
         .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
 
-        // Average chunks per atom
-        let mut result: Vec<(String, Vec<f32>)> = Vec::new();
-        let mut current_id: Option<String> = None;
-        let mut current_sum: Vec<f32> = Vec::new();
-        let mut current_count: f32 = 0.0;
-
-        for (atom_id, embedding) in rows {
-            if current_id.as_ref() != Some(&atom_id) {
-                if let Some(prev_id) = current_id.take() {
-                    if current_count > 0.0 {
-                        for val in &mut current_sum {
-                            *val /= current_count;
-                        }
-                        result.push((prev_id, current_sum.clone()));
-                    }
-                }
-                current_id = Some(atom_id);
-                current_sum = embedding;
-                current_count = 1.0;
-            } else {
-                for (i, val) in embedding.iter().enumerate() {
-                    if i < current_sum.len() {
-                        current_sum[i] += val;
-                    }
-                }
-                current_count += 1.0;
-            }
-        }
-        if let Some(prev_id) = current_id {
-            if current_count > 0.0 {
-                for val in &mut current_sum {
-                    *val /= current_count;
-                }
-                result.push((prev_id, current_sum));
-            }
-        }
-
-        Ok(result)
+        Ok(rows)
     }
 
     async fn get_top_k_canvas_edges(&self, top_k: usize) -> StorageResult<Vec<CanvasEdgeData>> {

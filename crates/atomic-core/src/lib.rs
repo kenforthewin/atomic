@@ -114,9 +114,14 @@ type CanvasRebuilder =
     Box<dyn Fn() -> Result<Arc<GlobalCanvasData>, AtomicCoreError> + Send + Sync + 'static>;
 
 /// How long `invalidate_debounced` waits after the last invalidation before
-/// kicking off a background rebuild. Sized so that bulk-event storms (e.g.
-/// a 100-atom embedding batch) collapse into a single rebuild.
-const CANVAS_CACHE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// kicking off a background rebuild. Batch pipelines complete one atom at a
+/// time with provider calls in between, so completions arrive seconds apart —
+/// a sub-second window rebuilt once per atom (observed: 3 full rebuilds per
+/// hourly feed poll). Each new invalidation supersedes the pending one, so
+/// this window only has to outlast the gap *between* completions, not the
+/// whole batch: the rebuild fires once, after the burst settles. Direct user
+/// mutations use eager `invalidate()` and don't wait on this.
+const CANVAS_CACHE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Per-DB settings key holding the dashboard's featured-report id. The
 /// seed helper stamps this on every DB; the dashboard widget reads it; a

@@ -1629,6 +1629,56 @@ mod postgres_tests {
         test_wiki_update_chunks_pending_atom_errors(s, s, s).await;
     }
 
+    /// The SQL-side `AVG(embedding)` must reproduce the per-atom chunk
+    /// averaging the canvas compute relies on: multi-chunk atoms get the
+    /// element-wise mean, single-chunk atoms pass through unchanged, and
+    /// atoms without embeddings are absent.
+    #[tokio::test]
+    async fn pg_embedding_pairs_average_chunks_per_atom() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let request = CreateAtomRequest {
+                content: format!("Atom {i}"),
+                ..Default::default()
+            };
+            s.insert_atom(&id, &request, &now).await.unwrap();
+            ids.push(id);
+        }
+
+        s.save_chunks_and_embeddings(
+            &ids[0],
+            &[
+                ("chunk a".to_string(), vec![1.0, 0.0, 0.0]),
+                ("chunk b".to_string(), vec![0.0, 1.0, 0.0]),
+            ],
+        )
+        .await
+        .unwrap();
+        s.save_chunks_and_embeddings(&ids[1], &[("solo".to_string(), vec![0.0, 0.0, 1.0])])
+            .await
+            .unwrap();
+        // ids[2] has no chunks and must not appear.
+
+        let pairs: std::collections::HashMap<String, Vec<f32>> =
+            s.get_all_embedding_pairs().await.unwrap().into_iter().collect();
+
+        assert_eq!(pairs.len(), 2);
+        let averaged = &pairs[&ids[0]];
+        assert_eq!(averaged.len(), 3);
+        for (got, want) in averaged.iter().zip([0.5, 0.5, 0.0]) {
+            assert!((got - want).abs() < 1e-6, "averaged: {averaged:?}");
+        }
+        assert_eq!(pairs[&ids[1]], vec![0.0, 0.0, 1.0]);
+        assert!(!pairs.contains_key(&ids[2]));
+    }
+
     /// Cross-`db_id` fencing: two storage handles sharing one pool but
     /// scoped to different logical databases must not see each other's
     /// settings rows — the exact leak that used to share `task.{id}.*`
