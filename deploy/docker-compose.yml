@@ -43,11 +43,24 @@ services:
     shm_size: 256mb
     # max_connections must cover the §6 fan-out (cached tenants × tenant pool
     # size + control pool + pg_dump); 200 is ample headroom for launch scale.
+    #
+    # pg_stat_statements is the query-performance ledger (top queries by
+    # time/calls/IO, per database — so per tenant). track=all includes
+    # queries inside functions; track_io_timing prices buffer reads in the
+    # same view. Query it from any DB after CREATE EXTENSION there (one-time,
+    # done in the control DB). Entries are per-(userid, dbid, queryid), so
+    # the same statement across N tenant DBs is N rows — raise
+    # pg_stat_statements.max well before tenant count × query shapes
+    # approaches it.
     command: >-
       postgres
       -c max_connections=200
       -c shared_buffers=1GB
       -c effective_cache_size=3GB
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c pg_stat_statements.max=10000
+      -c track_io_timing=on
     environment:
       POSTGRES_USER: atomic
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
