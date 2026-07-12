@@ -42,6 +42,7 @@ pub mod dispatch_hints;
 pub mod dispatcher;
 pub mod email;
 pub mod error;
+pub mod export_plane;
 pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;

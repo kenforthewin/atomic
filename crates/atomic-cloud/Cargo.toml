@@ -21,6 +21,9 @@ atomic-core = { path = "../atomic-core", features = ["postgres"] }
 
 # Web framework — same major as atomic-server so middleware composes.
 actix-web = "4.9"
+# Artifact download streaming on the tenant export plane; same major as
+# atomic-server's export routes.
+actix-files = "0.6"
 
 # Database — version/features match atomic-core's postgres feature exactly,
 # plus `chrono` for TIMESTAMPTZ decode and `json` for JSONB decode

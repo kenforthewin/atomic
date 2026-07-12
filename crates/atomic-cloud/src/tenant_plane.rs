@@ -354,6 +354,9 @@ impl AccountLocks {
 #[derive(Clone)]
 pub struct TenantPlane {
     state: web::Data<PlaneState>,
+    /// Per-account export-job managers (see [`crate::export_plane`]) —
+    /// process-wide like `state`, shared by every worker's route table.
+    exports: web::Data<crate::export_plane::TenantExportPlane>,
 }
 
 impl TenantPlane {
@@ -390,6 +393,10 @@ impl TenantPlane {
                 billing_configured: false,
                 billing_provider: None,
             }),
+            exports: web::Data::new(
+                crate::export_plane::TenantExportPlane::new()
+                    .expect("creating the export artifact directory"),
+            ),
         }
     }
 
@@ -534,8 +541,12 @@ impl TenantPlane {
                 .app_data(self.state.clone())
                 .route(web::delete().to(revoke_token_route))
                 .wrap(from_fn(cloud_plane_guard))
-                .wrap(auth),
+                .wrap(auth.clone()),
         );
+        // The tenant export plane shadows atomic-server's export family the
+        // same way the token plane shadows `/api/auth/tokens*` (see
+        // `crate::export_plane` module docs).
+        crate::export_plane::TenantExportPlane::configure(self.exports.clone(), cfg, auth);
     }
 }
 
@@ -1690,7 +1701,7 @@ async fn revoke_token_route(
     }
 }
 
-fn require_account_scope(req: &HttpRequest) -> Result<ResolvedTenant, HttpResponse> {
+pub(crate) fn require_account_scope(req: &HttpRequest) -> Result<ResolvedTenant, HttpResponse> {
     let Some(tenant) = req.extensions().get::<ResolvedTenant>().cloned() else {
         tracing::error!(
             path = req.path(),

@@ -266,10 +266,13 @@ pub const DEFAULT_MCP_SSE_KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// module docs enumerate each family and why:
 ///
 /// - `/api/auth/*` — self-hosted's token plane (`state.manager`).
-/// - `/api/exports/{id}` and `/api/databases/{id}/exports/*` — the
-///   export-job plane (`state.export_jobs`): one process-global namespace of
-///   job ids and artifacts, so any tenant could read or delete another
-///   tenant's export by id.
+/// - the export family — self-hosted's `state.export_jobs` is one
+///   process-global namespace of job ids and artifacts, so any tenant could
+///   read or delete another tenant's export by id. The exact routes the
+///   product app uses have a cloud-owned, per-tenant implementation
+///   ([`crate::export_plane`]) registered ahead of `api_scope` and are
+///   carved out below; any *other* path under the family (a future export
+///   format added to atomic-server) stays unrouted by default.
 /// - `/api/logs` — the process-wide log ring buffer (`state.log_buffer`).
 fn fallback_bound_plane(path: &str) -> bool {
     if path.starts_with("/api/auth/") {
@@ -280,15 +283,29 @@ fn fallback_bound_plane(path: &str) -> bool {
         // unrouted.
         return !(path == "/api/auth/tokens" || path.starts_with("/api/auth/tokens/"));
     }
-    if path.starts_with("/api/exports/") || path == "/api/logs" {
+    if let Some(rest) = path.strip_prefix("/api/exports/") {
+        // Cloud-owned job routes (`{id}` and `{id}/download`,
+        // crate::export_plane) pass; anything deeper or empty stays
+        // unrouted.
+        let mut segments = rest.split('/');
+        let id = segments.next().unwrap_or("");
+        let tail = segments.next();
+        let cloud_owned =
+            !id.is_empty() && matches!(tail, None | Some("download")) && segments.next().is_none();
+        return !cloud_owned;
+    }
+    if path == "/api/logs" {
         return true;
     }
-    // `/api/databases/{id}/exports/...` — the export-start route lives under
-    // the databases prefix; match the whole exports subtree so a future
-    // export format added to atomic-server stays unrouted here by default.
+    // `/api/databases/{id}/exports/...` — the markdown start route is
+    // cloud-owned (crate::export_plane); the rest of the exports subtree
+    // stays unrouted so a future export format added to atomic-server is
+    // fallback-bound here by default.
     path.strip_prefix("/api/databases/")
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, tail)| tail == "exports" || tail.starts_with("exports/"))
+        .is_some_and(|(_, tail)| {
+            tail != "exports/markdown" && (tail == "exports" || tail.starts_with("exports/"))
+        })
 }
 
 /// Composition-level guard between [`CloudAuth`] and atomic-server's routes.
@@ -620,10 +637,13 @@ mod tests {
             // only the token subtree is cloud-owned (tenant_plane).
             "/api/auth/setup",
             "/api/auth/whoami",
-            "/api/exports/job-1",
-            "/api/exports/job-1/download",
-            "/api/databases/default/exports/markdown",
+            // Beyond the cloud-owned job routes, the export family stays
+            // unrouted: no id, deeper than download, or a non-markdown
+            // format under the databases prefix.
+            "/api/exports/",
+            "/api/exports/job-1/download/extra",
             "/api/databases/abc-123/exports",
+            "/api/databases/abc-123/exports/pdf",
             "/api/logs",
         ] {
             assert!(fallback_bound_plane(unrouted), "{unrouted} must be 404'd");
@@ -638,6 +658,11 @@ mod tests {
             // The token subtree is cloud-owned now (tenant_plane serves it).
             "/api/auth/tokens",
             "/api/auth/tokens/some-id",
+            // The export job routes are cloud-owned now (export_plane
+            // serves them per-account).
+            "/api/exports/job-1",
+            "/api/exports/job-1/download",
+            "/api/databases/default/exports/markdown",
             "/api/databases/default/stats",
             "/api/databases/default/activate",
             // Only the exact /api/logs path is the log plane.

@@ -762,14 +762,14 @@ async fn unknown_subdomain_and_unauthenticated_requests() {
     .await;
 }
 
-/// The export-job and log planes are bound to composition-time state
-/// (`AppState.export_jobs` / `AppState.log_buffer` — under cloud, the single
-/// inert fallback shared by every tenant), making export jobs/artifacts and
-/// the log ring buffer one process-global namespace: any authenticated
-/// tenant could read or DELETE another tenant's export by id, or read
-/// cross-tenant logs. The composition unroutes those planes; pin the
-/// route-level 404 — including the guard's denial body, which distinguishes
-/// "unrouted" from a handler's own not-found — for an authenticated tenant.
+/// The log plane — and every export path beyond the cloud-owned job routes
+/// — stays bound to composition-time state (`AppState.log_buffer`, and
+/// `AppState.export_jobs` for any future export format atomic-server
+/// grows), i.e. one process-global namespace under cloud. The served export
+/// family has a per-tenant implementation now (`crate::export_plane`,
+/// pinned by `tenant_export_lifecycle_and_isolation`); everything else in
+/// those families must keep 404ing with the guard's denial body, which
+/// distinguishes "unrouted" from a handler's own not-found.
 #[actix_web::test]
 async fn export_and_log_planes_are_unrouted() {
     with_control_db("export_and_log_planes_are_unrouted", |url| async move {
@@ -777,11 +777,12 @@ async fn export_and_log_planes_are_unrouted() {
         let alpha = h.provision("alpha").await;
 
         for (method, path) in [
-            // Would otherwise start a job (202) against the fallback state.
-            (Method::POST, "/api/databases/default/exports/markdown"),
-            // Would otherwise read/delete jobs in the shared namespace.
-            (Method::GET, "/api/exports/any-job-id"),
-            (Method::DELETE, "/api/exports/any-job-id"),
+            // A future non-markdown export format must stay unrouted here
+            // until it gets its own tenant-scoped implementation.
+            (Method::POST, "/api/databases/default/exports/pdf"),
+            (Method::GET, "/api/databases/default/exports"),
+            // Deeper-than-download job paths are nobody's routes.
+            (Method::GET, "/api/exports/any-job-id/download/extra"),
             // Would otherwise return the process-wide log buffer (200).
             (Method::GET, "/api/logs"),
         ] {
@@ -2276,6 +2277,146 @@ async fn admin_plane_gates_and_plan_override() {
             !body.contains(&bravo.account_id) && !body.contains("bravo"),
             "no admin data on a tenant host"
         );
+
+        h.stop().await;
+    })
+    .await;
+}
+
+/// The tenant export plane end to end (crate::export_plane): start a
+/// markdown export through the same routes the product app calls, poll it
+/// to completion, download the zip artifact — and prove the per-account job
+/// namespace holds: another tenant polling or deleting the job id gets 404,
+/// never a peek at the artifact.
+#[actix_web::test]
+async fn tenant_export_lifecycle_and_isolation() {
+    with_control_db("tenant_export_lifecycle_and_isolation", |url| async move {
+        let h = CloudHarness::spawn(&url, AccountCacheConfig::default()).await;
+        let alpha = h.provision("alpha").await;
+        let bravo = h.provision("bravo").await;
+
+        h.create_atom(&alpha, "Alpha's exportable note about egress.")
+            .await;
+
+        // The default knowledge base's id, exactly as the settings UI
+        // resolves it before offering Export.
+        let dbs: Value = h
+            .api(Method::GET, &alpha.subdomain, "/api/databases")
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("list alpha dbs")
+            .json()
+            .await
+            .expect("alpha dbs json");
+        let db_id = dbs["databases"]
+            .as_array()
+            .expect("databases array")
+            .iter()
+            .find(|db| db["is_default"] == json!(true))
+            .and_then(|db| db["id"].as_str())
+            .expect("default db id")
+            .to_string();
+
+        // Start; poll to completion (a one-atom export is fast, but the job
+        // is genuinely asynchronous).
+        let started: Value = {
+            let resp = h
+                .api(
+                    Method::POST,
+                    &alpha.subdomain,
+                    &format!("/api/databases/{db_id}/exports/markdown"),
+                )
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("start export");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "start export");
+            resp.json().await.expect("start export json")
+        };
+        let job_id = started["id"].as_str().expect("job id").to_string();
+
+        let deadline = std::time::Instant::now() + EVENT_DEADLINE;
+        let complete: Value = loop {
+            let job: Value = h
+                .api(Method::GET, &alpha.subdomain, &format!("/api/exports/{job_id}"))
+                .bearer_auth(&alpha.token)
+                .send()
+                .await
+                .expect("poll export")
+                .json()
+                .await
+                .expect("export status json");
+            match job["status"].as_str() {
+                Some("complete") => break job,
+                Some("queued") | Some("running") => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "export not complete in {EVENT_DEADLINE:?}: {job:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("export reached {other:?}: {job:?}"),
+            }
+        };
+
+        // The completed status issues the tokened download path; the
+        // artifact must be a real zip that actually carries the note
+        // (bytes_written counts the markdown written into the archive, so
+        // the exported content is at least that large pre-compression).
+        let download_path = complete["download_path"]
+            .as_str()
+            .expect("download path issued on completion");
+        assert!(
+            complete["bytes_written"].as_u64().expect("bytes written") > 0,
+            "export wrote content"
+        );
+        let artifact = h
+            .api(Method::GET, &alpha.subdomain, download_path)
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("download export");
+        assert_eq!(artifact.status(), StatusCode::OK, "download export");
+        let bytes = artifact.bytes().await.expect("artifact bytes");
+        assert_eq!(&bytes[..4], b"PK\x03\x04", "artifact is a zip");
+        // Stored (uncompressed or deflated) markdown this small survives
+        // byte-for-byte scanning for a distinctive fragment only when the
+        // zip stores it uncompressed; assert on the filename entry instead,
+        // which the zip format always stores verbatim.
+        assert!(
+            bytes.windows(3).any(|w| w == b".md"),
+            "zip names a markdown file"
+        );
+
+        // Isolation: bravo probing alpha's job id — status, delete, even a
+        // (tokenless) download — sees a namespace where it never existed.
+        for (method, path) in [
+            (Method::GET, format!("/api/exports/{job_id}")),
+            (Method::DELETE, format!("/api/exports/{job_id}")),
+            (Method::GET, format!("/api/exports/{job_id}/download?token=x")),
+        ] {
+            let resp = h
+                .api(method.clone(), &bravo.subdomain, &path)
+                .bearer_auth(&bravo.token)
+                .send()
+                .await
+                .expect("bravo probe");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "bravo {method} {path} must 404"
+            );
+        }
+
+        // And alpha can still clean up its own job.
+        let resp = h
+            .api(Method::DELETE, &alpha.subdomain, &format!("/api/exports/{job_id}"))
+            .bearer_auth(&alpha.token)
+            .send()
+            .await
+            .expect("alpha delete");
+        assert_eq!(resp.status(), StatusCode::OK, "alpha deletes its own job");
 
         h.stop().await;
     })

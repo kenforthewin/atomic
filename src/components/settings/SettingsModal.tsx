@@ -387,9 +387,6 @@ function PipelineDetailCounts({ status }: { status: DatabasePipelineStatus['stat
 }
 
 function DatabasesTab() {
-  // Markdown archive export streams from the local/self-hosted server; on the
-  // cloud data plane that endpoint 404s, so the per-DB Export button is hidden.
-  const isCloud = isCloudTenant();
   const { databases, activeId, fetchDatabases, renameDatabase, deleteDatabase, setDefaultDatabase, getDatabaseStats } = useDatabasesStore();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
@@ -663,7 +660,6 @@ function DatabasesTab() {
                         {isExpanded ? 'Hide' : 'Details'}
                       </button>
                     )}
-                    {!isCloud && (
                     <button
                       onClick={() => handleExportMarkdown(db)}
                       disabled={!!exportingDb}
@@ -675,7 +671,6 @@ function DatabasesTab() {
                         ? `${Math.round((exportJob.processed_atoms / exportJob.total_atoms) * 100)}%`
                         : 'Export'}
                     </button>
-                    )}
                     {!db.is_default && (
                       <button
                         onClick={() => handleSetDefault(db.id)}

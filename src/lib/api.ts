@@ -164,16 +164,18 @@ export async function downloadExportJob(job: ExportJob): Promise<void> {
   }
 
   const { baseUrl } = transport.getConfig();
-  if (!baseUrl) {
-    throw new Error('Not connected to a server');
-  }
 
   if (isTauri()) {
+    if (!baseUrl) {
+      throw new Error('Not connected to a server');
+    }
     await saveExportJobWithTauri(baseUrl, job);
     return;
   }
 
-  const url = `${baseUrl}${job.download_path}`;
+  // An empty baseUrl is the cloud tenant's same-origin mode — the relative
+  // download path resolves against the current origin, cookie attached.
+  const url = `${baseUrl ?? ''}${job.download_path}`;
   const a = document.createElement('a');
   a.href = url;
   a.rel = 'noopener noreferrer';

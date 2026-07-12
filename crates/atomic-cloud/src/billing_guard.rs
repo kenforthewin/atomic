@@ -53,8 +53,29 @@ fn is_mutating(method: &Method) -> bool {
 /// deleting data — lives *past* onboarding). It writes a single, fixed
 /// settings key and creates no metered resource, so exempting it costs the
 /// write-block nothing while unsticking the recovery flow.
+///
+/// The markdown-export routes ([`crate::export_plane`]) are exempt for a
+/// bigger reason: "read-only" is a serving state, not a hostage state — the
+/// non-payment promise is that data stays exportable throughout. Starting an
+/// export (POST) and cancelling/deleting one (DELETE) mutate only scratch
+/// job state, never tenant content, and the artifacts are size-bounded by
+/// the tenant's own data.
 fn is_write_block_exempt(method: &Method, path: &str) -> bool {
-    *method == Method::PUT && path == "/api/settings/onboarding_completed"
+    if *method == Method::PUT && path == "/api/settings/onboarding_completed" {
+        return true;
+    }
+    if *method == Method::POST
+        && path
+            .strip_prefix("/api/databases/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, tail)| tail == "exports/markdown")
+    {
+        return true;
+    }
+    *method == Method::DELETE
+        && path
+            .strip_prefix("/api/exports/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 /// Data-plane middleware: while the tenant is blocked for writes by EITHER
@@ -165,6 +186,32 @@ mod tests {
             "/api/settings/onboarding_completed"
         ));
         assert!(!is_write_block_exempt(&Method::POST, "/api/atoms"));
+    }
+
+    #[test]
+    fn export_egress_is_exempt() {
+        // The non-payment promise: a read_only tenant can still start,
+        // manage, and download an export.
+        assert!(is_write_block_exempt(
+            &Method::POST,
+            "/api/databases/default/exports/markdown"
+        ));
+        assert!(is_write_block_exempt(&Method::DELETE, "/api/exports/job-1"));
+        // …but the exemption is exactly the export family, nothing wider:
+        // other formats, other methods, other shapes stay blocked.
+        assert!(!is_write_block_exempt(
+            &Method::POST,
+            "/api/databases/default/exports/pdf"
+        ));
+        assert!(!is_write_block_exempt(
+            &Method::POST,
+            "/api/exports/job-1"
+        ));
+        assert!(!is_write_block_exempt(
+            &Method::DELETE,
+            "/api/exports/job-1/download"
+        ));
+        assert!(!is_write_block_exempt(&Method::DELETE, "/api/exports/"));
     }
 
     #[test]
