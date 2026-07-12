@@ -640,6 +640,7 @@ dependencies = [
 name = "atomic-cloud"
 version = "0.1.0"
 dependencies = [
+ "actix-files",
  "actix-web",
  "aes-gcm",
  "async-trait",
