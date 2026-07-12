@@ -5,6 +5,10 @@ description: Download and install the Atomic desktop app, or run Atomic from sou
 
 The Atomic desktop app is the easiest way to run Atomic for local personal use. It bundles the React UI, starts a local `atomic-server` sidecar, and manages a local API token automatically.
 
+:::tip[No install at all]
+[Atomic Cloud](/cloud/) runs the same product hosted at a subdomain you choose, with AI included — nothing to download or configure.
+:::
+
 ## Download
 
 Download the latest desktop build from [GitHub Releases](https://github.com/kenforthewin/atomic/releases/latest). Releases are the canonical distribution channel for desktop builds.

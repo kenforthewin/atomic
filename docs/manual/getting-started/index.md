@@ -7,12 +7,13 @@ Atomic turns freeform markdown notes ("atoms") into a semantically connected, AI
 
 ## What Is Atomic?
 
-Atomic has two common ways to run:
+Atomic has three common ways to run:
 
+- **[Atomic Cloud](/cloud/)** - the hosted service at a subdomain you choose, with AI included and nothing to configure. The fastest way to start.
 - **Desktop app** - a local-first Tauri app that starts its own `atomic-server` sidecar on your machine.
 - **Self-hosted server** - a headless `atomic-server` plus optional web frontend for remote access, mobile use, browser clipping, and MCP over HTTP.
 
-Both modes use the same core engine and HTTP API. The desktop app is simpler for one-person local use. Self-hosting is better when you want access from multiple devices or integrations.
+All three use the same core engine and HTTP API, and your data can [migrate between them](/cloud/migrating/). Cloud is the quickest start; the desktop app is simplest for one-person local use; self-hosting is best when you want everything on your own hardware.
 
 When you create or update a note in Atomic, an asynchronous pipeline can automatically:
 
