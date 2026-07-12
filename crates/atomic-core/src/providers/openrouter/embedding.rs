@@ -15,6 +15,25 @@ struct EmbeddingRequest {
     /// client-side (see [`embed_batch`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     dimensions: Option<usize>,
+    provider: ProviderPreferences,
+}
+
+/// OpenRouter provider-routing preferences.
+///
+/// Embeddings are latency-sensitive (a semantic search blocks on embedding the
+/// query) and upstreams for the same model differ wildly: measured 2026-07-12,
+/// qwen3-embedding-8b took ~0.5s on two upstreams and 13–80s on a third, and
+/// OpenRouter's default price-sorted routing kept picking the slow one. Sorting
+/// by latency routes around pathological upstreams without pinning any by name.
+#[derive(Serialize)]
+struct ProviderPreferences {
+    sort: &'static str,
+}
+
+impl ProviderPreferences {
+    fn lowest_latency() -> Self {
+        Self { sort: "latency" }
+    }
 }
 
 /// OpenRouter Embeddings API response
@@ -57,6 +76,7 @@ pub async fn embed_batch(
         model: config.model.clone(),
         input: texts.to_vec(),
         dimensions: config.dimensions,
+        provider: ProviderPreferences::lowest_latency(),
     };
 
     let response = provider
@@ -157,4 +177,22 @@ pub async fn embed_batch(
     }
 
     Ok(vectors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_asks_for_lowest_latency_routing() {
+        let request = EmbeddingRequest {
+            model: "qwen/qwen3-embedding-8b".to_string(),
+            input: vec!["hello".to_string()],
+            dimensions: Some(1536),
+            provider: ProviderPreferences::lowest_latency(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["provider"]["sort"], "latency");
+        assert_eq!(json["dimensions"], 1536);
+    }
 }
