@@ -2,6 +2,15 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.42.2 — 2026-07-13
+
+- Fix embedding failures on atoms with very large code blocks (e.g. RSS-ingested posts with 60KB+ fenced code) by splitting oversized blocks at line boundaries
+- Enable markdown export for Atomic Cloud users — the Export button is no longer hidden and works with tenant-scoped isolation
+- Improve embedding speed by routing to the lowest-latency OpenRouter upstream, avoiding a pathological provider that could stall requests for 13–80 seconds
+- Reduce canvas rebuild cost on Cloud by averaging chunk embeddings in SQL instead of transferring all vectors to the app server, and widen the rebuild debounce to avoid redundant recomputes during batch pipelines
+- Fix Atomic Cloud checkout: Stripe webhook parsing now handles the current API shape, and post-checkout redirects land on the correct tenant URL instead of a 404
+- Update curated Cloud model lists — Pro tier adds Claude Sonnet 5, GPT-5.6 Terra, and GLM-5.2; Free tier swaps to Gemini 3.1 Flash Lite
+
 ## v1.42.1 — 2026-07-11
 
 - Fix text selection not being visible when drag-selecting inside code blocks in the editor
