@@ -2,11 +2,12 @@
 //!
 //! Chunking strategy:
 //! - Uses pulldown-cmark to parse markdown structure
-//! - Never splits code blocks (kept atomic for syntax integrity)
+//! - Code blocks are kept intact for syntax integrity, up to the maximum
+//!   chunk size; oversized ones are split at line boundaries and re-fenced
 //! - Headers create natural chunk boundaries
 //! - Target chunk size: ~3200 chars (~800 tokens)
 //! - Minimum chunk size: ~240 chars (~60 tokens)
-//! - Maximum chunk size: ~4000 chars (~1000 tokens, except code blocks)
+//! - Maximum chunk size: ~4000 chars (~1000 tokens)
 //! - Overlap: ~320 chars (~80 tokens) from next chunk appended to each chunk
 //!
 //! Uses character counts for fast size estimation (~4 chars/token).
@@ -299,6 +300,79 @@ fn hard_split_by_chars(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Split an oversized code block at line boundaries, re-wrapping each piece
+/// in the original fence so every piece still reads (and embeds) as code.
+///
+/// Code blocks normally stay intact for syntax integrity, but a block larger
+/// than `max_chars` exceeds the embedding model's context window, which fails
+/// embedding for the whole atom — a re-fenced split is strictly better than
+/// no embedding at all.
+fn split_code_block(content: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = content.lines();
+    let first_line = lines.next().unwrap_or("");
+    let opener = first_line.trim_start();
+
+    // Fenced blocks get their fence lines peeled off so only the body is
+    // split, then each piece is re-wrapped. Indented blocks have no fence.
+    let (open, close, body_lines) = if opener.starts_with("```") || opener.starts_with("~~~") {
+        let fence_char = opener.chars().next().unwrap();
+        let fence_len = opener.chars().take_while(|&c| c == fence_char).count();
+        let mut body: Vec<&str> = lines.collect();
+        // Unterminated blocks (EOF inside the fence) have no closing line.
+        if body.last().is_some_and(|line| {
+            let trimmed = line.trim();
+            trimmed.len() >= 3 && trimmed.chars().all(|c| c == fence_char)
+        }) {
+            body.pop();
+        }
+        (first_line, fence_char.to_string().repeat(fence_len), body)
+    } else {
+        ("", String::new(), content.lines().collect())
+    };
+
+    let overhead = if open.is_empty() {
+        0
+    } else {
+        open.len() + close.len() + 2 // the newlines joining fences to body
+    };
+    let budget = max_chars.saturating_sub(overhead).max(CHARS_PER_TOKEN);
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in body_lines {
+        if !current.is_empty() && current.len() + 1 + line.len() > budget {
+            pieces.push(std::mem::take(&mut current));
+        }
+        if line.len() > budget {
+            // A single line past the budget (minified JS, base64 blobs, …)
+            // offers no boundary to honor — hard-split it.
+            pieces.extend(hard_split_by_chars(line, budget));
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    if pieces.is_empty() {
+        return vec![content.to_string()];
+    }
+
+    pieces
+        .into_iter()
+        .map(|body| {
+            if open.is_empty() {
+                body
+            } else {
+                format!("{open}\n{body}\n{close}")
+            }
+        })
+        .collect()
+}
+
 /// Merge adjacent small blocks into chunks respecting character limits
 fn merge_blocks_into_chunks(blocks: Vec<MarkdownBlock>) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
@@ -307,17 +381,18 @@ fn merge_blocks_into_chunks(blocks: Vec<MarkdownBlock>) -> Vec<String> {
     for block in blocks {
         let block_len = block.content.len();
 
-        // Code blocks are never split - add as their own chunk if large
+        // Code blocks stay intact for syntax integrity — but only up to
+        // MAX_CHUNK_CHARS. Beyond that the chunk exceeds the embedding
+        // model's context window and the whole atom fails to embed, so
+        // oversized blocks are split at line boundaries and re-fenced.
         if block.block_type == BlockType::CodeBlock {
             if !current_chunk.is_empty() {
                 chunks.push(current_chunk.clone());
                 current_chunk = String::new();
             }
 
-            // Code blocks stay intact even if they exceed MAX_CHUNK_CHARS
-            // (intentional for syntax integrity)
             if block_len > MAX_CHUNK_CHARS {
-                chunks.push(block.content);
+                chunks.extend(split_code_block(&block.content, MAX_CHUNK_CHARS));
             } else if block_len > TARGET_CHUNK_CHARS {
                 chunks.push(block.content);
             } else {
@@ -688,6 +763,95 @@ print("second")
         for split in &splits {
             assert!(split.len() <= 10 || split.len() <= "ñ".len()); // May slightly exceed due to char boundary
         }
+    }
+
+    #[test]
+    fn test_split_code_block_refences_pieces() {
+        let body: Vec<String> = (0..2000).map(|i| format!("println!(\"line {i}\");")).collect();
+        let content = format!("```rust\n{}\n```", body.join("\n"));
+        assert!(content.len() > MAX_CHUNK_CHARS);
+
+        let pieces = split_code_block(&content, MAX_CHUNK_CHARS);
+
+        assert!(pieces.len() > 1, "oversized block should split");
+        for piece in &pieces {
+            assert!(piece.len() <= MAX_CHUNK_CHARS, "piece exceeds max: {}", piece.len());
+            assert!(piece.starts_with("```rust\n"), "piece keeps the language fence");
+            assert!(piece.ends_with("\n```"), "piece is re-terminated");
+        }
+
+        // No line lost or reordered by the split.
+        let mut reassembled: Vec<&str> = Vec::new();
+        for piece in &pieces {
+            let inner = piece
+                .strip_prefix("```rust\n")
+                .unwrap()
+                .strip_suffix("\n```")
+                .unwrap();
+            reassembled.extend(inner.lines());
+        }
+        let original: Vec<&str> = body.iter().map(String::as_str).collect();
+        assert_eq!(reassembled, original);
+    }
+
+    #[test]
+    fn test_split_code_block_hard_splits_giant_line() {
+        // A single line with no boundaries (minified JS, base64 blob)
+        let line = "x".repeat(3 * MAX_CHUNK_CHARS);
+        let content = format!("```\n{line}\n```");
+
+        let pieces = split_code_block(&content, MAX_CHUNK_CHARS);
+
+        assert!(pieces.len() >= 3);
+        let mut total_body = 0;
+        for piece in &pieces {
+            assert!(piece.len() <= MAX_CHUNK_CHARS);
+            total_body += piece
+                .strip_prefix("```\n")
+                .unwrap()
+                .strip_suffix("\n```")
+                .unwrap()
+                .len();
+        }
+        assert_eq!(total_body, line.len(), "hard split must not drop characters");
+    }
+
+    #[test]
+    fn test_code_block_between_target_and_max_stays_intact() {
+        let body = "let x = 0;\n".repeat(320); // ~3.5KB: above TARGET, below MAX
+        let content = format!("```rust\n{body}```");
+        assert!(content.len() > TARGET_CHUNK_CHARS && content.len() <= MAX_CHUNK_CHARS);
+
+        let chunks = chunk_content(&content);
+
+        assert_eq!(chunks.len(), 1, "code blocks under MAX stay whole");
+    }
+
+    #[test]
+    fn test_issue_197_oversized_code_block_stays_embeddable() {
+        // Regression for issue #197: an RSS-ingested mailing-list post whose
+        // body is one giant fenced code block (~72KB) became a single ~68KB
+        // chunk, exceeding the embedding model's context window and failing
+        // embedding for the whole atom.
+        let body_line = "static const struct option long_options[] = { /* ... */ };";
+        let lines = vec![body_line; 1200].join("\n");
+        let content = format!("Advisory intro text.\n\n```c\n{lines}\n```\n\nPowered by blists.");
+        assert!(content.len() > 60_000);
+
+        let chunks = chunk_content(&content);
+
+        for chunk in &chunks {
+            // +2 accounts for the "\n\n" joining a chunk to its overlap.
+            assert!(
+                chunk.len() <= MAX_CHUNK_CHARS + OVERLAP_CHARS + 2,
+                "chunk of {} chars would exceed the embedding context window",
+                chunk.len()
+            );
+        }
+        assert!(
+            chunks.iter().filter(|c| c.contains(body_line)).count() > 1,
+            "the code should survive, spread across multiple chunks"
+        );
     }
 
     #[test]
