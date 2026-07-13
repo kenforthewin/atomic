@@ -795,8 +795,16 @@ pub struct TickOutcome {
     pub polled: usize,
     /// Jobs admitted into pools this tick.
     pub scheduled: usize,
+    /// Jobs seen but not admitted this tick: atom-limit-gate deferrals plus
+    /// items parked by pool saturation. Nothing is lost — the durable
+    /// ledger rows re-derive next tick; this is the backpressure signal
+    /// (metrics: `dispatcher_jobs_deferred_total`).
+    pub deferred: usize,
     /// Hints cleared because the tenant's ledgers were empty.
     pub hints_cleared: usize,
+    /// Whether this tick's candidate scan covered every active account
+    /// (the slow full scan — scaling doc #2's load driver).
+    pub full_scan: bool,
     /// Worker tasks spawned this tick.
     pub handles: Vec<JoinHandle<()>>,
 }
@@ -815,6 +823,10 @@ pub struct Dispatcher {
     /// gate (test dispatchers that aren't exercising quota enforcement);
     /// production always supplies it via [`Dispatcher::new`].
     plan_registry: Option<Arc<PlanRegistry>>,
+    /// Metrics sink, updated at tick end and worker settle. `None` (test
+    /// dispatchers) makes every update a no-op; `serve` always attaches the
+    /// process registry via [`Dispatcher::with_metrics`].
+    metrics: Option<Arc<crate::metrics::MetricsRegistry>>,
     config: DispatcherConfig,
     last_slow_scan: Mutex<Option<Instant>>,
 }
@@ -857,6 +869,7 @@ impl Dispatcher {
             pools: Arc::new(WorkerPools::new(config.pools)),
             executor,
             plan_registry: None,
+            metrics: None,
             config,
             last_slow_scan: Mutex::new(None),
         }
@@ -869,6 +882,14 @@ impl Dispatcher {
     /// finite-limit registry to exercise the defer behavior.
     pub fn with_plan_registry(mut self, plan_registry: Arc<PlanRegistry>) -> Self {
         self.plan_registry = Some(plan_registry);
+        self
+    }
+
+    /// Attach the process metrics registry: tick end records durations and
+    /// deferral counts, worker settle records executions (see
+    /// [`crate::metrics`]). Absent, every update site is a no-op.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -906,10 +927,16 @@ impl Dispatcher {
     /// logged and skipped per tenant — a broken tenant (or a control-plane
     /// hiccup) must not stall everyone else.
     pub async fn tick(&self) -> TickOutcome {
+        let started = Instant::now();
+        // Captured before the scan consumes the marker, so the tick-end
+        // metrics know whether this tick's poll count was fleet-wide.
+        let full_scan_due = self.slow_scan_due();
         let mut outcome = TickOutcome {
             polled: 0,
             scheduled: 0,
+            deferred: 0,
             hints_cleared: 0,
+            full_scan: false,
             handles: Vec::new(),
         };
 
@@ -917,9 +944,13 @@ impl Dispatcher {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "[dispatcher] candidate scan failed; skipping tick");
+                self.record_tick_metrics(started, &outcome);
                 return outcome;
             }
         };
+        // The scan succeeded, so a due full scan actually ran (the marker
+        // is consumed inside `scan_candidates` only on success).
+        outcome.full_scan = full_scan_due;
         let held = self.held_accounts(&candidates).await;
 
         // Poll candidates with bounded concurrency: one wedged or slow tenant
@@ -948,6 +979,7 @@ impl Dispatcher {
 
         while let Some(result) = polls.next().await {
             outcome.polled += 1;
+            outcome.deferred += result.deferred;
             if result.hint_cleared {
                 outcome.hints_cleared += 1;
             }
@@ -959,8 +991,26 @@ impl Dispatcher {
 
         let (scheduled, handles) = self.drain(&mut queues).await;
         outcome.scheduled = scheduled;
+        // Whatever drain parked (pool saturation) waits for the next tick's
+        // re-derive — count it with the atom-gate deferrals above.
+        outcome.deferred += queues.iter().map(|q| q.items.len()).sum::<usize>();
         outcome.handles = handles;
+        self.record_tick_metrics(started, &outcome);
         outcome
+    }
+
+    /// Tick-end metrics update (no-op without a registry). Split out so the
+    /// scan-failure early return records the tick too — a control-plane
+    /// outage must not freeze the tick-duration gauge at a healthy value.
+    fn record_tick_metrics(&self, started: Instant, outcome: &TickOutcome) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_dispatcher_tick(
+                started.elapsed(),
+                outcome.full_scan,
+                outcome.polled,
+                outcome.deferred,
+            );
+        }
     }
 
     /// Poll one (non-held) candidate and run its hint lifecycle, returning
@@ -1022,11 +1072,12 @@ impl Dispatcher {
         // skipped: it doesn't grow the count, and stalling it would strand
         // the very pipeline that lets a user get back under the limit.
         let mut poll = poll;
+        let mut deferred = 0;
         if poll.items.iter().any(WorkItem::creates_atoms) && self.over_atom_limit(&account_id).await
         {
             let before = poll.items.len();
             poll.items.retain(|item| !item.creates_atoms());
-            let deferred = before - poll.items.len();
+            deferred = before - poll.items.len();
             tracing::info!(
                 account_id,
                 deferred,
@@ -1082,6 +1133,7 @@ impl Dispatcher {
         CandidatePoll {
             queue,
             hint_cleared,
+            deferred,
         }
     }
 
@@ -1138,6 +1190,7 @@ impl Dispatcher {
         let executor = Arc::clone(&self.executor);
         let control = self.control.clone();
         let cache = Arc::clone(&self.cache);
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             // Held for the full execution; releases the class + tenant
             // slots on drop (including panic/cancellation).
@@ -1175,6 +1228,12 @@ impl Dispatcher {
                 }
             }
             if work_ran {
+                // The execution settled (success or ledger-settled failure)
+                // — the metrics' "executed" event. `Skipped` never counts:
+                // a lost claim is a peer pod's execution, not this one's.
+                if let Some(metrics) = &metrics {
+                    metrics.record_job_executed();
+                }
                 // Promote the no-touch dispatch resolve to a real touch:
                 // executed work is legitimate tenant activity, so the entry
                 // (pools, event channel) stays warm while work flows instead
@@ -1454,6 +1513,9 @@ impl Dispatcher {
 struct CandidatePoll {
     queue: Option<TenantQueue>,
     hint_cleared: bool,
+    /// Items the atom-limit gate held back this tick (folded into
+    /// [`TickOutcome::deferred`]).
+    deferred: usize,
 }
 
 impl CandidatePoll {
@@ -1462,6 +1524,7 @@ impl CandidatePoll {
         Self {
             queue: None,
             hint_cleared: false,
+            deferred: 0,
         }
     }
 }

@@ -47,6 +47,7 @@ pub mod fleet_migration;
 pub mod keyvault;
 pub mod magic_links;
 pub mod managed_keys;
+pub mod metrics;
 pub mod oauth_routes;
 pub mod oauth_store;
 pub mod plans;
@@ -65,7 +66,7 @@ pub mod spa;
 pub mod tenant_plane;
 pub mod tokens;
 
-pub use account_cache::{AccountCache, AccountCacheConfig, TenantHandle};
+pub use account_cache::{AccountCache, AccountCacheConfig, CacheStats, TenantHandle};
 pub use account_plane::{
     AccountPlane, AccountPlaneConfig, RateLimits, TrialPolicy, DEFAULT_MAX_CONCURRENT_PROVISIONS,
     SESSION_TTL,
@@ -92,9 +93,9 @@ pub use billing::dunning::{
     advance_dunning, advance_dunning_with, advance_expired_trials, apply_payment_failed,
     apply_payment_failed_on_conn, apply_payment_succeeded, apply_payment_succeeded_on_conn,
     apply_subscription_deleted, apply_subscription_deleted_on_conn, apply_subscription_event,
-    apply_subscription_event_on_conn, billing_state_from_column, claim_webhook_event,
-    claim_webhook_event_on_conn, expired_trials, finish_expired_trial, link_stripe_customer,
-    claim_trial_warnings, reconcile_managed_key_limit, release_webhook_event, reset_trial_warning,
+    apply_subscription_event_on_conn, billing_state_from_column, claim_trial_warnings,
+    claim_webhook_event, claim_webhook_event_on_conn, expired_trials, finish_expired_trial,
+    link_stripe_customer, reconcile_managed_key_limit, release_webhook_event, reset_trial_warning,
     start_trial, BillingState, DunningAdvance, DunningThresholds, TrialAdvance, TrialDowngraded,
     TrialWarning, DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_TRIAL_DAYS,
     DEFAULT_TRIAL_WARNING_LEAD_DAYS, READ_ONLY_AFTER_DAYS, SUSPENDED_AFTER_DAYS,
@@ -144,6 +145,7 @@ pub use magic_links::{
 pub use managed_keys::{
     default_managed_model_config, ManagedKeyConfig, ManagedKeys, DEFAULT_MONTHLY_ALLOWANCE_CENTS,
 };
+pub use metrics::{configure_metrics_app, MetricsRegistry, MetricsState, PROMETHEUS_CONTENT_TYPE};
 pub use oauth_routes::OAuthPlane;
 pub use oauth_store::{
     consume_oauth_code, create_oauth_client, get_oauth_client, insert_oauth_code,

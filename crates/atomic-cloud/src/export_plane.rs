@@ -75,6 +75,16 @@ impl TenantExportPlane {
         })
     }
 
+    /// Jobs currently queued or running across every account's manager —
+    /// the metrics scrape's exports gauge (scaling doc #5: export
+    /// artifacts share the data volume). Poisoned locks read as 0.
+    pub(crate) fn active_job_count(&self) -> usize {
+        self.managers
+            .lock()
+            .map(|managers| managers.values().map(ExportJobManager::active_jobs).sum())
+            .unwrap_or(0)
+    }
+
     /// The requesting account's manager, created on first use.
     fn for_account(&self, account_id: &str) -> Result<ExportJobManager, AtomicCoreError> {
         let mut managers = self

@@ -6,6 +6,15 @@
 #                encrypted DO volume
 #   atomic-cloud the pod image (cloud.dockerfile)
 #
+# Plus an opt-in monitoring profile (COMPOSE_PROFILES=monitoring in .env;
+# runbook: MONITORING.md) that ships metrics to Grafana Cloud:
+#   grafana-alloy      scrapes the pod's internal /metrics, postgres-exporter,
+#                      and its own host (node) exporter; remote_writes to
+#                      Grafana Cloud (config: alloy/config.alloy)
+#   postgres-exporter  Postgres metrics (connections, autovacuum, per-DB sizes)
+# Without the profile, `docker compose up` starts exactly the three services
+# above and the monitoring services are inert.
+#
 # The app connects to Postgres DIRECTLY, no pgbouncer: the provisioning /
 # migration / backup paths hold session advisory locks, which transaction
 # pooling breaks (verified: provisioning hangs — see DEPLOY.md §6). At
@@ -87,6 +96,57 @@ services:
       # Direct to Postgres (see header note); no sslmode on a same-host bridge.
       ATOMIC_CLOUD_CONTROL_URL: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/atomic_cloud_control
       ATOMIC_CLOUD_CLUSTER_URL: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/postgres
+    # The internal metrics listener (ATOMIC_CLOUD_METRICS_BIND in .env; off
+    # when unset). expose: documents the port on the compose network WITHOUT
+    # publishing it on the host — grafana-alloy scrapes it, the internet
+    # (and tenants) cannot reach it. Never move this to ports:.
+    expose:
+      - "9464"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── monitoring profile (COMPOSE_PROFILES=monitoring; see MONITORING.md) ──
+
+  grafana-alloy:
+    profiles: ["monitoring"]
+    # :latest because the operator enables this profile interactively (it is
+    # never started by an unattended deploy); pin to the tag you verified
+    # once the stack is up.
+    image: grafana/alloy:latest
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+    environment:
+      # Deliberately ${VAR:-} (not :?): compose interpolates the WHOLE file
+      # before profiles apply, so a hard-required var here would break
+      # `docker compose up` for deployments that never enable monitoring.
+      # alloy fails loudly at start when they're empty — but only for
+      # operators who opted into the profile.
+      GRAFANA_CLOUD_PROM_URL: ${GRAFANA_CLOUD_PROM_URL:-}
+      GRAFANA_CLOUD_PROM_USER: ${GRAFANA_CLOUD_PROM_USER:-}
+      GRAFANA_CLOUD_API_KEY: ${GRAFANA_CLOUD_API_KEY:-}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy
+      # Host (node-exporter-style) metrics via alloy's unix exporter: the
+      # scaling doc's disk/CPU/RAM signals (#5, #8). Read-only mounts.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+    depends_on:
+      - atomic-cloud
+      - postgres-exporter
+
+  postgres-exporter:
+    profiles: ["monitoring"]
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    restart: unless-stopped
+    environment:
+      # Same-host bridge, same no-sslmode rationale as the pod's URLs above.
+      DATA_SOURCE_NAME: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
@@ -94,3 +154,4 @@ services:
 volumes:
   caddy-data:
   caddy-config:
+  alloy-data:

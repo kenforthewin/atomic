@@ -309,6 +309,19 @@ enum Command {
             default_value_t = atomic_cloud::DEFAULT_BACKUP_TIMEOUT.as_secs()
         )]
         backup_timeout_secs: u64,
+
+        /// Bind address for the INTERNAL Prometheus metrics listener
+        /// (`GET /metrics`), e.g. `127.0.0.1:9464`. A SEPARATE HTTP listener
+        /// in the same process — the metrics surface is never registered on
+        /// the public tenant/app listener, so no route-table mistake or auth
+        /// bug can expose it to tenants. Unset (the default) disables the
+        /// listener entirely. In the compose deployment bind `0.0.0.0:9464`
+        /// and expose the port on the compose network only (`expose:`, never
+        /// `ports:`): the docker network is the boundary — the scraper
+        /// (grafana-alloy) reaches it, the internet cannot. See
+        /// deploy/MONITORING.md.
+        #[arg(long, env = "ATOMIC_CLOUD_METRICS_BIND")]
+        metrics_bind: Option<String>,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -1427,6 +1440,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_backups_per_pass,
             backup_staleness_secs,
             backup_timeout_secs,
+            metrics_bind,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
@@ -1598,6 +1612,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 std::time::Duration::from_secs(backup_interval_secs.max(1)),
                 spa_dir,
                 product_dir,
+                metrics_bind,
             )
             .await
         }
@@ -2205,7 +2220,13 @@ async fn serve(
     backup_interval: std::time::Duration,
     spa_dir: std::path::PathBuf,
     product_dir: Option<std::path::PathBuf>,
+    metrics_bind: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Process metrics registry (see atomic_cloud::metrics). Built
+    // unconditionally — the update sites are a handful of atomics either
+    // way — while the internal /metrics listener below only binds when
+    // --metrics-bind is set.
+    let metrics = Arc::new(atomic_cloud::MetricsRegistry::new());
     // Sweep at least as often as the background-fault TTL: the dispatcher's
     // full scan relies on its no-work faults leaving the cache near that
     // short TTL (scaling doc #2), which only holds if sweeps run at that
@@ -2297,6 +2318,7 @@ async fn serve(
         Arc::clone(&backup_store),
         backup_config,
         backup_interval,
+        Arc::clone(&metrics),
     ));
 
     // Deploy gate (plan: "Schema migration on deploy"): boot in migrating
@@ -2511,6 +2533,9 @@ async fn serve(
     // path's plan catalogue so its atom-limit gate on atom-creating
     // background work reads the same limits the data-plane quota guard does.
     let dispatcher_plan_registry = quota_billing.plan_registry.clone().into_inner();
+    // The dispatcher's worker pools, held for the metrics scrape (in-flight
+    // vs cap per class); absent exactly when the dispatcher is disabled.
+    let mut worker_pools = None;
     match dispatcher_config {
         Some(config) => {
             tracing::info!(
@@ -2520,8 +2545,10 @@ async fn serve(
             );
             let dispatcher = Arc::new(
                 Dispatcher::new(control.clone(), Arc::clone(&cache), config)
-                    .with_plan_registry(dispatcher_plan_registry),
+                    .with_plan_registry(dispatcher_plan_registry)
+                    .with_metrics(Arc::clone(&metrics)),
             );
+            worker_pools = Some(Arc::clone(dispatcher.pools()));
             tokio::spawn(dispatcher.run_loop());
         }
         None => {
@@ -2530,6 +2557,34 @@ async fn serve(
                  will not run in this process; tenant pipelines execute inline"
             );
         }
+    }
+
+    // Internal metrics listener (scaling doc: "The recurring remediation is
+    // monitoring"). A SEPARATE HTTP server in this process: the public
+    // listener below never registers /metrics, so tenants can't reach the
+    // ops surface through any host or route-table mistake; the scraper
+    // reaches this port over the docker network only.
+    if let Some(bind) = &metrics_bind {
+        let metrics_state = atomic_cloud::MetricsState {
+            registry: Arc::clone(&metrics),
+            cache: Arc::clone(&cache),
+            control: control.clone(),
+            pools: worker_pools,
+            tenant_plane: tenant_plane.clone(),
+        };
+        let metrics_server = HttpServer::new(move || {
+            App::new().configure(atomic_cloud::configure_metrics_app(metrics_state.clone()))
+        })
+        // One worker is ample for a scrape every 15-60s, and keeps the
+        // listener from competing with serving for accept threads.
+        .workers(1)
+        .bind(bind.as_str())?
+        .run();
+        tracing::info!(
+            bind,
+            "metrics listener on http://{bind}/metrics (internal only)"
+        );
+        tokio::spawn(metrics_server);
     }
 
     // Must outlive the server: it owns the scratch directory backing the
@@ -2700,6 +2755,7 @@ async fn run_backup_loop(
     store: Arc<dyn atomic_cloud::BackupStore>,
     mut config: atomic_cloud::BackupConfig,
     interval: std::time::Duration,
+    metrics: Arc<atomic_cloud::MetricsRegistry>,
 ) {
     // The CLI interval is the *cadence* a tenant is held to; the loop ticks
     // much faster and lets the due-filter do the work.
@@ -2719,12 +2775,22 @@ async fn run_backup_loop(
         ticker.tick().await;
         let now = chrono::Utc::now();
         let include_control = last_control_dump_date != Some(now.date_naive());
-        let summary =
-            atomic_cloud::run_backup_pass(&control, &cluster, &store, &config, now, include_control)
-                .await;
+        let summary = atomic_cloud::run_backup_pass(
+            &control,
+            &cluster,
+            &store,
+            &config,
+            now,
+            include_control,
+        )
+        .await;
         if summary.control_backed_up {
             last_control_dump_date = Some(now.date_naive());
         }
+        // Pass-end metrics (the natural site): last-pass counts, and the
+        // success stamp behind the backup-age gauge — the alertable version
+        // of the staleness log below (launch week's silent stall).
+        metrics.record_backup_pass(&summary, now);
         if summary.is_quiet() {
             tracing::debug!("backup pass: nothing to do");
         } else {
@@ -2737,6 +2803,7 @@ async fn run_backup_loop(
         // error level so it pages, not just logs.
         match atomic_cloud::stale_tenant_backups(&control, config.staleness_horizon).await {
             Ok(stale) if !stale.is_empty() => {
+                metrics.record_backup_staleness(stale.len());
                 for tenant in &stale {
                     tracing::error!(
                         account_id = tenant.account_id,
@@ -2750,7 +2817,15 @@ async fn run_backup_loop(
                     );
                 }
             }
-            Ok(_) => {}
+            Ok(_) => metrics.record_backup_staleness(0),
+            // Deliberately NOT record_backup_staleness here: a failed check
+            // must leave the check stamp behind, so its age gauge
+            // (atomic_cloud_backup_staleness_check_age_seconds) grows past
+            // the alert threshold. The log line alone is invisible in
+            // production — logs are not shipped (MONITORING.md) — and the
+            // stale-tenants gauge would otherwise freeze at its last
+            // healthy value while the only clean-but-skipping-pass signal
+            // is broken.
             Err(e) => tracing::error!(error = %e, "backup staleness check failed"),
         }
     }

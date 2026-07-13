@@ -93,6 +93,7 @@
 //! and any lost race, converges on the next authenticated request.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -285,6 +286,22 @@ pub struct AccountCache {
     vault: Arc<dyn KeyVault>,
     config: AccountCacheConfig,
     inner: Mutex<Inner>,
+    /// Entries evicted since construction — idle sweep, hard cap, and the
+    /// deletion path's explicit [`Self::evict`] all count. Monotonic, read
+    /// by the metrics scrape ([`Self::stats`]); relaxed ordering is enough
+    /// for an independent statistic.
+    evictions: AtomicU64,
+}
+
+/// One scrape's view of the cache (see [`AccountCache::stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Entries promoted to the serving TTL (real tenant traffic or work).
+    pub serving: usize,
+    /// Unpromoted background-dispatch faults on the short TTL.
+    pub background: usize,
+    /// Entries evicted since the cache was built.
+    pub evictions: u64,
 }
 
 impl AccountCache {
@@ -303,6 +320,7 @@ impl AccountCache {
             vault,
             config,
             inner: Mutex::new(Inner::default()),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -564,7 +582,11 @@ impl AccountCache {
     /// apply — deletion outranks an open WebSocket, and dropping the
     /// entry's `Sender` is exactly what severs those sessions.
     pub async fn evict(&self, account_id: &str) -> bool {
-        self.inner.lock().await.entries.remove(account_id).is_some()
+        let removed = self.inner.lock().await.entries.remove(account_id).is_some();
+        if removed {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Run the idle-TTL sweep now. The same pass runs inline whenever a
@@ -588,6 +610,38 @@ impl AccountCache {
         self.inner.lock().await.entries.contains_key(account_id)
     }
 
+    /// One consistent snapshot of residency (by kind) and the eviction
+    /// counter, for the metrics scrape (scaling doc #2's cache signals).
+    pub async fn stats(&self) -> CacheStats {
+        let inner = self.inner.lock().await;
+        let background = inner.entries.values().filter(|e| e.background).count();
+        CacheStats {
+            serving: inner.entries.len() - background,
+            background,
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Open tenant-pool connections summed across every cached entry — the
+    /// pod's share of the cluster's `max_connections` budget (scaling doc
+    /// #1). Manager handles are cloned out under the lock and sampled
+    /// outside it, so a scrape never stalls serving on pool internals.
+    pub async fn tenant_pool_connections(&self) -> u64 {
+        let managers: Vec<Arc<DatabaseManager>> = {
+            let inner = self.inner.lock().await;
+            inner
+                .entries
+                .values()
+                .map(|e| Arc::clone(&e.manager))
+                .collect()
+        };
+        managers
+            .iter()
+            .filter_map(|manager| manager.postgres_pool_status())
+            .map(|(size, _idle)| u64::from(size))
+            .sum()
+    }
+
     /// The idle TTL `entry` is currently living on: the full serving TTL,
     /// or — while the entry is an unpromoted background fault — the short
     /// background TTL, capped by the serving TTL so a background fault
@@ -603,9 +657,12 @@ impl AccountCache {
     /// Idle-TTL pass: drop entries untouched past their TTL, keeping any
     /// with live WebSocket subscribers.
     fn sweep_locked(&self, inner: &mut Inner) {
+        let before = inner.entries.len();
         inner
             .entries
             .retain(|_, e| !e.evictable() || e.last_touched.elapsed() <= self.ttl_of(e));
+        self.evictions
+            .fetch_add((before - inner.entries.len()) as u64, Ordering::Relaxed);
     }
 
     /// Hard-cap pass, run before inserting a new entry: evict the evictable
@@ -625,6 +682,7 @@ impl AccountCache {
             match victim {
                 Some(id) => {
                     inner.entries.remove(&id);
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
                 }
                 None => break,
             }

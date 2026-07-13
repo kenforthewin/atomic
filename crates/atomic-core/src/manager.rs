@@ -169,6 +169,24 @@ impl DatabaseManager {
         self.database_url.is_some()
     }
 
+    /// The shared Postgres pool's `(open, idle)` connection counts —
+    /// metrics instrumentation (atomic-cloud sums this across its cached
+    /// tenants against the cluster's `max_connections` budget). `None` on
+    /// SQLite storage (no server-side pool) or before any core is loaded.
+    /// Synchronous and lock-light: one core-map read plus sqlx counter
+    /// reads, safe to call from a scrape path.
+    #[cfg(feature = "postgres")]
+    pub fn postgres_pool_status(&self) -> Option<(u32, usize)> {
+        let core = self.any_core().ok()?;
+        match core.storage() {
+            crate::storage::StorageBackend::Postgres(pg) => {
+                let pool = pg.pool();
+                Some((pool.size(), pool.num_idle()))
+            }
+            _ => None,
+        }
+    }
+
     /// Migrate a local SQLite database file into this manager's Postgres
     /// backend as a brand-new logical database. See [`crate::migrate`] for
     /// what is copied, what is regenerated, and the failure semantics.

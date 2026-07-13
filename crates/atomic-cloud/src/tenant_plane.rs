@@ -368,6 +368,12 @@ impl TenantPlane {
         self.state.managed.clone()
     }
 
+    /// Export jobs currently queued or running across all accounts — the
+    /// metrics listener's exports gauge (see [`crate::metrics`]).
+    pub fn active_export_jobs(&self) -> usize {
+        self.exports.active_job_count()
+    }
+
     /// Build the plane over the same control plane, cluster, vault, and
     /// cache the rest of the composition serves from.
     pub fn new(
@@ -1597,10 +1603,7 @@ async fn create_token_route(
     let name = body.into_inner().name;
     let name = name.trim();
     if name.is_empty() || name.len() > 100 {
-        return bad_request(
-            "invalid_token_name",
-            "Token name must be 1-100 characters.",
-        );
+        return bad_request("invalid_token_name", "Token name must be 1-100 characters.");
     }
 
     match crate::tokens::issue_token(

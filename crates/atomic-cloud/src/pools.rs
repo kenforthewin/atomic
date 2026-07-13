@@ -52,6 +52,17 @@ impl WorkClass {
         WorkClass::Ingestion,
         WorkClass::Maintenance,
     ];
+
+    /// Stable lowercase name, used as the `class` metric label. Renaming a
+    /// value here breaks dashboard queries — treat as an API.
+    pub fn label(&self) -> &'static str {
+        match self {
+            WorkClass::Embedding => "embedding",
+            WorkClass::Llm => "llm",
+            WorkClass::Ingestion => "ingestion",
+            WorkClass::Maintenance => "maintenance",
+        }
+    }
 }
 
 /// One class's caps: total in-flight per pod, and in-flight per tenant.
@@ -241,6 +252,12 @@ impl WorkerPools {
     pub fn total_in_flight(&self, class: WorkClass) -> usize {
         let pool = &self.classes[&class];
         pool.caps.total.max(1) - pool.total.available_permits()
+    }
+
+    /// The configured caps for `class` (metrics: in-flight vs cap on one
+    /// dashboard panel).
+    pub fn caps(&self, class: WorkClass) -> PoolCaps {
+        self.classes[&class].caps
     }
 }
 

@@ -100,6 +100,25 @@ impl ExportJobManager {
         Self::new(export_dir).expect("failed to create test export manager")
     }
 
+    /// Jobs currently queued or running — metrics instrumentation (export
+    /// artifacts share the data volume, so in-flight exports are a disk
+    /// signal). A poisoned lock reads as 0 rather than panicking a scrape.
+    pub fn active_jobs(&self) -> usize {
+        self.jobs
+            .lock()
+            .map(|jobs| {
+                jobs.values()
+                    .filter(|job| {
+                        matches!(
+                            job.state.lock().map(|s| s.status.clone()),
+                            Ok(ExportJobStatus::Queued | ExportJobStatus::Running)
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub async fn start_markdown_export(
         &self,
         manager: Arc<DatabaseManager>,

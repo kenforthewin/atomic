@@ -1,0 +1,67 @@
+// Grafana Alloy pipeline for the Atomic Cloud single-box stack.
+// Mounted read-only into the grafana-alloy service (docker-compose.yml,
+// monitoring profile). Operator runbook: ../MONITORING.md.
+//
+// Three scrape sources, one sink:
+//   - the pod's internal /metrics listener (atomic-cloud:9464 — compose
+//     network only, never published on the host)
+//   - postgres-exporter (connections vs max_connections, autovacuum,
+//     per-database sizes — scaling doc #1/#7)
+//   - alloy's built-in unix (node) exporter for host CPU/RAM/disk
+//     (scaling doc #5/#8; the host filesystem is mounted at /host/*)
+// remote_write to Grafana Cloud, credentials from the environment (the
+// compose file passes GRAFANA_CLOUD_* through from deploy/.env).
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_CLOUD_PROM_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_CLOUD_PROM_USER")
+      password = sys.env("GRAFANA_CLOUD_API_KEY")
+    }
+  }
+}
+
+// The pod. 30s is plenty for ops gauges and keeps Grafana Cloud's free-tier
+// active-series/DPM budget comfortable.
+prometheus.scrape "atomic_cloud" {
+  targets = [{
+    __address__ = "atomic-cloud:9464",
+    job         = "atomic-cloud",
+  }]
+  scrape_interval = "30s"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+// Postgres. The exporter's default port is 9187.
+prometheus.scrape "postgres" {
+  targets = [{
+    __address__ = "postgres-exporter:9187",
+    job         = "postgres",
+  }]
+  scrape_interval = "30s"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+// Host metrics (node-exporter equivalent), reading the host's /proc, /sys,
+// and root filesystem through the read-only mounts in docker-compose.yml.
+// The filesystem collector is the scaling doc's hard-wall signal: alert on
+// the data volume before Postgres hits ENOSPC.
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host/root"
+
+  filesystem {
+    // Container-runtime noise; the DO volume (mounted under /mnt on the
+    // host, /host/root/mnt here) stays included.
+    mount_points_exclude = "^/(dev|proc|sys|run|var/lib/docker/.+)($|/)"
+  }
+}
+
+prometheus.scrape "host" {
+  targets         = prometheus.exporter.unix.host.targets
+  scrape_interval = "30s"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
