@@ -125,9 +125,9 @@ services:
       # `docker compose up` for deployments that never enable monitoring.
       # alloy fails loudly at start when they're empty — but only for
       # operators who opted into the profile.
-      GRAFANA_CLOUD_PROM_URL: ${GRAFANA_CLOUD_PROM_URL:-}
-      GRAFANA_CLOUD_PROM_USER: ${GRAFANA_CLOUD_PROM_USER:-}
-      GRAFANA_CLOUD_API_KEY: ${GRAFANA_CLOUD_API_KEY:-}
+      GRAFANA_CLOUD_OTLP_URL: ${GRAFANA_CLOUD_OTLP_URL:-}
+      GRAFANA_CLOUD_OTLP_USER: ${GRAFANA_CLOUD_OTLP_USER:-}
+      GRAFANA_CLOUD_OTLP_TOKEN: ${GRAFANA_CLOUD_OTLP_TOKEN:-}
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
       - alloy-data:/var/lib/alloy

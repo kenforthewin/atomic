@@ -25,17 +25,20 @@ consumer is the `grafana-alloy` container on the same bridge network.
 
 1. **Create a Grafana Cloud stack** (free tier is ample at this scale):
    grafana.com → create account → create stack.
-2. **Collect the Prometheus push credentials**: stack → *Send Metrics*
-   (Prometheus) → note the push URL, the numeric username/instance id, and
-   create an access-policy token with `metrics:write`.
+2. **Collect the OTLP gateway credentials**: stack → *Send Metrics* →
+   OTLP card → note the gateway URL (the base ending in `/otlp`), the
+   stack/instance id (the basic-auth username), and create an
+   access-policy token with `metrics:write`. (Alloy converts the
+   Prometheus scrapes to OTLP in-process; same stored metrics, and the
+   OTLP card's credentials are the ones the integration flow hands out.)
 3. **Fill `deploy/.env`** (template comments in `.env.example`):
 
    ```
    COMPOSE_PROFILES=monitoring
    ATOMIC_CLOUD_METRICS_BIND=0.0.0.0:9464
-   GRAFANA_CLOUD_PROM_URL=…/api/prom/push
-   GRAFANA_CLOUD_PROM_USER=<numeric id>
-   GRAFANA_CLOUD_API_KEY=<token>
+   GRAFANA_CLOUD_OTLP_URL=https://otlp-gateway-<region>.grafana.net/otlp
+   GRAFANA_CLOUD_OTLP_USER=<stack id>
+   GRAFANA_CLOUD_OTLP_TOKEN=<glc_… token>
    ```
 
 4. **Redeploy**: `docker compose up -d` from `deploy/` (or the usual
