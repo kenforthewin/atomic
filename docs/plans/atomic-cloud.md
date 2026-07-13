@@ -2,15 +2,24 @@
 
 ## Status
 
-Living plan, iterating section by section. Sections marked **[drafted]** have
-been worked through; sections marked **[stub]** are placeholders for future
-deep dives. Decisions made so far are recorded in the "Decisions log" at the
-bottom — when you change one, update the log so future-us knows what shifted.
+**Launched.** Atomic Cloud is in production at `atomicapp.ai` (single-box
+topology: one DO droplet running caddy + postgres + the cloud pod, deployed
+via `deploy/`), with open signup, live Stripe billing (Pro $12/mo with
+$10/mo AI credits, 14-day trial of the paid tier, monthly only), managed AI
+on curated models, due-driven backups to object storage, and
+markdown-export egress. The first cohort of real accounts signed up
+2026-07-11; billing was exercised end-to-end (checkout, webhook, portal,
+refund) the same day.
 
-Implementation began 2026-06-10. Slice 1 (control plane, provisioning core,
-CloudAuth/AccountCache, composed cloud server + multi-tenant e2e suite) is on
-branch `cloud-control-plane`; see the **Implementation log** section for what
-landed, where it deviates from this plan, and what each slice deferred.
+This remains a living document. Sections marked **[drafted]** were designed
+here and are now largely shipped — where reality diverged, the section has
+been amended and the change recorded in the **Decisions log**; the
+**Implementation log** records what landed when. When you change a
+decision, update the log so future-us knows what shifted.
+
+Implementation began 2026-06-10; the frontloaded functional build-out
+(slices 1–9, all on merged branches) completed 2026-06-14; production
+deployment and launch hardening are recorded as slices 10–12.
 
 ## Context
 
@@ -607,18 +616,30 @@ Two pieces of shared infrastructure come with this:
 
 ### Model curation (managed mode)
 
-We pay for managed inference, so we pick the models:
+We pay for managed inference, so we pick the models. Shipped shape
+(`crates/atomic-cloud/src/curated_models.rs` is authoritative; the
+dashboard's picker mirrors it from `frontend/src/lib/models.ts`, kept in
+lockstep by a CI drift-guard test):
 
-- **The embedding model is pinned fleet-wide.** Not user-changeable:
-  switching embedding models invalidates every stored vector and triggers a
-  full re-embed billed to the platform.
-- Tagging, wiki, and chat run on a curated list of 2–3 cost-effective
-  models; users pick within the list.
-- Frontier-model access is a paid-tier feature flag (`plans.feature_flags`),
-  not a free-tier option.
+- **The embedding model is pinned fleet-wide** (`qwen/qwen3-embedding-8b`
+  at 1536 Matryoshka dims — the width every tenant's vector column is
+  created at). Not user-changeable: switching embedding models invalidates
+  every stored vector and triggers a full re-embed billed to the platform.
+- **Tagging is a fixed cheap utility model** (platform-owned, not
+  user-selectable); wiki/chat/reports run on a user-picked **agentic**
+  model from a plan-gated list — the free list, plus premium unlocks via
+  the `premium_models` feature flag.
+- **Curation criteria** (refresh 2026-07-12): every agentic entry must do
+  reliable multi-step tool calling on OpenRouter, be served by more than
+  one upstream (single-provider models have no routing escape hatch when
+  that upstream degrades), and price such that the plan's monthly
+  allowance buys real usage. Refresh the lists as model generations turn —
+  they froze at the 5.0 era for three months and the pro tier had no
+  headliner until the 2026-07 refresh.
 
 BYOK accounts choose models freely — their key, their bill. (An
-embedding-model switch still forces a full re-embed; warn loudly.)
+embedding-model switch still forces a full re-embed; the routes warn
+loudly, and a dimension-changing config is rejected outright.)
 
 ### Storage schema
 
@@ -955,11 +976,25 @@ Database-per-tenant makes per-tenant backup natural; hard-delete v1 makes it
 mandatory. Without this section, a reaper bug, a bad migration, or a
 fat-fingered delete confirmation is unrecoverable customer data loss.
 
-### v1: nightly logical dumps
+### v1: due-driven daily logical dumps
 
-- Nightly `pg_dump -Fc` per tenant database **plus the control plane**,
-  streamed to object storage (`backups/<date>/acct_<uuid>.dump`). Driven by
-  the same reaper/job-runner machinery, with a concurrency cap.
+*(Amended 2026-07-12 — the original "nightly pass on a jittered 24h timer"
+design starved itself during launch week: the loop slept a random
+0..=interval before its first pass, every deploy rerolled the timer, and
+backups silently stopped for 34 hours; day-one signups were never backed up
+at all. The staleness alert lived behind the same jitter, so the watchdog
+never ran either. Redesigned so process restarts are irrelevant.)*
+
+- `pg_dump -Fc` per tenant database **plus the control plane**, streamed to
+  object storage (`backups/<date>/acct_<uuid>.dump`), with a concurrency cap.
+- **Cadence, not schedule**: the pass runs every few minutes
+  (`BACKUP_TICK`, 5 min, ≤60s startup jitter) but is **due-driven** — it
+  dumps only tenants whose last successful backup is older than the cadence
+  (`--backup-interval-secs`, default 24h) or who have never been backed up,
+  so a new signup gets its first backup within minutes of provisioning and
+  a restart costs one tick, not a fresh day-scale timer. Quiet ticks write
+  no ledger row. The control-plane dump runs once per UTC day (per-day
+  idempotent key; a post-restart re-dump is a harmless overwrite).
 - Retention: 14 daily + 8 weekly. Bucket lifecycle rules, not custom code.
 - **Final dump on account deletion** — written to `backups/final/` with
   30-day retention before `DROP DATABASE` (step 4 of the deletion
@@ -970,7 +1005,11 @@ fat-fingered delete confirmation is unrecoverable customer data loss.
   AccountCache entry. Per-tenant restore never touches other tenants —
   that's the payoff of database-per-tenant.
 - **Monitoring** — alert when any tenant's last successful backup is >36h
-  old. An unmonitored backup job is a placebo.
+  old. An unmonitored backup job is a placebo. *(The staleness check now
+  runs on every tick, decoupled from whether a pass fires — during the
+  2026-07-12 incident the original design's alert was gated behind the same
+  jitter as the pass it was supposed to watch. External alerting on these
+  error-level logs is still the open monitoring item.)*
 
 ### Deferred
 
@@ -1571,17 +1610,109 @@ it (automated review can't fully judge "looks great").
 pass; per-page deep-linking polish and any marketing-grade landing content live
 on the separate `atomic-website`.
 
+### Slice 10 — model split, curation enforcement, production deployment (2026-06-15 → 2026-07-02)
+
+- **Tagging/agentic model split** (atomic-core): the utility model (tagging,
+  single-shot structured output) and the agentic model (wiki/chat/reports
+  tool loops) became distinct `ProviderConfig` slots, so cloud can pin the
+  former and tier-gate the latter.
+- **Curation enforcement**: `curated_models.rs` — pinned embedding model
+  (Qwen3-Embedding-8B at 1536, stored at uniform width), fixed tagging
+  model, free/pro agentic lists gated by `premium_models`, user writes
+  validated against the list, platform-owned config keys (base URLs)
+  unwritable (the key-exfiltration rule). The dashboard's model picker
+  mirrors the lists; a CI drift-guard test pins the mirror to the server
+  constants.
+- **Production deployment** (`deploy/`): single-box docker-compose topology
+  (caddy with wildcard DNS-01 TLS, pgvector postgres on an encrypted DO
+  volume, the pod image from `cloud-image.yml`), `deploy.sh` as the one
+  deploy path (rsyncs the local deploy dir — the local `.env` is the source
+  of truth), post-deploy health checks and boot-warning sweep. Cloud tenants
+  in the product frontend: same-origin cookie auth, control-plane-managed
+  settings tabs hidden, external-client setup flows replaced with pointers
+  to the account dashboard (and the export flows hidden — see slice 12's
+  export plane, which un-hid them).
+
+### Slice 11 — SQLite→Postgres migration ingress (2026-07-10, PR #220)
+
+- The migration engine copies a self-hosted SQLite database into a cloud
+  tenant (schema-mapped, per-table reports), exposed three ways: `migrate
+  sqlite` (direct copy), `migrate push` + server endpoints (push a local DB
+  to a remote Atomic server / cloud tenant over HTTP, token-authed, env:
+  `ATOMIC_MIGRATE_TARGET_TOKEN`), and the desktop app's Settings → "Migrate
+  to Cloud" tab driving the same flow.
+- Ingress only, by design — egress is the markdown export (slice 12), not a
+  reverse migration.
+
+### Slice 12 — launch & launch-week hardening (2026-07-11 → 2026-07-12)
+
+Go-live (2026-07-11):
+
+- **Stripe live**: product/price/webhook/portal configured against the live
+  account; `ATOMIC_CLOUD_STRIPE_*` env in the deploy `.env`. Two launch-day
+  bugs found by a real purchase and fixed: Stripe API 2025-03-31 moved
+  `current_period_{start,end}` to line items (parser now falls back
+  item-level), and checkout/portal return URLs pointed at the app host
+  where `/account/*` doesn't exist (now built from the tenant's subdomain).
+- **Trial lifecycle emails** (migration 021): claim-based exactly-once
+  warning 3 days before expiry (`trial_warning_sent_at` claimed via
+  UPDATE…RETURNING, cross-pod safe, re-armed on send failure) and a
+  markerless downgrade notice; email-only by decision — no cloud popups in
+  the shared product frontend.
+- **Marketing/docs seam**: website cloud overhaul (landing CTA → cloud,
+  `/cloud` pricing page, terms, rewritten privacy) and the cloud manual
+  section (`docs/manual/cloud/`, synced to the website build from the
+  atomic repo's main).
+
+Launch-week hardening (2026-07-12), each item found in production:
+
+- **Embedding latency**: OpenRouter's default price-sorted routing kept
+  landing qwen3-embedding-8b requests on a pathological upstream (13–80s;
+  the healthy upstreams answer in ~0.5s). All OpenRouter embedding requests
+  now send `provider: {sort: "latency"}` — self-healing, no upstream pinned
+  by name, and vector-space-friendlier (sticks to one upstream).
+- **Curated model refresh** (2026-07 generation): free = gpt-5-mini
+  (default) + gemini-3.1-flash-lite; pro adds claude-sonnet-5 (headliner),
+  gpt-5.6-terra, z-ai/glm-5.2 (open-weight value). Curation criteria
+  recorded on the constant (multi-upstream serving is now a requirement —
+  the embedding incident taught why).
+- **Query observability**: `pg_stat_statements` + `track_io_timing` on the
+  tenant cluster. Its first catch: the canvas rebuild loaded every chunk
+  embedding (~90MB/rebuild, 3× per feed poll). Fixed with pgvector's
+  `avg()` aggregate (per-atom mean computed in SQL, ~9× less transfer) and
+  a 15s debounce (one rebuild per burst): ~11× less DB load.
+- **Tenant export plane** (`export_plane.rs`): the export family had been
+  deliberately unrouted (process-global job namespace = cross-tenant risk)
+  with a "later slice" note — which made the always-exportable promise
+  false on cloud. Now: one `ExportJobManager` per account, per-account
+  artifact dirs, the four product-app routes registered ahead of
+  `api_scope` (token-plane pattern), job ids resolving only within the
+  requesting account (foreign ids 404 — e2e-pinned), export start/delete
+  exempt from the read-only write-block (read-only ≠ hostage), and the
+  frontend un-gated (empty-baseUrl same-origin download fixed). Verified
+  against production: full-tenant export, valid zip, cross-tenant 404s.
+- **Backups redesign** (due-driven; see the amended Backups section): the
+  jittered-nightly design silently stopped 2026-07-11 under launch-week
+  deploy frequency; caught by eyeball 34h later, root-caused, redesigned,
+  and verified (first due-driven pass backfilled all 7 tenants, 7/7
+  succeeded).
+
+The recurring lesson of the week: three separate faults (slow embeddings,
+dead backups, missing egress) were each invisible until a human looked.
+External monitoring/alerting (Grafana Cloud tier + uptime checks on
+`/health` + Mailgun delivery) is the top open operational item.
+
 ## Open questions (carried across sections)
 
-- **Free tier shape & abuse model.** Open free signup needs CAPTCHA +
-  rate-limited token issuance — and with managed keys, free signups are
-  platform-funded inference, so per-account allowances cap the blast radius
-  but mass signup is the residual vector. Invite-only beta sidesteps all of
-  this *and* defers the entire billing build; strongly consider it as the
-  launch shape.
+- **Free tier shape & abuse model.** ~~Invite-only beta as launch shape?~~
+  **Resolved (launch, 2026-07-11): open signup** with per-account managed
+  allowances as the blast-radius cap and signup rate limiting; every new
+  account starts on a 14-day paid-tier trial, then downgrades to free.
+  Mass-signup abuse remains the residual vector to watch.
 - **Email deliverability.** Magic-link-only auth makes it critical-path
-  (decided 2026-05-25). Mailgun client exists in the prototype crate;
-  domain warmup, SPF/DKIM, and a bounce strategy still need an owner.
+  (decided 2026-05-25). Mailgun is live in production (magic links, trial
+  lifecycle notices) with SPF/DKIM configured; delivery-rate monitoring
+  and a bounce strategy still need an owner.
 - **MCP token default scope.** ~~Account-wide vs per-KB.~~ **Resolved (slice
   7): account scope.** Tokens minted by the cloud OAuth consent flow default
   to `account` scope (full access to the account's KBs, `allowed_db_id =
@@ -1612,21 +1743,32 @@ on the separate `atomic-website`.
 - **Master OpenRouter account ops.** Auto-top-up threshold, balance
   alerting, and what happens to tenants in the minutes after the balance
   hits zero (presumably 402s → circuit breakers → recovery on top-up; verify).
-- **Included-credit sizing per tier.** Free placeholder is $0.50/mo; paid
-  tiers need allowance numbers that keep "allowance < price" with margin.
+- **Included-credit sizing per tier.** ~~Free placeholder is $0.50/mo; paid
+  tiers need allowance numbers.~~ **Resolved (migration 017, live):** free
+  $0.50/mo, Pro $12/mo with $10/mo AI credits — allowance < price with
+  margin. All subject to change; the live `plans` table is authoritative.
 - **Per-tenant metric cardinality strategy.** Top-N high-cardinality buckets
   + aggregate vs buy a high-cardinality TSDB (Mimir, VictoriaMetrics).
   Deferable until we have noisy tenants.
-- **Plan tier structure beyond free.** Number of paid tiers, what features
-  differ, pricing. Product/business call.
-- **Free-tier limits (numbers).** Placeholder is 100 atoms / $0.50 AI
-  credits / 1 KB / 100 MB.
+- **Plan tier structure beyond free.** ~~Number of paid tiers, features,
+  pricing.~~ **Resolved (launch): two tiers** — free and Pro ($12/mo,
+  monthly only, `premium_models` + 10 GB). A frontier tier above Pro (e.g.
+  gpt-5.6-sol-class models) is the natural next rung if demanded.
+- **Free-tier limits (numbers).** ~~Placeholder is 100 atoms / $0.50 AI
+  credits / 1 KB / 100 MB.~~ **Resolved (migration 017):** live values in
+  the `plans` table; the pricing page renders them.
 - **Storage quota unit — bytes vs atoms.** Bytes is more accurate for cost,
   atoms is easier to communicate. Likely bytes for enforcement, atoms for
   marketing copy.
-- **Trial length.** 14 days conventional; 7 or 30 also defensible.
-- **Read-only / suspended UX details.** What the user sees, friendly upgrade
-  prompts, "your data is safe" messaging.
+- **Trial length.** ~~14 days conventional; 7 or 30 also defensible.~~
+  **Resolved: 14 days** (`DEFAULT_TRIAL_DAYS`), paid tier, no card; warning
+  email 3 days before expiry, downgrade notice on expiry.
+- **Read-only / suspended UX details.** **Resolved (2026-07-11):
+  email-only comms** — no cloud-specific popups in the shared product
+  frontend. Surfaces: trial/dunning emails, the `/account/*` dashboard, and
+  the product app's generic structured-402 banner. "Your data is safe /
+  always exportable" is in the terms and enforced (export routes are
+  exempt from the read-only write-block).
 - **account_events retention policy.** 90 days default? Per-event-type
   retention?
 - **Tracing sample rate.** 1–5% baseline; tail sampling for errors.
@@ -1762,6 +1904,8 @@ and link the discussion if it lives in a memory file.
   storage (14 daily + 8 weekly), final dump to `backups/final/` (30-day
   retention) before account deletion, restore runbook rehearsed before
   launch, backup-staleness alerting. PITR via WAL archiving deferred.
+  **Scheduling superseded 2026-07-12** (due-driven ticks; see below) —
+  retention, final-dump, and restore machinery stand.
 - **2026-06-09** — Second auth chokepoint test: credentials for account A
   presented on account B's subdomain must fail. The `.atomic.cloud` cookie
   crosses subdomains by design, so this test is what pins browser-level
@@ -1780,7 +1924,9 @@ and link the discussion if it lives in a memory file.
 - **2026-06-10** — Export jobs, `/api/logs`, and `/api/auth/*` are unrouted
   (404) in the cloud composition until each gets a per-tenant story — they
   bind process-global state in atomic-server and would otherwise be a
-  cross-tenant namespace.
+  cross-tenant namespace. **Partially superseded**: tokens got their
+  per-tenant story in slice 3, exports got theirs 2026-07-12 (see below);
+  `/api/logs` and the rest of `/api/auth/*` remain unrouted.
 - **2026-06-10** — Per-tenant pools are bounded at the composition layer
   (default 5 connections, 5-min idle timeout) via a cloud-unaware
   pool-config constructor added to atomic-core. The plan's pgbouncer
@@ -1897,3 +2043,42 @@ and link the discussion if it lives in a memory file.
   Remaining work is observability and the iterative visual polish of the
   frontend (a human-in-the-loop pass), plus the deferred items each slice
   recorded.
+- **2026-07-02** — Managed model curation is enforced in one module
+  (`curated_models.rs`): user-writable config keys are exactly
+  `{embedding_model, llm_model}`, the embedding model is pinned (a
+  dimension-changing config is rejected, not stored-with-a-warning), and
+  the dashboard's picker mirror is pinned to the server constants by a CI
+  drift-guard test rather than by discipline.
+- **2026-07-11** — Launch pricing: two tiers, monthly only. Pro $12/mo,
+  $10/mo AI credits, 10 GB (migration 017); 14-day paid-tier trial, no
+  card. All values live in the `plans` table and are expected to evolve.
+- **2026-07-11** — Trial/dunning comms are **email-only**: no cloud-specific
+  popups in the shared product frontend (it stays cloud-unaware). Surfaces
+  are the emails, the account dashboard, and the product app's generic
+  structured-402 banner. Warning emails use claim-based exactly-once
+  delivery (UPDATE…RETURNING on `trial_warning_sent_at`), cross-pod safe.
+- **2026-07-12** — OpenRouter embedding requests always send
+  `provider: {sort: "latency"}`: same-priced upstreams can differ 100× in
+  latency and default price-sorted routing happily picks the slow one.
+  Route around pathology without pinning upstreams by name.
+- **2026-07-12** — Curated-list requirement added: every managed agentic
+  model must be served by **more than one** OpenRouter upstream. A
+  single-provider model has no routing escape hatch when its only upstream
+  degrades (qwen3.7-plus was rejected on exactly this despite winning on
+  price and tool-calling benchmarks).
+- **2026-07-12** — The export family is cloud-owned and per-tenant
+  (`export_plane.rs`): one `ExportJobManager` per account under a
+  per-account artifact dir, job ids resolved only inside the requesting
+  account's namespace (foreign ids 404 by construction), registered ahead
+  of `api_scope` at the same paths the product app already calls (the
+  token-plane shadowing pattern). Export start (POST) and job delete
+  (DELETE) are exempt from the dunning write-block: "read-only" is a
+  serving state, not a hostage state — egress must work precisely when the
+  user is leaving or lapsed.
+- **2026-07-12** — Backups are **due-driven, not scheduled**: the loop
+  ticks every 5 minutes and dumps only tenants past the cadence (or never
+  backed up), the control plane once per UTC day. Supersedes the
+  2026-06-09 "nightly pass on a jittered 24h timer" scheduling (retention,
+  final-dump, and restore machinery unchanged). Rule extracted from the
+  incident: never gate periodic work — or its watchdog — behind a timer a
+  process restart resets.
