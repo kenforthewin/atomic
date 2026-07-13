@@ -74,8 +74,16 @@ dashboards — alerts are the point.
    data volume mount (warn), `< 0.15` (page). DO volumes resize online —
    but only if someone is watching.
 3. **/health synthetic**: a Grafana Cloud synthetic-monitoring HTTP check
-   against `https://app.<base-domain>/health` (liveness) and `/ready`
-   (deploy gate). This is the only check that catches "the box is off".
+   against `https://app.<base-domain>/health`. This is the only check that
+   catches "the box is off" — every other signal is the droplet reporting
+   on itself. Provisioned 2026-07-13: job `atomic-cloud-health`, Ohio +
+   Zurich probes, 2-minute frequency (keeps the free execution budget at
+   ~43k/month of ~100k), paired with the "Health endpoint unreachable"
+   alert rule on `avg(probe_success) < 0.5` with noDataState=Alerting so
+   Synthetic Monitoring itself breaking also fires. Note: the SM app needs
+   one-time initialization in the UI before its API accepts checks, and
+   modern stacks reject the legacy `alertSensitivity` field — alert via a
+   normal rule over `probe_success` instead.
 4. **Connection budget** (doc #1):
    `sum(pg_stat_activity_count) > 160` (80% of max_connections=200).
    The `sum()` is load-bearing: postgres-exporter emits one series per
