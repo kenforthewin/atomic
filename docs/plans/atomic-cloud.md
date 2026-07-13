@@ -21,6 +21,13 @@ Implementation began 2026-06-10; the frontloaded functional build-out
 (slices 1–9, all on merged branches) completed 2026-06-14; production
 deployment and launch hardening are recorded as slices 10–12.
 
+Growth-related limits of the single-box topology (the cross-tenant ledger
+scan, connection budgets, deploy-time fleet migration, disk overcommit,
+and friends) are tracked in the companion document
+**`atomic-cloud-scaling.md`** — each with the signal to watch and a
+remediation ladder, so bottlenecks get widened deliberately instead of
+discovered as incidents.
+
 ## Context
 
 The earlier exploration of "Atomic Cloud on SQLite + per-customer mounted
