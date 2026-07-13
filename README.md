@@ -10,9 +10,8 @@
 [![Web Image](https://img.shields.io/github/v/tag/kenforthewin/atomic?label=web&logo=docker)](https://github.com/kenforthewin/atomic/pkgs/container/atomic-web)
 [![Atomic Cloud](https://img.shields.io/badge/cloud-atomicapp.ai-7c3aed)](https://atomicapp.ai/cloud)
 
-> ☁️ **[Atomic Cloud](https://atomicapp.ai/cloud)** — Atomic, hosted: your
-> knowledge graph at your own subdomain in about thirty seconds, AI
-> included. 14-day Pro trial, no card. Everything below still
+> ☁️ **[Atomic Cloud](https://atomicapp.ai/cloud)** — Atomic, hosted at
+> your own subdomain. Try it out for free. Everything below still
 > self-hosts forever.
 
 A personal knowledge base that turns markdown notes into a semantically-connected, AI-augmented knowledge graph.
