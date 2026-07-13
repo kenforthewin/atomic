@@ -55,8 +55,12 @@ cost ~0 connections (pool idle timeout 5 min), so this is a concurrency
 ceiling, not a tenant-count ceiling — but a burst (launch spike, a popular
 share) hits it as connection-acquire timeouts.
 
-**Signal.** `pg_stat_activity` count vs 200; sqlx acquire-timeout errors in
-pod logs.
+**Signal.** `sum(pg_stat_activity_count)` vs 200 via postgres-exporter
+(the `sum()` is load-bearing — the metric is per-(datname, state), and
+database-per-tenant spreads the budget so no single series ever nears the
+ceiling); `atomic_cloud_tenant_pool_connections` + control-pool gauges on
+the pod's /metrics; sqlx acquire-timeout errors in pod logs. Alert #4 in
+deploy/MONITORING.md.
 
 **Remediation ladder.** (a) Lower per-tenant pool to 3 — most tenant work
 is serial. (b) Raise `max_connections` with the droplet's RAM (each
@@ -108,8 +112,15 @@ artifacts are sacrificed before serving entries when the cap bites. Call
 it: rebuild churn noticeable in the **high hundreds**, structural fix
 warranted at **~1000+**.
 
-**Signal.** Tick-duration logs (`dispatcher` tick summary), RSS of the pod,
-`pg_stat_statements` calls on the ledger-poll query shape climbing with N.
+**Signal.** Exported live since 2026-07-13:
+`atomic_cloud_dispatcher_last_full_scan_seconds` /
+`_last_full_scan_tenants` (scan cost growing with N),
+`atomic_cloud_account_cache_entries{kind}` (serving vs background-fault
+residency), `_account_cache_evictions_total`, plus
+`_dispatcher_last_tick_age_seconds` / `_last_full_scan_age_seconds` for
+loop liveness (+Inf until first event — a dead dispatcher reads as
+unbounded age, never as frozen-healthy). Alert #5 in deploy/MONITORING.md.
+Cross-check: `pg_stat_statements` calls on the ledger-poll query shape.
 
 **Remediation ladder.** (a) ~~Stretch `slow_scan_interval`~~ — applied:
 default 900s; the cost is a 15-minute worst-case pickup for cron/feed work
@@ -148,27 +159,40 @@ building it.
 
 ## 4. Deploy-time fleet migration
 
-**Shape.** Every deploy boots in migrating mode and walks all N tenant
-databases before `/ready` flips (deploy-gating policy: >30 min wall time =
-timeout). O(N × migration cost) on every single deploy, even no-op ones
-(a no-op `initialize()` still connects and version-checks each DB).
+**Shape.** Every deploy boots in migrating mode and walks the *lagging*
+tenant databases before `/ready` flips (deploy-gating policy: >30 min wall
+time = timeout). Since the 2026-07-13 stamp short-circuit work, tenants
+whose `account_databases.last_migrated_version` already equals the
+compiled target are never connected to — a no-op deploy's fleet gate is
+one control-plane query, O(changed tenants), and the run reports
+`skipped_current` (in logs, the `deploy_runs` ledger via migration 022,
+and `deploy status`, disambiguating "fleet all current" from "gate saw no
+fleet"). The trust chain is documented on `count_skipped_current`: stamps
+are written only post-migration, and the one writer that could lie — the
+restore runbook, which used to stamp the compiled target onto a
+possibly-older dump — now stamps the restored database's own
+`schema_version`. E2e-pinned by
+`tests/e2e_deploy.rs::fully_stamped_fleet_short_circuits_without_tenant_connections`
+(tenant DBs dropped before a fully-stamped run; only a true skip stays
+green).
 
-**Bites at.** At ~1s per no-op tenant check, 1000 tenants ≈ 17 min serial —
-inside the window but uncomfortable; a real DDL migration across big
-tenants blows it. We deploy many times per day; this is the first concern
-that taxes *velocity* rather than capacity.
+**Bites at.** No-op deploys no longer scale with N. What remains O(N) is a
+deploy that actually raises the schema target — every tenant is then
+lagging by definition and must be walked (~1s per no-op check, more for
+real DDL; 1000 tenants ≈ 17+ min serial, against the 30-min policy
+window).
 
-**Signal.** `run_fleet_gate` duration in boot logs — record it per deploy
-starting now (it's in the journal; nobody looks yet).
+**Signal.** `run_fleet_gate` duration in boot logs and
+`skipped_current`/total in `deploy status` — record wall time per
+schema-raising deploy starting now.
 
-**Remediation ladder.** (a) Concurrency in the fleet runner (advisory locks
-already make it safe). (b) Version-stamp short-circuit: skip connecting to
-tenants whose `last_migrated_version` already equals the target (the
-mapping row exists; trust it, verify on drift). (c) Lazy migration — the
-straggler path (503 `account_upgrading` + reaper retry) already works;
-flip the default so deploys gate only on the control plane + a canary
-subset, and the fleet migrates in the background. That converts deploy
-time from O(N) to O(1) and is the eventual end state.
+**Remediation ladder.** (a) ~~Version-stamp short-circuit~~ — applied (see
+Shape). (b) Concurrency in the fleet runner for schema-raising deploys
+(advisory locks already make it safe). (c) Lazy migration — the straggler
+path (503 `account_upgrading` + reaper retry) already works; flip the
+default so deploys gate only on the control plane + a canary subset, and
+the fleet migrates in the background. That converts even DDL deploys from
+O(N) to O(1) and is the eventual end state.
 
 ## 5. Disk: sold storage vs the volume (the hard wall)
 
@@ -184,8 +208,11 @@ volume. With today's tenants this is years away; with one viral thread it
 is not. It is the only concern on this list that ends in data-loss-shaped
 downtime rather than slowness.
 
-**Signal.** `df` on the volume (alert at 70/85%), the storage rollup the
-quota system already computes per tenant, DO volume metrics.
+**Signal.** Host disk gauges via the monitoring profile's node exporter
+(alert at 70/85% — recipe #3 in deploy/MONITORING.md),
+`atomic_cloud_export_jobs_active` (artifacts share the volume), the
+storage rollup the quota system already computes per tenant, DO volume
+metrics.
 
 **Remediation ladder.** (a) DO volumes resize online — but only if someone
 is watching; this is a monitoring item more than an engineering one.
@@ -207,7 +234,11 @@ box.
 self-spreads across the day (each tenant re-dumps ~24h after its last),
 which is the saving grace.
 
-**Signal.** `backup_runs` ledger (pass duration = finished_at −
+**Signal.** `atomic_cloud_backup_last_success_age_seconds` (+Inf until
+the first clean pass — a loop dead from boot is alertable at first
+scrape), `_backup_stale_tenants`, `_backup_staleness_check_age_seconds`
+(the checker watching the checker); alert #1 in deploy/MONITORING.md.
+Also the `backup_runs` ledger (pass duration = finished_at −
 started_at), tenant dump timeouts in logs, query-latency correlation with
 pass times in `pg_stat_statements`.
 
@@ -251,8 +282,11 @@ every tenant down together.
 allowances keep AI work bounded; the uncapped shapes are import/export and
 dump IO.
 
-**Signal.** Droplet CPU/load/RAM (the missing Grafana item — every row of
-this table keeps landing on the same remediation), p95 request latency.
+**Signal.** Host CPU/load/RAM/disk via the monitoring profile's node
+exporter; `atomic_cloud_worker_pool_in_flight{class}` vs `_cap` for
+work-side pressure. Request-path latency histograms are deliberately not
+exported yet (noted in `metrics.rs`); p95 latency remains a gap until
+that or an edge-side measurement exists.
 
 **Remediation ladder.** (a) Bigger droplet — vertical headroom is cheap
 and instant, take it before anything structural. (b) Move the pod off the
@@ -297,10 +331,14 @@ signal). (c) A real metrics pipeline (the Grafana item, again).
 - **Measure, don't estimate**: record fleet-migration wall time per deploy
   and backup-pass durations now, while N is small — the trend line is the
   early warning this doc can't compute from constants.
-- **The recurring remediation is monitoring.** Six of ten concerns list
-  "watch X" as the first step and we currently watch nothing
-  automatically. The Grafana Cloud + uptime item from the launch list is
-  the prerequisite for operating this document rather than re-reading it
-  after incidents.
+- **The recurring remediation is monitoring — code side shipped
+  2026-07-13.** The pod exports 22 `atomic_cloud_*` families on an
+  internal-only /metrics listener, and the compose `monitoring` profile
+  (grafana-alloy + postgres-exporter + host metrics) ships them to Grafana
+  Cloud; `deploy/MONITORING.md` is the runbook, including the first five
+  alerts keyed to this document's signal columns. The remaining step is
+  operator-side: create the Grafana Cloud stack, fill the three env vars,
+  enable the profile. Until then the gauges exist but nothing watches
+  them.
 - Revisit this doc at every ~10× tenant milestone (10 → 100 → 1000) and on
   every topology change (second pod, second cluster, pgbouncer).
