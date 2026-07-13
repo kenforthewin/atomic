@@ -12,9 +12,13 @@
 //! - **The boot-time fleet runner** ([`FleetMigrator`]) enumerates lagging
 //!   tenants ([`list_unmigrated`]), fans out under a concurrency cap, runs
 //!   `storage.initialize()` per tenant, and records each outcome
-//!   ([`record_migration_success`] / [`record_migration_failure`]). The
-//!   deploy gate around it (readiness, the failure-rate policy, the
-//!   `deploy_runs` history) lives in [`crate::deploy`].
+//!   ([`record_migration_success`] / [`record_migration_failure`]). Rows
+//!   already stamped at the compiled target are skipped on the stamp alone
+//!   — no tenant connection, counted in the summary as
+//!   [`skipped_current`](FleetRunOutcome::skipped_current) — so a deploy
+//!   that moves no tenant schema is pure control-plane work. The deploy
+//!   gate around it (readiness, the failure-rate policy, the `deploy_runs`
+//!   history) lives in [`crate::deploy`].
 //! - **The reaper's lagging-migrations arm** ([`crate::reaper`], arm 4)
 //!   owns *every* lagging row whose backoff horizon (if any) has passed
 //!   ([`list_retryable_failures`]) and retries each through the same
@@ -93,6 +97,13 @@ pub struct UnmigratedTenant {
 /// oldest-version first (the furthest-behind tenants have the most pending
 /// work; start them earliest). Non-`active` mapping rows are excluded —
 /// there is nothing to serve, so nothing to gate or migrate.
+///
+/// The `< $1` filter is the version-stamp short-circuit (scaling plan §4,
+/// remediation (b)): rows already stamped at the target never enter the
+/// worklist, so the runner never opens a connection to them — a deploy
+/// that moves no tenant schema costs O(1) control-plane queries instead of
+/// O(N) tenant connections. [`count_skipped_current`] keeps the run
+/// summary honest about how many rows the filter dropped.
 pub async fn list_unmigrated(
     control: &ControlPlane,
     target: i32,
@@ -108,6 +119,41 @@ pub async fn list_unmigrated(
     .fetch_all(control.pool())
     .await
     .map_err(CloudError::db("listing unmigrated tenants"))
+}
+
+/// The other half of the version-stamp short-circuit's bookkeeping: how
+/// many active rows [`list_unmigrated`]'s filter dropped because their
+/// stamp already meets `target`. Feeds [`FleetRunOutcome::skipped_current`]
+/// — and, through it, the `deploy_runs` ledger (migration 022) — so a
+/// fully-current fleet reports "N skipped" rather than the
+/// indistinguishable-from-empty "0 enumerated".
+///
+/// Trusting the stamp is sound because every sanctioned stamp writer
+/// records a version the database demonstrably reached:
+/// [`record_migration_success`] stamps only after `initialize()` returns;
+/// [`provision_account`](crate::provision::provision_account) stamps the
+/// compiled target after fully migrating the fresh tenant; and the restore
+/// runbook (`atomic-cloud backup restore`) has the operator stamp the
+/// restored database's **own** `schema_version` — read from the database
+/// after the restore, never assumed equal to the binary's target, since a
+/// dump restores at whatever version it was taken under. A stamp written
+/// outside those paths (hand-typed UPDATE, manual DDL) invalidates the
+/// trust by design — the same trust the reaper's lagging-check
+/// ([`list_retryable_failures`]) and CloudAuth's straggler gate already
+/// place in these stamps.
+pub async fn count_skipped_current(
+    control: &ControlPlane,
+    target: i32,
+) -> Result<usize, CloudError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM account_databases \
+         WHERE status = 'active' AND last_migrated_version >= $1",
+    )
+    .bind(target)
+    .fetch_one(control.pool())
+    .await
+    .map_err(CloudError::db("counting already-current tenants"))?;
+    Ok(count.max(0) as usize)
 }
 
 /// Plan step 3, success arm: record that `db_name` was brought to `version`
@@ -322,8 +368,21 @@ impl Default for FleetMigrationConfig {
 pub struct FleetRunOutcome {
     /// The compiled tenant schema target the run migrated toward.
     pub target: i32,
-    /// Lagging tenants enumerated at the start of the run.
+    /// Lagging tenants enumerated at the start of the run — the attempted
+    /// set. Rows already stamped at the target are counted in
+    /// [`skipped_current`](Self::skipped_current) instead, never here.
     pub total: usize,
+    /// Active tenants whose stamp already met the target when the run
+    /// enumerated — skipped without ever opening a tenant connection
+    /// (scaling plan §4, remediation (b); [`count_skipped_current`] covers
+    /// why the stamp is trustworthy). Excluded from `total` and from every
+    /// rate: a skipped tenant proves nothing about this binary's
+    /// migration, and letting it into the failure denominator would make a
+    /// bad migration look better the larger the already-current fleet.
+    /// Persisted to the run's `deploy_runs` row (migration 022): the
+    /// 0-enumerated-vs-N-skipped distinction must survive log rotation,
+    /// not live only in the boot log line.
+    pub skipped_current: usize,
     /// Tenants successfully migrated (and stamped) by this run — including
     /// tenants a concurrent pod migrated first, whose `initialize()` here
     /// was an idempotent no-op re-recording the same success.
@@ -354,8 +413,11 @@ impl FleetRunOutcome {
         self.total.saturating_sub(self.migrated + self.failed)
     }
 
-    /// Recorded failures over enumerated tenants; `0.0` for an empty fleet
-    /// (nothing lagged — vacuously healthy).
+    /// Recorded failures over tenants actually attempted (`total` — the
+    /// lagging set; skipped-current rows are excluded, see
+    /// [`skipped_current`](Self::skipped_current)). `0.0` when nothing was
+    /// attempted: an empty fleet and a 100%-skipped fleet are both
+    /// vacuously healthy.
     pub fn failure_rate(&self) -> f64 {
         if self.total == 0 {
             0.0
@@ -412,10 +474,11 @@ impl FleetMigrator {
         // error at boot must not brick the pod's gate outright — but a
         // control plane unreadable for the whole wall-clock limit is a
         // timed-out run, honestly reported.
-        let Some(pending) = self.enumerate_until(target, deadline).await else {
+        let Some((pending, skipped_current)) = self.enumerate_until(target, deadline).await else {
             return FleetRunOutcome {
                 target,
                 total: 0,
+                skipped_current: 0,
                 migrated: 0,
                 failed: 0,
                 timed_out: true,
@@ -427,6 +490,7 @@ impl FleetMigrator {
         tracing::info!(
             target,
             total,
+            skipped_current,
             concurrency = self.config.concurrency,
             "fleet migration: starting run over lagging tenants"
         );
@@ -499,6 +563,7 @@ impl FleetMigrator {
         FleetRunOutcome {
             target,
             total,
+            skipped_current,
             migrated,
             failed,
             timed_out,
@@ -506,16 +571,28 @@ impl FleetMigrator {
         }
     }
 
-    /// [`list_unmigrated`], retried (5s apart) until `deadline`. `None`
-    /// means the control plane stayed unreadable for the whole budget.
+    /// [`list_unmigrated`] plus [`count_skipped_current`], retried as a
+    /// unit (5s apart) until `deadline`. `None` means the control plane
+    /// stayed unreadable for the whole budget.
+    ///
+    /// The two reads are not one snapshot: a concurrent pod or reaper
+    /// stamping a row between them can skew the skipped count by a row or
+    /// two. Harmless — the count only informs the summary; gating math
+    /// runs on the attempted set alone.
     async fn enumerate_until(
         &self,
         target: i32,
         deadline: Instant,
-    ) -> Option<Vec<UnmigratedTenant>> {
+    ) -> Option<(Vec<UnmigratedTenant>, usize)> {
         loop {
-            match list_unmigrated(&self.control, target).await {
-                Ok(pending) => return Some(pending),
+            let enumerated = async {
+                let pending = list_unmigrated(&self.control, target).await?;
+                let skipped = count_skipped_current(&self.control, target).await?;
+                Ok::<_, CloudError>((pending, skipped))
+            }
+            .await;
+            match enumerated {
+                Ok(enumerated) => return Some(enumerated),
                 Err(e) => {
                     tracing::warn!(error = %e, "fleet migration: enumerating lagging tenants failed; retrying");
                     let retry_at = Instant::now() + Duration::from_secs(5);
@@ -724,6 +801,9 @@ mod tests {
         let outcome = FleetRunOutcome {
             target: 22,
             total: 20,
+            // A large already-current majority must not dilute the rate:
+            // the denominator is the attempted set, nothing else.
+            skipped_current: 1000,
             migrated: 17,
             failed: 1,
             timed_out: true,
@@ -735,6 +815,7 @@ mod tests {
         let empty = FleetRunOutcome {
             target: 22,
             total: 0,
+            skipped_current: 0,
             migrated: 0,
             failed: 0,
             timed_out: false,
@@ -745,6 +826,17 @@ mod tests {
             0.0,
             "empty fleet is vacuously healthy"
         );
+
+        let all_skipped = FleetRunOutcome {
+            skipped_current: 40,
+            ..empty
+        };
+        assert_eq!(
+            all_skipped.failure_rate(),
+            0.0,
+            "a 100%-skipped fleet attempted nothing and is vacuously healthy"
+        );
+        assert_eq!(all_skipped.unattempted(), 0);
     }
 
     #[test]

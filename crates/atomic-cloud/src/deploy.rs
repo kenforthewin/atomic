@@ -15,10 +15,11 @@
 //! | `x ≥ review`            | `RollbackRequired`   | never ready on this binary |
 //! | run > wall-clock limit  | `MigrationTimeout`   | not ready; restart re-runs the fleet (already-migrated tenants no-op) |
 //!
-//! Every boot attempt persists one `deploy_runs` row (migration 009):
-//! started/finished timestamps, the run's counts, and the policy verdict —
-//! operator history (`atomic-cloud deploy status`) plus the durable home of
-//! the awaiting-review acknowledgment.
+//! Every boot attempt persists one `deploy_runs` row (migration 009; the
+//! version-stamp short-circuit's `skipped_current` count joined it in
+//! migration 022): started/finished timestamps, the run's counts, and the
+//! policy verdict — operator history (`atomic-cloud deploy status`) plus
+//! the durable home of the awaiting-review acknowledgment.
 //!
 //! # `deploy advance` (the awaiting-review override)
 //!
@@ -163,6 +164,12 @@ impl Default for DeployPolicy {
 /// Plan step 5: map a finished run onto the policy table. Timeout wins
 /// unconditionally — a run that blew its wall clock proves nothing about
 /// the failure rate of the tenants it never reached.
+///
+/// The rate's denominator is tenants actually *attempted*
+/// (`FleetRunOutcome::total`, the lagging set) — rows the version-stamp
+/// short-circuit skipped are excluded on both sides, so a deploy where
+/// every tenant is already current attempts nothing, rates 0%, and lands
+/// `Ready` on control-plane work alone.
 pub fn evaluate_policy(outcome: &FleetRunOutcome, policy: &DeployPolicy) -> DeployStatus {
     if outcome.timed_out {
         return DeployStatus::MigrationTimeout;
@@ -177,7 +184,7 @@ pub fn evaluate_policy(outcome: &FleetRunOutcome, policy: &DeployPolicy) -> Depl
     }
 }
 
-/// One `deploy_runs` row (migration 009).
+/// One `deploy_runs` row (migration 009; `skipped_current` added in 022).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeployRun {
     pub id: String,
@@ -187,6 +194,14 @@ pub struct DeployRun {
     pub total: Option<i32>,
     pub migrated: Option<i32>,
     pub failed: Option<i32>,
+    /// Active rows the version-stamp short-circuit skipped as already
+    /// current ([`FleetRunOutcome::skipped_current`]). This is what makes a
+    /// fully-current fleet's `0/0/0` ledger row distinguishable from a run
+    /// that saw no active fleet at all — durably, after pods recycle and
+    /// the boot log line is gone. `None` on rows finished before migration
+    /// 022 (or by an older binary mid-rolling-deploy): unknown, not zero —
+    /// a genuine 0 is precisely the suspicious reading.
+    pub skipped_current: Option<i32>,
     pub deploy_status: String,
     pub advanced_at: Option<DateTime<Utc>>,
 }
@@ -213,13 +228,15 @@ pub async fn finish_deploy_run(
 ) -> Result<(), CloudError> {
     sqlx::query(
         "UPDATE deploy_runs \
-         SET finished_at = NOW(), total = $2, migrated = $3, failed = $4, deploy_status = $5 \
+         SET finished_at = NOW(), total = $2, migrated = $3, failed = $4, \
+             skipped_current = $5, deploy_status = $6 \
          WHERE id = $1",
     )
     .bind(run_id)
     .bind(outcome.total as i32)
     .bind(outcome.migrated as i32)
     .bind(outcome.failed as i32)
+    .bind(outcome.skipped_current as i32)
     .bind(status.as_str())
     .execute(control.pool())
     .await
@@ -245,7 +262,7 @@ pub async fn deploy_run_status(
 pub async fn latest_deploy_run(control: &ControlPlane) -> Result<Option<DeployRun>, CloudError> {
     sqlx::query_as(
         "SELECT id, target_version, started_at, finished_at, total, migrated, failed, \
-                deploy_status, advanced_at \
+                skipped_current, deploy_status, advanced_at \
          FROM deploy_runs ORDER BY started_at DESC, id DESC LIMIT 1",
     )
     .fetch_optional(control.pool())
@@ -343,7 +360,7 @@ pub enum AdvanceOutcome {
 pub async fn advance_deploy(control: &ControlPlane) -> Result<AdvanceOutcome, CloudError> {
     let latest: Option<DeployRun> = sqlx::query_as(
         "SELECT id, target_version, started_at, finished_at, total, migrated, failed, \
-                deploy_status, advanced_at \
+                skipped_current, deploy_status, advanced_at \
          FROM deploy_runs WHERE deploy_status <> $1 \
          ORDER BY started_at DESC, id DESC LIMIT 1",
     )
@@ -621,6 +638,7 @@ pub async fn run_fleet_gate(
                 run_id,
                 target,
                 total = outcome.total,
+                skipped_current = outcome.skipped_current,
                 migrated = outcome.migrated,
                 failed = outcome.failed,
                 unattempted = outcome.unattempted(),
@@ -636,6 +654,7 @@ pub async fn run_fleet_gate(
                 target,
                 status = holding.as_str(),
                 total = outcome.total,
+                skipped_current = outcome.skipped_current,
                 migrated = outcome.migrated,
                 failed = outcome.failed,
                 unattempted = outcome.unattempted(),
@@ -659,6 +678,7 @@ mod tests {
         FleetRunOutcome {
             target: 22,
             total,
+            skipped_current: 0,
             migrated: total - failed,
             failed,
             timed_out,
@@ -685,6 +705,22 @@ mod tests {
             evaluate_policy(&outcome(100, 0, true), &policy),
             DeployStatus::MigrationTimeout,
             "timeout wins even with a clean rate"
+        );
+    }
+
+    /// The version-stamp short-circuit's gate contract: a run that skipped
+    /// the entire fleet on stamps attempted nothing, and the policy must
+    /// read that as a clean success — not as suspicious emptiness.
+    #[test]
+    fn fully_skipped_run_is_a_clean_success() {
+        let run = FleetRunOutcome {
+            skipped_current: 500,
+            ..outcome(0, 0, false)
+        };
+        assert_eq!(
+            evaluate_policy(&run, &DeployPolicy::default()),
+            DeployStatus::Ready,
+            "100%-skipped run flips readiness"
         );
     }
 

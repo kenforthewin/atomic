@@ -41,6 +41,12 @@
 //! lagging — with no failure state — *after* the new pod's boot run already
 //! enumerated, healed by the reaper's lagging-row arm alone.
 //!
+//! A third (`fully_stamped_fleet_short_circuits_without_tenant_connections`)
+//! pins the version-stamp short-circuit (scaling plan §4, remediation (b)):
+//! a fleet already stamped at the compiled target deploys on control-plane
+//! work alone — no tenant connection — proven by dropping every tenant
+//! database before the run and still landing a clean `ready`.
+//!
 //! Postgres-gated; see `tests/support/mod.rs` for the skip/cleanup
 //! conventions and the run command.
 
@@ -54,8 +60,8 @@ use atomic_cloud::{
     configure_cloud_app, issue_token, latest_deploy_run, provision_account, run_fleet_gate,
     run_reaper_pass, tenant_schema_target, AccountCache, AccountCacheConfig, AccountPlane,
     AccountPlaneConfig, ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DeployPolicy,
-    FallbackAppState, FleetMigrationConfig, ManagedKeys, NewAccount, QuotaBilling, Readiness,
-    ReaperPolicy, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
+    FallbackAppState, FleetMigrationConfig, FleetMigrator, ManagedKeys, NewAccount, QuotaBilling,
+    Readiness, ReaperPolicy, TenantPlane, TokenScope, DEFAULT_CHAT_STREAMS_PER_ACCOUNT,
 };
 use chrono::{DateTime, Utc};
 use reqwest::header::HOST;
@@ -638,5 +644,126 @@ async fn late_stamped_straggler_heals_without_a_pod_reboot() {
             pod.stop().await;
         },
     )
+    .await;
+}
+
+/// The version-stamp short-circuit (scaling plan §4, remediation (b)): a
+/// deploy where every tenant's stamp already equals the compiled target
+/// must not open a single tenant connection — the fleet run is
+/// control-plane work alone, and the gate goes straight to ready.
+///
+/// The no-connection proof is injected, not inferred from counters: both
+/// tenant databases are **dropped** before the run, so any connection the
+/// runner opened would fail and be recorded (2/2 failures →
+/// `rollback_required`). The clean `ready` verdict over dropped databases
+/// is reachable only through the short-circuit. The below-target contrast
+/// at the end re-runs over the same dropped databases and shows lagging
+/// rows still get real connection attempts — the skip is exactly
+/// stamp-deep, never broader.
+#[actix_web::test]
+async fn fully_stamped_fleet_short_circuits_without_tenant_connections() {
+    with_control_db("fleet_stamp_short_circuit", |url| async move {
+        let control = ControlPlane::connect(
+            &url,
+            atomic_cloud::control_plane::DEFAULT_CONTROL_POOL_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect control");
+        control.initialize().await.expect("migrate control plane");
+        let cluster = cluster_config();
+        let target = tenant_schema_target();
+
+        let delta = provision(&control, &cluster, "delta").await;
+        let echo = provision(&control, &cluster, "echo").await;
+        // provision_account already stamps the compiled target; restamp
+        // explicitly so the precondition is the test's own spec, not a
+        // provisioning detail.
+        stamp_fleet(&control, target).await;
+
+        drop_database(&cluster.cluster_url, &delta.db_name).await;
+        drop_database(&cluster.cluster_url, &echo.db_name).await;
+
+        // The runner's own summary: the whole fleet skipped on stamps,
+        // nothing attempted, nothing failed — over databases that do not
+        // exist to connect to.
+        let outcome = FleetMigrator::new(control.clone(), cluster.clone(), sim_config())
+            .run()
+            .await;
+        assert_eq!(
+            outcome.skipped_current, 2,
+            "both tenants counted skipped-current"
+        );
+        assert_eq!(outcome.total, 0, "zero tenants attempted");
+        assert_eq!(
+            (outcome.migrated, outcome.failed),
+            (0, 0),
+            "a connect to a dropped database would have recorded a failure"
+        );
+        assert_eq!(outcome.unattempted(), 0);
+        assert!(!outcome.timed_out);
+
+        // The full boot gate over the same fleet: a 100%-skipped run is a
+        // clean success — readiness flips with no operator action, and the
+        // recorded run row shows the empty attempted set PLUS the skipped
+        // count (migration 022) that makes 0/0/0 legible as "fleet fully
+        // current" rather than "the gate saw no fleet at all" — durably,
+        // for the `deploy status` an incident reads after logs rotate.
+        let readiness = Readiness::new(control.clone());
+        run_fleet_gate(
+            control.clone(),
+            cluster.clone(),
+            sim_config(),
+            DeployPolicy::default(),
+            readiness.clone(),
+        )
+        .await;
+        assert!(
+            readiness.is_ready().await,
+            "fully-skipped gate flips readiness"
+        );
+        let run = latest_deploy_run(&control)
+            .await
+            .expect("read latest run")
+            .expect("run recorded");
+        assert_eq!(run.deploy_status, "ready");
+        assert_eq!(
+            (run.total, run.migrated, run.failed),
+            (Some(0), Some(0), Some(0))
+        );
+        assert_eq!(
+            run.skipped_current,
+            Some(2),
+            "the ledger row carries the skipped count — 0/0/0 alone is \
+             indistinguishable from a run that enumerated no fleet"
+        );
+
+        // The mapping rows are untouched: current stamps, no failure state
+        // — the dropped databases were never reached for.
+        for tenant in [&delta, &echo] {
+            let (version, failed_at, error, retry_after, retries) =
+                row_state(&control, &tenant.account_id).await;
+            assert_eq!(version, target, "{} stamp untouched", tenant.subdomain);
+            assert!(
+                failed_at.is_none() && error.is_none() && retry_after.is_none() && retries == 0,
+                "{}: no failure state — no connection was attempted",
+                tenant.subdomain
+            );
+        }
+
+        // Contrast: one stamp below target and the same fleet gets real
+        // connection attempts — the dropped databases now surface as two
+        // recorded connect failures, proving the skip keys on the stamp
+        // and nothing else.
+        stamp_fleet(&control, target - 1).await;
+        let outcome = FleetMigrator::new(control.clone(), cluster.clone(), sim_config())
+            .run()
+            .await;
+        assert_eq!(outcome.skipped_current, 0);
+        assert_eq!(outcome.total, 2, "lagging rows are enumerated");
+        assert_eq!(
+            outcome.failed, 2,
+            "lagging rows get real connection attempts"
+        );
+    })
     .await;
 }

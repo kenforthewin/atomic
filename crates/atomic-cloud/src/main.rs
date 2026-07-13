@@ -36,16 +36,16 @@ use actix_web::{web, App, HttpServer};
 use atomic_cloud::account_over_plan_limits;
 use atomic_cloud::{
     abandoned_run_threshold, advance_deploy, advance_dunning_with, advance_expired_trials,
-    configure_cloud_app, delete_account, finalize_abandoned_runs, issue_token, latest_deploy_run,
-    list_failed_migrations, list_unmigrated, provision_account, recompute_storage,
-    roll_over_period, run_fleet_gate, tenant_schema_target, AccountCache, AccountCacheConfig,
-    AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig, ChatStreamLimiter,
-    CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter, DataPlaneRateLimits,
-    DeployPolicy, Dispatcher, DispatcherConfig, EmailSender, EnvMasterKeyVault, FallbackAppState,
-    FleetMigrationConfig, KeyVault, LogSender, MailgunSender, ManagedKeyConfig, ManagedKeys,
-    NewAccount, OpenRouterProvisioning, PlanRegistry, PoolCaps, QuotaBilling, RateLimits,
-    Readiness, TenantPlane, TokenScope, WorkerPoolsConfig, DEFAULT_DUNNING_SWEEP_INTERVAL,
-    DEFAULT_PLAN_ID,
+    configure_cloud_app, count_skipped_current, delete_account, finalize_abandoned_runs,
+    issue_token, latest_deploy_run, list_failed_migrations, list_unmigrated, provision_account,
+    recompute_storage, roll_over_period, run_fleet_gate, tenant_schema_target, AccountCache,
+    AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig,
+    ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
+    DataPlaneRateLimits, DeployPolicy, Dispatcher, DispatcherConfig, EmailSender,
+    EnvMasterKeyVault, FallbackAppState, FleetMigrationConfig, KeyVault, LogSender, MailgunSender,
+    ManagedKeyConfig, ManagedKeys, NewAccount, OpenRouterProvisioning, PlanRegistry, PoolCaps,
+    QuotaBilling, RateLimits, Readiness, TenantPlane, TokenScope, WorkerPoolsConfig,
+    DEFAULT_DUNNING_SWEEP_INTERVAL, DEFAULT_PLAN_ID,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
@@ -1990,21 +1990,47 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("restore complete: {target_db} is populated from {key}.");
                 println!();
+                // The honest stamp is the restored database's OWN schema
+                // version, read now — a dump restores at whatever version it
+                // was taken under, and stamping this binary's compiled
+                // target onto an older dump would mark the row current
+                // while its schema lags: hidden from the fleet runner, the
+                // reaper, and `deploy status` (all keyed on
+                // last_migrated_version < target) yet served by CloudAuth,
+                // failing at runtime on the missing migrations' objects.
+                let restored_version =
+                    atomic_cloud::restored_schema_version(&cluster, &target_db).await?;
                 let target_version = atomic_cloud::tenant_schema_target();
                 println!("REMAINING RUNBOOK STEPS (plan: \"Restore runbook\"):");
                 println!(
-                    "  1. Repoint the account's mapping to the restored database, recording the"
+                    "  1. Repoint the account's mapping to the restored database, stamping the"
                 );
                 println!(
-                    "     schema version the dump carries (this binary's compiled target = \
-                     {target_version}) so CloudAuth's straggler gate does not 503 the restored"
+                    "     schema version the restored database actually carries \
+                     ({restored_version}, read from its"
                 );
-                println!("     tenant as forever-upgrading:");
+                println!("     schema_version table just now) and clearing failure state recorded");
+                println!(
+                    "     against the database being replaced (stale failure rows on a current"
+                );
+                println!("     stamp would sit in `deploy status` forever):");
                 println!(
                     "       UPDATE account_databases SET db_name = '{target_db}', \
-                     last_migrated_version = {target_version}, last_migrated_at = NOW() \
+                     last_migrated_version = {restored_version}, last_migrated_at = NOW(), \
+                     migration_failed_at = NULL, last_migration_error = NULL, \
+                     migration_retry_after = NULL, migration_retry_count = 0 \
                      WHERE account_id = '<account-id>';"
                 );
+                if restored_version < target_version {
+                    println!(
+                        "     NOTE: the dump lags this binary's compiled target \
+                         ({restored_version} < {target_version}). After the"
+                    );
+                    println!(
+                        "     repoint, CloudAuth 503s the tenant `account_upgrading` until the"
+                    );
+                    println!("     reaper's lagging arm migrates it — automatic, no pod restart.");
+                }
                 println!(
                     "  2. Evict any running serve process's AccountCache entry for that account"
                 );
@@ -2041,12 +2067,17 @@ async fn finalize_stale_runs(control: &ControlPlane) {
 }
 
 /// `deploy status`: the latest run, the compiled target plus how many
-/// tenants still lag it, and the currently-failed tenant migrations.
+/// tenants lag vs meet it, and the currently-failed tenant migrations.
 async fn print_deploy_status(control: &ControlPlane) -> Result<(), Box<dyn std::error::Error>> {
     let target = tenant_schema_target();
     println!("compiled tenant schema target: {target}");
     let lagging = list_unmigrated(control, target).await?;
+    let current = count_skipped_current(control, target).await?;
     println!("tenants below target: {}", lagging.len());
+    // Both counts filter status = 'active', so 0 below + 0 at target does
+    // not mean a healthy fleet — it means the control plane sees no active
+    // fleet at all (wrong database, or mapping rows wedged non-active).
+    println!("tenants at target:    {current}");
 
     match latest_deploy_run(control).await? {
         None => println!("no deploy runs recorded yet"),
@@ -2072,6 +2103,19 @@ async fn print_deploy_status(control: &ControlPlane) -> Result<(), Box<dyn std::
                      {failed} failed ({rate:.2}% failure rate), {} unattempted",
                     total - migrated - failed
                 );
+                // The 0/0/0 disambiguation (migration 022): "0 enumerated,
+                // N skipped" is a fully-current fleet's clean short-circuit;
+                // "0 enumerated, 0 skipped" means the gate saw no active
+                // fleet at all — worth suspicion, not celebration. NULL is
+                // a row from before the column existed: unknown, not zero.
+                match run.skipped_current {
+                    Some(skipped) => {
+                        println!("  skipped:        {skipped} already current on the version stamp")
+                    }
+                    None => {
+                        println!("  skipped:        (not recorded; run predates migration 022)")
+                    }
+                }
             }
             if let Some(advanced_at) = run.advanced_at {
                 println!("  advanced:       {}", advanced_at.to_rfc3339());

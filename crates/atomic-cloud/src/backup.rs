@@ -421,6 +421,42 @@ pub async fn restore_database(
     Ok(())
 }
 
+/// Read the tenant schema version a just-restored database actually
+/// carries — `MAX(version)` of its `schema_version` table, the same read
+/// atomic-core's migration runner keys on. The restore runbook's honest
+/// stamp source: a dump restores at whatever version it was taken under,
+/// which is **not** this binary's compiled target whenever the dump
+/// predates a deploy. Stamping the target onto such a row would mark it
+/// current while its schema lags — invisible to the boot runner, the
+/// reaper, and `deploy status` (all keyed on `last_migrated_version <
+/// target`), served by CloudAuth, and failing at runtime on every query
+/// that touches the missing migrations' objects. Stamping this read
+/// instead keeps the row honestly lagging, and the reaper migrates it
+/// like any other straggler.
+///
+/// Errors are hard errors on purpose: a restored database whose
+/// `schema_version` cannot be read is not a tenant database anyone should
+/// repoint an account at.
+pub async fn restored_schema_version(
+    cluster: &ClusterConfig,
+    db_name: &str,
+) -> Result<i32, CloudError> {
+    let db_name = checked_tenant_db_name(db_name)?;
+    let url = cluster.tenant_db_url(db_name)?;
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .map_err(CloudError::db("connecting to the restored database"))?;
+    let version =
+        sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(&mut conn)
+            .await
+            .map_err(CloudError::db(
+                "reading the restored database's schema_version",
+            ));
+    let _ = conn.close().await;
+    version
+}
+
 /// A bounded, lossy-UTF-8 tail of captured stderr for error messages — the
 /// last [`DUMP_STDERR_MAX_LEN`] bytes (the failure is at the end), trimmed.
 fn bounded_stderr(stderr: &[u8]) -> String {

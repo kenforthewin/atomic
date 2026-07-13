@@ -25,9 +25,9 @@ use atomic_cloud::backup::backup_tools_available;
 use atomic_cloud::{
     delete_account, dump_tenant_database, dumps_for_account, list_active_tenant_databases,
     provision_account, recent_backup_runs, record_backup_failure, record_backup_success,
-    restore_database, stale_tenant_backups, start_backup_run, tenant_backup_status, tenant_db_name,
-    BackupStore, ClusterConfig, ControlPlane, DumpConnection, LocalFileSystemStore, ManagedKeys,
-    NewAccount,
+    restore_database, restored_schema_version, stale_tenant_backups, start_backup_run,
+    tenant_backup_status, tenant_db_name, tenant_schema_target, BackupStore, ClusterConfig,
+    ControlPlane, DumpConnection, LocalFileSystemStore, ManagedKeys, NewAccount,
 };
 use atomic_core::{CreateAtomRequest, DatabaseManager};
 use support::{with_control_db, with_db_guard};
@@ -1235,6 +1235,46 @@ async fn dump_restore_round_trip_rehydrates_real_data() {
                 assert_eq!(atom.atom.source_url.as_deref(), Some(source_url));
                 drop(core);
                 drop(manager);
+
+                // The restore runbook's stamp source (`backup restore` in
+                // the CLI): the version stamped onto the repointed mapping
+                // row is the restored database's OWN recorded
+                // schema_version. This fresh dump carries the compiled
+                // target, and the read says so...
+                let version = restored_schema_version(&cluster, &restore_db)
+                    .await
+                    .expect("read restored schema version");
+                assert_eq!(
+                    version,
+                    tenant_schema_target(),
+                    "a dump of a freshly provisioned tenant carries the compiled target"
+                );
+
+                // ...but only because the dump does: the helper follows the
+                // schema_version table, never the binary. Lower the restored
+                // database's recorded version (a dump taken under an older
+                // binary looks exactly like this) and the read follows —
+                // the stamp that keeps a restored-from-before-a-deploy
+                // tenant honestly lagging (straggler-gated, reaper-owned)
+                // instead of stamped current over a behind schema.
+                use sqlx::Connection as _;
+                let mut conn = sqlx::PgConnection::connect(&restored_url)
+                    .await
+                    .expect("connect restored db");
+                sqlx::query("DELETE FROM schema_version WHERE version = $1")
+                    .bind(version)
+                    .execute(&mut conn)
+                    .await
+                    .expect("lower the recorded version");
+                let _ = conn.close().await;
+                let lowered = restored_schema_version(&cluster, &restore_db)
+                    .await
+                    .expect("re-read restored schema version");
+                assert!(
+                    lowered < version,
+                    "the helper reports the database's recorded version \
+                     ({lowered}), never the compiled target ({version})"
+                );
             })
             .await;
         },
@@ -1594,6 +1634,8 @@ async fn dump_and_restore_reject_bad_db_names() {
 /// 3. restore that exact final dump into a FRESH database,
 /// 4. repoint `account_databases.db_name` to the restored database (the
 ///    runbook's manual step the CLI deliberately leaves to the operator),
+///    stamping the schema version the restored database actually carries
+///    — the honest stamp the CLI's printed UPDATE now uses,
 /// 5. assert the atom is present in the restored tenant.
 ///
 /// This is the proof that the final dump is a real, restorable undo — not just
@@ -1699,7 +1741,14 @@ async fn final_dump_restore_runbook_roundtrip() {
             // 4 — repoint the account's mapping to the restored database (the
             // runbook's manual control-plane step). We re-seed the account +
             // mapping for the restored UUID so the repointed row is well-formed
-            // and isolated to this tenant.
+            // and isolated to this tenant. The stamp is the restored
+            // database's own schema version, read like the CLI's runbook
+            // print reads it — never assumed equal to the binary's target
+            // (an older dump restores at an older version, and the mapping
+            // row must say so or every migration path skips it).
+            let restored_version = restored_schema_version(&cluster, &restore_db)
+                .await
+                .expect("read restored schema version");
             sqlx::query(
                 "INSERT INTO accounts (id, subdomain, email, status, plan, created_at) \
                  VALUES ($1, 'runbook-restored', 'runbook@example.com', 'active', 'free', NOW())",
@@ -1709,11 +1758,13 @@ async fn final_dump_restore_runbook_roundtrip() {
             .await
             .expect("reinstate account row");
             sqlx::query(
-                "INSERT INTO account_databases (account_id, cluster_id, db_name, status) \
-                 VALUES ($1, 'test-cluster-1', $2, 'active')",
+                "INSERT INTO account_databases (account_id, cluster_id, db_name, status, \
+                                                last_migrated_version, last_migrated_at) \
+                 VALUES ($1, 'test-cluster-1', $2, 'active', $3, NOW())",
             )
             .bind(restore_uuid.to_string())
             .bind(&restore_db)
+            .bind(restored_version)
             .execute(control.pool())
             .await
             .expect("repoint mapping to the restored database");
