@@ -14,16 +14,31 @@
 //! hits pay nothing. And because a stable working set produces no inserts —
 //! idle entries would otherwise hold their pools forever — the `serve`
 //! binary also runs [`AccountCache::sweep`] from a **periodic task**
-//! (default every `idle_ttl / 4`; see `main.rs`). The cache itself owns no
-//! task lifecycle; `sweep` is a plain method the composition schedules.
+//! (default every `idle_ttl / 4`, capped at `background_idle_ttl` so
+//! background faults actually leave near their short TTL; see `main.rs`).
+//! The cache itself owns no task lifecycle; `sweep` is a plain method the
+//! composition schedules.
 //!
 //! Two rules, in order:
 //!
-//! 1. **Idle TTL** — entries untouched for longer than
-//!    [`AccountCacheConfig::idle_ttl`] are dropped.
+//! 1. **Idle TTL** — entries untouched for longer than their TTL are
+//!    dropped. Entries built or promoted by serving traffic (or by the
+//!    dispatcher's touch — see below) live on
+//!    [`AccountCacheConfig::idle_ttl`]; entries a background-dispatch miss
+//!    faulted in that nothing has since promoted live on the much shorter
+//!    [`AccountCacheConfig::background_idle_ttl`]. The dispatcher's
+//!    periodic full scan faults every active tenant through
+//!    [`AccountCache::get_for_dispatch`]; if those faults earned the full
+//!    serving TTL, any scan cadence at or under the TTL would keep the
+//!    whole fleet resident — a hidden ordering constraint between two
+//!    independently tuned knobs (scaling doc #2). On the short TTL a
+//!    scan's faults drain by the next sweep instead, regardless of how the
+//!    scan interval and the idle TTL compare.
 //! 2. **Hard cap** — if the cache is still at
-//!    [`AccountCacheConfig::max_entries`], least-recently-touched entries
-//!    are dropped until the new entry fits.
+//!    [`AccountCacheConfig::max_entries`], the evictable entries closest
+//!    to their idle deadline (`last_touched` plus their TTL, so unpromoted
+//!    background faults go first even when fresher) are dropped until the
+//!    new entry fits.
 //!
 //! Neither rule ever evicts an entry whose `event_tx` has live receivers
 //! (decision 2026-06-09): a quiet-but-connected WebSocket client would
@@ -110,6 +125,20 @@ pub struct AccountCacheConfig {
     /// Target ceiling on cached accounts. Exceeded only when every entry
     /// has live WebSocket subscribers. Default 1000.
     pub max_entries: usize,
+    /// TTL for entries faulted in by a **background-dispatch miss**
+    /// ([`AccountCache::get_for_dispatch`]) that no serving traffic or
+    /// [`AccountCache::touch`] has since promoted. The dispatcher's slow
+    /// scan resolves every active account through the dispatch path, so
+    /// each scan faults the whole fleet in; on the full `idle_ttl` those
+    /// faults would pin the fleet resident whenever scans recur at or
+    /// under the TTL, silently coupling two knobs that are tuned
+    /// independently (scaling doc #2). A background fault only needs to
+    /// survive its own tick — the poll that faulted it promotes it within
+    /// the same tick if it found live ledger state — so entries that
+    /// showed no work drain at the first sweep past this TTL. Effectively
+    /// capped at `idle_ttl`: a background fault never outlives a serving
+    /// entry. Default 60 seconds.
+    pub background_idle_ttl: Duration,
     /// Max connections in each tenant's pool. Every cached account holds an
     /// open pool against the shared cluster, so each must stay small —
     /// default 5, the plan's per-tenant budget ("Tenant model"). The rest of
@@ -147,6 +176,7 @@ impl Default for AccountCacheConfig {
         Self {
             idle_ttl: Duration::from_secs(15 * 60),
             max_entries: 1000,
+            background_idle_ttl: Duration::from_secs(60),
             tenant_pool_max_connections: 5,
             tenant_pool_idle_timeout: Duration::from_secs(5 * 60),
             inline_pipeline: true,
@@ -160,6 +190,7 @@ impl std::fmt::Debug for AccountCacheConfig {
         f.debug_struct("AccountCacheConfig")
             .field("idle_ttl", &self.idle_ttl)
             .field("max_entries", &self.max_entries)
+            .field("background_idle_ttl", &self.background_idle_ttl)
             .field(
                 "tenant_pool_max_connections",
                 &self.tenant_pool_max_connections,
@@ -200,6 +231,11 @@ struct Entry {
     manager: Arc<DatabaseManager>,
     event_tx: broadcast::Sender<ServerEvent>,
     last_touched: Instant,
+    /// Whether the entry was faulted in by background dispatch and has not
+    /// yet been promoted by serving traffic or [`AccountCache::touch`].
+    /// Such entries idle out on the short
+    /// [`AccountCacheConfig::background_idle_ttl`] (module docs: Eviction).
+    background: bool,
     /// `accounts.provider_generation` the entry's provider config was built
     /// from (module docs: "Generation-checked convergence"). Read in the
     /// same query as the credentials, so it is never newer than the config
@@ -287,17 +323,53 @@ impl AccountCache {
     /// Resolve `account_id` for **background dispatch**, WITHOUT refreshing the
     /// entry's idle clock on a hit (DISP-3).
     ///
-    /// The slow-scan poll (300s) resolves every active tenant; if each of those
-    /// resolves through [`get_or_load`](Self::get_or_load) it bumps
-    /// `last_touched`, so above `max_entries` no idle tenant ever ages out — the
-    /// scan keeps the whole fleet warm and every miss evicts an LRU entry the
-    /// next scan rebuilds, thrashing pool opens against the shared cluster. This
-    /// accessor leaves `last_touched` untouched on a hit, so only genuine
-    /// serving traffic (the request/WS path) keeps a tenant warm; background
-    /// polling can't pin the cache at cap. A miss still builds (and seeds the
-    /// new entry's clock — a load is a load), so dispatch always sees fresh data.
+    /// The slow-scan poll resolves every active tenant, at whatever cadence
+    /// the dispatcher is configured with; if each of those resolves went
+    /// through [`get_or_load`](Self::get_or_load) it would bump
+    /// `last_touched`, so with scans recurring inside the idle TTL no idle
+    /// tenant would ever age out — the scan would keep the whole fleet
+    /// warm, and above `max_entries` every miss would evict an LRU entry
+    /// the next scan rebuilds, thrashing pool opens against the shared
+    /// cluster (scaling doc #2). This accessor leaves
+    /// `last_touched` untouched on a hit, so only genuine serving traffic
+    /// (the request/WS path) — or live ledger state, which the dispatcher
+    /// promotes via [`touch`](Self::touch) — keeps a tenant warm; polling
+    /// alone can't pin the cache at cap. A miss still builds, so dispatch
+    /// always sees fresh data — but the built entry starts as a
+    /// **background fault** living on the short
+    /// [`AccountCacheConfig::background_idle_ttl`], so a full scan's faults
+    /// drain by the next sweep unless the poll finds work worth promoting.
+    /// That bound is what lets the scan interval and the idle TTL be tuned
+    /// independently: no ordering between them can pin the fleet resident.
     pub async fn get_for_dispatch(&self, account_id: &str) -> Result<TenantHandle, CloudError> {
         self.lookup_or_build(account_id, false).await
+    }
+
+    /// Refresh `account_id`'s idle clock iff an entry is cached — promoting
+    /// a background fault to the full serving TTL — returning whether one
+    /// was. Never loads.
+    ///
+    /// This is the dispatch path's promotion step, the counterpart to
+    /// [`get_for_dispatch`](Self::get_for_dispatch)'s no-touch reads: a scan
+    /// that merely *polls* a tenant and finds nothing must leave it
+    /// idle-evictable, but the dispatcher calls this in two places where the
+    /// tenant is demonstrably not idle. When a poll finds **live ledger
+    /// state** — pending rows, due or backed off; either way the dispatch
+    /// hint stays marked, so the fast path will fault this handle every tick
+    /// regardless, and evicting it would reclaim nothing while costing a
+    /// full rebuild (pool open + provider decrypt) once per idle TTL. And
+    /// when a **claimed execution settles** — real work flowing. Both mean a
+    /// tenant with a steady or backed-off background workload stays resident
+    /// on one entry instead of churning an evict/refault cycle mid-workload.
+    pub async fn touch(&self, account_id: &str) -> bool {
+        match self.inner.lock().await.entries.get_mut(account_id) {
+            Some(entry) => {
+                entry.last_touched = Instant::now();
+                entry.background = false;
+                true
+            }
+            None => false,
+        }
     }
 
     /// [`get_or_load`](Self::get_or_load), plus the per-request convergence
@@ -320,16 +392,19 @@ impl AccountCache {
         Ok(handle)
     }
 
-    /// `touch_on_hit` refreshes the entry's idle clock on a cache hit. The
-    /// serving paths pass `true`; background dispatch passes `false` so polling
-    /// can't keep an idle tenant warm (DISP-3 — see [`get_for_dispatch`]).
-    /// A miss always builds and seeds the new entry's clock regardless.
+    /// `serving` marks the caller as request-path traffic: a serving hit
+    /// refreshes the entry's idle clock (and promotes a background fault to
+    /// the full TTL). Background dispatch passes `false`, so its hits leave
+    /// the clock alone (DISP-3 — see [`get_for_dispatch`]) and its misses
+    /// build entries that live on the short
+    /// [`AccountCacheConfig::background_idle_ttl`] until promoted (module
+    /// docs: Eviction).
     ///
     /// [`get_for_dispatch`]: Self::get_for_dispatch
     async fn lookup_or_build(
         &self,
         account_id: &str,
-        touch_on_hit: bool,
+        serving: bool,
     ) -> Result<TenantHandle, CloudError> {
         loop {
             // Fast path: cache hit. Otherwise pick up (or register) the
@@ -337,8 +412,9 @@ impl AccountCache {
             let load_lock = {
                 let mut inner = self.inner.lock().await;
                 if let Some(entry) = inner.entries.get_mut(account_id) {
-                    if touch_on_hit {
+                    if serving {
                         entry.last_touched = Instant::now();
+                        entry.background = false;
                     }
                     return Ok(entry.handle());
                 }
@@ -355,8 +431,9 @@ impl AccountCache {
             {
                 let mut inner = self.inner.lock().await;
                 if let Some(entry) = inner.entries.get_mut(account_id) {
-                    if touch_on_hit {
+                    if serving {
                         entry.last_touched = Instant::now();
+                        entry.background = false;
                     }
                     return Ok(entry.handle());
                 }
@@ -382,7 +459,12 @@ impl AccountCache {
             {
                 inner.loading.remove(account_id);
             }
-            let entry = built?;
+            let mut entry = built?;
+            // A dispatch-path miss still builds — the poll needs fresh data
+            // — but the entry starts as a background fault: it earns only
+            // the short background TTL until real work or serving traffic
+            // promotes it (module docs: Eviction).
+            entry.background = !serving;
             let handle = entry.handle();
             self.sweep_locked(&mut inner);
             self.make_room_locked(&mut inner);
@@ -506,16 +588,31 @@ impl AccountCache {
         self.inner.lock().await.entries.contains_key(account_id)
     }
 
-    /// Idle-TTL pass: drop entries untouched past the TTL, keeping any with
-    /// live WebSocket subscribers.
+    /// The idle TTL `entry` is currently living on: the full serving TTL,
+    /// or — while the entry is an unpromoted background fault — the short
+    /// background TTL, capped by the serving TTL so a background fault
+    /// never outlives a serving entry (module docs: Eviction).
+    fn ttl_of(&self, entry: &Entry) -> Duration {
+        if entry.background {
+            self.config.background_idle_ttl.min(self.config.idle_ttl)
+        } else {
+            self.config.idle_ttl
+        }
+    }
+
+    /// Idle-TTL pass: drop entries untouched past their TTL, keeping any
+    /// with live WebSocket subscribers.
     fn sweep_locked(&self, inner: &mut Inner) {
         inner
             .entries
-            .retain(|_, e| !e.evictable() || e.last_touched.elapsed() <= self.config.idle_ttl);
+            .retain(|_, e| !e.evictable() || e.last_touched.elapsed() <= self.ttl_of(e));
     }
 
-    /// Hard-cap pass, run before inserting a new entry: evict
-    /// least-recently-touched evictable entries until the newcomer fits.
+    /// Hard-cap pass, run before inserting a new entry: evict the evictable
+    /// entries closest to their idle deadline (`last_touched` plus their
+    /// TTL) until the newcomer fits. Deadline order rather than plain LRU so
+    /// unpromoted background faults — a full scan's artifacts — are
+    /// sacrificed before serving entries even when the fault is fresher.
     /// Stops short when only live-subscriber entries remain (module docs).
     fn make_room_locked(&self, inner: &mut Inner) {
         while inner.entries.len() >= self.config.max_entries.max(1) {
@@ -523,7 +620,7 @@ impl AccountCache {
                 .entries
                 .iter()
                 .filter(|(_, e)| e.evictable())
-                .min_by_key(|(_, e)| e.last_touched)
+                .min_by_key(|(_, e)| e.last_touched + self.ttl_of(e))
                 .map(|(id, _)| id.clone());
             match victim {
                 Some(id) => {
@@ -668,6 +765,9 @@ impl AccountCache {
             manager: Arc::new(manager),
             event_tx,
             last_touched: Instant::now(),
+            // The inserting path stamps the caller's flavor; a bare build
+            // defaults to the serving shape.
+            background: false,
             provider_generation: state.provider_generation,
         })
     }

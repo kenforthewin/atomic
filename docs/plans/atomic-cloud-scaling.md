@@ -69,34 +69,64 @@ cluster (the `cluster_id` column exists for exactly this).
 
 **Shape.** The fast path is fine: ticks every 2s but polls only *hinted*
 tenants (`dispatch_hints`), so it scales with active mutation, not tenant
-count. The problem is the **slow scan**: every `slow_scan_interval` (300s)
-a tick polls **every active account** — the recovery bound for lost hints
-and the only driver for purely time-based work (cron reports, feed polls)
-on tenants nobody is touching (`dispatcher.rs`, `SCAN_CONCURRENCY = 16`).
-Two compounding effects: each poll goes through
-`AccountCache::get_for_dispatch`, so the scan **faults every tenant into
-the cache**, and at `idle_ttl = 15 min` vs scans every 5 min, **no tenant
-is ever idle-evicted** — the cache converges on all-tenants-resident.
+count. The load driver is the **slow scan**: every `slow_scan_interval`
+(default 900s since 2026-07; was 300s) a tick polls **every active
+account** — the recovery bound for lost hints and the only driver for
+purely time-based work (cron reports, feed polls) on tenants nobody is
+touching (`dispatcher.rs`, `SCAN_CONCURRENCY = 16`). Each poll goes
+through `AccountCache::get_for_dispatch`, so the scan **faults every
+tenant into the cache**. The second compounding effect — scans-as-touches
+defeating idle eviction, converging on all-tenants-resident — is fixed in
+two layers. Dispatch reads never renew the serving idle TTL
+(`get_for_dispatch` is a no-touch hit), and the entries a dispatch *miss*
+builds start as **background faults** on a short TTL of their own
+(`AccountCacheConfig::background_idle_ttl`, default 60s; the periodic
+sweep runs at least that often), so a scan's faults drain by the next
+sweep no matter how `slow_scan_interval` compares to `idle_ttl` — the two
+knobs are independent, with no ordering constraint to tune or validate.
+What promotes an entry to the full serving TTL (`AccountCache::touch`) is
+evidence the tenant isn't idle: a poll that finds **live ledger state**
+(pending rows, due or backed off — either way the hint keeps the fast
+path faulting the handle every tick, so eviction would reclaim nothing),
+and a claim that actually **executed**, on settle. Net: a scan-only
+tenant is resident for ~a background TTL per interval; a tenant with
+flowing — or deferred, waiting out a provider Retry-After or exponential
+backoff — work rides the window on one entry instead of an evict/refault
+cycle per TTL. Pinned by
+`tests/account_cache.rs::dispatch_hits_do_not_renew_idle_ttl_but_serving_hits_do`,
+`tests/account_cache.rs::background_faults_live_on_short_ttl_until_promoted`,
+`tests/dispatcher.rs::scan_evicts_idle_tenant_but_executed_work_keeps_tenant_resident`,
+and `tests/dispatcher.rs::deferred_ledger_rows_keep_hinted_tenant_resident_across_ttl`.
 
-**Bites at.** Gradually: N × (pool fault + ledger queries) per 300s is
-~3 polls/s at 1000 tenants — fine as query load, but cache memory grows
-with N (a resident entry holds core + pools + decrypted provider config)
-until the `max_entries = 1000` cap, after which the scan **thrashes** the
-cache every 5 minutes (evict → refault → evict). Call it: memory pressure
-in the **hundreds**, thrash at **~1000**.
+**Bites at.** Gradually: N × (pool fault + ledger queries) per 900s is
+~1 poll/s at 1000 tenants — fine as query load. The scan still faults
+every tenant once per interval, so a per-interval rebuild pass (pool open
++ provider decrypt per tenant per 900s) remains; but residency is now a
+short pulse (out by the first sweep past the 60s background TTL) instead
+of a floor, and the hard-cap pass evicts by idle *deadline*, so scan
+artifacts are sacrificed before serving entries when the cap bites. Call
+it: rebuild churn noticeable in the **high hundreds**, structural fix
+warranted at **~1000+**.
 
 **Signal.** Tick-duration logs (`dispatcher` tick summary), RSS of the pod,
 `pg_stat_statements` calls on the ledger-poll query shape climbing with N.
 
-**Remediation ladder.** (a) Stretch `slow_scan_interval` (it's a CLI flag;
-15–30 min is fine — hints cover the interactive path). (b) Move
+**Remediation ladder.** (a) ~~Stretch `slow_scan_interval`~~ — applied:
+default 900s; the cost is a 15-minute worst-case pickup for cron/feed work
+on unhinted tenants, documented on the `--dispatcher-slow-scan-secs` flag
+and `DispatcherConfig::slow_scan_interval`. The flag is now safe to tune
+in either direction — scan residency is bounded by the background TTL,
+not the idle TTL, so tightening it back toward 300s costs query load and
+rebuild churn, never fleet-wide cache residency. (b) Move
 time-driven work into the control plane: a `next_run_at` column per
 (account, schedule) written at schedule-save time, so cron/feed due-ness
 becomes one indexed control-plane query and the full scan exists only for
 lost-hint recovery. (c) Peek ledgers without faulting the full tenant
-handle (a bare one-shot connection, no cache entry). (d) The outbox/LISTEN-
-NOTIFY pattern the plan deferred "until N+1 hurts" — this section is the
-definition of "hurts."
+handle (a bare one-shot connection, no cache entry) — rejected for now:
+per-scan connection open/close per tenant trades cache memory for cluster
+connection churn, which concern #1 says is the scarcer resource. (d) The
+outbox/LISTEN-NOTIFY pattern the plan deferred "until N+1 hurts" — this
+section is the definition of "hurts."
 
 ## 3. Per-request control-plane auth
 

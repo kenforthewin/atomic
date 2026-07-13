@@ -78,6 +78,21 @@
 //! any execution that ran (or failed — failures leave backed-off retry rows
 //! the fast path must keep watching).
 //!
+//! The dispatch path's cache discipline (DISP-3, scaling doc #2) hangs off
+//! the same signals. Dispatch resolves never renew the cache's serving TTL,
+//! and the entries a dispatch miss faults in start on the cache's short
+//! background TTL — so a scan that finds nothing leaves the tenant to drain
+//! from the cache by the next sweep, and the periodic full scan cannot pin
+//! the fleet resident no matter how the scan interval compares to the idle
+//! TTL. What DOES keep a tenant resident is evidence it isn't idle, promoted
+//! via [`AccountCache::touch`] at two points: a poll that finds live ledger
+//! state (pending rows, due or backed off — either way the hint keeps the
+//! fast path faulting the handle every tick, so eviction would reclaim
+//! nothing), and a claim that actually executed. A tenant with steady — or
+//! deferred, waiting out a provider backoff — background work therefore
+//! stays resident on one entry instead of being evicted and rebuilt once
+//! per TTL mid-workload.
+//!
 //! # What is deliberately NOT here: streaming chat
 //!
 //! Every ledger-backed work-type flows through these pools; streaming chat
@@ -181,8 +196,19 @@ pub struct DispatcherConfig {
     /// How often a tick also sweeps ALL active accounts instead of only
     /// hinted ones — the recovery bound for lost hint writes and for purely
     /// time-driven work (cron reports, feed intervals) on tenants nobody is
-    /// mutating. The first tick after boot always full-scans; a failed full
-    /// scan doesn't consume the interval (it retries next tick).
+    /// mutating, which makes it that work's worst-case pickup latency too.
+    /// Default 15 minutes (scaling doc #2): the full scan is pure O(N)
+    /// tenant load, hints cover everything interactive, and a 15-minute
+    /// floor on cron/feed pickup for otherwise-idle tenants is acceptable.
+    /// The first tick after boot always full-scans; a failed full scan
+    /// doesn't consume the interval (it retries next tick).
+    ///
+    /// Tunable independently of the account cache's idle TTL, in either
+    /// direction: tenants a scan faults in only to find no work evict on
+    /// the cache's short background TTL
+    /// (`AccountCacheConfig::background_idle_ttl`), so tightening this
+    /// interval raises scan query load and rebuild churn but can never pin
+    /// the fleet resident.
     pub slow_scan_interval: Duration,
     /// Ceiling on one tenant's ledger poll inside a tick. A wedged or
     /// unreachable tenant database must not head-of-line-block every other
@@ -212,7 +238,7 @@ impl Default for DispatcherConfig {
     fn default() -> Self {
         Self {
             tick_interval: Duration::from_secs(2),
-            slow_scan_interval: Duration::from_secs(300),
+            slow_scan_interval: Duration::from_secs(900),
             tenant_poll_timeout: Duration::from_secs(10),
             pipeline_batch_size: 8,
             reports_per_tenant_cap: 1,
@@ -393,10 +419,12 @@ impl CoreExecutor {
     ) -> Result<(AtomicCore, TenantHandle), CloudError> {
         // Resolve through the no-touch dispatch accessor (DISP-3): this — and
         // the dispatcher's other dispatch reads (`poll_tenant`,
-        // `over_atom_limit`) — must NOT refresh `last_touched`, or background
-        // polling alone (slow scan at 300s < the 900s idle TTL) keeps every
-        // active tenant warm and thrashes the LRU above `max_entries`. Only
-        // genuine serving traffic should keep a tenant warm.
+        // `over_atom_limit`) — must NOT refresh the serving TTL, or
+        // background polling alone keeps every active tenant warm and
+        // thrashes the LRU above `max_entries`. Only genuine serving traffic
+        // — or live ledger state, which the dispatcher promotes via
+        // `AccountCache::touch` when a poll finds pending rows and again
+        // when a claimed execution settles — should keep a tenant warm.
         let handle = self.cache.get_for_dispatch(account_id).await?;
         let core = handle
             .manager
@@ -1008,6 +1036,22 @@ impl Dispatcher {
         }
 
         let has_work = !poll.items.is_empty() || poll.ledger_active;
+        if has_work {
+            // Live ledger state is genuine tenant activity: promote the
+            // no-touch dispatch resolve to a real touch (DISP-3). `has_work`
+            // is exactly the condition that keeps the hint below marked, so
+            // the fast path will fault this tenant's handle every tick
+            // regardless — letting it idle out would reclaim nothing (the
+            // entry is refaulted within seconds) while costing a full
+            // rebuild (pool open + vault decrypt + migration check) once per
+            // TTL for as long as backed-off retries or held leases wait out
+            // their windows; after a provider-wide rate-limit incident that
+            // churn would synchronize across every deferred tenant. An empty
+            // poll never touches: a tenant the slow scan merely visited
+            // stays a background fault and drains from the cache on the
+            // short background TTL.
+            self.cache.touch(&account_id).await;
+        }
         let mut hint_cleared = false;
         match (has_work, hint_stamp) {
             (false, Some(stamp)) => {
@@ -1093,15 +1137,20 @@ impl Dispatcher {
     ) -> JoinHandle<()> {
         let executor = Arc::clone(&self.executor);
         let control = self.control.clone();
+        let cache = Arc::clone(&self.cache);
         tokio::spawn(async move {
             // Held for the full execution; releases the class + tenant
             // slots on drop (including panic/cancellation).
             let _permit = permit;
             let outcome = executor.execute(&account_id, &item).await;
-            let remark_hint = match &outcome {
+            let work_ran = match &outcome {
                 // Executed work may have enqueued follow-on ledger work;
                 // failures leave backed-off retry rows. Both need the fast
-                // path watching this tenant (module docs: follow-on work).
+                // path watching this tenant (module docs: follow-on work) —
+                // and both mean the claim genuinely ran, the trigger for the
+                // cache-touch promotion below. `Skipped` means a peer won
+                // the claim or the intent went stale: this tenant did no
+                // work here, so neither the hint nor the idle clock moves.
                 Ok(ExecOutcome::Executed) | Ok(ExecOutcome::Failed(_)) => true,
                 Ok(ExecOutcome::Skipped) => false,
                 Err(_) => false,
@@ -1125,7 +1174,17 @@ impl Dispatcher {
                     );
                 }
             }
-            if remark_hint {
+            if work_ran {
+                // Promote the no-touch dispatch resolve to a real touch:
+                // executed work is legitimate tenant activity, so the entry
+                // (pools, event channel) stays warm while work flows instead
+                // of churning an evict/refault cycle every idle TTL (module
+                // docs: follow-on work). Complements the poll-time touch on
+                // live ledger state — a long execution whose row settles
+                // terminal restarts the idle clock from *completion*, not
+                // from the last poll that saw the row. A no-op if the entry
+                // was evicted mid-execution — the next poll refaults it.
+                cache.touch(&account_id).await;
                 if let Err(e) = mark_hint(&control, &account_id).await {
                     tracing::warn!(account_id, error = %e, "[dispatcher] follow-on hint mark failed");
                 }

@@ -143,7 +143,10 @@ enum Command {
         control_pool_max_connections: u32,
 
         /// How often the periodic idle sweep of the account cache runs, in
-        /// seconds. Defaults to a quarter of the cache idle TTL.
+        /// seconds. Defaults to a quarter of the cache idle TTL, capped at
+        /// the cache's background-fault TTL so entries the dispatcher's
+        /// full scan faults in actually leave near their short TTL instead
+        /// of lingering until the next coarse sweep.
         #[arg(long, env = "ATOMIC_CLOUD_CACHE_SWEEP_INTERVAL_SECS")]
         cache_sweep_interval_secs: Option<u64>,
 
@@ -801,13 +804,21 @@ struct DispatcherArgs {
     #[arg(long, env = "ATOMIC_CLOUD_DISPATCHER_TICK_MS", default_value_t = 2_000)]
     dispatcher_tick_ms: u64,
 
-    /// Seconds between slow-path full scans of ALL active accounts (the
-    /// recovery bound for lost dispatch hints and for time-driven work on
-    /// otherwise-idle tenants). The first tick after boot always full-scans.
+    /// Seconds between slow-path full scans of ALL active accounts — the
+    /// recovery bound for lost dispatch hints, and the worst-case pickup
+    /// latency for purely time-driven work (cron reports, feed polls) on
+    /// tenants nobody is mutating: such work can wait up to this long
+    /// before its first dispatch. Default 15 minutes (scaling doc #2 —
+    /// full scans are O(active accounts), so keep them rare; hints cover
+    /// everything interactive). The first tick after boot always
+    /// full-scans. Safe to tune independently of the account cache's idle
+    /// TTL: tenants a scan faults in only to find no work evict on the
+    /// cache's short background-fault TTL, so a tighter interval costs
+    /// query load and rebuild churn, never fleet-wide cache residency.
     #[arg(
         long,
         env = "ATOMIC_CLOUD_DISPATCHER_SLOW_SCAN_SECS",
-        default_value_t = 300
+        default_value_t = 900
     )]
     dispatcher_slow_scan_secs: u64,
 
@@ -2158,7 +2169,8 @@ async fn print_deploy_status(control: &ControlPlane) -> Result<(), Box<dyn std::
 /// deliberately doesn't until later slices).
 ///
 /// `sweep_interval` controls the periodic account-cache sweep; `None` means
-/// a quarter of the cache's idle TTL. `reaper_interval` paces the
+/// a quarter of the cache's idle TTL, capped at its background-fault TTL
+/// (see the derivation below). `reaper_interval` paces the
 /// failure-recovery reaper. `dispatcher_config` (`Some` by default —
 /// `--dispatcher=false` to disable) runs the per-pod background dispatcher;
 /// the caller must have built `cache_config` with `inline_pipeline` set to
@@ -2194,8 +2206,13 @@ async fn serve(
     spa_dir: std::path::PathBuf,
     product_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Sweep at least as often as the background-fault TTL: the dispatcher's
+    // full scan relies on its no-work faults leaving the cache near that
+    // short TTL (scaling doc #2), which only holds if sweeps run at that
+    // granularity — a quarter of the serving TTL alone (225s at defaults)
+    // would stretch every background fault's residency to the sweep gap.
     let sweep_interval = sweep_interval
-        .unwrap_or(cache_config.idle_ttl / 4)
+        .unwrap_or_else(|| (cache_config.idle_ttl / 4).min(cache_config.background_idle_ttl))
         .max(std::time::Duration::from_secs(1));
     let cache = Arc::new(AccountCache::new(
         control.clone(),

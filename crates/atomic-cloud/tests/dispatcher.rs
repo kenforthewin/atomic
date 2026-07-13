@@ -811,6 +811,255 @@ async fn expired_lease_is_reclaimed_and_completed() {
     .await;
 }
 
+/// Scaling doc #2, both invariants through real ticks. The full scan
+/// reaches every tenant through the cache's no-touch dispatch path
+/// (DISP-3), so a tenant whose ONLY traffic is the scan idle-evicts on
+/// schedule — the scan must not defeat idle eviction (invariant A). A
+/// tenant the same scan finds claimable ledger work for still dispatches,
+/// and the tick promotes it to a real touch — at poll time on the live
+/// ledger rows, and again when the executed claim settles — keeping it
+/// resident while work flows instead of churning an evict/refault cycle
+/// (invariant B). No hints are marked: the boot tick's full scan reaches
+/// both tenants exactly the way the periodic slow scan would.
+#[tokio::test]
+async fn scan_evicts_idle_tenant_but_executed_work_keeps_tenant_resident() {
+    with_control_db("scan_vs_idle_eviction", |url| async move {
+        let control = connect_control(&url).await;
+        let mock = MockAiServer::start().await;
+        let busy = provision_tenant(&control, Some(&mock), "busy").await;
+        let quiet = provision_tenant(&control, None, "quiet").await;
+        disable_system_tasks(&busy).await;
+        disable_system_tasks(&quiet).await;
+
+        // TTL sized so the tick's accesses land mid-window with a ~1s
+        // margin on the overshoot-sensitive side (busy retention below).
+        let ttl = Duration::from_secs(3);
+        let cache = Arc::new(AccountCache::new(
+            control.clone(),
+            cluster_config(),
+            support::test_vault(),
+            AccountCacheConfig {
+                inline_pipeline: false,
+                idle_ttl: ttl,
+                ..AccountCacheConfig::default()
+            },
+        ));
+
+        // Fault both tenants in — the last "user" traffic either sees — and
+        // enqueue one durable pipeline row for `busy` (inline pipeline off:
+        // the save is enqueue-only; the dispatcher owns execution).
+        let busy_loaded = cache
+            .get_or_load(&busy.account_id)
+            .await
+            .expect("load busy");
+        cache
+            .get_or_load(&quiet.account_id)
+            .await
+            .expect("load quiet");
+        let busy_core = busy_loaded.manager.active_core().await.expect("busy core");
+        busy_core
+            .create_atom(
+                atomic_core::CreateAtomRequest {
+                    content: "a note whose embedding is pending ledger work".to_string(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect("create atom")
+            .expect("atom inserted");
+        assert_eq!(busy_core.count_pipeline_jobs().await.expect("count"), 1);
+
+        // A CoreExecutor dispatcher over the SAME cache (the serve wiring).
+        let breaker = Arc::new(ProviderBreaker::new(
+            control.clone(),
+            BreakerConfig::default(),
+        ));
+        let counting = CountingExecutor::new(Arc::new(CoreExecutor::new(
+            Arc::clone(&cache),
+            breaker,
+            atomic_cloud::DEFAULT_RETRY_AFTER_CAP,
+        )));
+        let executor: Arc<dyn WorkExecutor> = counting.clone();
+        let dispatcher = Dispatcher::with_executor(
+            control.clone(),
+            Arc::clone(&cache),
+            test_config(WorkerPoolsConfig::default()),
+            executor,
+        );
+
+        // Let most of the TTL pass, then run the scan tick: both tenants
+        // are polled through the no-touch path; busy's pipeline batch is
+        // claimed and executed, which promotes busy — and only busy — to a
+        // real touch when the worker settles.
+        tokio::time::sleep(ttl * 2 / 3).await;
+        let outcome = dispatcher.tick().await;
+        for handle in outcome.handles {
+            handle.await.expect("worker task");
+        }
+        assert_eq!(outcome.polled, 2, "the boot full scan polls both tenants");
+        assert!(
+            counting
+                .executed()
+                .iter()
+                .any(|(acct, kind)| acct == &busy.account_id && kind == "pipeline"),
+            "the scan must still dispatch the tenant with claimable ledger work"
+        );
+
+        // Cross quiet's TTL (measured from its load — the scan's poll must
+        // not have renewed it) while staying inside busy's (measured from
+        // the tick's promotion: the poll saw live rows, the executed claim
+        // settled).
+        tokio::time::sleep(ttl * 2 / 3).await;
+        cache.sweep().await;
+        assert!(
+            !cache.contains(&quiet.account_id).await,
+            "a tenant the scan merely polled must idle-evict on schedule"
+        );
+        let busy_after = cache
+            .get_for_dispatch(&busy.account_id)
+            .await
+            .expect("busy resolves");
+        assert!(
+            Arc::ptr_eq(&busy_loaded.manager, &busy_after.manager),
+            "executed work must keep the busy tenant resident (same entry, no refault)"
+        );
+    })
+    .await;
+}
+
+/// Scaling doc #2, the deferred-work corner the settle-time touch alone
+/// misses: a tenant whose ledger rows are all pending but NOT due — a
+/// backed-off retry after a provider 429/Retry-After, an exponential
+/// backoff window hours out — executes nothing, so no worker ever settles
+/// and touches. Those rows still keep the dispatch hint marked, so the
+/// fast path faults the tenant's handle every tick regardless: letting it
+/// idle out would reclaim nothing while forcing a full rebuild (pool open
+/// + vault decrypt + migration check) once per TTL, synchronized across
+/// every tenant a provider incident deferred. The poll itself must
+/// therefore promote a tenant with live ledger state, keeping it resident
+/// on ONE entry for as long as the backoff waits.
+#[tokio::test]
+async fn deferred_ledger_rows_keep_hinted_tenant_resident_across_ttl() {
+    with_control_db("deferred_rows_keep_resident", |url| async move {
+        let control = connect_control(&url).await;
+        let tenant = provision_tenant(&control, None, "deferred").await;
+        disable_system_tasks(&tenant).await;
+
+        // Manufacture the deferred shape directly: claim a run, "crash" it,
+        // then rewrite it as a pending retry whose next_attempt_at is an
+        // hour out — non-terminal but not due, so `poll_tenant` reports
+        // ledger_active with no items, tick after tick.
+        let manager = tenant_manager(&tenant).await;
+        let core = manager.active_core().await.expect("active core");
+        let claim = atomic_core::scheduler::ledger::claim_or_create(
+            &core,
+            "draft_pipeline",
+            None,
+            TaskRunTrigger::Schedule,
+            3,
+        )
+        .await
+        .expect("claim")
+        .expect("claim won");
+        drop(claim);
+        let tenant_url = cluster_config()
+            .tenant_db_url(&tenant.db_name)
+            .expect("tenant url");
+        let mut conn = PgConnection::connect(&tenant_url)
+            .await
+            .expect("connect tenant db");
+        let deferred = sqlx::query(
+            "UPDATE task_runs SET state = 'pending', lease_until = NULL, \
+             next_attempt_at = $1 WHERE task_id = 'draft_pipeline'",
+        )
+        .bind((Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+        .execute(&mut conn)
+        .await
+        .expect("defer row")
+        .rows_affected();
+        assert_eq!(deferred, 1);
+        conn.close().await.expect("close");
+
+        // Short TTLs so eviction pressure is constant: without the
+        // poll-time promotion the entry — a background fault, nothing ever
+        // executes — would evict at the first sweep past 500ms and refault
+        // on the next tick, over and over.
+        let ttl = Duration::from_secs(2);
+        let cache = Arc::new(AccountCache::new(
+            control.clone(),
+            cluster_config(),
+            support::test_vault(),
+            AccountCacheConfig {
+                inline_pipeline: false,
+                idle_ttl: ttl,
+                background_idle_ttl: Duration::from_millis(500),
+                ..AccountCacheConfig::default()
+            },
+        ));
+        let breaker = Arc::new(ProviderBreaker::new(
+            control.clone(),
+            BreakerConfig::default(),
+        ));
+        let counting = CountingExecutor::new(Arc::new(CoreExecutor::new(
+            Arc::clone(&cache),
+            breaker,
+            atomic_cloud::DEFAULT_RETRY_AFTER_CAP,
+        )));
+        let executor: Arc<dyn WorkExecutor> = counting.clone();
+        let dispatcher = Dispatcher::with_executor(
+            control.clone(),
+            Arc::clone(&cache),
+            test_config(WorkerPoolsConfig::default()),
+            executor,
+        );
+
+        // Boot full scan: faults the tenant in, finds the deferred row
+        // (ledger_active), marks the hint, and promotes the entry.
+        let outcome = dispatcher.tick().await;
+        assert!(
+            outcome.handles.is_empty(),
+            "nothing is due, so nothing may dispatch"
+        );
+        assert!(cache.contains(&tenant.account_id).await);
+        let first = cache
+            .get_for_dispatch(&tenant.account_id)
+            .await
+            .expect("resolve after boot scan");
+        let hinted = list_hinted_accounts(&control).await.expect("list hints");
+        assert!(
+            hinted.iter().any(|h| h.account_id == tenant.account_id),
+            "a deferred (non-due) row must keep the hint marked"
+        );
+
+        // Fast-path ticks across several idle TTLs, sweeping en route: the
+        // tenant must ride out the whole window on the SAME entry.
+        let deadline = tokio::time::Instant::now() + ttl * 3;
+        while tokio::time::Instant::now() < deadline {
+            let outcome = dispatcher.tick().await;
+            assert!(
+                outcome.handles.is_empty(),
+                "deferred work must never dispatch"
+            );
+            cache.sweep().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let after = cache
+            .get_for_dispatch(&tenant.account_id)
+            .await
+            .expect("resolve after backoff window");
+        assert!(
+            Arc::ptr_eq(&first.manager, &after.manager),
+            "a tenant waiting out a backoff must not be evicted and rebuilt"
+        );
+        assert!(
+            counting.executed().is_empty(),
+            "nothing was due, so nothing may have executed"
+        );
+    })
+    .await;
+}
+
 /// Hint lifecycle, empty side: a hinted tenant with no due work and empty
 /// ledgers gets its hint cleared by the tick.
 #[tokio::test]
