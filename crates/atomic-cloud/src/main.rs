@@ -1190,6 +1190,21 @@ enum AccountAction {
         /// still enforced.
         #[arg(long)]
         allow_reserved: bool,
+
+        /// Mint a managed provider key during provisioning, exactly as
+        /// signup does — requires the provisioning environment (mode, keys,
+        /// master key), so run this inside the serve container (`docker
+        /// exec`), not from an operator laptop. Without this flag the
+        /// account is created keyless (the pre-existing behavior).
+        #[arg(long)]
+        managed: bool,
+
+        #[command(flatten)]
+        provisioning: ProvisioningArgs,
+
+        /// See `serve --master-key-env`. Only read with --managed.
+        #[arg(long, default_value = atomic_cloud::MASTER_KEY_ENV)]
+        master_key_env: String,
     },
 
     /// Hard-delete an account: revoke its credentials, drop its tenant
@@ -1642,16 +1657,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 email,
                 subdomain,
                 allow_reserved,
+                managed,
+                provisioning,
+                master_key_env,
             } => {
-                // Operator-side creation never provisions a managed key:
-                // this command runs from hosts that hold neither the
-                // master key nor the provisioning key (see the module
-                // docs), so the account starts keyless — same state as
-                // provisioning-mode 'disabled'.
+                // Operator-side creation defaults to keyless: the command
+                // usually runs from hosts that hold neither the master key
+                // nor the provisioning key (see the module docs). With
+                // --managed (run inside the serve container, where the env
+                // lives) it mints the managed key exactly as signup does.
+                let managed_keys = if managed {
+                    let vault: Arc<dyn KeyVault> =
+                        Arc::new(EnvMasterKeyVault::from_env(&master_key_env)?);
+                    provisioning.into_managed_keys(vault)?
+                } else {
+                    ManagedKeys::Disabled
+                };
                 let account = atomic_cloud::provision::provision_account_with_policy(
                     &control,
                     &cluster.into_config(),
-                    &ManagedKeys::Disabled,
+                    &managed_keys,
                     NewAccount { email, subdomain },
                     if allow_reserved {
                         atomic_cloud::provision::SubdomainPolicy::AllowReserved
