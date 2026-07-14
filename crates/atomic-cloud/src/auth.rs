@@ -445,6 +445,37 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
     // 3 + 4 + 5 — credentials → verified principal. Bearer wins when both
     // are present: an API client deliberately sent it, while the session
     // cookie rides along on every browser request.
+    //
+    // The demo host (when configured) admits visitors through the demo
+    // whitelist in two shapes, sharing `visit`:
+    // - **no credential at all** — the plain anonymous visitor;
+    // - **a session cookie that doesn't verify** — the cookie is scoped to
+    //   the base domain and crosses subdomains BY DESIGN, so a visitor
+    //   logged into their own tenant (or carrying a stale session) presents
+    //   a cookie that can never verify against the demo account. That's
+    //   ambient noise, not a credential attempt: treat it as anonymous
+    //   rather than 401 (which the product app escalates into a login
+    //   redirect). A failed BEARER token stays a loud 401 everywhere — an
+    //   API client sent it deliberately. Foreign credentials still grant
+    //   nothing: visitor treatment is exactly what logged-out gets, so the
+    //   second-chokepoint invariant (account A's credentials never unlock
+    //   account B) is untouched.
+    let demo_for_host = ctx
+        .demo
+        .as_ref()
+        .filter(|demo| demo.subdomain() == subdomain);
+    let visit = |demo: &crate::demo_plane::DemoPlane| -> Result<AuthPrincipal, HttpResponse> {
+        // Admitted only through the demo whitelist, refused (403/429)
+        // right here for anything else — so every surface behind
+        // CloudAuth, present and future, is demo-closed by construction.
+        demo.authorize(req)?;
+        Ok(AuthPrincipal {
+            account_id: account_id.clone(),
+            scope: TokenScope::Account,
+            allowed_db_id: None,
+            source: CredentialSource::DemoVisitor,
+        })
+    };
     let principal = if let Some(token) = bearer_token(req) {
         let record = tokens::verify_token(&ctx.control, &account_id, &token)
             .await
@@ -460,36 +491,26 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
             source: CredentialSource::Token,
         }
     } else if let Some(session) = session_secret(req) {
-        tokens::verify_session(&ctx.control, &account_id, &session)
+        let verified = tokens::verify_session(&ctx.control, &account_id, &session)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "session verification failed");
                 internal_error()
-            })?
-            .ok_or_else(unauthorized)?;
-        AuthPrincipal {
-            account_id,
-            scope: TokenScope::Account,
-            allowed_db_id: None,
-            source: CredentialSource::Session,
+            })?;
+        if verified.is_some() {
+            AuthPrincipal {
+                account_id,
+                scope: TokenScope::Account,
+                allowed_db_id: None,
+                source: CredentialSource::Session,
+            }
+        } else if let Some(demo) = demo_for_host {
+            visit(demo)?
+        } else {
+            return Err(unauthorized());
         }
-    } else if let Some(demo) = ctx
-        .demo
-        .as_ref()
-        .filter(|demo| demo.subdomain() == subdomain)
-    {
-        // Anonymous visitor on the configured demo host: admitted only
-        // through the demo whitelist, refused (403/429) right here for
-        // anything else — so every surface behind CloudAuth, present and
-        // future, is demo-closed by construction. Credentialed requests
-        // took the branches above; the operator is never demo-restricted.
-        demo.authorize(req)?;
-        AuthPrincipal {
-            account_id,
-            scope: TokenScope::Account,
-            allowed_db_id: None,
-            source: CredentialSource::DemoVisitor,
-        }
+    } else if let Some(demo) = demo_for_host {
+        visit(demo)?
     } else {
         return Err(unauthorized());
     };

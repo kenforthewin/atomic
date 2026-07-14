@@ -381,6 +381,115 @@ async fn demo_search_works_anonymously_and_never_marks_hints() {
 }
 
 #[actix_web::test]
+async fn foreign_session_cookie_on_demo_host_degrades_to_visitor() {
+    with_control_db("demo_plane_foreign_cookie", |control_url| async move {
+        let h = DemoHarness::spawn(&control_url, true).await;
+
+        // A second, unrelated tenant with a real browser session. Its
+        // cookie is scoped to the base domain, so a browser sends it to
+        // EVERY subdomain — including the demo's.
+        let alpha = provision_account_with_policy(
+            &h.control,
+            &ClusterConfig {
+                cluster_id: "test-cluster-1".to_string(),
+                cluster_url: std::env::var("ATOMIC_TEST_DATABASE_URL").expect("cluster url"),
+            },
+            &ManagedKeys::Disabled,
+            NewAccount {
+                email: "alpha@example.com".to_string(),
+                subdomain: "alpha".to_string(),
+            },
+            SubdomainPolicy::EnforceReserved,
+        )
+        .await
+        .expect("provision alpha");
+        let session = atomic_cloud::create_session(
+            &h.control,
+            &alpha.account_id,
+            std::time::Duration::from_secs(3600),
+            None,
+            None,
+        )
+        .await
+        .expect("alpha session");
+        let cookie = format!("{}={session}", atomic_cloud::SESSION_COOKIE);
+
+        // On the demo host, alpha's (unverifiable-here) session is ambient
+        // noise: the request is served as an anonymous visitor — reads
+        // pass the whitelist, writes are demo_forbidden. NOT a 401, which
+        // the product app escalates into a login redirect.
+        let res = h
+            .client
+            .get(format!("{}/api/atoms", h.base_url))
+            .header(HOST, h.demo_host())
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), StatusCode::OK, "foreign cookie reads as visitor");
+        let res = h
+            .client
+            .post(format!("{}/api/atoms", h.base_url))
+            .header(HOST, h.demo_host())
+            .header("Cookie", &cookie)
+            .json(&json!({"content": "still forbidden"}))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "visitor treatment, not access");
+
+        // The probe answers demo:true for them, so the frontend renders
+        // demo chrome instead of bouncing to login.
+        let probe = h
+            .client
+            .get(format!("{}/api/demo-config", h.base_url))
+            .header(HOST, h.demo_host())
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .expect("probe");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        // The same cookie still works normally on alpha's own host…
+        let res = h
+            .client
+            .get(format!("{}/api/atoms", h.base_url))
+            .header(HOST, format!("alpha.{BASE_DOMAIN}"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), StatusCode::OK, "own host unaffected");
+
+        // …and on a third tenant's host the second-chokepoint rule stands:
+        // foreign session → 401, no demo leniency off the demo host.
+        let res = h
+            .client
+            .get(format!("{}/api/atoms", h.base_url))
+            .header(HOST, format!("demo-operator.{BASE_DOMAIN}"))
+            .send()
+            .await
+            .expect("request");
+        assert_ne!(res.status(), StatusCode::OK);
+
+        // A failed BEARER on the demo host stays a loud 401: deliberate
+        // credentials never degrade to visitor.
+        let res = h
+            .client
+            .get(format!("{}/api/atoms", h.base_url))
+            .header(HOST, h.demo_host())
+            .bearer_auth("atm_definitely_not_a_real_token")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        h.stop().await;
+    })
+    .await;
+}
+
+#[actix_web::test]
 async fn demo_path_opens_only_on_the_configured_host() {
     with_control_db("demo_plane_scoping", |control_url| async move {
         // With the demo plane configured, OTHER hosts still 401
