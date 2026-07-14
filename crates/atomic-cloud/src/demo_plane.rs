@@ -102,11 +102,14 @@ const DEMO_ALLOWED: &[(&Method, &str)] = &[
     (&Method::GET, "/api/wiki/*/status"),
     (&Method::GET, "/api/wiki/*/versions"),
     (&Method::GET, "/api/wiki/versions/*"),
-    // Reports (the daily-briefing showcase).
+    // Reports (the weekly-digest showcase): the report, its findings list,
+    // each finding atom, and the finding's citations back into the corpus.
     (&Method::GET, "/api/reports"),
     (&Method::GET, "/api/reports/*"),
+    (&Method::GET, "/api/reports/*/findings"),
     (&Method::GET, "/api/dashboard/featured-report"),
     (&Method::GET, "/api/findings/*"),
+    (&Method::GET, "/api/findings/*/citations"),
     // Boot/status reads the SPA needs to render.
     (&Method::GET, "/api/setup/status"),
     (&Method::GET, "/api/settings"),
@@ -303,6 +306,8 @@ mod tests {
             (&Method::GET, "/api/wiki/tag-9/status"),
             (&Method::GET, "/api/wiki/versions/v-2"),
             (&Method::GET, "/api/reports/r-1"),
+            (&Method::GET, "/api/reports/r-1/findings"),
+            (&Method::GET, "/api/findings/f-1/citations"),
             (&Method::GET, "/api/settings"),
             (&Method::GET, "/api/databases"),
             (&Method::GET, "/api/demo-config"),
@@ -345,6 +350,12 @@ mod tests {
             (&Method::POST, "/api/embeddings/process-pending"),
             (&Method::POST, "/api/clustering/compute"),
             (&Method::POST, "/api/graph/rebuild-edges"),
+            // Report mutations and run-now (an agentic run = AI spend).
+            (&Method::POST, "/api/reports"),
+            (&Method::POST, "/api/reports/r-1/run"),
+            (&Method::PUT, "/api/reports/r-1"),
+            (&Method::DELETE, "/api/reports/r-1"),
+            (&Method::PUT, "/api/dashboard/featured-report"),
             // Non-API surfaces behind CloudAuth.
             (&Method::GET, "/ws"),
             (&Method::POST, "/mcp"),
