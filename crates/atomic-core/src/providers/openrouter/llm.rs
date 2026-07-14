@@ -301,11 +301,16 @@ async fn complete_internal(
         None
     };
 
-    let max_tokens = if param_ok("max_tokens") {
-        config.params.max_tokens
-    } else {
-        None
-    };
+    // max_tokens is exempt from the strict-routing filter: it's universal
+    // across the OpenAI-compatible surface, and DROPPING it is the harmful
+    // direction — Anthropic's API requires the field, so an absent value
+    // gets a router-filled small default and long outputs come back
+    // truncated mid-sentence (which is exactly what happened when strict
+    // filtering stripped it here: capabilities are rarely loaded on
+    // background paths, so `is_param_known_supported` said no to
+    // everything). Temperature stays filtered — it's the param that
+    // empties the endpoint pool into a routing 404 when over-sent.
+    let max_tokens = config.params.max_tokens;
 
     // Only minimize reasoning when explicitly requested (for simple tasks like tag extraction)
     let reasoning =

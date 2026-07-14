@@ -50,10 +50,15 @@ use std::sync::Arc;
 /// OpenAI-family models treat "absent" as "model maximum", but Anthropic's
 /// API *requires* the field, so routers fill in a small default — which
 /// truncated a claude-authored report digest mid-sentence (2026-07-14).
-/// 8k tokens is roomy for the longest wiki article or digest while still
-/// bounding a runaway generation; short-output callers (tagging,
-/// extraction) are simply nowhere near it.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8000;
+///
+/// This is a CEILING, not a target — generation stops at the model's
+/// natural end and only generated tokens bill, so the number should be
+/// generous. 32k accommodates the longest wiki article or digest with
+/// room to spare while still bounding a runaway generation's cost; every
+/// model on the curated list (and effectively every modern OpenRouter
+/// endpoint) accepts it. Short-output callers (tagging, extraction) are
+/// nowhere near it.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 /// A single structured-output LLM call. Construct with [`StructuredCall::new`],
 /// optionally adjust via the `with_*` methods, then pass to [`call_structured`].
