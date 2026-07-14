@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { getTransport } from '../lib/transport';
+import { getTransport, isDemoInstance } from '../lib/transport';
 import { useUIStore } from './ui';
 import { useCanvasStore } from './canvas';
 
@@ -276,6 +276,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   // CRUD
   fetchConversations: async (tagId?: string) => {
+    // Demo visitors: conversations are closed server-side (403); render an
+    // empty list under the signup-CTA input instead of an error state.
+    if (isDemoInstance()) {
+      set({ conversations: [], isLoading: false, listFilterTagId: tagId ?? null });
+      return;
+    }
     set({ isLoading: true, error: null });
     try {
       const conversations = await getTransport().invoke<ConversationWithTags[]>('get_conversations', {
