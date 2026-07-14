@@ -1,3 +1,5 @@
+import { isDemoInstance, demoSignupUrl } from '../../lib/transport';
+
 interface ChatInputProps {
   value: string;
   onChange: (value: string) => void;
@@ -15,6 +17,22 @@ export function ChatInput({
   disabled = false,
   placeholder = 'Type a message...',
 }: ChatInputProps) {
+  // On the public demo, chat is the signup carrot: conversations are
+  // account-scoped (anonymous chat would be a shared wall), so the input
+  // becomes the CTA. Single chokepoint — every chat surface renders
+  // through this component.
+  if (isDemoInstance()) {
+    return (
+      <div className="flex-shrink-0 p-3 border-t border-[var(--color-border)]">
+        <a
+          href={demoSignupUrl()}
+          className="block w-full text-center px-4 py-3 rounded-lg border border-dashed border-[var(--color-border)] text-sm text-[var(--color-text-secondary)] hover:border-[var(--color-accent)] hover:text-[var(--color-text-primary)] transition-colors"
+        >
+          Chat with your knowledge base — free on your own Atomic →
+        </a>
+      </div>
+    );
+  }
   return (
     <div className="flex-shrink-0 p-3 border-t border-[var(--color-border)]">
       <textarea

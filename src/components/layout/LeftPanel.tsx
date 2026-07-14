@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { isDemoInstance } from '../../lib/transport';
 import { TagTree } from '../tags/TagTree';
 import { SettingsButton, SettingsModal, type SettingsTab } from '../settings';
 import { DatabaseSwitcher } from '../DatabaseSwitcher';
@@ -71,7 +72,9 @@ export function LeftPanel() {
           {/* Titlebar row with settings button */}
           <div className={`h-[52px] flex items-center px-3 flex-shrink-0 gap-1 ${isTauri() ? 'pl-[78px]' : ''}`} data-tauri-drag-region>
             <DatabaseSwitcher />
-            <SettingsButton onClick={() => { setSettingsInitialTab(undefined); setIsSettingsOpen(true); }} />
+            {!isDemoInstance() && (
+              <SettingsButton onClick={() => { setSettingsInitialTab(undefined); setIsSettingsOpen(true); }} />
+            )}
           </div>
 
           {/* Tag Tree with integrated search */}

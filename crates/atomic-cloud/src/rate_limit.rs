@@ -261,9 +261,15 @@ pub async fn data_plane_rate_limit_guard(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    // Demo visitors are exempt from the per-ACCOUNT windows: every
+    // anonymous visitor shares the demo account's key, so a traffic spike
+    // would collectively 429 the public demo. Their limits are per-IP,
+    // enforced at admission time (`crate::demo_plane`), with the managed
+    // key's credit cap bounding AI spend regardless.
     let account_id = req
         .extensions()
         .get::<ResolvedTenant>()
+        .filter(|t| t.principal.source != crate::auth::CredentialSource::DemoVisitor)
         .map(|t| t.principal.account_id.clone());
     let Some(account_id) = account_id else {
         return next.call(req).await.map(|res| res.map_into_boxed_body());

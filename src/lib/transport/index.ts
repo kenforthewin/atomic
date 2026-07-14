@@ -55,13 +55,49 @@ export function isCloudTenant(): boolean {
   return meta?.getAttribute('content') === 'true';
 }
 
+/** Resolved once during initTransport on cloud tenants; null everywhere else. */
+let demoConfig: { signup_url: string } | null = null;
+
+/**
+ * True when this session is an ANONYMOUS visitor on the cloud's public demo
+ * instance. The server tells us: `GET /api/demo-config` answers 200 only for
+ * demo visitors (the logged-in demo operator and every real tenant get 404,
+ * other unauthenticated hosts 401). UI uses this to render the demo chrome —
+ * signup banner, chat CTA, read-only editor, hidden edit affordances. The
+ * server-side whitelist is the actual enforcement; this flag is presentation.
+ */
+export function isDemoInstance(): boolean {
+  return demoConfig !== null;
+}
+
+/** The signup CTA target the demo server advertises. */
+export function demoSignupUrl(): string {
+  return demoConfig?.signup_url ?? 'https://atomicapp.ai/cloud';
+}
+
 export async function initTransport(): Promise<void> {
   if (isCloudTenant()) {
     // Cloud tenant: same-origin, cookie-authenticated. No localStorage config,
     // no setup prompt — the dashboard session cookie is the credential.
+    // Raw fetch (not the transport) so a 401/404 here can't trigger the
+    // transport's auth-expired redirect.
+    try {
+      const res = await fetch('/api/demo-config');
+      if (res.ok) {
+        const body = (await res.json()) as { demo?: boolean; signup_url?: string };
+        if (body.demo) demoConfig = { signup_url: body.signup_url ?? '' };
+      }
+    } catch {
+      // Network hiccup: boot as a normal tenant; API calls will sort it out.
+    }
     activeTransport = new HttpTransport({ baseUrl: '', authToken: '', cookieAuth: true });
     wireConnectionCallback(activeTransport);
-    connectInBackground(activeTransport);
+    // Demo visitors skip the WebSocket: the server closes /ws to them
+    // (403), and without a session there are no live events to receive —
+    // connecting would just cycle the reconnect backoff forever.
+    if (!isDemoInstance()) {
+      connectInBackground(activeTransport);
+    }
     return;
   }
   if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {

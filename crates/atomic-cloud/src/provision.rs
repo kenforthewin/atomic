@@ -245,6 +245,42 @@ pub async fn provision_account(
     managed: &ManagedKeys,
     new_account: NewAccount,
 ) -> Result<ProvisionedAccount, CloudError> {
+    provision_account_with_policy(
+        control,
+        cluster,
+        managed,
+        new_account,
+        SubdomainPolicy::EnforceReserved,
+    )
+    .await
+}
+
+/// Whether [`provision_account_with_policy`] honors the static
+/// reserved-subdomain blocklist. Type-enforced (the `BackupPolicy`
+/// precedent) so bypassing the blocklist is always a visible, deliberate
+/// choice at the call site — the signup path can never drift into
+/// `AllowReserved`.
+///
+/// `AllowReserved` exists for operator provisioning of platform-owned
+/// tenants on deliberately-reserved names (the public demo instance, plan:
+/// `docs/plans/demo-instance.md`). It bypasses ONLY the static blocklist;
+/// the active holds in `subdomains_reserved` (a recently deleted account's
+/// 90-day reservation) are a real conflict and stay enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubdomainPolicy {
+    EnforceReserved,
+    AllowReserved,
+}
+
+/// [`provision_account`] with an explicit [`SubdomainPolicy`]. Everything
+/// else is identical; see [`provision_account`]'s docs.
+pub async fn provision_account_with_policy(
+    control: &ControlPlane,
+    cluster: &ClusterConfig,
+    managed: &ManagedKeys,
+    new_account: NewAccount,
+    subdomain_policy: SubdomainPolicy,
+) -> Result<ProvisionedAccount, CloudError> {
     let NewAccount { email, subdomain } = new_account;
 
     // Step 1 — validate. The static blocklist and the active holds in
@@ -256,7 +292,9 @@ pub async fn provision_account(
     if !subdomain_format_ok(&subdomain) {
         return Err(CloudError::InvalidSubdomain(subdomain));
     }
-    if reserved_subdomains::is_reserved(&subdomain) {
+    if subdomain_policy == SubdomainPolicy::EnforceReserved
+        && reserved_subdomains::is_reserved(&subdomain)
+    {
         return Err(CloudError::SubdomainReserved(subdomain));
     }
     let actively_reserved: bool = sqlx::query_scalar(

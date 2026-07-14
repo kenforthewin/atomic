@@ -11,7 +11,7 @@ import { useTagsStore } from '../../stores/tags';
 import { useUIStore } from '../../stores/ui';
 import { useInlineEditor } from '../../hooks';
 import { formatDate } from '../../lib/date';
-import { getTransport } from '../../lib/transport';
+import { getTransport, isDemoInstance } from '../../lib/transport';
 import { readerEditorActions } from '../../lib/reader-editor-bridge';
 import { atomLinkExtension, type AtomLinkSuggestion, type AtomLinkSuggestionSource } from '../../editor/atom-links';
 import type {
@@ -177,7 +177,10 @@ function AtomReaderContent({
   onDismiss, onDelete, onTagClick, onRelatedAtomClick, onViewGraph, onAtomUpdated,
 }: AtomReaderContentProps) {
   const readerTheme = useUIStore(s => s.readerTheme);
-  const isEditing = useUIStore(s => s.readerState.editing);
+  // Demo visitors never edit: the pin here covers every entry into edit
+  // mode (i / Cmd+E / titlebar toggle) at once, and the server 403s any
+  // write that slipped through regardless.
+  const isEditing = useUIStore(s => s.readerState.editing) && !isDemoInstance();
   const setReaderEditing = useUIStore(s => s.setReaderEditing);
   const setReaderSaveStatus = useUIStore(s => s.setReaderSaveStatus);
   const retryTagging = useAtomsStore(s => s.retryTagging);

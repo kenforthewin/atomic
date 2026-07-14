@@ -57,7 +57,7 @@ use actix_web::middleware::Next;
 use actix_web::{web, HttpMessage};
 use chrono::{DateTime, Utc};
 
-use crate::auth::ResolvedTenant;
+use crate::auth::{CredentialSource, ResolvedTenant};
 use crate::control_plane::ControlPlane;
 use crate::error::CloudError;
 
@@ -184,9 +184,13 @@ pub async fn mark_hint_on_mutation(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
+    // Demo visitors never mark hints: their only whitelisted mutations are
+    // the search POSTs, which are semantically reads — a hint should mean
+    // "tenant work may exist", not "someone searched the public demo".
     let account_id = req
         .extensions()
         .get::<ResolvedTenant>()
+        .filter(|tenant| tenant.principal.source != CredentialSource::DemoVisitor)
         .map(|tenant| tenant.principal.account_id.clone());
 
     let res = next.call(req).await?;

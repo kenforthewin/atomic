@@ -1,4 +1,5 @@
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
+import { isDemoInstance } from '../../lib/transport';
 import { useShallow } from 'zustand/react/shallow';
 import {
   PanelLeft,
@@ -488,8 +489,9 @@ export function MainView() {
         )}
       </div>
 
-      {/* FAB — on atoms + dashboard base views only (no active tab) */}
-      {onBaseView && (viewMode === 'atoms' || viewMode === 'dashboard') && <FAB onClick={handleNewAtom} title="Create new atom" />}
+      {/* FAB — on atoms + dashboard base views only (no active tab); demo
+          visitors get no create affordance */}
+      {onBaseView && (viewMode === 'atoms' || viewMode === 'dashboard') && !isDemoInstance() && <FAB onClick={handleNewAtom} title="Create new atom" />}
     </main>
 
     {/* Chat sidebar backdrop — mobile only */}

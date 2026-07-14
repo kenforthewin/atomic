@@ -106,6 +106,11 @@ pub enum CredentialSource {
     Token,
     /// [`SESSION_COOKIE`] verified against `sessions`.
     Session,
+    /// No credential at all: an anonymous visitor on the configured demo
+    /// host, admitted through the demo whitelist
+    /// ([`crate::demo_plane::DemoPlane::authorize`]) at synthesis time.
+    /// Exists only when a demo subdomain is configured.
+    DemoVisitor,
 }
 
 impl CredentialSource {
@@ -114,6 +119,7 @@ impl CredentialSource {
         match self {
             CredentialSource::Token => "token",
             CredentialSource::Session => "session",
+            CredentialSource::DemoVisitor => "demo_visitor",
         }
     }
 }
@@ -186,6 +192,11 @@ struct AuthCtx {
     /// URLs from, so a client following the challenge reaches the tenant's
     /// own OAuth metadata.
     public_scheme: String,
+    /// When set, the one subdomain that serves anonymous demo visitors
+    /// (plan: `docs/plans/demo-instance.md`). `None` — the default, and
+    /// every deployment that doesn't opt in — means credential-less
+    /// requests are 401'd exactly as before this field existed.
+    demo: Option<crate::demo_plane::DemoPlane>,
 }
 
 /// The middleware factory. Cheap to clone; construct once and hand to every
@@ -218,8 +229,29 @@ impl CloudAuth {
                 cache,
                 base_domain,
                 public_scheme: "https".to_string(),
+                demo: None,
             }),
         }
+    }
+
+    /// Configure the demo plane (plan: `docs/plans/demo-instance.md`):
+    /// anonymous requests on `plane.subdomain()` are admitted through the
+    /// demo whitelist as [`CredentialSource::DemoVisitor`] principals.
+    /// `None` (the default) leaves credential-less requests 401'd
+    /// everywhere. Must be called before the first clone, like
+    /// [`with_public_scheme`](Self::with_public_scheme).
+    pub fn with_demo_plane(mut self, plane: Option<crate::demo_plane::DemoPlane>) -> Self {
+        Arc::get_mut(&mut self.ctx)
+            .expect("CloudAuth not yet cloned when configuring the demo plane")
+            .demo = plane;
+        self
+    }
+
+    /// The demo signup CTA URL, when a demo plane is configured — read by
+    /// the composition to seed the `/api/demo-config` resource
+    /// ([`crate::demo_plane::configure`]) without another assembly argument.
+    pub(crate) fn demo_signup_url(&self) -> Option<String> {
+        self.ctx.demo.as_ref().map(|d| d.signup_url().to_string())
     }
 
     /// Override the scheme used to build the MCP `WWW-Authenticate`
@@ -440,6 +472,23 @@ async fn authenticate(ctx: &AuthCtx, req: &mut ServiceRequest) -> Result<(), Htt
             scope: TokenScope::Account,
             allowed_db_id: None,
             source: CredentialSource::Session,
+        }
+    } else if let Some(demo) = ctx
+        .demo
+        .as_ref()
+        .filter(|demo| demo.subdomain() == subdomain)
+    {
+        // Anonymous visitor on the configured demo host: admitted only
+        // through the demo whitelist, refused (403/429) right here for
+        // anything else — so every surface behind CloudAuth, present and
+        // future, is demo-closed by construction. Credentialed requests
+        // took the branches above; the operator is never demo-restricted.
+        demo.authorize(req)?;
+        AuthPrincipal {
+            account_id,
+            scope: TokenScope::Account,
+            allowed_db_id: None,
+            source: CredentialSource::DemoVisitor,
         }
     } else {
         return Err(unauthorized());

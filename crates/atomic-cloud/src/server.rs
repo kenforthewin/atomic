@@ -517,6 +517,13 @@ pub fn configure_cloud_app(
         // Before api_scope: its exact-path /api/account resource must win
         // the route match over the /api scope.
         tenant_plane.configure(cfg, auth.clone());
+        // The demo-mode probe (`GET /api/demo-config`) — same
+        // ahead-of-api_scope registration. The demo *whitelist* needs no
+        // registration here at all: it is enforced at principal-synthesis
+        // time inside CloudAuth (see crate::demo_plane), so every
+        // auth-wrapped surface in this composition is demo-closed by
+        // construction.
+        crate::demo_plane::configure(cfg, auth.clone());
         // Per-tenant MCP Streamable HTTP (plan: "MCP token UX"). Behind
         // CloudAuth: the bearer MCP token this flow mints authenticates the
         // request and CloudAuth injects the tenant's `RequestDatabaseManager`,

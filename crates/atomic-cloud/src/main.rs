@@ -37,7 +37,7 @@ use atomic_cloud::account_over_plan_limits;
 use atomic_cloud::{
     abandoned_run_threshold, advance_deploy, advance_dunning_with, advance_expired_trials,
     configure_cloud_app, count_skipped_current, delete_account, finalize_abandoned_runs,
-    issue_token, latest_deploy_run, list_failed_migrations, list_unmigrated, provision_account,
+    issue_token, latest_deploy_run, list_failed_migrations, list_unmigrated,
     recompute_storage, roll_over_period, run_fleet_gate, tenant_schema_target, AccountCache,
     AccountCacheConfig, AccountPlane, AccountPlaneConfig, AdvanceOutcome, Billing, BillingConfig,
     ChatStreamLimiter, CloudAuth, ClusterConfig, ControlPlane, DataPlaneRateLimiter,
@@ -322,6 +322,16 @@ enum Command {
         /// deploy/MONITORING.md.
         #[arg(long, env = "ATOMIC_CLOUD_METRICS_BIND")]
         metrics_bind: Option<String>,
+
+        /// Subdomain served as the anonymous public demo (plan:
+        /// docs/plans/demo-instance.md). Credential-less requests on this
+        /// host are admitted through the demo read whitelist instead of
+        /// being 401'd; every other route stays closed to them, enforced at
+        /// authentication time. Unset (the default) disables demo behavior
+        /// entirely. The account itself must exist (provision it with
+        /// `account create --allow-reserved`).
+        #[arg(long, env = "ATOMIC_CLOUD_DEMO_SUBDOMAIN")]
+        demo_subdomain: Option<String>,
     },
 
     /// Connect to the control plane (creating the database if it doesn't
@@ -1173,6 +1183,13 @@ enum AccountAction {
         /// Subdomain the account is served under (3-32 chars of [a-z0-9-]).
         #[arg(long)]
         subdomain: String,
+
+        /// Bypass the static reserved-subdomain blocklist. For provisioning
+        /// platform-owned tenants on deliberately-reserved names (the public
+        /// demo instance). Active 90-day holds from deleted accounts are
+        /// still enforced.
+        #[arg(long)]
+        allow_reserved: bool,
     },
 
     /// Hard-delete an account: revoke its credentials, drop its tenant
@@ -1441,6 +1458,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             backup_staleness_secs,
             backup_timeout_secs,
             metrics_bind,
+            demo_subdomain,
         } => {
             // Boot-time master-key check (plan: "Encryption at rest").
             // Constructing the vault validates the key, so a deployment
@@ -1613,6 +1631,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 spa_dir,
                 product_dir,
                 metrics_bind,
+                demo_subdomain,
             )
             .await
         }
@@ -1622,17 +1641,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cluster,
                 email,
                 subdomain,
+                allow_reserved,
             } => {
                 // Operator-side creation never provisions a managed key:
                 // this command runs from hosts that hold neither the
                 // master key nor the provisioning key (see the module
                 // docs), so the account starts keyless — same state as
                 // provisioning-mode 'disabled'.
-                let account = provision_account(
+                let account = atomic_cloud::provision::provision_account_with_policy(
                     &control,
                     &cluster.into_config(),
                     &ManagedKeys::Disabled,
                     NewAccount { email, subdomain },
+                    if allow_reserved {
+                        atomic_cloud::provision::SubdomainPolicy::AllowReserved
+                    } else {
+                        atomic_cloud::provision::SubdomainPolicy::EnforceReserved
+                    },
                 )
                 .await?;
                 let token = issue_token(
@@ -2221,6 +2246,7 @@ async fn serve(
     spa_dir: std::path::PathBuf,
     product_dir: Option<std::path::PathBuf>,
     metrics_bind: Option<String>,
+    demo_subdomain: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Process metrics registry (see atomic_cloud::metrics). Built
     // unconditionally — the update sites are a handful of atomics either
@@ -2260,7 +2286,19 @@ async fn serve(
         .scheme()
         .to_string();
     let auth = CloudAuth::new(control.clone(), Arc::clone(&cache), &base_domain)
-        .with_public_scheme(public_scheme.clone());
+        .with_public_scheme(public_scheme.clone())
+        // The demo plane (plan: docs/plans/demo-instance.md): anonymous
+        // visitors on the configured subdomain are admitted through the
+        // read whitelist at authentication time. Reuses the signup/login
+        // limiters' proxy-header policy for its per-IP search limits, and
+        // the app host's signup page as the CTA target.
+        .with_demo_plane(demo_subdomain.map(|subdomain| {
+            atomic_cloud::demo_plane::DemoPlane::new(
+                subdomain,
+                &app_public_url,
+                plane_config.trust_proxy_header,
+            )
+        }));
     // The deletion route takes its final pre-drop dump to the backup store
     // (plan: "Account deletion" step 4) — the operator's undo under
     // hard-delete v1.

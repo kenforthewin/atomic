@@ -14,7 +14,8 @@ import { useDatabasesStore } from '../../stores/databases';
 import { useUIStore } from '../../stores/ui';
 import { useTheme, useFont } from '../../hooks';
 import { verifyProviderConfigured } from '../../lib/api';
-import { isCloudTenant } from '../../lib/transport';
+import { isCloudTenant, isDemoInstance } from '../../lib/transport';
+import { DemoBanner } from './DemoBanner';
 import { useSettingsStore } from '../../stores/settings';
 import { isTauri } from '../../lib/platform';
 
@@ -82,8 +83,10 @@ export function Layout() {
         return;
       }
 
-      // Cmd+N or Ctrl+N to create new atom (only when palettes are closed)
+      // Cmd+N or Ctrl+N to create new atom (only when palettes are closed;
+      // never for demo visitors — the server would 403 the create anyway)
       if ((e.metaKey || e.ctrlKey) && e.key === 'n' && !commandPaletteOpen && !searchPaletteOpen) {
+        if (isDemoInstance()) return;
         e.preventDefault();
         const { createAtom } = useAtomsStore.getState();
         createAtom('').then((newAtom) => {
@@ -115,6 +118,13 @@ export function Layout() {
   useEffect(() => {
     const checkSetup = async () => {
       try {
+        if (isDemoInstance()) {
+          // Demo visitor: no onboarding, no setup — straight into the
+          // read-only knowledge base. (The wizard's writes would 403.)
+          setIsSetupRequired(false);
+          await initializeApp();
+          return;
+        }
         if (isCloudTenant()) {
           // Cloud: the provider is already provisioned, so setup is gated on
           // whether the account finished onboarding (tag categories,
@@ -196,25 +206,28 @@ export function Layout() {
   }
 
   return (
-    <div className="flex h-full overflow-hidden bg-[var(--color-bg-main)]">
-      <RouterBridge />
-      <LeftPanel />
-      <MainView />
-      <LoadingIndicator />
-      <ServerConnectionStatus />
-      <CommandPalette
-        isOpen={commandPaletteOpen}
-        onClose={closeCommandPalette}
-      />
-      <SearchPalette
-        isOpen={searchPaletteOpen}
-        onClose={closeSearchPalette}
-        initialQuery={searchPaletteInitialQuery}
-      />
-      <SettingsModal
-        isOpen={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-      />
+    <div className="flex flex-col h-full overflow-hidden bg-[var(--color-bg-main)]">
+      {isDemoInstance() && <DemoBanner />}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        <RouterBridge />
+        <LeftPanel />
+        <MainView />
+        <LoadingIndicator />
+        <ServerConnectionStatus />
+        <CommandPalette
+          isOpen={commandPaletteOpen}
+          onClose={closeCommandPalette}
+        />
+        <SearchPalette
+          isOpen={searchPaletteOpen}
+          onClose={closeSearchPalette}
+          initialQuery={searchPaletteInitialQuery}
+        />
+        <SettingsModal
+          isOpen={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+        />
+      </div>
     </div>
   );
 }

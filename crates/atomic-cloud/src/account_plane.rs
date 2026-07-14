@@ -497,8 +497,10 @@ pub(crate) fn app_host_guard(base_domain: String) -> impl Guard {
 }
 
 /// The client IP for rate limiting and the `request_ip` breadcrumb. See the
-/// module docs for the proxy-header trade-off.
-fn client_ip(req: &HttpRequest, trust_proxy_header: bool) -> Option<String> {
+/// module docs for the proxy-header trade-off. `pub(crate)` so the demo
+/// plane's per-IP search limiter keys on the same identity the signup/login
+/// limiters use — one proxy-header policy, one helper.
+pub(crate) fn client_ip(req: &HttpRequest, trust_proxy_header: bool) -> Option<String> {
     if trust_proxy_header {
         if let Some(ip) = req
             .headers()

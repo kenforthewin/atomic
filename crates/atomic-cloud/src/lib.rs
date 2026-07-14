@@ -37,6 +37,7 @@ pub mod billing_routes;
 pub mod chat_streams;
 pub mod control_plane;
 pub mod curated_models;
+pub mod demo_plane;
 pub mod deploy;
 pub mod dispatch_hints;
 pub mod dispatcher;
@@ -164,9 +165,10 @@ pub use provider_credentials::{
     update_model_config, upsert_credentials, ActiveProviderState, CredentialOrigin, NewCredentials,
     Provider, ProviderCredentials,
 };
+pub use demo_plane::DemoPlane;
 pub use provision::{
-    delete_account, provision_account, tenant_db_account_id, tenant_db_name, ClusterConfig,
-    DeleteLock, NewAccount, ProvisionedAccount,
+    delete_account, provision_account, provision_account_with_policy, tenant_db_account_id,
+    tenant_db_name, ClusterConfig, DeleteLock, NewAccount, ProvisionedAccount, SubdomainPolicy,
 };
 pub use provisioning_api::{
     CreatedRuntimeKey, OpenRouterProvisioning, ProvisioningApi, RuntimeKeyUsage,
