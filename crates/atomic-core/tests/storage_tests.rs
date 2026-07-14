@@ -1679,6 +1679,71 @@ mod postgres_tests {
         assert!(!pairs.contains_key(&ids[2]));
     }
 
+    /// The centroid-ranked wiki chunk selectors must run against the real
+    /// Postgres schema — embeddings live ON `atom_chunks`, and a stale
+    /// `atom_chunk_embeddings` join here shipped to production unexercised
+    /// (cloud wiki generation failed on FIRST use, 2026-07-14). This pins
+    /// both ranked paths: full-source selection and the incremental-update
+    /// selection, ordered by similarity to the tag centroid.
+    #[tokio::test]
+    async fn pg_wiki_ranked_chunk_selection_uses_real_schema() {
+        use atomic_core::storage::{TagStore, WikiStore};
+
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        let tag = s.create_tag("Wiki Ranked Tag", None).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let request = CreateAtomRequest {
+                content: format!("Ranked atom {i}"),
+                tag_ids: vec![tag.id.clone()],
+                ..Default::default()
+            };
+            s.insert_atom(&id, &request, &now).await.unwrap();
+            ids.push(id);
+        }
+        // Chunk embeddings: ids[0] aligned with the centroid, ids[1]
+        // orthogonal. The cloud schema pins vector(1536), so build
+        // full-width basis vectors.
+        let axis = |i: usize| {
+            let mut v = vec![0.0f32; 1536];
+            v[i] = 1.0;
+            v
+        };
+        s.save_chunks_and_embeddings(&ids[0], &[("near".to_string(), axis(0))])
+            .await
+            .unwrap();
+        s.save_chunks_and_embeddings(&ids[1], &[("far".to_string(), axis(1))])
+            .await
+            .unwrap();
+        s.save_tag_centroid(&tag.id, &axis(0)).await.unwrap();
+
+        // Ranked full-source path: both chunks, similarity-ordered.
+        let (chunks, atom_count) = s
+            .get_wiki_source_chunks(&tag.id, 10_000)
+            .await
+            .expect("ranked source selection must run on the Postgres schema");
+        assert_eq!(atom_count, 2);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].content, "near", "centroid-nearest chunk first");
+        assert!(chunks[0].similarity_score > chunks[1].similarity_score);
+
+        // Ranked incremental path: only atoms created after the watermark.
+        let epoch = "1970-01-01T00:00:00Z";
+        let update = s
+            .get_wiki_update_chunks(&tag.id, epoch, 10_000)
+            .await
+            .expect("ranked update selection must run on the Postgres schema")
+            .expect("all atoms are newer than the epoch watermark");
+        assert_eq!(update.1, 2);
+        assert_eq!(update.0[0].content, "near");
+    }
+
     /// Cross-`db_id` fencing: two storage handles sharing one pool but
     /// scoped to different logical databases must not see each other's
     /// settings rows — the exact leak that used to share `task.{id}.*`

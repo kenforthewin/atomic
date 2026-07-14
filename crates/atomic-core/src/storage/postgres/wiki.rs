@@ -460,12 +460,16 @@ impl WikiStore for PostgresStorage {
         let chunks = if let Some(ref centroid_vec) = centroid {
             // Ranked path: query chunks by cosine similarity to centroid, scoped to atoms
             let rows: Vec<(String, i32, String, f64)> = sqlx::query_as(
+                // Embeddings live ON atom_chunks in the Postgres schema
+                // (the SQLite layout's separate vec_chunks table has no
+                // Postgres counterpart — a stale `atom_chunk_embeddings`
+                // join here made cloud wiki generation fail on first use).
                 "SELECT ac.atom_id, ac.chunk_index, ac.content,
-                        1 - (e.embedding <=> $1::vector) as similarity
-                 FROM atom_chunk_embeddings e
-                 JOIN atom_chunks ac ON e.chunk_id = ac.id
+                        1 - (ac.embedding <=> $1::vector) as similarity
+                 FROM atom_chunks ac
                  WHERE ac.atom_id = ANY($2) AND ac.db_id = $3
-                 ORDER BY e.embedding <=> $1::vector
+                   AND ac.embedding IS NOT NULL
+                 ORDER BY ac.embedding <=> $1::vector
                  LIMIT 3000",
             )
             .bind(centroid_vec.as_slice())
@@ -589,12 +593,16 @@ impl WikiStore for PostgresStorage {
 
         let mut new_chunks = if let Some(ref centroid_vec) = centroid {
             let rows: Vec<(String, i32, String, f64)> = sqlx::query_as(
+                // Embeddings live ON atom_chunks in the Postgres schema
+                // (the SQLite layout's separate vec_chunks table has no
+                // Postgres counterpart — a stale `atom_chunk_embeddings`
+                // join here made cloud wiki generation fail on first use).
                 "SELECT ac.atom_id, ac.chunk_index, ac.content,
-                        1 - (e.embedding <=> $1::vector) as similarity
-                 FROM atom_chunk_embeddings e
-                 JOIN atom_chunks ac ON e.chunk_id = ac.id
+                        1 - (ac.embedding <=> $1::vector) as similarity
+                 FROM atom_chunks ac
                  WHERE ac.atom_id = ANY($2) AND ac.db_id = $3
-                 ORDER BY e.embedding <=> $1::vector
+                   AND ac.embedding IS NOT NULL
+                 ORDER BY ac.embedding <=> $1::vector
                  LIMIT 3000",
             )
             .bind(centroid_vec.as_slice())
