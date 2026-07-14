@@ -108,8 +108,12 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ResponseMessage,
-    #[allow(dead_code)]
     finish_reason: Option<String>,
+    /// The upstream provider's RAW finish reason, before OpenRouter's
+    /// normalization — diagnostic gold when a generation ends early with a
+    /// normalized `stop` (e.g. an endpoint-side filter or emulation quirk).
+    #[serde(default)]
+    native_finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -387,6 +391,19 @@ async fn complete_internal(
         .tool_calls
         .map(|tcs| tcs.iter().map(convert_tool_call).collect());
 
+    // Any non-`stop` end is worth a log line even when the caller treats
+    // the response as success — invisible finish reasons are how two
+    // truncated demo digests reached the database looking healthy.
+    if let Some(reason) = choice.finish_reason.as_deref() {
+        if reason != "stop" && reason != "tool_calls" {
+            tracing::warn!(
+                finish_reason = reason,
+                native_finish_reason = choice.native_finish_reason.as_deref().unwrap_or("-"),
+                model = %config.model,
+                "OpenRouter completion ended early"
+            );
+        }
+    }
     Ok(CompletionResponse {
         finish_reason: choice.finish_reason.clone(),
         content: choice.message.content.unwrap_or_default(),

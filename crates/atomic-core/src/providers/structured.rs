@@ -257,22 +257,26 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
 
         match provider.complete(messages, &primary_config).await {
             Ok(response) => {
-                // A `length` stop means the content is truncated BY
-                // CONSTRUCTION — parsing it is how a mid-sentence digest
-                // ends up in the database looking like a success (the
-                // model may still close the JSON envelope around the cut
-                // string). Treat as transient and retry: another attempt
-                // (often another upstream) usually completes.
-                if response.finish_reason.as_deref() == Some("length") {
+                // A non-`stop` end means the content is incomplete BY
+                // CONSTRUCTION — `length` (output cap), `content_filter`
+                // (endpoint-side moderation cut a generation mid-flight),
+                // or `error`. Parsing it is how a mid-sentence digest ends
+                // up in the database looking like a success (the model may
+                // still close the JSON envelope around the cut string).
+                // Treat as transient and retry: another attempt — often
+                // another upstream — usually completes.
+                if let Some(reason) = response.finish_reason.as_deref().filter(|r| {
+                    matches!(*r, "length" | "content_filter" | "error")
+                }) {
                     last_parse_err = format!(
-                        "generation hit the output-token limit (finish_reason=length, \
-                         {} chars in)",
+                        "generation ended early (finish_reason={reason}, {} chars in)",
                         response.content.len()
                     );
                     tracing::warn!(
                         schema_name,
+                        finish_reason = reason,
                         content_chars = response.content.len(),
-                        "[structured] Truncated generation (finish_reason=length); retrying"
+                        "[structured] Incomplete generation; retrying"
                     );
                     if attempt < max_retries {
                         continue;
