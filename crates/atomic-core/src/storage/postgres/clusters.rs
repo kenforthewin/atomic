@@ -1261,4 +1261,22 @@ impl ClusterStore for PostgresStorage {
             (Some(pid), None) => build_tag_level(&self.pool, pid, &self.db_id).await,
         }
     }
+
+    async fn enrich_clusters_with_tags(
+        &self,
+        mut clusters: Vec<AtomCluster>,
+    ) -> StorageResult<Vec<AtomCluster>> {
+        // Overrides the trait's no-op default. Without this, clusters
+        // computed in-process (the global-canvas path) reach the label
+        // builder with empty dominant_tags and every canvas pill renders
+        // as "Cluster N" — SQLite has enriched here since day one; the
+        // Postgres side silently inherited the default. Uses the same
+        // child-tags-only query the canvas level builder labels with, so
+        // category roots ("Topics") never headline a cluster.
+        for cluster in &mut clusters {
+            cluster.dominant_tags =
+                get_dominant_tags_for_atoms(&self.pool, &cluster.atom_ids, &self.db_id).await?;
+        }
+        Ok(clusters)
+    }
 }

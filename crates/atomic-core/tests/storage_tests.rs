@@ -1679,6 +1679,52 @@ mod postgres_tests {
         assert!(!pairs.contains_key(&ids[2]));
     }
 
+    /// The global-canvas cluster labels depend on `enrich_clusters_with_tags`
+    /// having a REAL Postgres override — the trait default is a no-op, which
+    /// SQLite overrides and Postgres silently didn't, so every cloud canvas
+    /// pill rendered as "Cluster N" instead of its dominant tags.
+    #[tokio::test]
+    async fn pg_enrich_clusters_fills_dominant_tags() {
+        use atomic_core::storage::{ClusterStore, TagStore};
+
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        // Child tag under a category root: the enrich query is
+        // child-tags-only, so the parent must never headline.
+        let root = s.create_tag("Topics Enrich Root", None).await.unwrap();
+        let child = s
+            .create_tag("Distributed Consensus", Some(&root.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let request = CreateAtomRequest {
+                content: format!("Enrich atom {i}"),
+                tag_ids: vec![child.id.clone()],
+                ..Default::default()
+            };
+            s.insert_atom(&id, &request, &now).await.unwrap();
+            ids.push(id);
+        }
+
+        let bare = vec![atomic_core::AtomCluster {
+            cluster_id: 0,
+            atom_ids: ids.clone(),
+            dominant_tags: vec![],
+        }];
+        let enriched = s.enrich_clusters_with_tags(bare).await.unwrap();
+        assert_eq!(
+            enriched[0].dominant_tags,
+            vec!["Distributed Consensus".to_string()],
+            "the Postgres override must fill dominant tags (child tags only)"
+        );
+    }
+
     /// The centroid-ranked wiki chunk selectors must run against the real
     /// Postgres schema — embeddings live ON `atom_chunks`, and a stale
     /// `atom_chunk_embeddings` join here shipped to production unexercised
