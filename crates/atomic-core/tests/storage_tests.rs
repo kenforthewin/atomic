@@ -1679,6 +1679,60 @@ mod postgres_tests {
         assert!(!pairs.contains_key(&ids[2]));
     }
 
+    /// The search palette's endpoint (`/api/search/global`) must decode on
+    /// real Postgres: bare decimal literals in a CASE are typed NUMERIC,
+    /// which sqlx refuses to decode as f32 — the tag section 500'd the
+    /// whole palette on cloud until the scores were cast ::real. Exercises
+    /// every section (atoms, wiki, chats, tags) with a matching tag name
+    /// so the CASE branches actually produce rows.
+    #[tokio::test]
+    async fn pg_global_keyword_search_decodes_all_sections() {
+        use atomic_core::storage::TagStore;
+
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+
+        let tag = s.create_tag("Attention Mechanism", None).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let atom_id = uuid::Uuid::new_v4().to_string();
+        let request = CreateAtomRequest {
+            content: "Attention is all you need — the transformer paper.".to_string(),
+            tag_ids: vec![tag.id.clone()],
+            ..Default::default()
+        };
+        s.insert_atom(&atom_id, &request, &now).await.unwrap();
+        // Atom keyword search runs over CHUNK tsvectors — an unchunked atom
+        // is invisible to it, so seed one chunk (full-width vector, the
+        // schema pins 1536).
+        let mut embedding = vec![0.0f32; 1536];
+        embedding[0] = 1.0;
+        s.save_chunks_and_embeddings(
+            &atom_id,
+            &[(
+                "Attention is all you need — the transformer paper.".to_string(),
+                embedding,
+            )],
+        )
+        .await
+        .unwrap();
+
+        let res = s
+            .global_keyword_search("attention", 5)
+            .await
+            .expect("global search must decode on the Postgres schema");
+        assert!(
+            res.tags.iter().any(|t| t.name == "Attention Mechanism"),
+            "tag section must return the exact-prefix match (got {:?})",
+            res.tags.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !res.atoms.is_empty(),
+            "atom section must match the seeded content"
+        );
+    }
+
     /// The global-canvas cluster labels depend on `enrich_clusters_with_tags`
     /// having a REAL Postgres override — the trait default is a no-op, which
     /// SQLite overrides and Postgres silently didn't, so every cloud canvas

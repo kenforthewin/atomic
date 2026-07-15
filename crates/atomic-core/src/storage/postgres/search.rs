@@ -835,7 +835,7 @@ async fn pg_keyword_search_wiki(
                         WHEN LOWER(t.name) LIKE LOWER($3) THEN 0.95
                         ELSE 0.0
                     END
-                ) AS score
+                )::real AS score
          FROM wiki_articles w
          JOIN tags t ON t.id = w.tag_id AND t.db_id = $2
          WHERE w.db_id = $2
@@ -915,7 +915,7 @@ async fn pg_keyword_search_chats(
                        WHEN LOWER(c.title) = LOWER($1) THEN 1.0
                        WHEN LOWER(c.title) LIKE LOWER($3) THEN 0.9
                        ELSE 0.0
-                   END AS score,
+                   END::real AS score,
                    1 AS rn
             FROM conversations c
             LEFT JOIN chat_messages m_all
@@ -986,7 +986,7 @@ async fn pg_keyword_search_tags(
                     WHEN LOWER(name) LIKE LOWER($3) THEN 0.95
                     WHEN LOWER(name) LIKE LOWER($2) THEN 0.8
                     ELSE 0.0
-                END AS score
+                END::real AS score
          FROM tags
          WHERE db_id = $4
            AND LOWER(name) LIKE LOWER($2)
