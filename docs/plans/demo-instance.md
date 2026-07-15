@@ -226,8 +226,18 @@ In `tests/e2e_cloud.rs` (or a new `tests/demo_plane.rs`):
 
 ## Deferred (explicitly out of slice 1)
 
-- **Edge caching** for the demo host (fast-follow before any big launch
-  post; `atoms-with-embeddings` first).
+- **Edge caching** — ~~deferred~~ shipped 2026-07-15, one dashboard step
+  remaining. Origin stamps `Cache-Control: public, s-maxage=60` on
+  DemoVisitor 200 GETs only (`demo_plane::demo_cache_headers`,
+  e2e-pinned: owner and denial responses never carry it; no Vary on
+  Cookie — the whitelisted GET surface is visitor-identical by
+  construction). DNS: proxied A record `demo` → droplet (record
+  c3317e45…, shadows the unproxied wildcard; zone SSL `full`). REMAINING
+  (operator, dashboard — the deploy token is DNS-scoped): one Cache Rule,
+  hostname `demo.atomicapp.ai` → eligible for cache, respect origin
+  headers, bypass on `Authorization` header. Until it exists Cloudflare
+  reports DYNAMIC on JSON and the origin serves every request (status
+  quo, just proxied).
 - **Feeds**: subscribe-time backfill guard (mark-existing-seen), excerpt
   mode, retention task, permission emails — the whole liveness layer.
 - **WS** for demo visitors.
