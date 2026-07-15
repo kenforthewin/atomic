@@ -328,6 +328,16 @@ signal). (c) A real metrics pipeline (the Grafana item, again).
 
 ## Standing follow-ups
 
+- **Postgres batch-override debt** (2026-07-15 parity sweep): five storage
+  trait methods run on correct-but-unbatched default fallbacks on Postgres
+  (`compute_semantic_edges_batch`, `save_chunks_and_embeddings_batch`,
+  `set_embedding_status_batch`, `get_tag_ids_for_atoms_batch`,
+  `get_semantic_edges_raw`) — N queries where SQLite does one. Correctness
+  is fine (the sweep found no further no-op-default or phantom-table gaps
+  after the wiki/cluster fixes); the edge-compute one bites first, during
+  a tenant's bulk import. Add PG batch overrides before courting
+  10k-atom-vault migrations.
+
 - **Measure, don't estimate**: record fleet-migration wall time per deploy
   and backup-pass durations now, while N is small — the trend line is the
   early warning this doc can't compute from constants.
