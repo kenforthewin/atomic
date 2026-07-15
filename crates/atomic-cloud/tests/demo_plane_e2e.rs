@@ -295,7 +295,6 @@ async fn demo_whitelist_serves_reads_and_refuses_everything_else() {
             "/api/reports",
             "/api/settings",
             "/api/databases",
-            "/api/setup/status",
             "/api/embeddings/status/all",
         ] {
             let res = h.anon(Method::GET, path).await;
@@ -529,9 +528,7 @@ async fn demo_path_opens_only_on_the_configured_host() {
             StatusCode::NOT_FOUND,
             "an unknown subdomain is 404 (no such account), demo or not"
         );
-        // A real non-demo account still 401s anonymously: the demo tenant
-        // exists, so probe it through a NON-demo harness below instead —
-        // here, assert the app host is untouched by demo config.
+        // The app host is untouched by demo config.
         let res = h
             .client
             .get(format!("{}/api/atoms", h.base_url))
@@ -541,9 +538,19 @@ async fn demo_path_opens_only_on_the_configured_host() {
             .expect("request");
         assert_ne!(res.status(), StatusCode::OK);
         h.stop().await;
+    })
+    .await;
+}
 
-        // Without --demo-subdomain, the SAME host serves nothing
-        // anonymously: the feature is opt-in per deployment.
+// Own control DB (not a second phase of the scoping test): each
+// `DemoHarness::spawn` provisions the demo tenant, and two spawns against
+// one control database collide on the unique subdomain — the exact
+// SubdomainTaken failure CI caught the first time this suite actually ran.
+#[actix_web::test]
+async fn no_demo_config_leaves_anonymous_requests_unauthorized() {
+    with_control_db("demo_plane_unconfigured", |control_url| async move {
+        // Without --demo-subdomain, the demo tenant's own host serves
+        // nothing anonymously: the feature is opt-in per deployment.
         let h = DemoHarness::spawn(&control_url, false).await;
         let res = h.anon(Method::GET, "/api/atoms").await;
         assert_eq!(

@@ -110,8 +110,10 @@ const DEMO_ALLOWED: &[(&Method, &str)] = &[
     (&Method::GET, "/api/dashboard/featured-report"),
     (&Method::GET, "/api/findings/*"),
     (&Method::GET, "/api/findings/*/citations"),
-    // Boot/status reads the SPA needs to render.
-    (&Method::GET, "/api/setup/status"),
+    // Boot/status reads the SPA needs to render. (No /api/setup/* here:
+    // the self-hosted setup plane is deliberately unregistered in the
+    // cloud composition — whitelisting it would only expose the SPA
+    // fallback shell, not an API.)
     (&Method::GET, "/api/settings"),
     (&Method::GET, "/api/settings/models"),
     (&Method::GET, "/api/embeddings/status/all"),
