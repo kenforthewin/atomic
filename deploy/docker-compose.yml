@@ -89,6 +89,15 @@ services:
     # image isn't available.
     image: ${ATOMIC_CLOUD_IMAGE:-ghcr.io/kenforthewin/atomic-cloud:latest}
     restart: unless-stopped
+    # Docker's default soft nofile limit is 1024 — a slow socket leak hit it
+    # after ~28h on 2026-07-16 and the pod stopped accepting connections
+    # while reading as "up". 65536 turns any future leak from an outage
+    # fuse into a weeks-long grace period; the atomic_cloud_process_open_fds
+    # gauge + alert (deploy/MONITORING.md) is what actually catches it.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     env_file: .env
     environment:
       # Composed here (not in .env) because env_file values are passed

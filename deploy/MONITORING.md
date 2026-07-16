@@ -57,6 +57,15 @@ consumer is the `grafana-alloy` container on the same bridge network.
 These map 1:1 onto the scaling doc's signal column; create them before any
 dashboards — alerts are the point.
 
+0. **FD exhaustion** (the 2026-07-16 outage: a socket leak ate Docker's
+   default 1024 soft limit in ~28h; at the limit `accept()` fails and the
+   pod serves nothing while looking "up"):
+   `atomic_cloud_process_open_fds / atomic_cloud_process_fd_limit > 0.5`.
+   The compose file now sets nofile to 65536, so at the historical leak
+   rate this alert fires WEEKS before impact. If it fires: snapshot
+   `/proc/<pid>/fd` counts and classify sockets against `/proc/<pid>/net/*`
+   BEFORE restarting — the evidence does not survive the restart.
+
 1. **Backup staleness** (doc #6; the launch-week placebo lesson):
    `atomic_cloud_backup_last_success_age_seconds > 129600` (36h).
    The gauge is `+Inf` until the first successful pass after boot, so this

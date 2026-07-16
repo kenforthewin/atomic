@@ -260,6 +260,28 @@ pub async fn render(state: &MetricsState) -> String {
         &[],
         reg.started.elapsed().as_secs_f64(),
     );
+    // Open file descriptors vs the soft limit — computed at scrape time
+    // (same never-stale principle as the age gauges). A slow FD leak is a
+    // fuse: the 2026-07-16 outage was the pod hitting Docker's default
+    // 1024 soft limit after ~28h of a socket leak, at which point accept()
+    // fails and the pod serves nothing while looking "up". Alert on the
+    // ratio (recipe in deploy/MONITORING.md) and the next leak announces
+    // itself days before it detonates.
+    let (open_fds, fd_limit) = process_fd_usage();
+    family(
+        &mut out,
+        "atomic_cloud_process_open_fds",
+        "Open file descriptors held by this pod's process.",
+        "gauge",
+    );
+    sample(&mut out, "atomic_cloud_process_open_fds", &[], open_fds);
+    family(
+        &mut out,
+        "atomic_cloud_process_fd_limit",
+        "Soft limit on open file descriptors (RLIMIT_NOFILE).",
+        "gauge",
+    );
+    sample(&mut out, "atomic_cloud_process_fd_limit", &[], fd_limit);
 
     // ---- account cache (scaling doc #2) ----
     let cache_stats = state.cache.stats().await;
@@ -562,6 +584,24 @@ fn age_seconds(stamp_unix: u64) -> f64 {
 }
 
 /// Write one family's `# HELP` / `# TYPE` header.
+/// (open fd count, soft RLIMIT_NOFILE), read from /proc at scrape time.
+/// NaN on platforms without /proc (macOS dev) — Prometheus drops NaN
+/// samples, so the families are simply absent rather than lying.
+fn process_fd_usage() -> (f64, f64) {
+    let open = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count().saturating_sub(1) as f64) // read_dir itself holds one
+        .unwrap_or(f64::NAN);
+    let limit = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|s| {
+            s.lines().find(|l| l.starts_with("Max open files")).and_then(|l| {
+                l.split_whitespace().nth(3).and_then(|v| v.parse::<f64>().ok())
+            })
+        })
+        .unwrap_or(f64::NAN);
+    (open, limit)
+}
+
 fn family(out: &mut String, name: &str, help: &str, kind: &str) {
     // HELP text: Prometheus requires backslash and newline escaping.
     let help = help.replace('\\', "\\\\").replace('\n', "\\n");

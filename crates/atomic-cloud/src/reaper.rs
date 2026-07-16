@@ -907,6 +907,31 @@ async fn scan_orphans(
     .filter(|name| is_tenant_db_name(name))
     .collect();
 
+    // Batch pre-filter: a candidate with an active mapping row is owned and
+    // needs no further attention this pass. One control-plane query replaces
+    // a per-candidate `is_referenced` for the fleet-sized common case — and,
+    // more importantly, the guardrails below reason about ACTUAL disowned
+    // databases. (The previous shape gated on `candidates` — every
+    // tenant-shaped database on the cluster — so the "implausibly high
+    // orphan count" warning fired every pass from the moment the fleet
+    // grew to IMPLAUSIBLE_ORPHAN_COUNT tenants, drowning the signal it
+    // exists to raise.) Correctness never rests on this filter: every
+    // remaining candidate still passes the unlocked pre-check and the
+    // under-lock re-check before any drop.
+    let owned: std::collections::HashSet<String> =
+        sqlx::query_scalar::<_, String>(
+            "SELECT db_name FROM account_databases WHERE status = 'active'",
+        )
+        .fetch_all(control.pool())
+        .await
+        .map_err(CloudError::db("listing owned tenant databases"))?
+        .into_iter()
+        .collect();
+    let candidates: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| !owned.contains(name))
+        .collect();
+
     // Data-loss guardrail (REL-4). The under-lock re-check re-queries the
     // SAME control plane that produced the unlocked pre-check, so a control
     // plane that is wrong about *every* account — a `--control-url`
