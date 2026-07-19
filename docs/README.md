@@ -30,6 +30,7 @@ Design notes, rollout plans, and proposed product or architecture changes. These
 Exploratory analysis and investigation notes. These are useful context, but they are not implementation specs by default.
 
 - [LLM Wiki Gist Analysis](research/llm-wiki-gist-analysis.md)
+- [Memory Retention Audit](research/memory-retention-audit.md)
 
 ## Images
 

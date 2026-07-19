@@ -110,6 +110,66 @@ async fn run_ws_delivers_pipeline_events(backend: Backend) {
     server.stop().await;
 }
 
+/// A departed client must release its broadcast receiver promptly — for a
+/// graceful Close frame and for a bare TCP teardown alike. The receiver is
+/// more than a memory bump: composing layers use `receiver_count()` as a
+/// liveness signal (cloud pins a tenant's whole cache entry while any
+/// receiver exists), so a forwarding task that only notices dead clients
+/// when the next event's send fails retains tenants indefinitely on quiet
+/// servers. Storage-agnostic (transport behavior), so SQLite only.
+#[actix_web::test]
+async fn ws_disconnect_releases_broadcast_receiver() {
+    let Some(ctx) = TestCtx::new(Backend::Sqlite).await else {
+        return;
+    };
+    let server = spawn_live_server(&ctx).await;
+    let ws_url = format!(
+        "{}/ws?token={}",
+        server.base_url.replace("http://", "ws://"),
+        ctx.token
+    );
+
+    async fn wait_for_count(
+        tx: &tokio::sync::broadcast::Sender<atomic_server::state::ServerEvent>,
+        want: usize,
+        context: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tx.receiver_count() != want {
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "{context}: receiver_count stuck at {} (wanted {want})",
+                    tx.receiver_count()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let baseline = ctx.state.event_tx.receiver_count();
+
+    // Graceful shutdown: the client sends Close.
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("ws upgrade should succeed");
+    wait_for_count(&ctx.state.event_tx, baseline + 1, "after first connect").await;
+    ws.send(Message::Close(None)).await.expect("send close");
+    drop(ws);
+    wait_for_count(&ctx.state.event_tx, baseline, "after graceful close").await;
+
+    // Ungraceful shutdown: the client vanishes without a Close frame; the
+    // server must notice the stream ending (EOF) rather than waiting for
+    // the next broadcast event to fail.
+    let (ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("ws upgrade should succeed");
+    wait_for_count(&ctx.state.event_tx, baseline + 1, "after second connect").await;
+    drop(ws);
+    wait_for_count(&ctx.state.event_tx, baseline, "after abrupt disconnect").await;
+
+    server.stop().await;
+}
+
 #[actix_web::test]
 async fn ws_rejects_invalid_token_sqlite() {
     run_ws_rejects_invalid_token(Backend::Sqlite).await;

@@ -26,7 +26,10 @@ use rmcp::{
         common::http_header::{
             EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
         },
-        streamable_http_server::session::{local::LocalSessionManager, SessionManager},
+        streamable_http_server::session::{
+            local::{LocalSessionManager, SessionConfig},
+            SessionManager,
+        },
         TransportAdapterIdentity,
     },
 };
@@ -35,6 +38,13 @@ use tokio::sync::broadcast;
 
 const HEADER_X_ACCEL_BUFFERING: &str = "X-Accel-Buffering";
 const TEXT_MIME_TYPE: &str = "text/plain; charset=utf-8";
+
+/// Idle expiry for streamable-HTTP MCP sessions. Without one, a client
+/// that disappears without sending DELETE (crash, network loss, killed
+/// process) leaves its session entry, worker task, and service task alive
+/// for the life of the server. Orderly clients are unaffected: one that
+/// returns after expiry gets a session-not-found and re-initializes.
+const MCP_SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 pub struct AtomicMcpTransport {
@@ -51,7 +61,13 @@ impl AtomicMcpTransport {
             state: Data::new(TransportState {
                 manager,
                 event_tx,
-                session_manager: Arc::new(LocalSessionManager::default()),
+                session_manager: Arc::new(LocalSessionManager {
+                    sessions: Default::default(),
+                    session_config: SessionConfig {
+                        keep_alive: Some(MCP_SESSION_KEEP_ALIVE),
+                        ..SessionConfig::default()
+                    },
+                }),
                 sse_keep_alive,
             }),
         }

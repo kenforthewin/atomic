@@ -3,7 +3,17 @@
 use crate::event_channel::EventChannel;
 use crate::state::{AppState, ServerEvent};
 use actix_web::{web, HttpRequest, HttpResponse};
+use futures::StreamExt;
 use tokio::sync::broadcast;
+
+/// How often the forwarding task pings the client, and how long it waits
+/// past the last inbound frame before declaring the client dead. Browsers
+/// answer pings with pongs automatically, so a healthy-but-quiet client
+/// refreshes `last_seen` every ping interval; a client that vanished
+/// without closing the TCP stream stops answering and gets reaped within
+/// one timeout.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// WebSocket upgrade handler
 /// Auth via query param: /ws?token=xxx
@@ -56,34 +66,72 @@ pub fn start_event_session(
     stream: web::Payload,
     events: broadcast::Sender<ServerEvent>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (response, mut session, _msg_stream) = actix_ws::handle(req, stream)?;
+    let (response, mut session, mut msg_stream) = actix_ws::handle(req, stream)?;
 
     let mut rx = events.subscribe();
 
-    // Spawn task to forward broadcast events to this WebSocket client
+    // Forward broadcast events to this WebSocket client.
+    //
+    // The inbound stream MUST be polled alongside the event channel: it is
+    // the only place a client's Close frame or TCP EOF is observable. A
+    // task that waits solely on the (possibly quiet) event channel outlives
+    // its client indefinitely — retaining the broadcast receiver (which a
+    // composing layer may use as a liveness signal, e.g. cache pinning)
+    // and, when the peer sent a FIN nobody read, a CLOSE_WAIT socket. The
+    // heartbeat covers the third exit path: a peer that vanished without
+    // closing the stream stops answering pings and times out.
     actix_web::rt::spawn(async move {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_seen = tokio::time::Instant::now();
+
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if session.text(json).await.is_err() {
-                            break; // Client disconnected
+            tokio::select! {
+                broadcast = rx.recv() => match broadcast {
+                    Ok(event) => {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if session.text(json).await.is_err() {
+                                break; // Client disconnected
+                            }
                         }
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("WebSocket client lagged, skipped {} events", n);
-                    let event = ServerEvent::EventsLagged { skipped: n };
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if session.text(json).await.is_err() {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("WebSocket client lagged, skipped {} events", n);
+                        let event = ServerEvent::EventsLagged { skipped: n };
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if session.text(json).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                inbound = msg_stream.next() => match inbound {
+                    Some(Ok(actix_ws::Message::Close(_))) | None => break,
+                    Some(Ok(actix_ws::Message::Ping(bytes))) => {
+                        last_seen = tokio::time::Instant::now();
+                        if session.pong(&bytes).await.is_err() {
                             break;
                         }
                     }
-                    continue;
+                    // Pongs (heartbeat replies) and any client chatter both
+                    // count as liveness; this endpoint is send-only so
+                    // inbound payloads are otherwise ignored.
+                    Some(Ok(_)) => last_seen = tokio::time::Instant::now(),
+                    Some(Err(_)) => break,
+                },
+                _ = heartbeat.tick() => {
+                    if last_seen.elapsed() > CLIENT_TIMEOUT {
+                        let _ = session.close(None).await;
+                        return;
+                    }
+                    if session.ping(b"").await.is_err() {
+                        break;
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        let _ = session.close(None).await;
     });
 
     Ok(response)

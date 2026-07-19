@@ -160,6 +160,13 @@ struct CanvasCacheInner {
     /// Uses `tokio::sync::Mutex` so the guard is Send across `.await`,
     /// letting `compute_and_get_canvas_data` be `Send` when spawned.
     compute_lock: tokio::sync::Mutex<()>,
+    /// Deadline of the pending debounced rebuild; `None` when no sleeper
+    /// task is active. One sleeper serves any number of invalidations —
+    /// later calls just push this deadline instead of spawning their own
+    /// sleeping task (a large import fires one completion event per atom,
+    /// which is thousands of concurrent sleepers under a task-per-call
+    /// design).
+    debounce_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl CanvasCache {
@@ -206,38 +213,80 @@ impl CanvasCache {
 
     /// Debounced invalidation: schedule a background rebuild after
     /// [`CANVAS_CACHE_DEBOUNCE`], keeping the current (stale) payload visible
-    /// to readers in the meantime. Only the latest scheduled rebuild wins —
-    /// rapid successive calls collapse into a single rebuild. No-op if no
+    /// to readers in the meantime. Rapid successive calls collapse into a
+    /// single rebuild by pushing one shared deadline forward — at most one
+    /// sleeper task exists per cache regardless of event rate. No-op if no
     /// rebuilder has been registered.
     pub fn invalidate_debounced(&self) {
         use std::sync::atomic::Ordering;
-        let my_gen = self.inner.rebuild_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let cache = self.clone();
-        crate::executor::spawn(async move {
-            tokio::time::sleep(CANVAS_CACHE_DEBOUNCE).await;
-            if cache.inner.rebuild_gen.load(Ordering::SeqCst) != my_gen {
+        self.inner.rebuild_gen.fetch_add(1, Ordering::SeqCst);
+
+        let deadline = tokio::time::Instant::now() + CANVAS_CACHE_DEBOUNCE;
+        {
+            let mut slot = self
+                .inner
+                .debounce_deadline
+                .lock()
+                .expect("canvas debounce lock");
+            let sleeper_active = slot.is_some();
+            *slot = Some(deadline);
+            if sleeper_active {
+                // The existing sleeper re-reads the deadline when it wakes
+                // and sleeps again; nothing to spawn.
                 return;
             }
-            let cache_compute = cache.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                cache_compute.inner.rebuilder.get().map(|f| f())
-            })
-            .await;
-            match result {
-                Ok(Some(Ok(fresh))) => {
-                    if cache.inner.rebuild_gen.load(Ordering::SeqCst) == my_gen {
-                        cache.set(fresh);
+        }
+
+        let cache = self.clone();
+        crate::executor::spawn(async move {
+            loop {
+                let deadline = *cache
+                    .inner
+                    .debounce_deadline
+                    .lock()
+                    .expect("canvas debounce lock");
+                let Some(deadline) = deadline else { return };
+                if tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep_until(deadline).await;
+                    continue; // deadline may have been pushed while sleeping
+                }
+
+                // Deadline reached: claim it so the next invalidation
+                // spawns a fresh sleeper, then rebuild.
+                *cache
+                    .inner
+                    .debounce_deadline
+                    .lock()
+                    .expect("canvas debounce lock") = None;
+
+                let gen_at_start = cache.inner.rebuild_gen.load(Ordering::SeqCst);
+                let cache_compute = cache.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    cache_compute.inner.rebuilder.get().map(|f| f())
+                })
+                .await;
+                match result {
+                    Ok(Some(Ok(fresh))) => {
+                        // Invalidations that arrived mid-rebuild have
+                        // scheduled their own rebuild; don't overwrite the
+                        // cache with a payload we already know is stale.
+                        if cache.inner.rebuild_gen.load(Ordering::SeqCst) == gen_at_start {
+                            cache.set(fresh);
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        tracing::warn!(error = %e, "Debounced canvas rebuild failed");
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            "Debounced canvas rebuild skipped: no rebuilder registered"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Debounced canvas rebuild panicked");
                     }
                 }
-                Ok(Some(Err(e))) => {
-                    tracing::warn!(error = %e, "Debounced canvas rebuild failed");
-                }
-                Ok(None) => {
-                    tracing::debug!("Debounced canvas rebuild skipped: no rebuilder registered");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Debounced canvas rebuild panicked");
-                }
+                return;
             }
         });
     }

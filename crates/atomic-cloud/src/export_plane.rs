@@ -86,11 +86,19 @@ impl TenantExportPlane {
     }
 
     /// The requesting account's manager, created on first use.
+    ///
+    /// Also the map's garbage collector: managers whose jobs and retained
+    /// artifacts have all aged out are dropped here, so the map tracks
+    /// accounts with live export state rather than every account that has
+    /// ever exported. (Dropping only idle managers matters — recreating a
+    /// manager wipes its directory, which must never happen under a
+    /// still-downloadable artifact.)
     fn for_account(&self, account_id: &str) -> Result<ExportJobManager, AtomicCoreError> {
         let mut managers = self
             .managers
             .lock()
             .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        managers.retain(|id, manager| id == account_id || !manager.is_idle());
         if let Some(manager) = managers.get(account_id) {
             return Ok(manager.clone());
         }

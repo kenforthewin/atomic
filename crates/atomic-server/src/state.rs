@@ -16,6 +16,11 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 const SETUP_CLAIM_LIMIT: usize = 10;
 const SETUP_CLAIM_WINDOW: Duration = Duration::from_secs(60);
+/// Sweep threshold for the limiter map. The endpoint is public, so scanner
+/// IPs accumulate one key each; past this size, fully-aged keys are dropped
+/// on the next check. Live memory is then bounded by IPs active within the
+/// window, not by every IP ever seen.
+const SETUP_CLAIM_SWEEP_THRESHOLD: usize = 512;
 
 /// Hashed setup token configured through ATOMIC_SETUP_TOKEN.
 pub struct SetupToken {
@@ -62,6 +67,13 @@ impl SetupClaimLimiter {
             Ok(guard) => guard,
             Err(_) => return false,
         };
+        if attempts.len() > SETUP_CLAIM_SWEEP_THRESHOLD {
+            attempts.retain(|_, entries| {
+                entries
+                    .back()
+                    .is_some_and(|at| now.duration_since(*at) <= SETUP_CLAIM_WINDOW)
+            });
+        }
         let entries = attempts.entry(ip).or_default();
         while entries
             .front()

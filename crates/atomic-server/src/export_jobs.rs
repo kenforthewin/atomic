@@ -119,6 +119,16 @@ impl ExportJobManager {
             .unwrap_or(0)
     }
 
+    /// True when the manager tracks nothing at all — no queued or running
+    /// jobs and no completed jobs still inside their artifact-retention
+    /// window. An idle manager owns no state worth keeping and may be
+    /// dropped by its host; recreating one later wipes and recreates its
+    /// (empty) directory. A poisoned lock reads as not-idle so a host never
+    /// drops a manager it can't inspect.
+    pub fn is_idle(&self) -> bool {
+        self.jobs.lock().map(|jobs| jobs.is_empty()).unwrap_or(false)
+    }
+
     pub async fn start_markdown_export(
         &self,
         manager: Arc<DatabaseManager>,
