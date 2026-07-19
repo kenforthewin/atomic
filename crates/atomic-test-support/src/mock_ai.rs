@@ -505,13 +505,30 @@ impl Respond for ChatResponder {
 
         // Inspect the requested schema name so this responder can serve
         // more than just tag extraction as the test matrix grows.
+        //
+        // prompt_only callers (wiki generation/updates, the report final
+        // pass) send no `response_format` — the schema rides in an appended
+        // instruction message instead — so when the pointer comes up empty,
+        // identify the call by property names that appear in exactly one
+        // schema.
+        let request_text = body.to_string().to_lowercase();
         let schema_name = body
             .pointer("/response_format/json_schema/name")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_text = body.to_string().to_lowercase();
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if request_text.contains("after_heading") {
+                    "wiki_update_section_ops".to_string()
+                } else if request_text.contains("article_content") {
+                    "wiki_generation_result".to_string()
+                } else if request_text.contains("finding_content") {
+                    "report_generation_result".to_string()
+                } else {
+                    String::new()
+                }
+            });
 
-        let content = match schema_name {
+        let content = match schema_name.as_str() {
             "extraction_result" => {
                 let tag_name = if request_text.contains("biology") {
                     "Biology"

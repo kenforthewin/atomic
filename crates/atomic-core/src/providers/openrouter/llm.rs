@@ -96,9 +96,6 @@ struct JsonSchemaWrapper {
 #[derive(Serialize)]
 struct ProviderPreferences {
     require_parameters: bool,
-    /// Provider slugs OpenRouter must not route to for this request.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    ignore: Vec<String>,
 }
 
 // ==================== Response Types ====================
@@ -111,6 +108,10 @@ struct ChatResponse {
     /// Which upstream host served the request (e.g. "Anthropic", "Azure").
     #[serde(default)]
     provider: Option<String>,
+    /// OpenRouter's generation id (`gen-…`), the key into their
+    /// per-generation details endpoint.
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +158,8 @@ struct StreamingResponse {
     choices: Vec<StreamingChoice>,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -295,22 +298,8 @@ async fn complete_internal(
         });
 
     let provider_prefs = if config.params.structured_output.is_some() {
-        // Azure-hosted Claude (provider slug "azure", first seen serving
-        // claude-sonnet-5 on 2026-07-18) returned a structured output cut
-        // mid-sentence under a clean finish_reason — the silent Daily
-        // Briefing truncations — while the Bedrock and Anthropic-direct
-        // endpoints behaved on identical calls. Structured output is the
-        // one place a cut is invisible (the JSON envelope still closes),
-        // so Anthropic-model structured calls refuse that route until the
-        // endpoint proves trustworthy.
-        let ignore = if config.model.starts_with("anthropic/") {
-            vec!["azure".to_string()]
-        } else {
-            Vec::new()
-        };
         Some(ProviderPreferences {
             require_parameters: true,
-            ignore,
         })
     } else {
         None
@@ -417,6 +406,7 @@ async fn complete_internal(
         .as_ref()
         .and_then(|u| u.completion_tokens);
     let upstream_provider = chat_response.provider.clone();
+    let generation_id = chat_response.id.clone();
     let choice = chat_response
         .choices
         .into_iter()
@@ -448,6 +438,7 @@ async fn complete_internal(
         native_finish_reason: choice.native_finish_reason.clone(),
         completion_tokens,
         upstream_provider,
+        generation_id,
         content: choice.message.content.unwrap_or_default(),
         tool_calls,
     })
@@ -543,6 +534,7 @@ async fn complete_streaming_internal(
     let mut finish_reason = None;
     let mut native_finish_reason = None;
     let mut upstream_provider = None;
+    let mut generation_id = None;
 
     let mut stream = response.bytes_stream();
 
@@ -578,6 +570,9 @@ async fn complete_streaming_internal(
                     Ok(response) => {
                         if response.provider.is_some() {
                             upstream_provider = response.provider.clone();
+                        }
+                        if response.id.is_some() {
+                            generation_id = response.id.clone();
                         }
                         if let Some(choice) = response.choices.first() {
                             // Update finish reason
@@ -676,5 +671,6 @@ async fn complete_streaming_internal(
         // (stream_options.include_usage); not worth the extra chunk here.
         completion_tokens: None,
         upstream_provider,
+        generation_id,
     })
 }

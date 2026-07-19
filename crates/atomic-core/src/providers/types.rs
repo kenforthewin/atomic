@@ -265,6 +265,13 @@ pub struct CompletionResponse {
     /// per host — the 2026-07-18 briefing truncation was one Azure-served
     /// request among clean Bedrock ones — so logs must name the host.
     pub upstream_provider: Option<String>,
+    /// The aggregator's per-generation id (OpenRouter's `id`, `gen-…`).
+    /// Logged so any suspect completion can be looked up in
+    /// `GET /api/v1/generation?id=…` — the only place that records what the
+    /// upstream actually generated and billed vs. what was delivered
+    /// (delivered 429 vs billed 1,404 is how the 2026-07-19 silent
+    /// truncation was finally pinned down).
+    pub generation_id: Option<String>,
 }
 
 /// Streaming delta from LLM

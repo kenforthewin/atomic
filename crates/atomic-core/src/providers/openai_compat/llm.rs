@@ -334,6 +334,7 @@ async fn complete_internal(
         native_finish_reason: None,
         completion_tokens: None,
         upstream_provider: None,
+        generation_id: None,
     })
 }
 
@@ -532,5 +533,6 @@ pub async fn complete_streaming_with_tools(
         native_finish_reason: None,
         completion_tokens: None,
         upstream_provider: None,
+        generation_id: None,
     })
 }

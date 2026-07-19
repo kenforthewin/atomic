@@ -672,7 +672,13 @@ pub(crate) async fn call_llm_for_wiki_typed<T: DeserializeOwned>(
 
     let messages = vec![Message::system(system_prompt), Message::user(user_content)];
 
-    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema);
+    // prompt_only: wiki articles and section rewrites are the longest
+    // outputs in the app — the shape OpenRouter's structured-output layer
+    // silently corrupted on reports (stream tail lost, JSON repaired around
+    // the cut; see StructuredCall::prompt_only). Schema-in-prompt makes a
+    // lost tail an unparseable response — a loud retry, not a stored stub.
+    let call = StructuredCall::<T>::new(provider_config, model, &messages, schema_name, schema)
+        .with_prompt_only(true);
 
     let started = std::time::Instant::now();
     match call_structured::<T>(call).await {

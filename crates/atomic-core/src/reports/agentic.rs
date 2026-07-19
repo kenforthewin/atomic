@@ -616,13 +616,20 @@ async fn final_pass(
     model: &str,
     messages: &[Message],
 ) -> Result<String, AtomicCoreError> {
+    // prompt_only: report bodies are long-form prose, the exact shape
+    // OpenRouter's structured-output layer silently corrupted (three Daily
+    // Briefings stored cut mid-sentence, 2026-07-15/18/19 — the router lost
+    // part of the upstream stream and repaired the JSON around the cut).
+    // With the schema in the prompt instead, a lost tail fails the parse
+    // loudly and the retry/fallback regenerates.
     let call = StructuredCall::<ReportGenerationResult>::new(
         provider_config,
         model,
         messages,
         "report_generation_result",
         report_schema(),
-    );
+    )
+    .with_prompt_only(true);
     match call_structured::<ReportGenerationResult>(call).await {
         Ok(result) => Ok(result.finding_content),
         Err(e) => Err(AtomicCoreError::DatabaseOperation(format!(

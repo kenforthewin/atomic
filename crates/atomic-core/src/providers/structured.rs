@@ -81,6 +81,22 @@ pub struct StructuredCall<'a, T> {
     /// OpenRouter or non-OpenAI backends). The linter rules + prompt-based
     /// fallback still cover correctness when strict is off.
     pub strict: bool,
+    /// When true, the schema travels ONLY in an appended prompt message —
+    /// no wire-level `response_format` at all. Default: `false`.
+    ///
+    /// This exists for long-form outputs routed through an aggregator.
+    /// OpenRouter's structured-output layer reassembles the upstream
+    /// stream and, when it loses part of it, *repairs* the broken JSON
+    /// into a valid envelope around the cut content (observed on kenny's
+    /// Daily Briefing, gen-1784452040: Bedrock generated 1,404 native
+    /// tokens and finished `end_turn`; 429 tokens were delivered as clean
+    /// JSON with `finish_reason: stop`). No stop-reason gate can see that.
+    /// Without `response_format` there is no router-side salvage layer: a
+    /// dropped tail arrives as unparseable JSON, the parse fails loudly,
+    /// and the retry/fallback machinery regenerates. Corruption becomes
+    /// detection. Short-output callers should stay on wire schemas — the
+    /// loss window is negligible and constrained decoding earns its keep.
+    pub prompt_only: bool,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -105,6 +121,7 @@ impl<'a, T> StructuredCall<'a, T> {
                 .with_max_tokens(DEFAULT_MAX_OUTPUT_TOKENS),
             max_retries: 2,
             strict: true,
+            prompt_only: false,
             _marker: PhantomData,
         }
     }
@@ -132,6 +149,13 @@ impl<'a, T> StructuredCall<'a, T> {
     /// parse failures then fall through to the prompt-based fallback path.
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Convey the schema only via the prompt, never via `response_format`.
+    /// See the field docs for when (and why) to use this.
+    pub fn with_prompt_only(mut self, prompt_only: bool) -> Self {
+        self.prompt_only = prompt_only;
         self
     }
 }
@@ -253,19 +277,40 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         params,
         max_retries,
         strict,
+        prompt_only,
         ..
     } = call;
 
-    // Primary attempt: with structured output enabled. Strict defaults to
-    // true but callers can opt out via `StructuredCall::with_strict(false)`
-    // for models that reject OpenAI strict mode.
-    let schema_wrapper = StructuredOutputSchema {
-        name: schema_name.to_string(),
-        schema: schema.clone(),
-        strict,
+    let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
+
+    // Primary attempt: wire-level structured output by default (strict
+    // unless the caller opted out); in prompt_only mode the schema is
+    // appended as an explicit instruction instead and the request goes out
+    // as a plain completion (see the `prompt_only` field docs for why).
+    let (primary_config, primary_messages) = if prompt_only {
+        let instruction = format!(
+            "Respond with ONLY a single JSON object matching this schema. No \
+             markdown, no prose, no code fences, no surrounding text.\n\nSchema:\n{}",
+            schema_str
+        );
+        let mut with_instruction = messages.to_vec();
+        with_instruction.push(Message::user(instruction));
+        (
+            LlmConfig::new(model.to_string()).with_params(params.clone()),
+            with_instruction,
+        )
+    } else {
+        let schema_wrapper = StructuredOutputSchema {
+            name: schema_name.to_string(),
+            schema: schema.clone(),
+            strict,
+        };
+        (
+            LlmConfig::new(model.to_string())
+                .with_params(params.clone().with_structured_output(schema_wrapper)),
+            messages.to_vec(),
+        )
     };
-    let structured_params = params.clone().with_structured_output(schema_wrapper);
-    let primary_config = LlmConfig::new(model.to_string()).with_params(structured_params);
 
     let mut last_preview = String::new();
     let mut last_parse_err = String::new();
@@ -284,7 +329,7 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
 
-        match provider.complete(messages, &primary_config).await {
+        match provider.complete(&primary_messages, &primary_config).await {
             Ok(response) => {
                 // An early end means the content is incomplete BY
                 // CONSTRUCTION — `length`/`max_tokens` (output cap),
@@ -306,6 +351,9 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
                         native_finish_reason =
                             response.native_finish_reason.as_deref().unwrap_or("-"),
                         completion_tokens = response.completion_tokens,
+                        upstream_provider =
+                            response.upstream_provider.as_deref().unwrap_or("-"),
+                        generation_id = response.generation_id.as_deref().unwrap_or("-"),
                         content_chars = response.content.len(),
                         "[structured] Incomplete generation; retrying"
                     );
@@ -331,6 +379,9 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
                             native_finish_reason =
                                 response.native_finish_reason.as_deref().unwrap_or("-"),
                             completion_tokens = response.completion_tokens,
+                            upstream_provider =
+                                response.upstream_provider.as_deref().unwrap_or("-"),
+                            generation_id = response.generation_id.as_deref().unwrap_or("-"),
                             content_chars = response.content.len(),
                             "[structured] Completed"
                         );
@@ -365,7 +416,6 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
     // case where the provider silently ignored `response_format` (some weaker
     // OpenRouter-routed models, some Ollama models) and returned prose or
     // fenced JSON that the primary attempt couldn't cleanly parse.
-    let schema_str = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
     let nudge = format!(
         "Your previous response could not be parsed. Reply with ONLY a single JSON \
          object matching this schema. No markdown, no prose, no code fences, no \
@@ -400,6 +450,9 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
                         native_finish_reason =
                             response.native_finish_reason.as_deref().unwrap_or("-"),
                         completion_tokens = response.completion_tokens,
+                        upstream_provider =
+                            response.upstream_provider.as_deref().unwrap_or("-"),
+                        generation_id = response.generation_id.as_deref().unwrap_or("-"),
                         content_chars = response.content.len(),
                         "[structured] Fallback parse succeeded"
                     );
@@ -751,6 +804,7 @@ mod tests {
                     native_finish_reason: Some("end_turn".to_string()),
                     completion_tokens: None,
         upstream_provider: None,
+        generation_id: None,
                 }),
                 Some(MockResponse::OkWithFinish {
                     content,
@@ -763,6 +817,7 @@ mod tests {
                     native_finish_reason,
                     completion_tokens: None,
         upstream_provider: None,
+        generation_id: None,
                 }),
                 Some(MockResponse::Err(e)) => Err(e),
                 None => Err(ProviderError::Configuration(
@@ -999,6 +1054,70 @@ mod tests {
             }
             other => panic!("expected ParseFailed, got {:?}", other),
         }
+    }
+
+    // ==================== prompt_only mode ====================
+
+    #[tokio::test]
+    async fn prompt_only_sends_no_wire_schema_and_appends_instruction() {
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response(OK_JSON);
+
+        let config = test_provider_config();
+        let messages = vec![Message::system("s"), Message::user("u")];
+        let call = StructuredCall::<Sample>::new(
+            &config,
+            "test-model",
+            &messages,
+            "sample_result",
+            sample_schema(),
+        )
+        .with_prompt_only(true);
+        let result = call_structured_with_provider::<Sample>(call, provider.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 7);
+        // No response_format on the wire — the whole point: nothing for a
+        // router-side salvage layer to "repair".
+        let schemas = provider.captured_schemas();
+        assert_eq!(schemas.len(), 1);
+        assert!(schemas[0].is_none(), "prompt_only must not send a wire schema");
+        // The schema instruction rides as an appended user message instead.
+        let captured = provider.captured_messages();
+        let sent = &captured[0];
+        assert_eq!(sent.len(), 3, "original messages + schema instruction");
+        let instruction = sent.last().unwrap().content.as_deref().unwrap_or("");
+        assert!(
+            instruction.contains("ONLY a single JSON object") && instruction.contains("Schema:"),
+            "appended instruction should carry the schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_only_broken_json_still_reaches_fallback() {
+        // The failure mode this mode converts corruption into: a lost tail
+        // arrives as unparseable JSON and the fallback regenerates.
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response(r#"{"value":"cut mid-sen"#); // unterminated
+        provider.queue_response(OK_JSON);
+
+        let config = test_provider_config();
+        let messages = vec![Message::user("u")];
+        let call = StructuredCall::<Sample>::new(
+            &config,
+            "test-model",
+            &messages,
+            "sample_result",
+            sample_schema(),
+        )
+        .with_prompt_only(true);
+        let result = call_structured_with_provider::<Sample>(call, provider.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 7);
+        assert_eq!(provider.call_count(), 2, "fallback should have fired");
     }
 
     // ==================== Early-end gates ====================

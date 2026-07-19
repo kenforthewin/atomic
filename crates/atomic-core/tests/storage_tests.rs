@@ -1652,16 +1652,23 @@ mod postgres_tests {
             ids.push(id);
         }
 
+        // The cloud schema pins vector(1536), so build full-width basis
+        // vectors (3-wide literals fail the column's dimension check).
+        let axis = |i: usize| {
+            let mut v = vec![0.0f32; 1536];
+            v[i] = 1.0;
+            v
+        };
         s.save_chunks_and_embeddings(
             &ids[0],
             &[
-                ("chunk a".to_string(), vec![1.0, 0.0, 0.0]),
-                ("chunk b".to_string(), vec![0.0, 1.0, 0.0]),
+                ("chunk a".to_string(), axis(0)),
+                ("chunk b".to_string(), axis(1)),
             ],
         )
         .await
         .unwrap();
-        s.save_chunks_and_embeddings(&ids[1], &[("solo".to_string(), vec![0.0, 0.0, 1.0])])
+        s.save_chunks_and_embeddings(&ids[1], &[("solo".to_string(), axis(2))])
             .await
             .unwrap();
         // ids[2] has no chunks and must not appear.
@@ -1671,11 +1678,15 @@ mod postgres_tests {
 
         assert_eq!(pairs.len(), 2);
         let averaged = &pairs[&ids[0]];
-        assert_eq!(averaged.len(), 3);
-        for (got, want) in averaged.iter().zip([0.5, 0.5, 0.0]) {
-            assert!((got - want).abs() < 1e-6, "averaged: {averaged:?}");
+        assert_eq!(averaged.len(), 1536);
+        for (i, want) in [(0usize, 0.5f32), (1, 0.5), (2, 0.0)] {
+            assert!(
+                (averaged[i] - want).abs() < 1e-6,
+                "averaged[{i}] = {}, want {want}",
+                averaged[i]
+            );
         }
-        assert_eq!(pairs[&ids[1]], vec![0.0, 0.0, 1.0]);
+        assert_eq!(pairs[&ids[1]], axis(2));
         assert!(!pairs.contains_key(&ids[2]));
     }
 
