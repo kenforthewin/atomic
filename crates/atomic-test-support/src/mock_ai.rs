@@ -525,27 +525,24 @@ impl Respond for ChatResponder {
                 })));
             }
             let content = if request_text.contains("wiki article") {
-                if let Some(new_index) = first_new_source_index(&body) {
-                    format!(
-                        "# Mock Wiki\n\nUpdated article body integrating new source. [1] [{new_index}]\n\nCITATIONS_USED: 1, {new_index}"
-                    )
-                } else {
-                    let n = count_numbered_sources(&body);
-                    let cited: Vec<i32> = (1..=n.min(2).max(1)).collect();
-                    let markers = cited
-                        .iter()
-                        .map(|i| format!("[{i}]"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let list = cited
-                        .iter()
-                        .map(|i| i.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "# Mock Wiki\n\nThis is a deterministic mock article body. {markers}\n\nCITATIONS_USED: {list}"
-                    )
-                }
+                let n = count_numbered_sources(&body);
+                let cited: Vec<i32> = (1..=n.min(2).max(1)).collect();
+                let markers = cited
+                    .iter()
+                    .map(|i| format!("[{i}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let list = cited
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // A `##` section is load-bearing: the section-ops applier
+                // recognizes only ##/### headings, so an article without one
+                // rejects every targeted operation.
+                format!(
+                    "# Mock Wiki\n\n## Overview\n\nThis is a deterministic mock article body. {markers}\n\nCITATIONS_USED: {list}"
+                )
             } else {
                 "# Mock Finding\n\nA deterministic mock finding body. [1]\n\nCITATIONS_USED: 1"
                     .to_string()
@@ -621,7 +618,7 @@ impl Respond for ChatResponder {
                     "operations": [
                         {
                             "op": "AppendToSection",
-                            "heading": "Mock Wiki",
+                            "heading": "Overview",
                             "after_heading": "",
                             "content": format!(
                                 "Additional mock context referencing the new source. [{new_index}]"

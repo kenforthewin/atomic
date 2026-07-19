@@ -5,16 +5,12 @@
 
 use crate::chunking::count_tokens;
 use crate::embedding::distance_to_similarity;
-use crate::models::{ChunkWithContext, WikiArticle, WikiArticleWithCitations, WikiCitation};
+use crate::models::{ChunkWithContext, WikiArticleWithCitations};
 use crate::providers::ProviderConfig;
 
-use chrono::Utc;
 use rusqlite::Connection;
 
-use super::{
-    batch_fetch_chunk_details, call_llm_for_wiki, extract_citations, synthesize_article,
-    WikiStrategyContext,
-};
+use super::{batch_fetch_chunk_details, synthesize_article, WikiStrategyContext};
 
 /// Data needed for wiki article generation (extracted before async call)
 pub struct WikiGenerationInput {
@@ -24,14 +20,7 @@ pub struct WikiGenerationInput {
     pub tag_name: String,
 }
 
-/// Data needed for wiki article update (extracted before async call)
-pub struct WikiUpdateInput {
-    pub new_chunks: Vec<ChunkWithContext>,
-    pub existing_article: WikiArticle,
-    pub existing_citations: Vec<WikiCitation>,
-    pub atom_count: i32,
-    pub tag_id: String,
-}
+
 
 /// Generate a wiki article using centroid-based chunk selection + single-shot LLM.
 pub(crate) async fn generate(
@@ -75,46 +64,7 @@ pub(crate) async fn generate(
     Ok(result)
 }
 
-/// Update an existing wiki article with new content using centroid strategy.
-/// Returns None if no new content is available.
-pub(crate) async fn update(
-    ctx: &WikiStrategyContext,
-    existing: &WikiArticleWithCitations,
-) -> Result<Option<WikiArticleWithCitations>, String> {
-    let max_tokens = ctx.max_source_tokens();
 
-    let update_data = ctx
-        .storage
-        .get_wiki_update_chunks_sync(&ctx.tag_id, &existing.article.updated_at, max_tokens)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let (new_chunks, atom_count) = match update_data {
-        Some(data) => data,
-        None => return Ok(None),
-    };
-
-    tracing::info!(new_chunks = new_chunks.len(), "[wiki/centroid] Update");
-
-    let input = WikiUpdateInput {
-        new_chunks,
-        existing_article: existing.article.clone(),
-        existing_citations: existing.citations.clone(),
-        atom_count,
-        tag_id: ctx.tag_id.clone(),
-    };
-
-    let result = update_wiki_content(
-        &ctx.provider_config,
-        &input,
-        &ctx.wiki_model,
-        &ctx.linkable_article_names,
-        ctx.update_prompt(),
-    )
-    .await?;
-
-    Ok(Some(result))
-}
 
 /// Select chunks ranked by similarity to the tag centroid, up to the token budget.
 pub(crate) fn select_chunks_by_centroid(
@@ -269,109 +219,8 @@ async fn generate_wiki_content(
         model,
         existing_article_names,
         system_prompt,
-        None,
     )
     .await
 }
 
-/// Update wiki article content via API (async, no db needed)
-async fn update_wiki_content(
-    provider_config: &ProviderConfig,
-    input: &WikiUpdateInput,
-    model: &str,
-    existing_article_names: &[(String, String)],
-    system_prompt: &str,
-) -> Result<WikiArticleWithCitations, String> {
-    // Build existing sources section
-    let mut existing_sources = String::new();
-    for citation in &input.existing_citations {
-        existing_sources.push_str(&format!(
-            "[{}] {}\n\n",
-            citation.citation_index, citation.excerpt
-        ));
-    }
 
-    // Build new sources section (continuing numbering)
-    let start_index = input.existing_citations.len() as i32 + 1;
-    let mut new_sources = String::new();
-    for (i, chunk) in input.new_chunks.iter().enumerate() {
-        new_sources.push_str(&format!(
-            "[{}] {}\n\n",
-            start_index + i as i32,
-            chunk.content
-        ));
-    }
-
-    // Build existing articles list for cross-linking
-    let articles_section = if existing_article_names.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = existing_article_names
-            .iter()
-            .filter(|(tid, _)| tid != &input.tag_id)
-            .map(|(_, name)| name.as_str())
-            .collect();
-        if names.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nEXISTING WIKI ARTICLES IN THIS KNOWLEDGE BASE:\n{}\n",
-                names.join(", ")
-            )
-        }
-    };
-
-    let user_content = format!(
-        "CURRENT ARTICLE:\n{}\n\nEXISTING SOURCES (already cited as [1] through [{}]):\n{}\nNEW SOURCES TO INCORPORATE (cite as [{}] onwards):\n{}{}\nUpdate the article to incorporate the new information.{}",
-        input.existing_article.content,
-        input.existing_citations.len(),
-        existing_sources,
-        start_index,
-        new_sources,
-        articles_section,
-        if articles_section.is_empty() {
-            ""
-        } else {
-            " Use [[Article Name]] to link to other articles listed above where relevant."
-        }
-    );
-
-    // Call LLM API
-    let result = call_llm_for_wiki(
-        provider_config,
-        system_prompt,
-        &user_content,
-        model,
-        Some(crate::wiki::WIKI_UPDATE_RESPONSE_CONTRACT),
-    )
-    .await?;
-
-    // Create updated article
-    let now = Utc::now().to_rfc3339();
-    let article = WikiArticle {
-        id: input.existing_article.id.clone(),
-        tag_id: input.tag_id.clone(),
-        content: result.article_content.clone(),
-        created_at: input.existing_article.created_at.clone(),
-        updated_at: now,
-        atom_count: input.atom_count,
-    };
-
-    // Extract all citations from the updated content
-    // Combine existing chunks with new chunks for citation mapping
-    let mut all_chunks: Vec<ChunkWithContext> = input
-        .existing_citations
-        .iter()
-        .map(|c| ChunkWithContext {
-            atom_id: c.atom_id.clone(),
-            chunk_index: c.chunk_index.unwrap_or(0),
-            content: c.excerpt.clone(),
-            similarity_score: 1.0,
-        })
-        .collect();
-    all_chunks.extend(input.new_chunks.clone());
-
-    let citations = extract_citations(&article.id, &result.article_content, &all_chunks)?;
-
-    Ok(WikiArticleWithCitations { article, citations })
-}

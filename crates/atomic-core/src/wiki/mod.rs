@@ -69,14 +69,6 @@ impl WikiStrategyContext {
             .unwrap_or(WIKI_GENERATION_SYSTEM_PROMPT)
     }
 
-    /// Returns the update system prompt, using custom if set, otherwise the default.
-    pub fn update_prompt(&self) -> &str {
-        self.custom_update_prompt
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(WIKI_UPDATE_SYSTEM_PROMPT)
-    }
-
     /// Returns the section-ops update prompt. If a custom update prompt is set,
     /// it is prepended to the structural instructions so user tone/style preferences
     /// are respected while preserving the JSON schema contract.
@@ -117,19 +109,6 @@ pub async fn strategy_generate(
     match strategy {
         WikiStrategy::Centroid => centroid::generate(ctx).await,
         WikiStrategy::Agentic => agentic::generate(ctx).await,
-    }
-}
-
-/// Update an existing wiki article using the given strategy.
-/// Returns None if no update is needed (e.g., no new content).
-pub async fn strategy_update(
-    strategy: &WikiStrategy,
-    ctx: &WikiStrategyContext,
-    existing: &WikiArticleWithCitations,
-) -> Result<Option<WikiArticleWithCitations>, String> {
-    match strategy {
-        WikiStrategy::Centroid => centroid::update(ctx, existing).await,
-        WikiStrategy::Agentic => agentic::update(ctx, existing).await,
     }
 }
 
@@ -568,30 +547,6 @@ Guidelines:
 - Only use [[wiki links]] for topics listed in the EXISTING WIKI ARTICLES section provided
 - Do not force wiki links where they don't fit naturally"#;
 
-/// Rides in the long-form call's final format instruction (see
-/// `call_long_form_markdown`'s `response_contract`) so it can't be
-/// out-framed by earlier messages: an update prompt whose completeness
-/// requirement sits above the source materials gets answered with only
-/// the new section, written as if appended to the article.
-pub(crate) const WIKI_UPDATE_RESPONSE_CONTRACT: &str =
-    "Your response must be the COMPLETE updated article: begin with the \
-     current article's opening heading and reproduce every existing section \
-     — revised where the new sources require — through the end, with the \
-     new material integrated where it belongs. Never respond with only the \
-     new or changed sections.";
-
-pub(crate) const WIKI_UPDATE_SYSTEM_PROMPT: &str = r#"You are updating an existing wiki article with new information from additional sources. Integrate the new information naturally into the existing article.
-
-Guidelines:
-- Maintain the existing structure where sensible
-- Add new sections if needed for new topics
-- Do not remove existing content unless directly contradicted by new sources
-- Use [N] notation for citations, continuing from the existing numbering
-- Every new factual claim MUST have a citation
-- Keep tone consistent with the existing article
-- When mentioning topics that have their own articles, use [[Topic Name]] wiki-link notation
-- Only use [[wiki links]] for topics listed in the EXISTING WIKI ARTICLES section provided
-- Do not force wiki links where they don't fit naturally"#;
 
 pub(crate) const WIKI_UPDATE_SECTION_OPS_PROMPT: &str = r#"You are proposing updates to an existing wiki article based on new sources.
 
@@ -635,7 +590,6 @@ pub(crate) async fn call_llm_for_wiki(
     system_prompt: &str,
     user_content: &str,
     model: &str,
-    response_contract: Option<&str>,
 ) -> Result<WikiGenerationResult, String> {
     tracing::info!(
         model,
@@ -650,7 +604,7 @@ pub(crate) async fn call_llm_for_wiki(
         model,
         &messages,
         "wiki_article",
-        response_contract,
+        None,
     )
     .await
     {
@@ -867,14 +821,6 @@ pub(crate) fn batch_fetch_chunk_details(
 
 /// Synthesize a wiki article from a set of chunks.
 /// Used by both centroid and agentic strategies after source selection.
-///
-/// `existing_content` distinguishes the two jobs this serves: `None` writes
-/// a fresh article from the sources; `Some` is the legacy full-rewrite
-/// update, where the model must return the COMPLETE updated article with
-/// the sources integrated. The existing article has to be in the synthesis
-/// prompt itself — showing it only during research (chunk selection) makes
-/// synthesis rewrite the article from the selected chunks alone, shrinking
-/// it to a replacement built from mostly-new material.
 pub(crate) async fn synthesize_article(
     provider_config: &ProviderConfig,
     tag_id: &str,
@@ -884,7 +830,6 @@ pub(crate) async fn synthesize_article(
     model: &str,
     linkable_article_names: &[(String, String)],
     system_prompt: &str,
-    existing_content: Option<&str>,
 ) -> Result<WikiArticleWithCitations, String> {
     // Build source materials for prompt
     let mut source_materials = String::new();
@@ -911,30 +856,21 @@ pub(crate) async fn synthesize_article(
         }
     };
 
-    let link_hint = if articles_section.is_empty() {
-        ""
-    } else {
-        " Use [[Article Name]] to link to other articles listed above where relevant."
-    };
-    let user_content = match existing_content {
-        Some(existing) => format!(
-            "CURRENT ARTICLE:\n{}\n\n{}\
-             SOURCE MATERIALS:\n{}\
-             Integrate the source materials into the current article about \
-             \"{}\", citing sources with [N] notation.{}",
-            existing, articles_section, source_materials, tag_name, link_hint
-        ),
-        None => format!(
-            "Write a wiki article about \"{}\".\n\n{}\
-             SOURCE MATERIALS:\n{}\
-             Write the article now, citing sources with [N] notation.{}",
-            tag_name, articles_section, source_materials, link_hint
-        ),
-    };
+    let user_content = format!(
+        "Write a wiki article about \"{}\".\n\n{}\
+         SOURCE MATERIALS:\n{}\
+         Write the article now, citing sources with [N] notation.{}",
+        tag_name,
+        articles_section,
+        source_materials,
+        if articles_section.is_empty() {
+            ""
+        } else {
+            " Use [[Article Name]] to link to other articles listed above where relevant."
+        }
+    );
 
-    let contract = existing_content.map(|_| WIKI_UPDATE_RESPONSE_CONTRACT);
-    let result =
-        call_llm_for_wiki(provider_config, system_prompt, &user_content, model, contract).await?;
+    let result = call_llm_for_wiki(provider_config, system_prompt, &user_content, model).await?;
 
     let article_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();

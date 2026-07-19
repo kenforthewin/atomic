@@ -2001,49 +2001,30 @@ impl AtomicCore {
     /// Deprecated: prefer `propose_wiki_update` + `accept_wiki_proposal` for the
     /// human-in-the-loop review flow. This method remains for backwards
     /// compatibility with external MCP clients and will be removed in a later release.
+    /// One-shot update: propose + immediately accept. Same section-ops
+    /// machinery as the review flow, so untouched sections are preserved
+    /// byte-for-byte rather than regenerated — a full-article rewrite asks
+    /// the model to reproduce thousands of words it isn't changing, and
+    /// models under-reproduce (condensed or delta-only articles).
+    ///
+    /// No outer tag lock here: propose and accept each take it, and
+    /// accept's staleness check (base article id + updated_at) covers the
+    /// window between them.
     pub async fn update_wiki(
         &self,
         tag_id: &str,
         tag_name: &str,
     ) -> Result<WikiArticleWithCitations, AtomicCoreError> {
-        tracing::warn!(
-            tag_id,
-            "[wiki] update_wiki is deprecated; use propose_wiki_update instead"
-        );
-        let _guard = self.wiki_tag_lock(tag_id).await;
-        tracing::info!(tag_name, tag_id, "[wiki] Updating article");
+        tracing::info!(tag_name, tag_id, "[wiki] Updating article (one-shot propose+accept)");
 
-        let existing = self
-            .get_wiki(tag_id)
-            .await?
-            .ok_or_else(|| AtomicCoreError::Wiki("No existing article to update".to_string()))?;
-
-        let (strategy, ctx) = self.build_wiki_strategy_context(tag_id, tag_name).await?;
-
-        let result = wiki::strategy_update(&strategy, &ctx, &existing)
-            .await
-            .map_err(|e| AtomicCoreError::Wiki(e))?;
-
-        // If no update needed, return existing article
-        let result = match result {
-            Some(r) => r,
-            None => return Ok(existing),
-        };
-
-        // Extract wiki links from updated content
-        let wiki_links = wiki::extract_wiki_links(
-            &result.article.id,
-            &result.article.content,
-            &ctx.linkable_article_names,
-        );
-
-        // Save to database
-        self.storage
-            .save_wiki_with_links_sync(&result.article, &result.citations, &wiki_links)
-            .await?;
-
-        tracing::info!("[wiki] Article updated successfully");
-        Ok(result)
+        match self.propose_wiki_update(tag_id, tag_name).await? {
+            Some(_) => self.accept_wiki_proposal(tag_id).await,
+            // No update warranted — return the live article unchanged.
+            None => self
+                .get_wiki(tag_id)
+                .await?
+                .ok_or_else(|| AtomicCoreError::Wiki("No existing article to update".to_string())),
+        }
     }
 
     /// Propose an update to an existing wiki article.

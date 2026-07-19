@@ -565,7 +565,6 @@ pub(crate) async fn generate(
         &ctx.wiki_model,
         &ctx.linkable_article_names,
         ctx.generation_prompt(),
-        None,
     )
     .await
 }
@@ -676,33 +675,4 @@ pub(crate) async fn research_for_update(
     Ok(Some((chunks, atom_count)))
 }
 
-/// Update an existing wiki article using the agentic research strategy.
-/// Re-runs full research with existing article as context, then full re-synthesis.
-///
-/// Legacy full-rewrite path used by `strategy_update` (deprecated `/update` route).
-/// The propose path uses `research_for_update` directly + the shared section-ops
-/// generator; it does not go through this function.
-pub(crate) async fn update(
-    ctx: &WikiStrategyContext,
-    existing: &WikiArticleWithCitations,
-) -> Result<Option<WikiArticleWithCitations>, String> {
-    let Some((chunks, atom_count)) = research_for_update(ctx, existing, false).await? else {
-        return Ok(None);
-    };
 
-    tracing::info!("[wiki/agentic] Synthesizing updated article...");
-    let result = synthesize_article(
-        &ctx.provider_config,
-        &ctx.tag_id,
-        &ctx.tag_name,
-        &chunks,
-        atom_count,
-        &ctx.wiki_model,
-        &ctx.linkable_article_names,
-        ctx.update_prompt(),
-        Some(&existing.article.content),
-    )
-    .await?;
-
-    Ok(Some(result))
-}

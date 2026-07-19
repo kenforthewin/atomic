@@ -295,11 +295,15 @@ async fn run_incremental_update_integrates_new_atoms(backend: Backend) {
         .set_json(json!({ "tag_name": "CookingWiki" }))
         .to_request();
     let resp = actix_test::call_service(&app, req).await;
-    assert!(
-        resp.status().is_success(),
-        "wiki update must succeed, got {}",
-        resp.status()
-    );
+    let status = resp.status();
+    if !status.is_success() {
+        let body = actix_test::read_body(resp).await;
+        panic!(
+            "wiki update must succeed, got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let updated: Value = actix_test::read_body_json(resp).await;
     let updated_content = updated["article"]["content"].as_str().unwrap();
     assert_ne!(
