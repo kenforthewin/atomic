@@ -50,8 +50,8 @@ use std::sync::Arc;
 /// Default output-token budget for LLM calls that lack an explicit one.
 /// Never leave `max_tokens` unset on a call whose output can be long:
 /// OpenAI-family models treat "absent" as "model maximum", but Anthropic's
-/// API *requires* the field, so routers fill in a small default — which
-/// truncated a claude-authored report digest mid-sentence (2026-07-14).
+/// API *requires* the field, so routers fill in a small default and long
+/// outputs come back truncated mid-sentence.
 ///
 /// This is a CEILING, not a target — generation stops at the model's
 /// natural end and only generated tokens bill, so the number should be
@@ -454,18 +454,16 @@ const LONG_FORM_TRAILER: &str = "CITATIONS_USED:";
 /// Long-form generation WITHOUT any JSON envelope: the model writes plain
 /// markdown and ends with a single `CITATIONS_USED: 1, 4, 7` trailer line.
 ///
-/// This is the output contract for report bodies and wiki articles, born of
-/// two incidents in one week:
+/// This is the output contract for report bodies and wiki articles. Both
+/// JSON transports fail on long-form prose:
 ///
-/// - Wire-level `response_format` put OpenRouter's structured-output layer
-///   in the path, and that layer silently repaired a partially-delivered
-///   generation into valid JSON around cut prose (gen-1784452040: upstream
-///   billed 1,404 native tokens and finished `end_turn`, 429 were delivered
-///   as clean JSON with `finish_reason: stop`). Undetectable client-side.
-/// - Prompt-only JSON removed that layer but reintroduced hand-escaping:
+/// - Wire-level `response_format` puts the aggregator's structured-output
+///   layer in the path, and that layer can repair a partially-delivered
+///   generation into valid JSON around cut prose, reported under a clean
+///   finish reason. Undetectable client-side.
+/// - Prompt-only JSON removes that layer but reintroduces hand-escaping:
 ///   models writing thousands of words inside one JSON string emit raw
-///   newlines and unescaped quotes (both observed on the very first two
-///   live runs), so the parse failed nearly every time.
+///   newlines and unescaped quotes, so the parse fails routinely.
 ///
 /// Markdown-plus-trailer has neither failure class: there is nothing for a
 /// router to "repair", no escaping to get wrong, and the trailer is a
@@ -1355,7 +1353,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pipeline_native_max_tokens_retries_despite_normalized_stop() {
-        // The 2026-07 silent-truncation shape: normalized finish says all is
+        // The silent-truncation shape: normalized finish says all is
         // well, the upstream's native reason says the output was cut. The
         // gate must trust the native field and retry.
         let provider = Arc::new(MockLlmProvider::new());

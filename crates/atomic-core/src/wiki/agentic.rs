@@ -565,6 +565,7 @@ pub(crate) async fn generate(
         &ctx.wiki_model,
         &ctx.linkable_article_names,
         ctx.generation_prompt(),
+        None,
     )
     .await
 }
@@ -699,6 +700,7 @@ pub(crate) async fn update(
         &ctx.wiki_model,
         &ctx.linkable_article_names,
         ctx.update_prompt(),
+        Some(&existing.article.content),
     )
     .await?;
 

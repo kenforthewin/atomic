@@ -582,13 +582,10 @@ async fn final_pass(
     model: &str,
     messages: &[Message],
 ) -> Result<String, AtomicCoreError> {
-    // Markdown + trailer, not JSON: report bodies are long-form prose, the
-    // exact shape both JSON transports corrupted in the 2026-07 truncation
-    // incidents (wire response_format → router-side salvage stored cut
-    // briefings as valid JSON; prompt-only JSON → raw newlines/unescaped
-    // quotes in the giant string failed nearly every parse). The trailer
-    // doubles as a structural completeness check. See
-    // providers::structured::call_long_form_markdown.
+    // Markdown + trailer, not JSON: report bodies are long-form prose,
+    // the shape JSON transports fail on (see
+    // providers::structured::call_long_form_markdown). The trailer doubles
+    // as a structural completeness check.
     match crate::providers::structured::call_long_form_markdown(
         provider_config,
         model,

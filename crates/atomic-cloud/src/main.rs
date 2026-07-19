@@ -1406,8 +1406,13 @@ enum TokenAction {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // atomic_core at INFO is deliberate: the per-call LLM attribution lines
+    // ([structured]/[long-form] Completed — finish reasons, token counts,
+    // serving provider, generation id) are the flight recorder for silent-
+    // truncation incidents, and they're INFO. A WARN-only core filter
+    // leaves those incidents undiagnosable from the box.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "atomic_cloud=info,warn".parse().unwrap());
+        .unwrap_or_else(|_| "atomic_cloud=info,atomic_core=info,warn".parse().unwrap());
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cli = Cli::parse();

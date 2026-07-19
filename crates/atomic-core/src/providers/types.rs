@@ -262,15 +262,12 @@ pub struct CompletionResponse {
     /// Which upstream actually served the request when routed through an
     /// aggregator (OpenRouter's top-level `provider` field, e.g. "Anthropic",
     /// "Azure", "Amazon Bedrock"). The same model slug can behave differently
-    /// per host — the 2026-07-18 briefing truncation was one Azure-served
-    /// request among clean Bedrock ones — so logs must name the host.
+    /// per host, so logs must name the host for failures to be attributable.
     pub upstream_provider: Option<String>,
     /// The aggregator's per-generation id (OpenRouter's `id`, `gen-…`).
     /// Logged so any suspect completion can be looked up in
     /// `GET /api/v1/generation?id=…` — the only place that records what the
-    /// upstream actually generated and billed vs. what was delivered
-    /// (delivered 429 vs billed 1,404 is how the 2026-07-19 silent
-    /// truncation was finally pinned down).
+    /// upstream actually generated and billed vs. what was delivered.
     pub generation_id: Option<String>,
 }
 

@@ -614,11 +614,10 @@ pub(crate) struct WikiGenerationResult {
 ///
 /// Uses the long-form markdown contract (`call_long_form_markdown`), not a
 /// JSON envelope: articles are the longest outputs in the app, and both
-/// JSON transports corrupted long-form output in the 2026-07 truncation
-/// incidents (wire `response_format` → router-side salvage stored cut
-/// content as valid JSON; prompt-only JSON → raw newlines/unescaped quotes
-/// in the giant string failed the parse). The trailer line doubles as a
-/// structural completeness check.
+/// JSON transports fail on output that size (wire `response_format` lets a
+/// router-side salvage layer store cut content as valid JSON; prompt-only
+/// JSON trips on raw newlines/unescaped quotes in the giant string). The
+/// trailer line doubles as a structural completeness check.
 pub(crate) async fn call_llm_for_wiki(
     provider_config: &ProviderConfig,
     system_prompt: &str,
@@ -854,6 +853,14 @@ pub(crate) fn batch_fetch_chunk_details(
 
 /// Synthesize a wiki article from a set of chunks.
 /// Used by both centroid and agentic strategies after source selection.
+///
+/// `existing_content` distinguishes the two jobs this serves: `None` writes
+/// a fresh article from the sources; `Some` is the legacy full-rewrite
+/// update, where the model must return the COMPLETE updated article with
+/// the sources integrated. The existing article has to be in the synthesis
+/// prompt itself — showing it only during research (chunk selection) makes
+/// synthesis rewrite the article from the selected chunks alone, shrinking
+/// it to a replacement built from mostly-new material.
 pub(crate) async fn synthesize_article(
     provider_config: &ProviderConfig,
     tag_id: &str,
@@ -863,6 +870,7 @@ pub(crate) async fn synthesize_article(
     model: &str,
     linkable_article_names: &[(String, String)],
     system_prompt: &str,
+    existing_content: Option<&str>,
 ) -> Result<WikiArticleWithCitations, String> {
     // Build source materials for prompt
     let mut source_materials = String::new();
@@ -889,19 +897,29 @@ pub(crate) async fn synthesize_article(
         }
     };
 
-    let user_content = format!(
-        "Write a wiki article about \"{}\".\n\n{}\
-         SOURCE MATERIALS:\n{}\
-         Write the article now, citing sources with [N] notation.{}",
-        tag_name,
-        articles_section,
-        source_materials,
-        if articles_section.is_empty() {
-            ""
-        } else {
-            " Use [[Article Name]] to link to other articles listed above where relevant."
-        }
-    );
+    let link_hint = if articles_section.is_empty() {
+        ""
+    } else {
+        " Use [[Article Name]] to link to other articles listed above where relevant."
+    };
+    let user_content = match existing_content {
+        Some(existing) => format!(
+            "CURRENT ARTICLE:\n{}\n\n{}\
+             SOURCE MATERIALS:\n{}\
+             Write the complete updated article about \"{}\" now, integrating \
+             the source materials into the current article. Return the ENTIRE \
+             article from its first heading to its end — keep all existing \
+             content that isn't contradicted, never a summary of changes or \
+             only the new sections. Cite sources with [N] notation.{}",
+            existing, articles_section, source_materials, tag_name, link_hint
+        ),
+        None => format!(
+            "Write a wiki article about \"{}\".\n\n{}\
+             SOURCE MATERIALS:\n{}\
+             Write the article now, citing sources with [N] notation.{}",
+            tag_name, articles_section, source_materials, link_hint
+        ),
+    };
 
     let result = call_llm_for_wiki(provider_config, system_prompt, &user_content, model).await?;
 

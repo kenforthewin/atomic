@@ -269,6 +269,7 @@ async fn generate_wiki_content(
         model,
         existing_article_names,
         system_prompt,
+        None,
     )
     .await
 }

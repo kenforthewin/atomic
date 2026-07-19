@@ -419,8 +419,8 @@ async fn complete_internal(
         .map(|tcs| tcs.iter().map(convert_tool_call).collect());
 
     // Any non-`stop` end is worth a log line even when the caller treats
-    // the response as success — invisible finish reasons are how two
-    // truncated demo digests reached the database looking healthy.
+    // the response as success — an invisible finish reason lets a
+    // truncated completion reach the database looking healthy.
     if let Some(reason) = choice.finish_reason.as_deref() {
         if reason != "stop" && reason != "tool_calls" {
             tracing::warn!(
