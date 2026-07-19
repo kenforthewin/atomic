@@ -25,12 +25,23 @@
 
 name: atomic-cloud
 
+# Applied to every service: without limits, docker's json-file driver keeps
+# every log line for the container's lifetime — unbounded disk growth, and
+# the privacy policy's "logs are size-capped and rotate automatically" claim
+# depends on this being real.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   caddy:
     build:
       context: .
       dockerfile: caddy.dockerfile
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "80:80"
       - "443:443"
@@ -49,6 +60,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
+    logging: *default-logging
     shm_size: 256mb
     # max_connections must cover the §6 fan-out (cached tenants × tenant pool
     # size + control pool + pg_dump); 200 is ample headroom for launch scale.
@@ -89,6 +101,7 @@ services:
     # image isn't available.
     image: ${ATOMIC_CLOUD_IMAGE:-ghcr.io/kenforthewin/atomic-cloud:latest}
     restart: unless-stopped
+    logging: *default-logging
     # Docker's default soft nofile limit is 1024 — a slow socket leak hit it
     # after ~28h on 2026-07-16 and the pod stopped accepting connections
     # while reading as "up". 65536 turns any future leak from an outage
@@ -124,6 +137,7 @@ services:
     # once the stack is up.
     image: grafana/alloy:latest
     restart: unless-stopped
+    logging: *default-logging
     command:
       - run
       - /etc/alloy/config.alloy
@@ -153,6 +167,7 @@ services:
     profiles: ["monitoring"]
     image: quay.io/prometheuscommunity/postgres-exporter:latest
     restart: unless-stopped
+    logging: *default-logging
     environment:
       # Same-host bridge, same no-sslmode rationale as the pod's URLs above.
       DATA_SOURCE_NAME: postgres://atomic:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable

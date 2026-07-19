@@ -72,10 +72,10 @@ export function SiteFooter() {
         </div>
         <div className="mt-10 pt-6 border-t border-border-light flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-text-muted">
           <span>&copy; {new Date().getFullYear()} Atomic</span>
-          <a href="/terms" className="hover:text-text-primary transition-colors">
+          <a href="https://atomicapp.ai/terms" className="hover:text-text-primary transition-colors">
             Terms
           </a>
-          <a href="/privacy" className="hover:text-text-primary transition-colors">
+          <a href="https://atomicapp.ai/privacy" className="hover:text-text-primary transition-colors">
             Privacy
           </a>
         </div>

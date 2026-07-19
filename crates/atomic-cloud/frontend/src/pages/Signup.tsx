@@ -6,7 +6,7 @@ import { CheckEmail } from '../components/CheckEmail';
 import { Button } from '../components/ui/Button';
 import { Field } from '../components/ui/Field';
 import { Banner } from '../components/ui/Banner';
-import { TextLink } from '../components/ui/TextLink';
+import { ExternalTextLink, TextLink } from '../components/ui/TextLink';
 import { ApiError, requestSignupLink } from '../lib/api';
 import {
   isEmailFormatOk,
@@ -219,13 +219,23 @@ export function Signup() {
 
           <p className="text-center text-xs text-text-muted">
             By signing up, you agree to our{' '}
-            <TextLink to="/terms" className="text-xs">
+            <ExternalTextLink
+              href="https://atomicapp.ai/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs"
+            >
               Terms
-            </TextLink>{' '}
+            </ExternalTextLink>{' '}
             and{' '}
-            <TextLink to="/privacy" className="text-xs">
+            <ExternalTextLink
+              href="https://atomicapp.ai/privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs"
+            >
               Privacy Policy
-            </TextLink>
+            </ExternalTextLink>
             .
           </p>
         </form>
