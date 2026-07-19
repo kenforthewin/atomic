@@ -249,6 +249,22 @@ pub struct CompletionResponse {
     /// content (structured outputs) must treat it as a failed generation,
     /// never as material to salvage. `None` when the provider didn't say.
     pub finish_reason: Option<String>,
+    /// The upstream provider's raw stop reason before OpenRouter's
+    /// normalization (e.g. Anthropic's `max_tokens` / `refusal`). Routers
+    /// have lost the truncation signal in normalization before — notably
+    /// when tool-call emulation reports `tool_calls` for a generation the
+    /// upstream actually cut — so early-end gates must check BOTH fields.
+    pub native_finish_reason: Option<String>,
+    /// Output tokens billed for this generation, when the provider reports
+    /// usage. A completion that stopped "normally" after suspiciously few
+    /// tokens is the observable for silent-truncation bugs.
+    pub completion_tokens: Option<u32>,
+    /// Which upstream actually served the request when routed through an
+    /// aggregator (OpenRouter's top-level `provider` field, e.g. "Anthropic",
+    /// "Azure", "Amazon Bedrock"). The same model slug can behave differently
+    /// per host — the 2026-07-18 briefing truncation was one Azure-served
+    /// request among clean Bedrock ones — so logs must name the host.
+    pub upstream_provider: Option<String>,
 }
 
 /// Streaming delta from LLM

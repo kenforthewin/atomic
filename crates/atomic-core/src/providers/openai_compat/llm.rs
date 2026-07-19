@@ -331,6 +331,9 @@ async fn complete_internal(
         content,
         tool_calls,
         finish_reason: choice.finish_reason.clone(),
+        native_finish_reason: None,
+        completion_tokens: None,
+        upstream_provider: None,
     })
 }
 
@@ -526,5 +529,8 @@ pub async fn complete_streaming_with_tools(
         content,
         tool_calls,
         finish_reason,
+        native_finish_reason: None,
+        completion_tokens: None,
+        upstream_provider: None,
     })
 }

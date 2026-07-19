@@ -36,7 +36,9 @@
 
 use crate::providers::error::ProviderError;
 use crate::providers::traits::{LlmConfig, LlmProvider};
-use crate::providers::types::{GenerationParams, Message, StructuredOutputSchema};
+use crate::providers::types::{
+    CompletionResponse, GenerationParams, Message, StructuredOutputSchema,
+};
 use crate::providers::{get_llm_provider, ProviderConfig};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -178,6 +180,33 @@ impl StructuredCallError {
     }
 }
 
+/// If the completion's stop reasons say the generation ended early, return
+/// the offending reason. Checks BOTH the normalized `finish_reason` and the
+/// upstream `native_finish_reason`: OpenRouter's normalization has lost the
+/// truncation signal before (tool-call emulation can report `tool_calls` or
+/// `stop` for a generation the upstream actually cut at `max_tokens`), so
+/// the normalized field alone is not trustworthy. Vocabulary is matched
+/// case-insensitively to cover Google's SHOUTING variants.
+fn early_end_reason(response: &CompletionResponse) -> Option<&str> {
+    fn is_cut(reason: &str) -> bool {
+        matches!(
+            reason.to_ascii_lowercase().as_str(),
+            "length"
+                | "max_tokens"
+                | "content_filter"
+                | "error"
+                | "refusal"
+                | "safety"
+                | "recitation"
+        )
+    }
+    response
+        .finish_reason
+        .as_deref()
+        .filter(|r| is_cut(r))
+        .or_else(|| response.native_finish_reason.as_deref().filter(|r| is_cut(r)))
+}
+
 /// Run a structured-output call against the configured provider. See the
 /// module-level docs for the full semantics.
 ///
@@ -257,24 +286,26 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
 
         match provider.complete(messages, &primary_config).await {
             Ok(response) => {
-                // A non-`stop` end means the content is incomplete BY
-                // CONSTRUCTION — `length` (output cap), `content_filter`
-                // (endpoint-side moderation cut a generation mid-flight),
-                // or `error`. Parsing it is how a mid-sentence digest ends
-                // up in the database looking like a success (the model may
-                // still close the JSON envelope around the cut string).
-                // Treat as transient and retry: another attempt — often
-                // another upstream — usually completes.
-                if let Some(reason) = response.finish_reason.as_deref().filter(|r| {
-                    matches!(*r, "length" | "content_filter" | "error")
-                }) {
+                // An early end means the content is incomplete BY
+                // CONSTRUCTION — `length`/`max_tokens` (output cap),
+                // `content_filter` (endpoint-side moderation cut a
+                // generation mid-flight), or `error`. Parsing it is how a
+                // mid-sentence digest ends up in the database looking like
+                // a success (the model may still close the JSON envelope
+                // around the cut string). Treat as transient and retry:
+                // another attempt — often another upstream — usually
+                // completes.
+                if let Some(reason) = early_end_reason(&response) {
                     last_parse_err = format!(
-                        "generation ended early (finish_reason={reason}, {} chars in)",
+                        "generation ended early (reason={reason}, {} chars in)",
                         response.content.len()
                     );
                     tracing::warn!(
                         schema_name,
-                        finish_reason = reason,
+                        finish_reason = response.finish_reason.as_deref().unwrap_or("-"),
+                        native_finish_reason =
+                            response.native_finish_reason.as_deref().unwrap_or("-"),
+                        completion_tokens = response.completion_tokens,
                         content_chars = response.content.len(),
                         "[structured] Incomplete generation; retrying"
                     );
@@ -289,7 +320,22 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
                     ));
                 }
                 match parse_tolerant::<T>(&response.content) {
-                    Ok(value) => return Ok(value),
+                    Ok(value) => {
+                        // One line per call, INFO: when the next silent
+                        // truncation shows up, `docker logs | grep structured`
+                        // should answer "what did the provider claim?"
+                        // without a redeploy.
+                        tracing::info!(
+                            schema_name,
+                            finish_reason = response.finish_reason.as_deref().unwrap_or("-"),
+                            native_finish_reason =
+                                response.native_finish_reason.as_deref().unwrap_or("-"),
+                            completion_tokens = response.completion_tokens,
+                            content_chars = response.content.len(),
+                            "[structured] Completed"
+                        );
+                        return Ok(value);
+                    }
                     Err(parse_err) => {
                         last_preview = preview_of(&response.content);
                         last_parse_err = parse_err.to_string();
@@ -335,17 +381,37 @@ pub async fn call_structured_with_provider<T: DeserializeOwned>(
         .complete(&fallback_messages, &fallback_config)
         .await
     {
-        Ok(response) => match parse_tolerant::<T>(&response.content) {
-            Ok(value) => {
-                tracing::info!(schema_name, "[structured] Fallback parse succeeded");
-                Ok(value)
+        Ok(response) => {
+            // Same early-end gate as the primary path. The fallback is the
+            // last call we make, so a truncated response here becomes an
+            // error rather than a retry — better a failed run (the caller's
+            // ledger retries later) than a cut digest stored as a success.
+            if let Some(reason) = early_end_reason(&response) {
+                return Err(StructuredCallError::Other(format!(
+                    "fallback generation ended early (reason={reason}, {} chars in)",
+                    response.content.len()
+                )));
             }
-            Err(parse_err) => Err(StructuredCallError::ParseFailed {
-                parse_error: parse_err.to_string(),
-                preview: preview_of(&response.content),
-                attempts: 2,
-            }),
-        },
+            match parse_tolerant::<T>(&response.content) {
+                Ok(value) => {
+                    tracing::info!(
+                        schema_name,
+                        finish_reason = response.finish_reason.as_deref().unwrap_or("-"),
+                        native_finish_reason =
+                            response.native_finish_reason.as_deref().unwrap_or("-"),
+                        completion_tokens = response.completion_tokens,
+                        content_chars = response.content.len(),
+                        "[structured] Fallback parse succeeded"
+                    );
+                    Ok(value)
+                }
+                Err(parse_err) => Err(StructuredCallError::ParseFailed {
+                    parse_error: parse_err.to_string(),
+                    preview: preview_of(&response.content),
+                    attempts: 2,
+                }),
+            }
+        }
         Err(e) => {
             // Fallback couldn't even reach the provider. Surface the ORIGINAL
             // parse failure as the primary diagnostic (it's the more actionable
@@ -567,6 +633,13 @@ mod tests {
 
     enum MockResponse {
         Ok(String),
+        /// Success with explicit stop reasons — exercises the early-end
+        /// gates (normalized and native).
+        OkWithFinish {
+            content: String,
+            finish_reason: Option<String>,
+            native_finish_reason: Option<String>,
+        },
         Err(ProviderError),
     }
 
@@ -595,6 +668,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back(MockResponse::Ok(content.into()));
+            self
+        }
+
+        fn queue_response_with_finish(
+            &self,
+            content: impl Into<String>,
+            finish_reason: Option<&str>,
+            native_finish_reason: Option<&str>,
+        ) -> &Self {
+            self.responses
+                .lock()
+                .unwrap()
+                .push_back(MockResponse::OkWithFinish {
+                    content: content.into(),
+                    finish_reason: finish_reason.map(String::from),
+                    native_finish_reason: native_finish_reason.map(String::from),
+                });
             self
         }
 
@@ -658,6 +748,21 @@ mod tests {
                     content,
                     tool_calls: None,
                     finish_reason: Some("stop".to_string()),
+                    native_finish_reason: Some("end_turn".to_string()),
+                    completion_tokens: None,
+        upstream_provider: None,
+                }),
+                Some(MockResponse::OkWithFinish {
+                    content,
+                    finish_reason,
+                    native_finish_reason,
+                }) => Ok(CompletionResponse {
+                    content,
+                    tool_calls: None,
+                    finish_reason,
+                    native_finish_reason,
+                    completion_tokens: None,
+        upstream_provider: None,
                 }),
                 Some(MockResponse::Err(e)) => Err(e),
                 None => Err(ProviderError::Configuration(
@@ -893,6 +998,71 @@ mod tests {
                 );
             }
             other => panic!("expected ParseFailed, got {:?}", other),
+        }
+    }
+
+    // ==================== Early-end gates ====================
+
+    #[tokio::test(start_paused = true)]
+    async fn pipeline_native_max_tokens_retries_despite_normalized_stop() {
+        // The 2026-07 silent-truncation shape: normalized finish says all is
+        // well, the upstream's native reason says the output was cut. The
+        // gate must trust the native field and retry.
+        let provider = Arc::new(MockLlmProvider::new());
+        provider.queue_response_with_finish(
+            r#"{"value":"cut mid-sen","count":1}"#,
+            Some("stop"),
+            Some("max_tokens"),
+        );
+        provider.queue_response(OK_JSON);
+
+        let messages = vec![Message::user("u")];
+        let result = run_sample(provider.clone(), messages).await.unwrap();
+
+        assert_eq!(result.count, 7, "should use the retried, complete response");
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipeline_early_end_exhausts_retries_returns_error() {
+        let provider = Arc::new(MockLlmProvider::new());
+        for _ in 0..3 {
+            provider.queue_response_with_finish(OK_JSON, Some("length"), None);
+        }
+
+        let messages = vec![Message::user("u")];
+        let err = run_sample(provider.clone(), messages).await.unwrap_err();
+
+        // 1 primary + 2 retries, all cut → Other; the prompt-based fallback
+        // must NOT fire (its output would be no more trustworthy).
+        assert_eq!(provider.call_count(), 3);
+        match err {
+            StructuredCallError::Other(msg) => {
+                assert!(msg.contains("ended early"), "got: {}", msg)
+            }
+            other => panic!("expected Other, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_truncated_fallback_rejected() {
+        let provider = Arc::new(MockLlmProvider::new());
+        // Primary: unparseable prose → triggers the fallback.
+        provider.queue_response("no json here, sorry");
+        // Fallback: valid JSON but the generation was cut.
+        provider.queue_response_with_finish(OK_JSON, Some("length"), None);
+
+        let messages = vec![Message::user("u")];
+        let err = run_sample(provider.clone(), messages).await.unwrap_err();
+
+        assert_eq!(provider.call_count(), 2);
+        match err {
+            StructuredCallError::Other(msg) => assert!(
+                msg.contains("fallback generation ended early"),
+                "got: {}",
+                msg
+            ),
+            other => panic!("expected Other, got {:?}", other),
         }
     }
 

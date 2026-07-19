@@ -96,6 +96,9 @@ struct JsonSchemaWrapper {
 #[derive(Serialize)]
 struct ProviderPreferences {
     require_parameters: bool,
+    /// Provider slugs OpenRouter must not route to for this request.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ignore: Vec<String>,
 }
 
 // ==================== Response Types ====================
@@ -103,6 +106,17 @@ struct ProviderPreferences {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
+    /// Which upstream host served the request (e.g. "Anthropic", "Azure").
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseUsage {
+    #[serde(default)]
+    completion_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -141,12 +155,16 @@ struct ResponseFunctionCall {
 #[derive(Deserialize)]
 struct StreamingResponse {
     choices: Vec<StreamingChoice>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StreamingChoice {
     delta: StreamingDelta,
     finish_reason: Option<String>,
+    #[serde(default)]
+    native_finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -277,8 +295,22 @@ async fn complete_internal(
         });
 
     let provider_prefs = if config.params.structured_output.is_some() {
+        // Azure-hosted Claude (provider slug "azure", first seen serving
+        // claude-sonnet-5 on 2026-07-18) returned a structured output cut
+        // mid-sentence under a clean finish_reason — the silent Daily
+        // Briefing truncations — while the Bedrock and Anthropic-direct
+        // endpoints behaved on identical calls. Structured output is the
+        // one place a cut is invisible (the JSON envelope still closes),
+        // so Anthropic-model structured calls refuse that route until the
+        // endpoint proves trustworthy.
+        let ignore = if config.model.starts_with("anthropic/") {
+            vec!["azure".to_string()]
+        } else {
+            Vec::new()
+        };
         Some(ProviderPreferences {
             require_parameters: true,
+            ignore,
         })
     } else {
         None
@@ -380,6 +412,11 @@ async fn complete_internal(
             ProviderError::ParseError(format!("Failed to parse chat response: {e}"))
         })?;
 
+    let completion_tokens = chat_response
+        .usage
+        .as_ref()
+        .and_then(|u| u.completion_tokens);
+    let upstream_provider = chat_response.provider.clone();
     let choice = chat_response
         .choices
         .into_iter()
@@ -399,6 +436,8 @@ async fn complete_internal(
             tracing::warn!(
                 finish_reason = reason,
                 native_finish_reason = choice.native_finish_reason.as_deref().unwrap_or("-"),
+                completion_tokens,
+                upstream_provider = upstream_provider.as_deref().unwrap_or("-"),
                 model = %config.model,
                 "OpenRouter completion ended early"
             );
@@ -406,6 +445,9 @@ async fn complete_internal(
     }
     Ok(CompletionResponse {
         finish_reason: choice.finish_reason.clone(),
+        native_finish_reason: choice.native_finish_reason.clone(),
+        completion_tokens,
+        upstream_provider,
         content: choice.message.content.unwrap_or_default(),
         tool_calls,
     })
@@ -499,6 +541,8 @@ async fn complete_streaming_internal(
     let mut tool_call_accumulators: Vec<ToolCallAccumulator> = Vec::new();
     let mut buffer = String::new();
     let mut finish_reason = None;
+    let mut native_finish_reason = None;
+    let mut upstream_provider = None;
 
     let mut stream = response.bytes_stream();
 
@@ -532,10 +576,16 @@ async fn complete_streaming_internal(
                         tracing::debug!(error = %e, chunk_preview = %crate::providers::error::truncate_utf8(json_str, 200), "OpenRouter stream chunk parse error");
                     }
                     Ok(response) => {
+                        if response.provider.is_some() {
+                            upstream_provider = response.provider.clone();
+                        }
                         if let Some(choice) = response.choices.first() {
                             // Update finish reason
                             if choice.finish_reason.is_some() {
                                 finish_reason = choice.finish_reason.clone();
+                            }
+                            if choice.native_finish_reason.is_some() {
+                                native_finish_reason = choice.native_finish_reason.clone();
                             }
 
                             // Handle content delta
@@ -621,5 +671,10 @@ async fn complete_streaming_internal(
         content,
         tool_calls,
         finish_reason,
+        native_finish_reason,
+        // Usage arrives only in a final SSE chunk we don't request
+        // (stream_options.include_usage); not worth the extra chunk here.
+        completion_tokens: None,
+        upstream_provider,
     })
 }

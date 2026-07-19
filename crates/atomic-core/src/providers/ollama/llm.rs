@@ -243,6 +243,9 @@ pub async fn complete(
         content: chat_response.message.content,
         tool_calls,
         finish_reason: None,
+        native_finish_reason: None,
+        completion_tokens: None,
+        upstream_provider: None,
     })
 }
 
@@ -322,6 +325,9 @@ pub async fn complete_with_tools(
         content: chat_response.message.content,
         tool_calls,
         finish_reason: None,
+        native_finish_reason: None,
+        completion_tokens: None,
+        upstream_provider: None,
     })
 }
 
@@ -458,5 +464,8 @@ pub async fn complete_streaming_with_tools(
             Some(tool_calls)
         },
         finish_reason: None,
+        native_finish_reason: None,
+        completion_tokens: None,
+        upstream_provider: None,
     })
 }
