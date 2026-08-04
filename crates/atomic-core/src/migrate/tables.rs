@@ -109,7 +109,8 @@ pub(super) const TABLE_SPECS: &[TableSpec] = &[
         table: "tags",
         source_table: "tags",
         select_exprs: "id, name, NULL, created_at, 0, COALESCE(is_autotag_target, 0), \
-                       COALESCE(autotag_description, '')",
+                       COALESCE(autotag_description, ''), wiki_generation_prompt, \
+                       wiki_update_prompt",
         guard: None,
         pg_cols: &[
             "id",
@@ -119,6 +120,8 @@ pub(super) const TABLE_SPECS: &[TableSpec] = &[
             "atom_count",
             "is_autotag_target",
             "autotag_description",
+            "wiki_generation_prompt",
+            "wiki_update_prompt",
         ],
         types: &[
             Col::Text,
@@ -127,6 +130,8 @@ pub(super) const TABLE_SPECS: &[TableSpec] = &[
             Col::Text,
             Col::Int,
             Col::Bool,
+            Col::Text,
+            Col::Text,
             Col::Text,
         ],
         binds_skip_json: false,

@@ -1735,6 +1735,24 @@ impl AtomicCore {
             .await
     }
 
+    /// Read a tag's wiki prompt overrides. `None` when the tag doesn't exist.
+    pub async fn get_tag_wiki_prompts(
+        &self,
+        id: &str,
+    ) -> Result<Option<TagWikiPrompts>, AtomicCoreError> {
+        self.storage.get_tag_wiki_prompts_impl(id).await
+    }
+
+    /// Replace a tag's wiki prompt overrides. Takes effect the next time the
+    /// tag's article is generated or updated — nothing is regenerated here.
+    pub async fn set_tag_wiki_prompts(
+        &self,
+        id: &str,
+        prompts: &TagWikiPrompts,
+    ) -> Result<(), AtomicCoreError> {
+        self.storage.set_tag_wiki_prompts_impl(id, prompts).await
+    }
+
     /// Configure auto-tag targets in one shot — used by the onboarding wizard
     /// and the settings tab.
     ///
@@ -1933,6 +1951,32 @@ impl AtomicCore {
                 .map(|s| s.as_str())
                 .unwrap_or("centroid"),
         );
+        // A tag deleted out from under an in-flight generation resolves as
+        // "no overrides"; the missing tag surfaces on the caller's own path.
+        let TagWikiPrompts {
+            generation_prompt: tag_generation_prompt,
+            update_prompt: tag_update_prompt,
+        } = self
+            .storage
+            .get_tag_wiki_prompts_impl(tag_id)
+            .await?
+            .unwrap_or_default();
+        // Precedence, per field independently: this tag's override, then the
+        // global custom prompt, then the built-in default (applied by
+        // `WikiStrategyContext` when both are absent).
+        //
+        // The update chain takes the tag's *generation* prompt as its middle
+        // term: the article was written to that prompt, so an update falling
+        // straight through to the global one would accrete stock encyclopedia
+        // prose onto a deliberately-shaped article — a "collect the unchecked
+        // tasks" wiki would stop being a checklist after its first update.
+        // `section_ops_prompt` prepends whatever it is handed, so the JSON
+        // section-ops contract holds for either text.
+        let custom_update_prompt = tag_update_prompt
+            .or_else(|| tag_generation_prompt.clone())
+            .or_else(|| settings_map.get("wiki_update_prompt").cloned());
+        let custom_generation_prompt =
+            tag_generation_prompt.or_else(|| settings_map.get("wiki_generation_prompt").cloned());
         let related = self
             .storage
             .get_related_tags_impl(tag_id, MAX_CROSS_LINK_TAGS)
@@ -1952,8 +1996,8 @@ impl AtomicCore {
             tag_id: tag_id.to_string(),
             tag_name: tag_name.to_string(),
             linkable_article_names,
-            custom_generation_prompt: settings_map.get("wiki_generation_prompt").cloned(),
-            custom_update_prompt: settings_map.get("wiki_update_prompt").cloned(),
+            custom_generation_prompt,
+            custom_update_prompt,
         };
         Ok((strategy, ctx))
     }

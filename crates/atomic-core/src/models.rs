@@ -174,6 +174,38 @@ pub struct Tag {
     pub autotag_description: String,
 }
 
+/// Per-tag overrides for the wiki prompts, `None` meaning "no override".
+///
+/// Deliberately not a field on [`Tag`]: the tag tree ships hundreds of rows to
+/// every client on load and a prompt can run to several kilobytes, so these are
+/// fetched on demand for the one tag being edited.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TagWikiPrompts {
+    #[serde(default)]
+    pub generation_prompt: Option<String>,
+    #[serde(default)]
+    pub update_prompt: Option<String>,
+}
+
+impl TagWikiPrompts {
+    /// Blank text clears an override. Persisting `Some("")` instead would pin
+    /// the tag to an empty prompt and cut off the global/default fallback.
+    pub fn normalized(&self) -> Self {
+        fn clear_if_blank(prompt: &Option<String>) -> Option<String> {
+            prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        }
+        Self {
+            generation_prompt: clear_if_blank(&self.generation_prompt),
+            update_prompt: clear_if_blank(&self.update_prompt),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AtomWithTags {

@@ -61,11 +61,19 @@ pub struct WikiStrategyContext {
 }
 
 impl WikiStrategyContext {
-    /// Returns the generation system prompt, using custom if set, otherwise the default.
-    pub fn generation_prompt(&self) -> &str {
+    /// The custom generation prompt, when one carries any content. Callers
+    /// that must tell "the user asked for this" apart from the built-in
+    /// prompt — the agentic research loop, which steers curation by it — read
+    /// this rather than [`Self::generation_prompt`].
+    pub fn generation_prompt_override(&self) -> Option<&str> {
         self.custom_generation_prompt
             .as_deref()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Returns the generation system prompt, using custom if set, otherwise the default.
+    pub fn generation_prompt(&self) -> &str {
+        self.generation_prompt_override()
             .unwrap_or(WIKI_GENERATION_SYSTEM_PROMPT)
     }
 
@@ -76,7 +84,7 @@ impl WikiStrategyContext {
         match self
             .custom_update_prompt
             .as_deref()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
         {
             Some(custom) => format!("{}\n\n{}", custom, WIKI_UPDATE_SECTION_OPS_PROMPT),
             None => WIKI_UPDATE_SECTION_OPS_PROMPT.to_string(),
@@ -1700,6 +1708,65 @@ mod tests {
     fn lint_wiki_section_ops_schema() {
         lint_schema(&section_ops_schema())
             .expect("section_ops_schema must be portable across providers");
+    }
+
+    // ==================== Prompt resolution ====================
+
+    /// The two accessors every strategy and the update path read through.
+    /// The temp file rides along so the database outlives the context.
+    fn prompt_ctx(
+        custom_generation_prompt: Option<&str>,
+        custom_update_prompt: Option<&str>,
+    ) -> (WikiStrategyContext, NamedTempFile) {
+        let (db, temp) = create_test_db();
+        let ctx = WikiStrategyContext {
+            storage: StorageBackend::Sqlite(crate::storage::SqliteStorage::new(
+                std::sync::Arc::new(db),
+            )),
+            provider_config: ProviderConfig::from_settings(&Default::default()),
+            wiki_model: "test-model".to_string(),
+            tag_id: "tag1".to_string(),
+            tag_name: "TestTopic".to_string(),
+            linkable_article_names: Vec::new(),
+            custom_generation_prompt: custom_generation_prompt.map(str::to_string),
+            custom_update_prompt: custom_update_prompt.map(str::to_string),
+        };
+        (ctx, temp)
+    }
+
+    #[test]
+    fn generation_prompt_falls_back_unless_a_custom_prompt_has_content() {
+        for blank in [None, Some(""), Some("   \n\t ")] {
+            let (ctx, _temp) = prompt_ctx(blank, None);
+            assert_eq!(
+                ctx.generation_prompt(),
+                WIKI_GENERATION_SYSTEM_PROMPT,
+                "blank custom prompt {blank:?} must not replace the built-in one"
+            );
+        }
+
+        let (ctx, _temp) = prompt_ctx(Some("Write it as a diary."), None);
+        assert_eq!(ctx.generation_prompt(), "Write it as a diary.");
+    }
+
+    #[test]
+    fn section_ops_prompt_prepends_only_a_custom_prompt_with_content() {
+        for blank in [None, Some(""), Some("   \n\t ")] {
+            let (ctx, _temp) = prompt_ctx(None, blank);
+            assert_eq!(
+                ctx.section_ops_prompt(),
+                WIKI_UPDATE_SECTION_OPS_PROMPT,
+                "blank custom prompt {blank:?} must not prepend to the section-ops contract"
+            );
+        }
+
+        let (ctx, _temp) = prompt_ctx(None, Some("Newest entries on top."));
+        let prompt = ctx.section_ops_prompt();
+        assert!(prompt.starts_with("Newest entries on top."));
+        assert!(
+            prompt.ends_with(WIKI_UPDATE_SECTION_OPS_PROMPT),
+            "the structural contract must survive the prepend"
+        );
     }
 
     fn insert_tag(conn: &Connection, id: &str, name: &str) {

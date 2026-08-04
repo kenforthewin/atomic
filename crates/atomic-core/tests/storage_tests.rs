@@ -472,6 +472,97 @@ async fn test_get_tag(storage: &dyn TagStore) {
     assert!(missing.is_none());
 }
 
+async fn test_tag_wiki_prompts_round_trip(storage: &dyn TagStore) {
+    let tag = storage.create_tag("Diary", None).await.unwrap();
+
+    // A fresh tag has no overrides.
+    let fresh = storage.get_tag_wiki_prompts(&tag.id).await.unwrap();
+    let fresh = fresh.expect("existing tag resolves to a prompts row");
+    assert!(fresh.generation_prompt.is_none());
+    assert!(fresh.update_prompt.is_none());
+
+    // Both fields set.
+    storage
+        .set_tag_wiki_prompts(
+            &tag.id,
+            &TagWikiPrompts {
+                generation_prompt: Some("Collect the unchecked tasks.".to_string()),
+                update_prompt: Some("Keep the newest entries on top.".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let saved = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.generation_prompt.as_deref(),
+        Some("Collect the unchecked tasks.")
+    );
+    assert_eq!(
+        saved.update_prompt.as_deref(),
+        Some("Keep the newest entries on top.")
+    );
+
+    // A null field clears that field alone — the write replaces the pair.
+    storage
+        .set_tag_wiki_prompts(
+            &tag.id,
+            &TagWikiPrompts {
+                generation_prompt: Some("Collect the unchecked tasks.".to_string()),
+                update_prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+    let saved = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.generation_prompt.as_deref(),
+        Some("Collect the unchecked tasks.")
+    );
+    assert!(saved.update_prompt.is_none());
+
+    // Whitespace-only text clears rather than pinning an empty prompt.
+    storage
+        .set_tag_wiki_prompts(
+            &tag.id,
+            &TagWikiPrompts {
+                generation_prompt: Some("   \n ".to_string()),
+                update_prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+    let cleared = storage
+        .get_tag_wiki_prompts(&tag.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cleared.generation_prompt.is_none(),
+        "blank text must clear the override, not store an empty prompt"
+    );
+
+    // Unknown tag: read yields None, write reports NotFound.
+    assert!(storage
+        .get_tag_wiki_prompts("nonexistent-tag-id")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        storage
+            .set_tag_wiki_prompts("nonexistent-tag-id", &TagWikiPrompts::default())
+            .await,
+        Err(AtomicCoreError::NotFound(_))
+    ));
+}
+
 // ==================== TaskRunStore Tests ====================
 
 /// Build a `TaskRun` row with caller-controlled state/timing fields —
@@ -1322,6 +1413,12 @@ async fn sqlite_get_tag() {
 }
 
 #[tokio::test]
+async fn sqlite_tag_wiki_prompts_round_trip() {
+    let (s, _dir) = sqlite_storage().await;
+    test_tag_wiki_prompts_round_trip(&s).await;
+}
+
+#[tokio::test]
 async fn sqlite_list_runnable_task_runs() {
     let (s, _dir) = sqlite_storage().await;
     test_list_runnable_task_runs(&s).await;
@@ -1517,6 +1614,72 @@ mod postgres_tests {
     pg_test!(pg_update_tag, test_update_tag);
     pg_test!(pg_delete_tag, test_delete_tag);
     pg_test!(pg_get_tag, test_get_tag);
+    pg_test!(
+        pg_tag_wiki_prompts_round_trip,
+        test_tag_wiki_prompts_round_trip
+    );
+
+    /// `tags.id` is a global primary key on Postgres: several logical
+    /// databases share the table, and the `AND db_id = $n` predicate in the
+    /// wiki-prompt queries is the entire fence between them. This is the only
+    /// test that puts two db_ids in front of it.
+    #[tokio::test]
+    async fn pg_tag_wiki_prompts_fenced_by_db_id() {
+        let Some(ref owner) = postgres_storage().await else {
+            eprintln!(
+                "Skipping pg_tag_wiki_prompts_fenced_by_db_id (ATOMIC_TEST_DATABASE_URL not set)"
+            );
+            return;
+        };
+        // Connected after `postgres_storage`, whose truncate would otherwise
+        // wipe the tag this test just seeded.
+        let url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
+        let neighbor = atomic_core::storage::PostgresStorage::connect(&url, "test-neighbor")
+            .await
+            .unwrap();
+
+        let tag = owner.create_tag("FencedDiary", None).await.unwrap();
+        owner
+            .set_tag_wiki_prompts(
+                &tag.id,
+                &TagWikiPrompts {
+                    generation_prompt: Some("Only this database may see it.".to_string()),
+                    update_prompt: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            neighbor
+                .get_tag_wiki_prompts(&tag.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another database's tag must read as absent, not as its prompts"
+        );
+        assert!(
+            matches!(
+                neighbor
+                    .set_tag_wiki_prompts(&tag.id, &TagWikiPrompts::default())
+                    .await,
+                Err(AtomicCoreError::NotFound(_))
+            ),
+            "another database's tag must not be writable"
+        );
+
+        let owned = owner
+            .get_tag_wiki_prompts(&tag.id)
+            .await
+            .unwrap()
+            .expect("the owning database still sees its tag");
+        assert_eq!(
+            owned.generation_prompt.as_deref(),
+            Some("Only this database may see it."),
+            "the rejected cross-database write must not have landed"
+        );
+    }
+
     pg_test!(pg_list_runnable_task_runs, test_list_runnable_task_runs);
     pg_test!(
         pg_gc_task_runs_never_deletes_non_terminal,

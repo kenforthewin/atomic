@@ -1,7 +1,8 @@
 import { useState, useRef, useMemo, useEffect, MouseEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Pencil, Plus, Trash2, Inbox, Search } from 'lucide-react';
+import { Pencil, Plus, Trash2, Inbox, Search, BookOpen } from 'lucide-react';
 import { TagNode } from './TagNode';
+import { TagWikiPromptModal } from './TagWikiPromptModal';
 import { ContextMenu } from '../ui/ContextMenu';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
@@ -135,6 +136,11 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
     name: string;
   }>({ isOpen: false, parentId: null, name: '' });
 
+  const [wikiPromptModal, setWikiPromptModal] = useState<{
+    isOpen: boolean;
+    tag: TagWithCount | null;
+  }>({ isOpen: false, tag: null });
+
   const handleSelectTag = async (tagId: string | null) => {
     setSelectedTag(tagId);
     if (tagId) {
@@ -201,6 +207,18 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
           },
           icon: (
             <Plus className="w-4 h-4" strokeWidth={2} />
+          ),
+        },
+        {
+          label: 'Wiki Prompt…',
+          onClick: () => {
+            setWikiPromptModal({
+              isOpen: true,
+              tag: contextMenu.tag,
+            });
+          },
+          icon: (
+            <BookOpen className="w-4 h-4" strokeWidth={2} />
           ),
         },
         {
@@ -402,6 +420,13 @@ export function TagTree({ onOpenTagSettings }: TagTreeProps = {}) {
           </div>
         )}
       </Modal>
+
+      {/* Wiki Prompt Modal */}
+      <TagWikiPromptModal
+        isOpen={wikiPromptModal.isOpen}
+        tag={wikiPromptModal.tag}
+        onClose={() => setWikiPromptModal({ isOpen: false, tag: null })}
+      />
 
       {/* New Tag Modal */}
       <Modal

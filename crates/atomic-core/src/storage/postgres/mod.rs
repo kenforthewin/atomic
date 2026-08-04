@@ -173,6 +173,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         25,
         include_str!("migrations/025_conversation_tags_mode.sql"),
     ),
+    (26, include_str!("migrations/026_tag_wiki_prompts.sql")),
 ];
 
 /// Postgres-backed storage implementation using sqlx + pgvector.

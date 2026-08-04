@@ -452,8 +452,13 @@ fn trim_to_budget(
 
 // ==================== Research Prompts ====================
 
-fn research_system_prompt(tag_name: &str) -> String {
-    format!(
+/// `article_prompt` is the custom prompt the article will be written to, when
+/// there is one. It is appended rather than substituted: the curation
+/// guidelines below ("skip redundant, vague, off-topic chunks") are tuned for
+/// an encyclopedia article and would otherwise discard exactly the material a
+/// diary or checklist wiki needs, while the tool contract must stay intact.
+fn research_system_prompt(tag_name: &str, article_prompt: Option<&str>) -> String {
+    let mut prompt = format!(
         r#"You are a research agent curating source material for a wiki article about "{tag_name}".
 
 Your job is to search the knowledge base, review results, and select the best chunks to use as sources for the article. You have three tools:
@@ -469,7 +474,13 @@ Guidelines:
 - Aim for comprehensive coverage of the topic's key aspects
 - Call done() when you have sufficient material for a well-sourced article
 - You do NOT write the article — you only curate the sources"#
-    )
+    );
+    if let Some(article_prompt) = article_prompt {
+        prompt.push_str(&format!(
+            "\n\nThe article will be written to these instructions — select material accordingly:\n{article_prompt}"
+        ));
+    }
+    prompt
 }
 
 fn research_user_prompt_generate(tag_name: &str) -> String {
@@ -521,7 +532,7 @@ pub(crate) async fn generate(
 
     // Run research
     let mut rc = ResearchContext::new(
-        research_system_prompt(&ctx.tag_name),
+        research_system_prompt(&ctx.tag_name, ctx.generation_prompt_override()),
         research_user_prompt_generate(&ctx.tag_name),
     );
 
@@ -606,7 +617,7 @@ pub(crate) async fn research_for_update(
         .map_err(|e| e.to_string())?;
 
     let mut rc = ResearchContext::new(
-        research_system_prompt(&ctx.tag_name),
+        research_system_prompt(&ctx.tag_name, ctx.generation_prompt_override()),
         research_user_prompt_update(&ctx.tag_name, &existing.article.content),
     );
 
@@ -675,4 +686,24 @@ pub(crate) async fn research_for_update(
     Ok(Some((chunks, atom_count)))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::research_system_prompt;
 
+    #[test]
+    fn research_prompt_appends_the_article_instructions() {
+        let stock = research_system_prompt("Diary", None);
+        assert!(stock.contains("You do NOT write the article"));
+
+        let steered = research_system_prompt("Diary", Some("Keep it chronological."));
+        assert!(
+            steered.starts_with(&stock),
+            "curation guidance must be appended to the tool contract, never replace it; \
+             got {steered}"
+        );
+        assert!(
+            steered.ends_with("Keep it chronological."),
+            "the article's own instructions must reach the researcher; got {steered}"
+        );
+    }
+}

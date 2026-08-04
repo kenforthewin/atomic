@@ -263,6 +263,13 @@ pub trait TagStore: Send + Sync {
     /// Set optional guidance used when this tag is an auto-tag target.
     async fn set_tag_autotag_description(&self, id: &str, description: &str) -> StorageResult<()>;
 
+    /// Read a tag's wiki prompt overrides. `None` when no tag with that id exists.
+    async fn get_tag_wiki_prompts(&self, id: &str) -> StorageResult<Option<TagWikiPrompts>>;
+
+    /// Replace a tag's wiki prompt overrides, normalizing blank text to "no
+    /// override". Errors with `NotFound` when no tag with that id exists.
+    async fn set_tag_wiki_prompts(&self, id: &str, prompts: &TagWikiPrompts) -> StorageResult<()>;
+
     /// Apply a full auto-tag-target configuration in a single transaction.
     /// See `AtomicCore::configure_autotag_targets` for semantics.
     async fn configure_autotag_targets(

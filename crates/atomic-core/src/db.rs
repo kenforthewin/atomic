@@ -281,7 +281,7 @@ impl Database {
     ///   1. Add a new `if version < N` block at the end (before the virtual-table section)
     ///   2. End the block with `PRAGMA user_version = N;`
     ///   3. Bump LATEST_VERSION
-    const LATEST_VERSION: i32 = 24;
+    const LATEST_VERSION: i32 = 25;
 
     pub fn run_migrations(conn: &Connection) -> Result<(), AtomicCoreError> {
         Self::run_migrations_internal(conn, false)
@@ -1174,8 +1174,49 @@ impl Database {
                 )?;
             }
 
-            conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
+            conn.execute_batch("PRAGMA user_version = 24;")?;
         }
+
+        // V25: a tag can override the wiki prompts used for its own article.
+        // NULL means "no override" — the resolver in
+        // `AtomicCore::build_wiki_strategy_context` then falls through to the
+        // global setting and finally the built-in prompt.
+        //
+        // Two ALTERs and the version bump run in one transaction. Left to
+        // autocommit they land separately, and the probe below only asks about
+        // the *first* column: a crash between the two ALTERs would re-enter
+        // with `has_col` true, skip the second column, and stamp 25 over a
+        // schema that has no `wiki_update_prompt` — every wiki read then fails
+        // for good, with no version left to repair it.
+        if version < 25 {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('tags') WHERE name='wiki_generation_prompt'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            let tx = conn.unchecked_transaction()?;
+            if !has_col {
+                tx.execute_batch(
+                    "ALTER TABLE tags ADD COLUMN wiki_generation_prompt TEXT;
+                     ALTER TABLE tags ADD COLUMN wiki_update_prompt TEXT;",
+                )?;
+            }
+            tx.execute_batch("PRAGMA user_version = 25;")?;
+            tx.commit()?;
+        }
+
+        // Each block above stamps its own literal N, while `LATEST_VERSION` is
+        // a separate declaration; a new migration that bumps one without the
+        // other is a skew nothing else would catch. Debug builds — every test
+        // run — assert the two agree.
+        debug_assert_eq!(
+            conn.query_row::<i32, _, _>("PRAGMA user_version", [], |row| row.get(0))?,
+            Self::LATEST_VERSION,
+            "migrations must leave the database at LATEST_VERSION"
+        );
 
         // --- Triggers (recreated every startup to stay current) ---
         conn.execute_batch(

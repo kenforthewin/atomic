@@ -12,6 +12,16 @@ export interface Tag {
   autotag_description: string;
 }
 
+/// Per-tag overrides for the prompts that write and update that tag's wiki
+/// article. `null` on either field means "no override" — the global prompt
+/// from settings applies, and failing that Atomic's built-in prompt. Kept off
+/// the `Tag` model on purpose: prompts can be multi-KB and the tree fetches
+/// hundreds of tags at a time, so they are loaded on demand.
+export interface TagWikiPrompts {
+  generation_prompt: string | null;
+  update_prompt: string | null;
+}
+
 export interface TagWithCount extends Tag {
   atom_count: number;
   children_total: number;
@@ -45,6 +55,8 @@ interface TagsStore {
   deleteTag: (id: string, recursive?: boolean) => Promise<void>;
   setTagAutotagTarget: (id: string, value: boolean) => Promise<void>;
   setTagAutotagDescription: (id: string, description: string) => Promise<void>;
+  fetchTagWikiPrompts: (id: string) => Promise<TagWikiPrompts>;
+  saveTagWikiPrompts: (id: string, prompts: TagWikiPrompts) => Promise<TagWikiPrompts>;
   configureAutotagTargets: (keepDefaults: string[], addCustom: string[]) => Promise<Tag[]>;
   compactTags: () => Promise<CompactionResult>;
   clearError: () => void;
@@ -235,6 +247,32 @@ export const useTagsStore = create<TagsStore>((set, get) => ({
       await getTransport().invoke('set_tag_autotag_description', { id, description });
       const tags = await fetchAllTagsFresh();
       set({ tags });
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
+  // Wiki prompts live outside the cached tree, so neither action refetches
+  // it. Callers hold the values for as long as their editor is open.
+  fetchTagWikiPrompts: async (id: string) => {
+    set({ error: null });
+    try {
+      return await getTransport().invoke<TagWikiPrompts>('get_tag_wiki_prompts', { id });
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
+  saveTagWikiPrompts: async (id: string, prompts: TagWikiPrompts) => {
+    set({ error: null });
+    try {
+      // The server normalizes blank prompts to null and echoes the stored
+      // record back, so the response is what the tag now has. `id` is spread
+      // last so the tag being written is always the one the caller named,
+      // whatever the prompts object happens to carry.
+      return await getTransport().invoke<TagWikiPrompts>('set_tag_wiki_prompts', { ...prompts, id });
     } catch (error) {
       set({ error: String(error) });
       throw error;

@@ -8,7 +8,7 @@ use crate::state::ServerEvent;
 use actix_web::{web, HttpResponse};
 use atomic_core::{
     AtomLink, AtomWithTags, BulkCreateResult, PaginatedAtoms, PaginatedTagChildren, SourceInfo,
-    Tag, TagWithCount,
+    Tag, TagWikiPrompts, TagWithCount,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -737,6 +737,65 @@ pub async fn set_tag_autotag_description(
     let description = body.into_inner().description;
     match db.0.set_tag_autotag_description(&id, &description).await {
         Ok(()) => HttpResponse::NoContent().finish(),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/tags/{id}/wiki-prompts",
+    params(
+        ("id" = String, Path, description = "Tag ID"),
+    ),
+    responses(
+        (status = 200, description = "The tag's wiki prompt overrides", body = TagWikiPrompts),
+        (status = 404, description = "Tag not found", body = ApiErrorResponse),
+    ),
+    tag = "tags",
+)]
+pub async fn get_tag_wiki_prompts(db: Db, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    match db.0.get_tag_wiki_prompts(&id).await {
+        Ok(Some(prompts)) => HttpResponse::Ok().json(prompts),
+        Ok(None) => tag_not_found(),
+        Err(e) => crate::error::error_response(e),
+    }
+}
+
+/// The one body both wiki-prompt routes answer an unknown tag with. GET learns
+/// of the missing tag as `Ok(None)` and PUT as a storage `NotFound`, whose
+/// rendering ("Not found: tag <id>") the modal would otherwise show verbatim
+/// for the identical condition.
+fn tag_not_found() -> HttpResponse {
+    HttpResponse::NotFound().json(serde_json::json!({"error": "Tag not found"}))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/tags/{id}/wiki-prompts",
+    params(
+        ("id" = String, Path, description = "Tag ID"),
+    ),
+    request_body = TagWikiPrompts,
+    responses(
+        (status = 200, description = "The saved overrides, normalized", body = TagWikiPrompts),
+        (status = 404, description = "Tag not found", body = ApiErrorResponse),
+    ),
+    tag = "tags",
+)]
+pub async fn set_tag_wiki_prompts(
+    db: Db,
+    path: web::Path<String>,
+    body: web::Json<TagWikiPrompts>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    // Normalizing here as well as in storage is what lets the response echo
+    // exactly what was persisted without a follow-up read; `normalized` is
+    // idempotent, so the second pass is a no-op.
+    let prompts = body.into_inner().normalized();
+    match db.0.set_tag_wiki_prompts(&id, &prompts).await {
+        Ok(()) => HttpResponse::Ok().json(prompts),
+        Err(atomic_core::AtomicCoreError::NotFound(_)) => tag_not_found(),
         Err(e) => crate::error::error_response(e),
     }
 }

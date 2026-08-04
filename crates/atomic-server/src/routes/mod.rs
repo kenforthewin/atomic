@@ -77,6 +77,14 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/tags/{id}/autotag-description",
         web::put().to(atoms::set_tag_autotag_description),
     );
+    cfg.route(
+        "/tags/{id}/wiki-prompts",
+        web::get().to(atoms::get_tag_wiki_prompts),
+    );
+    cfg.route(
+        "/tags/{id}/wiki-prompts",
+        web::put().to(atoms::set_tag_wiki_prompts),
+    );
     cfg.route("/tags/{id}", web::put().to(atoms::update_tag));
     cfg.route("/tags/{id}", web::delete().to(atoms::delete_tag));
 

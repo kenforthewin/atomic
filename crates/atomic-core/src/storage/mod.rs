@@ -287,6 +287,7 @@ impl_reborrow_struct!(
     CreateAtomRequest,
     UpdateAtomRequest,
     ListAtomsParams,
+    TagWikiPrompts,
     WikiArticle,
     WikiProposal,
     crate::models::KindFilter,
@@ -420,6 +421,10 @@ dispatch! {
         => sqlite: set_tag_autotag_target_impl, pg_trait: TagStore, pg_method: set_tag_autotag_target;
     fn set_tag_autotag_description_impl(&self, id: &str, description: &str) -> Result<(), AtomicCoreError>
         => sqlite: set_tag_autotag_description_impl, pg_trait: TagStore, pg_method: set_tag_autotag_description;
+    fn get_tag_wiki_prompts_impl(&self, id: &str) -> Result<Option<TagWikiPrompts>, AtomicCoreError>
+        => sqlite: get_tag_wiki_prompts_impl, pg_trait: TagStore, pg_method: get_tag_wiki_prompts;
+    fn set_tag_wiki_prompts_impl(&self, id: &str, prompts: &TagWikiPrompts) -> Result<(), AtomicCoreError>
+        => sqlite: set_tag_wiki_prompts_impl, pg_trait: TagStore, pg_method: set_tag_wiki_prompts;
     fn configure_autotag_targets_impl(&self, keep_default_names: &[String], add_custom_names: &[String]) -> Result<Vec<Tag>, AtomicCoreError>
         => sqlite: configure_autotag_targets_impl, pg_trait: TagStore, pg_method: configure_autotag_targets;
     fn get_related_tags_impl(&self, tag_id: &str, limit: usize) -> Result<Vec<RelatedTag>, AtomicCoreError>

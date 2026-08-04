@@ -684,3 +684,300 @@ async fn run_distinct_tags_generate_concurrently(backend: Backend) {
         assert_eq!(history[0].subject_id.as_deref(), Some(tag_id.as_str()));
     }
 }
+
+// ==================== 10. Per-tag prompt beats the global setting ====================
+
+/// A tag-level generation prompt fully replaces the global custom prompt,
+/// which in turn replaces the built-in default. The assertion reads the
+/// system message the mock provider actually received, so it fails if the
+/// resolver in `build_wiki_strategy_context` stops preferring the tag.
+const GLOBAL_WIKI_PROMPT: &str = "GLOBAL-WIKI-PROMPT: write it the house way.";
+const TAG_WIKI_PROMPT: &str = "TAG-WIKI-PROMPT: list only the unchecked tasks.";
+const GLOBAL_UPDATE_PROMPT: &str = "GLOBAL-UPDATE-PROMPT: fold changes in the house way.";
+const TAG_UPDATE_PROMPT: &str = "TAG-UPDATE-PROMPT: put the newest tasks on top.";
+
+/// The `system` message of every chat request the mock has answered, in
+/// arrival order.
+fn system_prompts(ctx: &TestCtx) -> Vec<String> {
+    ctx.mock
+        .chat_request_bodies()
+        .iter()
+        .filter_map(system_prompt_of)
+        .collect()
+}
+
+/// The system prompts of the incremental-update calls, in arrival order —
+/// the requests asking for the `wiki_update_section_ops` schema, as opposed
+/// to the full-rewrite calls generation makes.
+fn section_ops_system_prompts(ctx: &TestCtx) -> Vec<String> {
+    ctx.mock
+        .chat_request_bodies()
+        .iter()
+        .filter(|body| {
+            body.pointer("/response_format/json_schema/name")
+                .and_then(Value::as_str)
+                == Some("wiki_update_section_ops")
+        })
+        .filter_map(system_prompt_of)
+        .collect()
+}
+
+fn system_prompt_of(body: &Value) -> Option<String> {
+    body["messages"]
+        .as_array()?
+        .iter()
+        .find(|m| m["role"] == "system")?["content"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// PUT the tag's wiki prompt overrides, asserting the save lands.
+async fn set_wiki_prompts<S, B>(app: &S, auth: (&'static str, String), tag_id: &str, body: Value)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    let req = actix_test::TestRequest::put()
+        .uri(&format!("/api/tags/{tag_id}/wiki-prompts"))
+        .insert_header(auth)
+        .set_json(body)
+        .to_request();
+    let resp = actix_test::call_service(app, req).await;
+    assert_eq!(resp.status(), 200, "saving the tag's prompts must succeed");
+}
+
+/// POST /api/wiki/{tag_id}/update, asserting the incremental path ran.
+async fn update_wiki<S, B>(app: &S, auth: (&'static str, String), tag_id: &str, tag_name: &str)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    let req = actix_test::TestRequest::post()
+        .uri(&format!("/api/wiki/{tag_id}/update"))
+        .insert_header(auth)
+        .set_json(json!({ "tag_name": tag_name }))
+        .to_request();
+    let resp = actix_test::call_service(app, req).await;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = actix_test::read_body(resp).await;
+        panic!(
+            "wiki update must succeed, got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[actix_web::test]
+async fn tag_prompt_overrides_global_wiki_prompt_sqlite() {
+    run_tag_prompt_overrides_global_wiki_prompt(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_prompt_overrides_global_wiki_prompt_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_prompt_overrides_global_wiki_prompt_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_prompt_overrides_global_wiki_prompt(Backend::Postgres).await;
+}
+
+async fn run_tag_prompt_overrides_global_wiki_prompt(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    active_core(&ctx)
+        .await
+        .set_setting("wiki_generation_prompt", GLOBAL_WIKI_PROMPT)
+        .await
+        .expect("seed global wiki prompt");
+
+    let tag_id = create_tag(&app, ctx.auth_header(), "TodoWiki").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "- [ ] renew the domain\n- [x] pay the invoice",
+        &[tag_id.as_str()],
+    )
+    .await;
+
+    set_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        &tag_id,
+        json!({ "generation_prompt": TAG_WIKI_PROMPT }),
+    )
+    .await;
+
+    generate_wiki(&app, ctx.auth_header(), &tag_id, "TodoWiki").await;
+
+    let prompts = system_prompts(&ctx);
+    assert!(
+        prompts.iter().any(|p| p == TAG_WIKI_PROMPT),
+        "generation must run on the tag's prompt; system prompts seen: {prompts:?}"
+    );
+    assert!(
+        !prompts.iter().any(|p| p.contains(GLOBAL_WIKI_PROMPT)),
+        "the tag override replaces the global prompt outright; system prompts seen: {prompts:?}"
+    );
+
+    // Second half of the chain: a tag with no override still reaches the
+    // global prompt. Without this, dropping `.or_else(global)` from the
+    // resolver would leave the assertions above green.
+    let plain_tag_id = create_tag(&app, ctx.auth_header(), "PlainWiki").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "the domain registrar bills annually",
+        &[plain_tag_id.as_str()],
+    )
+    .await;
+    generate_wiki(&app, ctx.auth_header(), &plain_tag_id, "PlainWiki").await;
+
+    let prompts = system_prompts(&ctx);
+    assert!(
+        prompts.iter().any(|p| p == GLOBAL_WIKI_PROMPT),
+        "a tag with no override must fall through to the global prompt; \
+         system prompts seen: {prompts:?}"
+    );
+}
+
+// ============ 11. The tag's generation prompt also steers its updates ============
+
+#[actix_web::test]
+async fn tag_prompts_steer_wiki_updates_sqlite() {
+    run_tag_prompts_steer_wiki_updates(Backend::Sqlite).await;
+}
+
+#[actix_web::test]
+async fn tag_prompts_steer_wiki_updates_postgres() {
+    if std::env::var("ATOMIC_TEST_DATABASE_URL").is_err() {
+        eprintln!(
+            "tag_prompts_steer_wiki_updates_postgres: skipping (ATOMIC_TEST_DATABASE_URL not set)"
+        );
+        return;
+    }
+    run_tag_prompts_steer_wiki_updates(Backend::Postgres).await;
+}
+
+/// Precedence for the update prepend is `tag.update_prompt →
+/// tag.generation_prompt → global wiki_update_prompt`. The middle term is
+/// what keeps a deliberately-shaped article in shape: a tag told to "list
+/// only the unchecked tasks" must not accrete stock prose the first time it
+/// is incrementally updated.
+async fn run_tag_prompts_steer_wiki_updates(backend: Backend) {
+    let Some(ctx) = TestCtx::new(backend).await else {
+        return;
+    };
+    let app = actix_test::init_service(test_app(&ctx)).await;
+
+    active_core(&ctx)
+        .await
+        .set_setting("wiki_update_prompt", GLOBAL_UPDATE_PROMPT)
+        .await
+        .expect("seed global update prompt");
+
+    let tag_id = create_tag(&app, ctx.auth_header(), "TaskWiki").await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "- [ ] renew the domain",
+        &[tag_id.as_str()],
+    )
+    .await;
+    set_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        &tag_id,
+        json!({ "generation_prompt": TAG_WIKI_PROMPT }),
+    )
+    .await;
+    generate_wiki(&app, ctx.auth_header(), &tag_id, "TaskWiki").await;
+
+    // (a) Only a generation prompt is set: it steers the update too, ahead of
+    // the global update prompt, and prepended so the structural section-ops
+    // contract still follows it.
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "- [ ] file the quarterly report",
+        &[tag_id.as_str()],
+    )
+    .await;
+    update_wiki(&app, ctx.auth_header(), &tag_id, "TaskWiki").await;
+
+    let prompts = section_ops_system_prompts(&ctx);
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the update path must issue one section-ops call; saw {prompts:?}"
+    );
+    assert!(
+        prompts[0].starts_with(TAG_WIKI_PROMPT),
+        "the tag's generation prompt must lead the update prompt; saw {:?}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].len() > TAG_WIKI_PROMPT.len(),
+        "the section-ops instructions must survive the prepend; saw {:?}",
+        prompts[0]
+    );
+    assert!(
+        !prompts[0].contains(GLOBAL_UPDATE_PROMPT),
+        "the tag's own intent outranks the global update prompt; saw {:?}",
+        prompts[0]
+    );
+
+    // (b) A per-tag update prompt outranks both.
+    set_wiki_prompts(
+        &app,
+        ctx.auth_header(),
+        &tag_id,
+        json!({
+            "generation_prompt": TAG_WIKI_PROMPT,
+            "update_prompt": TAG_UPDATE_PROMPT,
+        }),
+    )
+    .await;
+    seed_atom(
+        &app,
+        ctx.auth_header(),
+        "- [ ] book the venue deposit",
+        &[tag_id.as_str()],
+    )
+    .await;
+    update_wiki(&app, ctx.auth_header(), &tag_id, "TaskWiki").await;
+
+    let prompts = section_ops_system_prompts(&ctx);
+    assert_eq!(
+        prompts.len(),
+        2,
+        "the second update must issue its own section-ops call; saw {prompts:?}"
+    );
+    let latest = &prompts[1];
+    assert!(
+        latest.starts_with(TAG_UPDATE_PROMPT),
+        "the tag's update prompt must lead; saw {latest:?}"
+    );
+    assert!(
+        !latest.contains(TAG_WIKI_PROMPT),
+        "the update prompt replaces the generation prompt, not adds to it; saw {latest:?}"
+    );
+    assert!(
+        !latest.contains(GLOBAL_UPDATE_PROMPT),
+        "the tag's update prompt outranks the global one; saw {latest:?}"
+    );
+}

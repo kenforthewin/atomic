@@ -51,6 +51,8 @@ use utoipa::OpenApi;
         routes::atoms::delete_tag,
         routes::atoms::set_tag_autotag_target,
         routes::atoms::set_tag_autotag_description,
+        routes::atoms::get_tag_wiki_prompts,
+        routes::atoms::set_tag_wiki_prompts,
         routes::atoms::configure_autotag_targets,
         // Search
         routes::search::search,
@@ -181,6 +183,7 @@ use utoipa::OpenApi;
         atomic_core::AtomLink,
         atomic_core::AtomLinkSuggestion,
         atomic_core::Tag,
+        atomic_core::TagWikiPrompts,
         atomic_core::AtomWithTags,
         atomic_core::AtomSummary,
         atomic_core::PaginatedAtoms,

@@ -133,6 +133,17 @@ jobs:
             --locked \
             -- --test-threads=1
 
+      # The SQLite → Postgres migration suite is entirely `#![cfg(feature =
+      # "postgres")]`, so this job is the only place it has any tests at all.
+      - name: Run migration tests against Postgres
+        run: |
+          cargo test \
+            -p atomic-core \
+            --features postgres \
+            --test migrate_tests \
+            --locked \
+            -- --test-threads=1
+
       # End-to-end HTTP suites exercise the full atomic-server stack
       # (BearerAuth middleware, X-Atomic-Database routing, route handlers,
       # background pipeline) against Postgres. The suite is parameterized
@@ -149,6 +160,8 @@ jobs:
             --test e2e_websocket \
             --test e2e_concurrent \
             --test e2e_mcp \
+            --test e2e_wiki \
+            --test e2e_tags_settings \
             --locked \
             -- --test-threads=1
 
@@ -223,6 +236,11 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Vitest strips types without checking them, so a type error reaches
+      # main unless something type-checks the app separately.
+      - name: Typecheck
+        run: npx tsc --noEmit
 
       - name: Run Vitest
         run: npm test

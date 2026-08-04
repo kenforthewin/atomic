@@ -285,6 +285,46 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub(crate) fn get_tag_wiki_prompts_impl(
+        &self,
+        id: &str,
+    ) -> StorageResult<Option<TagWikiPrompts>> {
+        let conn = self.db.read_conn()?;
+        conn.query_row(
+            "SELECT wiki_generation_prompt, wiki_update_prompt FROM tags WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(TagWikiPrompts {
+                    generation_prompt: row.get(0)?,
+                    update_prompt: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(AtomicCoreError::from)
+    }
+
+    pub(crate) fn set_tag_wiki_prompts_impl(
+        &self,
+        id: &str,
+        prompts: &TagWikiPrompts,
+    ) -> StorageResult<()> {
+        let prompts = prompts.normalized();
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let affected = conn.execute(
+            "UPDATE tags SET wiki_generation_prompt = ?1, wiki_update_prompt = ?2 WHERE id = ?3",
+            rusqlite::params![prompts.generation_prompt, prompts.update_prompt, id],
+        )?;
+        if affected == 0 {
+            return Err(AtomicCoreError::NotFound(format!("tag {}", id)));
+        }
+        Ok(())
+    }
+
     /// Apply a full auto-tag-target configuration in a single transaction.
     ///
     /// Steps run atomically: any error rolls back the savepoint, leaving the
@@ -720,6 +760,14 @@ impl TagStore for SqliteStorage {
 
     async fn set_tag_autotag_description(&self, id: &str, description: &str) -> StorageResult<()> {
         self.set_tag_autotag_description_impl(id, description)
+    }
+
+    async fn get_tag_wiki_prompts(&self, id: &str) -> StorageResult<Option<TagWikiPrompts>> {
+        self.get_tag_wiki_prompts_impl(id)
+    }
+
+    async fn set_tag_wiki_prompts(&self, id: &str, prompts: &TagWikiPrompts) -> StorageResult<()> {
+        self.set_tag_wiki_prompts_impl(id, prompts)
     }
 
     async fn configure_autotag_targets(

@@ -78,9 +78,10 @@ fn seed_source_db(dir: &TempDir) -> PathBuf {
         -- external tools (where the pragma defaults off) may hold.
         PRAGMA foreign_keys = OFF;
 
-        INSERT INTO tags (id, name, parent_id, created_at, atom_count, is_autotag_target, autotag_description)
-        VALUES ('tag-root', 'Topics', NULL, '2026-01-01T00:00:00Z', 1, 1, 'general topics'),
-               ('tag-child', 'Rust', 'tag-root', '2026-01-02T00:00:00Z', 2, 0, '');
+        INSERT INTO tags (id, name, parent_id, created_at, atom_count, is_autotag_target,
+                          autotag_description, wiki_generation_prompt, wiki_update_prompt)
+        VALUES ('tag-root', 'Topics', NULL, '2026-01-01T00:00:00Z', 1, 1, 'general topics', NULL, NULL),
+               ('tag-child', 'Rust', 'tag-root', '2026-01-02T00:00:00Z', 2, 0, '', 'Lead with the ownership rules.', NULL);
 
         INSERT INTO atoms (id, content, title, snippet, source_url, source, published_at,
                            created_at, updated_at, embedding_status, tagging_status,
@@ -342,6 +343,19 @@ async fn migrate_full_fidelity_roundtrip() {
     .await
     .unwrap();
     assert!(root_autotag, "INTEGER 1 lands as BOOLEAN true");
+    let (generation, update): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT wiki_generation_prompt, wiki_update_prompt FROM tags WHERE id = 'tag-child' AND db_id = $1",
+    )
+    .bind(&db_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generation.as_deref(),
+        Some("Lead with the ownership rules."),
+        "per-tag wiki prompts travel with the tag"
+    );
+    assert!(update.is_none());
 
     // Column-mapped drift: wiki target_tag_name → link_text, tool_output → tool_result.
     let (link_text, target_tag): (String, Option<String>) = sqlx::query_as(

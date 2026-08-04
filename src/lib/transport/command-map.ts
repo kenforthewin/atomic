@@ -163,6 +163,24 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
       add_custom: a.addCustom ?? [],
     }),
   },
+  // Wiki prompt overrides are deliberately not part of the tag payload —
+  // the tree fetches hundreds of tags and a prompt can be multi-KB — so
+  // they get their own on-demand pair.
+  get_tag_wiki_prompts: {
+    method: 'GET',
+    path: (a) => `/api/tags/${encodeURIComponent(a.id as string)}/wiki-prompts`,
+  },
+  set_tag_wiki_prompts: {
+    method: 'PUT',
+    path: (a) => `/api/tags/${encodeURIComponent(a.id as string)}/wiki-prompts`,
+    argsMode: 'body',
+    // The prompts ride the body under their wire names; `id` stays in the
+    // path. A missing or empty field clears that override server-side.
+    transformArgs: (a) => ({
+      generation_prompt: a.generation_prompt ?? null,
+      update_prompt: a.update_prompt ?? null,
+    }),
+  },
 
   // ==================== Search ====================
   search_atoms_semantic: {

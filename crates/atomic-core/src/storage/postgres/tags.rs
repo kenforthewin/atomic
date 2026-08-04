@@ -428,6 +428,42 @@ impl TagStore for PostgresStorage {
         Ok(())
     }
 
+    async fn get_tag_wiki_prompts(&self, id: &str) -> StorageResult<Option<TagWikiPrompts>> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT wiki_generation_prompt, wiki_update_prompt
+             FROM tags WHERE id = $1 AND db_id = $2",
+        )
+        .bind(id)
+        .bind(&self.db_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(row.map(|r| TagWikiPrompts {
+            generation_prompt: r.0,
+            update_prompt: r.1,
+        }))
+    }
+
+    async fn set_tag_wiki_prompts(&self, id: &str, prompts: &TagWikiPrompts) -> StorageResult<()> {
+        let prompts = prompts.normalized();
+        let result = sqlx::query(
+            "UPDATE tags
+             SET wiki_generation_prompt = $1, wiki_update_prompt = $2
+             WHERE id = $3 AND db_id = $4",
+        )
+        .bind(&prompts.generation_prompt)
+        .bind(&prompts.update_prompt)
+        .bind(id)
+        .bind(&self.db_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(AtomicCoreError::NotFound(format!("tag {}", id)));
+        }
+        Ok(())
+    }
+
     async fn configure_autotag_targets(
         &self,
         keep_default_names: &[String],
