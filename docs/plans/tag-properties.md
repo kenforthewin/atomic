@@ -2,8 +2,9 @@
 
 ## Status
 
-Plan, drafted 2026-08-08. Direction settled in conversation after analyzing
-Logseq 2.0's DB release; no implementation yet. Supersedes the "templates &
+Plan, drafted 2026-08-08; manual-entry, lifecycle, and extraction-honesty
+semantics settled in a same-day design talk-through. Direction settled in
+conversation after analyzing Logseq 2.0's DB release; no implementation yet. Supersedes the "templates &
 structured atoms" framing from the Discord feature analysis — this doc is the
 deliberate answer to that demand, not a transcription of it.
 
@@ -50,6 +51,17 @@ deterministically instead of hoping semantic search lands on the right chunk.
    variants of text (stored as JSON arrays). No cardinality apparatus, no
    constrained-choice UI, no per-tag visibility matrix. Atom-references are
    explicitly deferred (see Open questions).
+7. **Extraction is honest or it is silent.** Every generated schema field is
+   nullable and the prompt instructs the model to fill only what the source
+   states with high confidence — omit the rest. An absent value is an
+   affordance (the panel invites the human to fill it); a guessed value is a
+   trust bug. And some fields are categorically not the model's to fill —
+   judgment fields like `priority` or `status`, where the failure mode isn't
+   "the text doesn't state it" but "the text *implies* it": each declaration
+   carries `auto_extract` (default on), and opted-out fields are excluded
+   from the generated schema entirely — never shown to the model, not
+   instructed-to-skip. Same invitation-only philosophy as auto-tag targets,
+   one level down.
 
 ## Data model
 
@@ -64,6 +76,7 @@ tag_property_defs
   name        TEXT NOT NULL              -- snake_case key, unique per tag
   value_type  TEXT NOT NULL              -- text | number | date | boolean | text_list
   description TEXT NOT NULL DEFAULT ''   -- doubles as the extraction hint
+  auto_extract BOOLEAN NOT NULL DEFAULT TRUE  -- principle 7: off = manual-only field
   sort_order  INTEGER NOT NULL DEFAULT 0
   UNIQUE(tag_id, name)
 
@@ -81,7 +94,17 @@ atom_properties
 One row per (atom, name): when a manual value exists, extraction skips that
 key entirely (principle 3 enforced at the write, not at read time). `tag_id`
 on extracted rows keeps the audit trail and lets a tag's backfill re-extract
-only its own keys. Postgres adds `db_id` to both tables with the same fencing
+only its own keys.
+
+Keying on `(atom_id, name)` rather than `(atom_id, tag_id, name)` is a
+semantic choice, not a shortcut: properties describe the **atom**; tags
+contribute vocabulary. An atom tagged `#meeting` + `#project-alpha` gets the
+union of both declaration sets, and two tags declaring the same name (with
+the same type) converge on one field — shared names are shared vocabulary,
+the way a column name means the same thing across joined tables, and either
+tag's queries see the value. Same name with *different* types is a
+user-fixable smell: first declaration wins, a debug log records the
+collision, no UI ceremony in v1. Postgres adds `db_id` to both tables with the same fencing
 the tags queries carry — and the same two-db fencing test shape
 (`pg_tag_wiki_prompts_fenced_by_db_id` is the model).
 
@@ -102,9 +125,12 @@ tags' declarations — walking up the tag tree for inherited defs — and if any
 exist, make **one** additional structured call:
 
 - The JSON schema is *generated* from the merged declarations (name → type,
-  description → field docs). Two tags declaring the same name merge to one
-  field; first-writer wins on conflicting types, and a debug log records the
-  collision.
+  description → field docs) — but only from fields with `auto_extract` on;
+  manual-only fields never enter the schema. Every field is nullable, and
+  the prompt instructs: fill only what the source states with high
+  confidence, omit everything else (principle 7). Two tags declaring the
+  same name merge to one field; first-writer wins on conflicting types, and
+  a debug log records the collision.
 - Model: the tagging model (`provider_config.llm_model()`), same tier and
   temperature philosophy as tagging — this is utility extraction, not
   agentic work.
@@ -118,16 +144,56 @@ Manual tag add/remove outside the pipeline (tag chip UI) triggers the same
 pass for the affected atom. Content edits re-extract on the normal pipeline
 run; extracted rows are cheap to overwrite (manual rows are not touched).
 
-## Frontmatter
+## Manual entry: the panel first, frontmatter for power users
 
-On atom save, parse a leading `---` block for **flat** `key: value` pairs into
-manual rows (typed by simple inference: number, ISO date, true/false, `[a, b]`
-lists; everything else text). No YAML dependency and no nested structures —
-the import path's frontmatter handling (`lib.rs` Obsidian import) shows the
+The reader's properties panel is the **primary** manual path, and it is more
+than an editor for existing values — declared-but-empty properties render as
+affordances. An atom tagged `#meeting` whose transcript contained no date
+shows `date: —` with a date picker; every declared key (including manual-only
+ones, and those inherited through the tag tree) appears as a typed empty slot.
+That empty slot does double duty: manual-entry invitation *and* an honest
+signal about what the source actually contains (principle 7 guarantees
+extraction left it absent rather than guessing). Nothing is required, nothing
+blocks — the form is scaffolding, not a gate.
+
+Panel rules:
+
+- **Editing an extracted value converts it to manual.** The user's touch is
+  manual intent; the row's provenance flips and re-extraction never claws it
+  back — the per-value analog of manual tags surviving re-tag. Provenance is
+  shown subtly (extracted values marked the way auto-applied tags are
+  distinguished from manual ones).
+- **Ad-hoc keys are allowed** ("+ add property"): undeclared properties are
+  pure manual data — extraction ignores them, queries and export see them.
+  Frontmatter can contain any key, so the panel must too; the two manual
+  paths stay equal in expressive power.
+
+Frontmatter remains the power-user and portability path. On atom save, a
+leading `---` block is parsed for **flat** `key: value` pairs into manual rows
+(typed by simple inference: number, ISO date, true/false, `[a, b]` lists;
+everything else text). No YAML dependency and no nested structures — the
+import path's frontmatter handling (`lib.rs` Obsidian import) shows the
 precedent and the restraint. The chunker excludes the frontmatter block from
-embeddings (`chunking.rs`). Editing a property in the reader panel writes a
-manual row — it does not rewrite the user's text (principle 4). Export
-(markdown ZIP, per-atom) materializes the merged property set as frontmatter.
+embeddings (`chunking.rs`). Panel edits write manual rows — they never
+rewrite the user's text (principle 4). Export (markdown ZIP, per-atom)
+materializes the merged property set as frontmatter.
+
+## Lifecycle: untagging and declaration edits
+
+Extracted values are a **projection** of (content × current declarations);
+manual values are assertions. Every lifecycle rule follows from that split:
+
+- **Untagging re-projects.** Removing `#meeting` drops the extracted values
+  its schema produced (`tag_id` audit column) unless a remaining tag still
+  declares the key. Manual values — including edit-to-own conversions —
+  survive unconditionally: removing a tag doesn't make the date less true.
+  The dominant untag case with an auto-tagger is mis-tag correction, and the
+  extracted values are products of the same mistake; keeping them would
+  leave machine-authored ghost data. Nothing is lost that matters:
+  re-tagging re-extracts in one pipeline pass.
+- **Deleting a declaration** from a tag sweeps that key's extracted values
+  across the tag's atoms the same way; manual values survive as ad-hoc
+  properties.
 
 ## Backfill
 
@@ -144,9 +210,11 @@ modal. Progress via the existing event pattern.
 Migrations; storage trait + both impls; defs CRUD on the per-tag config seam
 (`GET/PUT /api/tags/{id}/properties`, modeled byte-for-byte on wiki-prompts);
 pipeline extraction pass; frontmatter parse + chunker exclusion; reader
-properties panel (read + manual edit); tag context-menu "Properties…" modal
-(name / type / description rows, mirroring the wiki-prompt modal's load-gate
-lessons); per-tag backfill. Export materialization.
+properties panel (declared-but-empty slots with typed inputs, edit-to-own,
+ad-hoc keys); tag context-menu "Properties…" modal (name / type /
+description / auto-extract toggle rows, mirroring the wiki-prompt modal's
+load-gate lessons); untag/declaration-edit re-projection; per-tag backfill.
+Export materialization.
 
 **Phase 2 — the query surface (where the value compounds).**
 Property predicates in search (`routes` + search UI filter row); an agent tool
