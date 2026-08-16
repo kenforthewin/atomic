@@ -22,6 +22,7 @@ pub const WORKSPACE_ONLY_KEYS: &[&str] = &[
     // Credentials — one set per user/account
     "openrouter_api_key",
     "openai_compat_api_key",
+    "orcarouter_api_key",
     // Machine-level URLs — one host per machine
     "ollama_host",
     "openai_compat_base_url",
@@ -40,6 +41,7 @@ pub const EMBEDDING_SPACE_KEYS: &[&str] = &[
     "ollama_embedding_model",
     "openai_compat_embedding_model",
     "openai_compat_embedding_dimension",
+    "orcarouter_embedding_model",
 ];
 
 /// True if `key` affects the embedding vector space.
@@ -73,6 +75,11 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("openai_compat_embedding_dimension", "1536"),
     ("openai_compat_context_length", "65536"),
     ("openai_compat_timeout_secs", "300"), // 5 minutes default for OpenAI-compatible servers
+    ("orcarouter_embedding_model", crate::providers::ORCAROUTER_DEFAULT_EMBEDDING_MODEL),
+    ("orcarouter_llm_model", crate::providers::ORCAROUTER_DEFAULT_LLM_MODEL),
+    ("orcarouter_agentic_model", crate::providers::ORCAROUTER_DEFAULT_LLM_MODEL),
+    ("orcarouter_context_length", "65536"),
+    ("orcarouter_timeout_secs", "300"), // 5 minutes default for OrcaRouter
     ("wiki_generation_prompt", ""),
     ("wiki_update_prompt", ""),
     ("chat_prompt", ""),

@@ -36,6 +36,7 @@ interface SettingsStore {
   setSetting: (key: string, value: string) => Promise<void>;
   clearOverride: (key: string) => Promise<void>;
   testOpenRouterConnection: (apiKey: string) => Promise<boolean>;
+  testOrcaRouterConnection: (apiKey: string) => Promise<boolean>;
 }
 
 function splitResolvedSettings(
@@ -110,6 +111,14 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
   testOpenRouterConnection: async (apiKey: string) => {
     const result = await getTransport().invoke<boolean>(
       'test_openrouter_connection',
+      { apiKey },
+    );
+    return result;
+  },
+
+  testOrcaRouterConnection: async (apiKey: string) => {
+    const result = await getTransport().invoke<boolean>(
+      'test_orcarouter_connection',
       { apiKey },
     );
     return result;

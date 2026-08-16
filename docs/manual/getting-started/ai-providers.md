@@ -1,6 +1,6 @@
 ---
 title: AI Providers
-description: Configure OpenRouter, Ollama, or an OpenAI-compatible provider for embeddings and LLM features.
+description: Configure OpenRouter, OrcaRouter, Ollama, or an OpenAI-compatible provider for embeddings and LLM features.
 ---
 
 Atomic's AI features require a configured provider. The provider is used for:
@@ -11,7 +11,7 @@ Atomic's AI features require a configured provider. The provider is used for:
 - Chat responses and chat tool use
 - Daily briefings
 
-Atomic supports OpenRouter, Ollama, and OpenAI-compatible APIs.
+Atomic supports OpenRouter, OrcaRouter, Ollama, and OpenAI-compatible APIs.
 
 ## OpenRouter
 
@@ -66,6 +66,17 @@ Configure:
 
 The server has a connection-test endpoint at `POST /api/settings/test-openai-compat`.
 
+## OrcaRouter
+
+[OrcaRouter](https://www.orcarouter.ai) is a model-routing gateway that unifies hosted models behind one OpenAI-compatible endpoint. It also runs gateway-level, zero-trust security for AI agents on the same endpoint — screening every prompt/response and governing every tool call on a default-deny basis, with no application code changes.
+
+1. Create an OrcaRouter account and generate an API key (prefixed `sk-orca-`).
+2. In Atomic, go to Settings and select **OrcaRouter** as the provider.
+3. Paste your API key.
+4. Choose the embedding and LLM models — use OrcaRouter model ids such as `openai/text-embedding-3-small` for embeddings and `openai/gpt-5-nano` for LLM tasks.
+
+OrcaRouter routes to many hosted providers, so model ids are namespaced (`vendor/model`). The connection-test endpoint is at `POST /api/settings/test-orcarouter`.
+
 ## Defaults
 
 Fresh databases seed these defaults:
@@ -80,6 +91,11 @@ Fresh databases seed these defaults:
 | `ollama_host` | `http://127.0.0.1:11434` |
 | `ollama_embedding_model` | `nomic-embed-text` |
 | `ollama_llm_model` | `llama3.2` |
+| `orcarouter_embedding_model` | `openai/text-embedding-3-small` |
+| `orcarouter_llm_model` | `openai/gpt-5-nano` |
+| `orcarouter_agentic_model` | `openai/gpt-5-nano` |
+| `orcarouter_context_length` | `65536` |
+| `orcarouter_timeout_secs` | `300` |
 | `auto_tagging_enabled` | `true` |
 
 ## Changing Embedding Models

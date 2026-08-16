@@ -1940,6 +1940,7 @@ impl AtomicCore {
         let model = match config.provider_type {
             ProviderType::Ollama => config.llm_model().to_string(),
             ProviderType::OpenAICompat => config.llm_model().to_string(),
+            ProviderType::OrcaRouter => config.llm_model().to_string(),
             ProviderType::OpenRouter => settings_map
                 .get("wiki_model")
                 .cloned()
@@ -3093,7 +3094,7 @@ impl AtomicCore {
         let settings_map = self.settings_for_ai().await?;
         let provider_config = ProviderConfig::from_settings(&settings_map);
         let model = match provider_config.provider_type {
-            ProviderType::Ollama | ProviderType::OpenAICompat => {
+            ProviderType::Ollama | ProviderType::OpenAICompat | ProviderType::OrcaRouter => {
                 provider_config.llm_model().to_string()
             }
             ProviderType::OpenRouter => settings_map
@@ -3932,6 +3933,10 @@ impl AtomicCore {
         match config.provider_type {
             ProviderType::OpenRouter => Ok(config
                 .openrouter_api_key
+                .as_ref()
+                .map_or(false, |k| !k.is_empty())),
+            ProviderType::OrcaRouter => Ok(config
+                .orcarouter_api_key
                 .as_ref()
                 .map_or(false, |k| !k.is_empty())),
             ProviderType::Ollama => Ok(!config.ollama_host.is_empty()),

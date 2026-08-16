@@ -33,6 +33,7 @@ export const WORKSPACE_ONLY_KEYS: readonly string[] = [
   'timezone',
   'openrouter_api_key',
   'openai_compat_api_key',
+  'orcarouter_api_key',
   'ollama_host',
   'openai_compat_base_url',
 ];

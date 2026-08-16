@@ -81,6 +81,7 @@ use utoipa::OpenApi;
         routes::settings::clear_setting_override,
         routes::settings::list_setting_overrides,
         routes::settings::test_openrouter_connection,
+        routes::settings::test_orcarouter_connection,
         routes::settings::test_openai_compat_connection,
         routes::settings::get_available_llm_models,
         routes::settings::get_openrouter_embedding_models,

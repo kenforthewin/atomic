@@ -196,7 +196,10 @@ use std::time::Duration;
 use actix_web::middleware::from_fn;
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use atomic_core::providers::openrouter::models as openrouter_models;
-use atomic_core::providers::{create_embedding_provider, EmbeddingConfig, OpenRouterProvider};
+use atomic_core::providers::{
+    create_embedding_provider, EmbeddingConfig, OpenAICompatProvider, OpenRouterProvider,
+    ORCAROUTER_DEFAULT_BASE_URL,
+};
 use atomic_core::{ProviderConfig, ProviderType};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1396,6 +1399,7 @@ async fn validate_provider_key(config: &ProviderConfig) -> Result<(), String> {
         match config.provider_type {
             ProviderType::OpenRouter => validate_openrouter_key(config).await,
             ProviderType::OpenAICompat => validate_openai_compat_key(config).await,
+            ProviderType::OrcaRouter => validate_orca_router_key(config).await,
             // Unreachable from these routes (`Provider` has no Ollama
             // variant); typed refusal rather than a panic if that changes.
             ProviderType::Ollama => Err("Ollama is not available in cloud".to_string()),
@@ -1461,6 +1465,39 @@ async fn validate_openai_compat_key(config: &ProviderConfig) -> Result<(), Strin
             tracing::warn!(error = %e, "openai-compatible BYOK validation failed");
             "the provider rejected the request".to_string()
         })
+}
+
+/// Validate an OrcaRouter key against OrcaRouter's fixed gateway. Unlike
+/// OpenRouter/OpenAI-compat there is no tenant-supplied base URL — the
+/// gateway endpoint is a constant (`ORCAROUTER_DEFAULT_BASE_URL`), so the
+/// key-introspection request goes to OrcaRouter itself and never to a
+/// tenant-controlled host. `GET /v1/models` returns 401 for a bad key and
+/// 200 for a good one; report the status code only, never the body.
+async fn validate_orca_router_key(config: &ProviderConfig) -> Result<(), String> {
+    let Some(api_key) = config.orcarouter_api_key.clone() else {
+        return Err("OrcaRouter API key not configured".to_string());
+    };
+    let provider = OpenAICompatProvider::new(
+        ORCAROUTER_DEFAULT_BASE_URL.to_string(),
+        Some(api_key),
+        Some(config.orcarouter_timeout_secs),
+    );
+    let url = format!("{}/models", provider.base_url());
+    let response = provider
+        .client()
+        .get(&url)
+        .bearer_auth(provider.api_key().unwrap_or_default())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(format!(
+        "OrcaRouter rejected the request (HTTP {})",
+        status.as_u16()
+    ))
 }
 
 /// Best-effort managed-key allowance usage for the status route. `null`
