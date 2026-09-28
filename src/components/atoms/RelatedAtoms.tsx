@@ -5,7 +5,7 @@ import { SimilarAtomResult } from '../../stores/atoms';
 import { MiniGraphPreview } from '../canvas/MiniGraphPreview';
 
 // Benchmarking helper
-const PERF_DEBUG = true;
+const PERF_DEBUG = import.meta.env.DEV;
 const perfLog = (label: string, startTime?: number) => {
   if (!PERF_DEBUG) return;
   if (startTime !== undefined) {
