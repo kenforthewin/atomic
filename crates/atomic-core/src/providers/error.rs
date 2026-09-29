@@ -58,22 +58,33 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
-    /// Check if this error is retryable (same request or smaller batch).
-    /// Only 400 (bad request) and 401 (auth) are permanent — everything
-    /// else (404, 413, 5xx, etc.) may succeed with a smaller batch or on retry.
+    /// Check if re-sending the same request may succeed: rate limits,
+    /// network faults, and the transient HTTP statuses (408 timeout, 425/429
+    /// throttling, 5xx server faults).
+    ///
+    /// Every other 4xx is a verdict on the request or the account, not the
+    /// moment — above all 402 and 401/403, which is how a provider reports an
+    /// exhausted credit limit or a revoked key. Retrying those in-call
+    /// can't succeed and only multiplies the failed calls (and the time
+    /// spent holding shared permits) until the caller finally sees the
+    /// error; callers that need to wait them out do so at the scheduling
+    /// layer via [`classify_provider_failure`].
     pub fn is_retryable(&self) -> bool {
         match self {
             ProviderError::RateLimited { .. } | ProviderError::Network(_) => true,
-            ProviderError::Api { status, .. } => !matches!(status, 400 | 401),
+            ProviderError::Api { status, .. } => {
+                matches!(status, 408 | 425 | 429 | 500..=599)
+            }
             _ => false,
         }
     }
 
-    /// Whether reducing batch size might resolve this error.
-    /// 400 errors may indicate the provider's batch limit was exceeded;
-    /// splitting the batch can succeed where retrying the same size won't.
+    /// Whether reducing batch size might resolve this error: a 400 may mean
+    /// the provider's batch limit was exceeded, and a 413 that the payload
+    /// was too large. Splitting the batch can succeed where retrying the
+    /// same size won't.
     pub fn is_batch_reducible(&self) -> bool {
-        matches!(self, ProviderError::Api { status: 400, .. })
+        matches!(self, ProviderError::Api { status: 400 | 413, .. })
     }
 
     /// Get suggested retry delay in seconds
@@ -230,6 +241,39 @@ mod classification_tests {
                 "{status} must classify as an auth failure"
             );
         }
+    }
+
+    /// Billing and credential rejections must fail fast: an exhausted
+    /// per-key limit (OpenRouter's 403 "Key limit exceeded") retried in-call
+    /// turned every embedding batch into a storm of doomed requests.
+    #[test]
+    fn only_transient_api_statuses_are_retryable() {
+        let api = |status| ProviderError::Api {
+            status,
+            message: "boom".to_string(),
+        };
+        for status in [408u16, 425, 429, 500, 502, 503, 504] {
+            assert!(api(status).is_retryable(), "{status} should be retryable");
+        }
+        for status in [400u16, 401, 402, 403, 404, 413, 422] {
+            assert!(!api(status).is_retryable(), "{status} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn oversized_batches_are_reducible() {
+        for status in [400u16, 413] {
+            let err = ProviderError::Api {
+                status,
+                message: "too big".to_string(),
+            };
+            assert!(err.is_batch_reducible(), "{status} should split the batch");
+        }
+        let limit = ProviderError::Api {
+            status: 403,
+            message: "Key limit exceeded".to_string(),
+        };
+        assert!(!limit.is_batch_reducible());
     }
 
     /// Real failure strings arrive wrapped in caller context; the substring
