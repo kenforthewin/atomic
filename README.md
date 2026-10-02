@@ -98,6 +98,10 @@ On first run, enter `ATOMIC_SETUP_TOKEN` in the setup wizard, or create an API t
 cargo run -p atomic-server -- --data-dir ./data token create --name default
 ```
 
+## ☁️ One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Atomic/)
+
 ## AI Provider Setup
 
 Atomic needs an AI provider for embeddings, tagging, wiki generation, and chat.
