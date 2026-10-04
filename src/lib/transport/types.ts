@@ -1,5 +1,5 @@
 export interface Transport {
-  invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+  invoke<T>(command: string, args?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T>;
   subscribe<T>(event: string, callback: (payload: T) => void): () => void;
   connect(): Promise<void>;
   disconnect(): void;

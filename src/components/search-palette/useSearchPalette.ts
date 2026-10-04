@@ -139,9 +139,12 @@ export function useSearchPalette({ isOpen, onClose, initialQuery = '' }: UseSear
   const [isSearching, setIsSearching] = useState(false);
 
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
   const tags = useTagsStore((state) => state.tags);
 
   useEffect(() => {
+    searchAbortRef.current?.abort();
+
     if (isOpen) {
       setQuery(initialQuery);
       setSelectedIndex(0);
@@ -191,6 +194,8 @@ export function useSearchPalette({ isOpen, onClose, initialQuery = '' }: UseSear
     }
 
     setIsSearching(true);
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     searchTimeoutRef.current = setTimeout(async () => {
       try {
         if (mode === 'atoms-hybrid') {
@@ -198,23 +203,27 @@ export function useSearchPalette({ isOpen, onClose, initialQuery = '' }: UseSear
             query: trimmed,
             limit: HYBRID_ATOM_LIMIT,
             threshold: HYBRID_ATOM_THRESHOLD,
-          });
+          }, { signal: controller.signal });
           setHybridAtomResults(results);
           setGlobalResults({ atoms: [], wiki: [], chats: [], tags: [] });
         } else {
           const results = await getTransport().invoke<GlobalSearchResponse>('search_global_keyword', {
             query: trimmed,
             sectionLimit: SECTION_LIMIT,
-          });
+          }, { signal: controller.signal });
           setGlobalResults(results);
           setHybridAtomResults([]);
         }
       } catch (error) {
+        if (controller.signal.aborted) return;
         console.error('Global search failed:', error);
         setGlobalResults({ atoms: [], wiki: [], chats: [], tags: [] });
         setHybridAtomResults([]);
       } finally {
-        setIsSearching(false);
+        if (searchAbortRef.current === controller) {
+          searchAbortRef.current = null;
+          setIsSearching(false);
+        }
       }
     }, SEARCH_DEBOUNCE_MS);
 
@@ -222,6 +231,7 @@ export function useSearchPalette({ isOpen, onClose, initialQuery = '' }: UseSear
       if (searchTimeoutRef.current) {
         clearTimeout(searchTimeoutRef.current);
       }
+      controller.abort();
     };
   }, [mode, searchQuery]);
 

@@ -217,7 +217,7 @@ export class HttpTransport implements Transport {
     return this.connected;
   }
 
-  async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  async invoke<T>(command: string, args?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T> {
     if (this.authExpired) {
       throw new Error('Authentication expired. Please reconnect with a valid token.');
     }
@@ -240,7 +240,7 @@ export class HttpTransport implements Transport {
       ? {}
       : { 'Authorization': `Bearer ${this.config.authToken}` };
 
-    const fetchOpts: RequestInit = { method: spec.method, headers };
+    const fetchOpts: RequestInit = { method: spec.method, headers, signal: options?.signal };
     if (this.config.cookieAuth) fetchOpts.credentials = 'include';
 
     if (spec.argsMode === 'body' && args) {
