@@ -518,6 +518,10 @@ export async function testOpenAICompatConnection(baseUrl: string, apiKey?: strin
   return getTransport().invoke('test_openai_compat_connection', { baseUrl, apiKey });
 }
 
+export async function testOrcaRouterConnection(apiKey: string): Promise<boolean> {
+  return getTransport().invoke('test_orcarouter_connection', { apiKey });
+}
+
 export async function getOllamaModels(host: string): Promise<OllamaModel[]> {
   return getTransport().invoke('get_ollama_models', { host });
 }

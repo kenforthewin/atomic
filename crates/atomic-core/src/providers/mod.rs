@@ -32,6 +32,7 @@ pub use traits::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderType {
     OpenRouter,
+    OrcaRouter,
     Ollama,
     OpenAICompat,
 }
@@ -39,6 +40,7 @@ pub enum ProviderType {
 impl ProviderType {
     pub fn from_string(s: &str) -> Self {
         match s.to_lowercase().as_str() {
+            "orcarouter" => ProviderType::OrcaRouter,
             "ollama" => ProviderType::Ollama,
             "openai_compat" => ProviderType::OpenAICompat,
             _ => ProviderType::OpenRouter,
@@ -50,6 +52,23 @@ impl ProviderType {
 /// resolves to this unless explicitly overridden (proxies, gateways, or test
 /// servers that speak the same API).
 pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Default OrcaRouter API endpoint. OrcaRouter is an OpenAI-compatible model
+/// routing gateway; its API surface matches the OpenAI-compatible provider
+/// (chat completions, embeddings, streaming, tool calls, structured outputs),
+/// so the transport is shared with [`OpenAICompatProvider`] while this fixed
+/// base URL and the [`ProviderConfig::orcarouter_api_key`] credential keep it
+/// a named provider users can select directly.
+pub const ORCAROUTER_DEFAULT_BASE_URL: &str = "https://api.orcarouter.ai/v1";
+
+/// Default OrcaRouter embedding model. `text-embedding-3-small` returns 1536
+/// dimensions natively, matching the vector schema the rest of the stack
+/// assumes, and is part of OrcaRouter's catalog.
+pub const ORCAROUTER_DEFAULT_EMBEDDING_MODEL: &str = "openai/text-embedding-3-small";
+
+/// Default OrcaRouter **utility** model for single-shot structured tasks
+/// (tagging). Part of OrcaRouter's catalog.
+pub const ORCAROUTER_DEFAULT_LLM_MODEL: &str = "openai/gpt-5-nano";
 
 /// The default embedding model (OpenRouter provider). Qwen3-Embedding-8B is the
 /// top open-weight retrieval model on MTEB, the cheapest embedding on
@@ -102,6 +121,23 @@ pub struct ProviderConfig {
     pub openrouter_agentic_model: String,
     /// User-specified context length override. None = use model default from API cache.
     pub openrouter_context_length: Option<usize>,
+    // OrcaRouter settings
+    /// OrcaRouter API key (keys start with `sk-orca-`). The provider hits the
+    /// fixed [`ORCAROUTER_DEFAULT_BASE_URL`] via the shared OpenAI-compatible
+    /// transport; this credential is what makes it a named provider rather than
+    /// a generic `openai_compat` base-URL entry.
+    pub orcarouter_api_key: Option<String>,
+    /// The **utility** LLM for single-shot tagging.
+    pub orcarouter_llm_model: String,
+    /// The **agentic** LLM for tool-using loops — wiki, chat, reports. Kept
+    /// distinct from [`orcarouter_llm_model`](Self::orcarouter_llm_model) so
+    /// tagging can run on a cheap model while agent loops use a capable one.
+    pub orcarouter_agentic_model: String,
+    /// The embedding model. Defaults to [`ORCAROUTER_DEFAULT_EMBEDDING_MODEL`]
+    /// (1536 dims, matching the vector schema).
+    pub orcarouter_embedding_model: String,
+    pub orcarouter_context_length: usize,
+    pub orcarouter_timeout_secs: u64,
     // Ollama settings
     pub ollama_host: String,
     pub ollama_embedding_model: String,
@@ -137,6 +173,15 @@ impl std::fmt::Debug for ProviderConfig {
             .field("openrouter_llm_model", &self.openrouter_llm_model)
             .field("openrouter_agentic_model", &self.openrouter_agentic_model)
             .field("openrouter_context_length", &self.openrouter_context_length)
+            .field("orcarouter_api_key", &redacted(&self.orcarouter_api_key))
+            .field("orcarouter_llm_model", &self.orcarouter_llm_model)
+            .field("orcarouter_agentic_model", &self.orcarouter_agentic_model)
+            .field(
+                "orcarouter_embedding_model",
+                &self.orcarouter_embedding_model,
+            )
+            .field("orcarouter_context_length", &self.orcarouter_context_length)
+            .field("orcarouter_timeout_secs", &self.orcarouter_timeout_secs)
             .field("ollama_host", &self.ollama_host)
             .field("ollama_embedding_model", &self.ollama_embedding_model)
             .field("ollama_llm_model", &self.ollama_llm_model)
@@ -204,6 +249,33 @@ impl ProviderConfig {
                     s.parse().ok()
                 }
             }),
+            orcarouter_api_key: settings
+                .get("orcarouter_api_key")
+                .cloned()
+                .filter(|k| !k.is_empty()),
+            orcarouter_llm_model: settings
+                .get("orcarouter_llm_model")
+                .cloned()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ORCAROUTER_DEFAULT_LLM_MODEL.to_string()),
+            orcarouter_agentic_model: settings
+                .get("orcarouter_agentic_model")
+                .cloned()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ORCAROUTER_DEFAULT_LLM_MODEL.to_string()),
+            orcarouter_embedding_model: settings
+                .get("orcarouter_embedding_model")
+                .cloned()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ORCAROUTER_DEFAULT_EMBEDDING_MODEL.to_string()),
+            orcarouter_context_length: settings
+                .get("orcarouter_context_length")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(65536),
+            orcarouter_timeout_secs: settings
+                .get("orcarouter_timeout_secs")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
             ollama_host: settings
                 .get("ollama_host")
                 .cloned()
@@ -283,6 +355,7 @@ impl ProviderConfig {
             ProviderType::OpenRouter => "openrouter",
             ProviderType::Ollama => "ollama",
             ProviderType::OpenAICompat => "openai_compat",
+            ProviderType::OrcaRouter => "orcarouter",
         };
         settings.insert("provider".to_string(), provider.to_string());
 
@@ -311,6 +384,31 @@ impl ProviderConfig {
             Some(len) => settings.insert("openrouter_context_length".to_string(), len.to_string()),
             None => settings.remove("openrouter_context_length"),
         };
+
+        match &self.orcarouter_api_key {
+            Some(key) => settings.insert("orcarouter_api_key".to_string(), key.clone()),
+            None => settings.remove("orcarouter_api_key"),
+        };
+        settings.insert(
+            "orcarouter_embedding_model".to_string(),
+            self.orcarouter_embedding_model.clone(),
+        );
+        settings.insert(
+            "orcarouter_llm_model".to_string(),
+            self.orcarouter_llm_model.clone(),
+        );
+        settings.insert(
+            "orcarouter_agentic_model".to_string(),
+            self.orcarouter_agentic_model.clone(),
+        );
+        settings.insert(
+            "orcarouter_context_length".to_string(),
+            self.orcarouter_context_length.to_string(),
+        );
+        settings.insert(
+            "orcarouter_timeout_secs".to_string(),
+            self.orcarouter_timeout_secs.to_string(),
+        );
 
         settings.insert("ollama_host".to_string(), self.ollama_host.clone());
         settings.insert(
@@ -364,6 +462,7 @@ impl ProviderConfig {
     pub fn embedding_model(&self) -> &str {
         match self.provider_type {
             ProviderType::OpenRouter => &self.openrouter_embedding_model,
+            ProviderType::OrcaRouter => &self.orcarouter_embedding_model,
             ProviderType::Ollama => &self.ollama_embedding_model,
             ProviderType::OpenAICompat => &self.openai_compat_embedding_model,
         }
@@ -371,10 +470,11 @@ impl ProviderConfig {
 
     /// The utility LLM for the current provider — single-shot tasks (tagging).
     /// For OpenRouter this is the cheap [`openrouter_llm_model`](Self::openrouter_llm_model);
-    /// single-model providers use their one LLM.
+    /// for OrcaRouter its utility slot; single-model providers use their one LLM.
     pub fn llm_model(&self) -> &str {
         match self.provider_type {
             ProviderType::OpenRouter => &self.openrouter_llm_model,
+            ProviderType::OrcaRouter => &self.orcarouter_llm_model,
             ProviderType::Ollama => &self.ollama_llm_model,
             ProviderType::OpenAICompat => &self.openai_compat_llm_model,
         }
@@ -382,12 +482,13 @@ impl ProviderConfig {
 
     /// The agentic LLM for the current provider — tool-using loops (wiki, chat,
     /// reports). For OpenRouter this is the distinct
-    /// [`openrouter_agentic_model`](Self::openrouter_agentic_model); Ollama and
-    /// OpenAI-compat have a single LLM, so it coincides with
-    /// [`llm_model`](Self::llm_model).
+    /// [`openrouter_agentic_model`](Self::openrouter_agentic_model); OrcaRouter
+    /// keeps a distinct agentic slot; Ollama and OpenAI-compat have a single
+    /// LLM, so it coincides with [`llm_model`](Self::llm_model).
     pub fn agentic_model(&self) -> &str {
         match self.provider_type {
             ProviderType::OpenRouter => &self.openrouter_agentic_model,
+            ProviderType::OrcaRouter => &self.orcarouter_agentic_model,
             ProviderType::Ollama => &self.ollama_llm_model,
             ProviderType::OpenAICompat => &self.openai_compat_llm_model,
         }
@@ -399,6 +500,14 @@ impl ProviderConfig {
             ProviderType::OpenRouter => {
                 openrouter::models::get_embedding_dimension(&self.openrouter_embedding_model)
                     .unwrap_or(1536) // Fall back to 1536 for unknown models
+            }
+            ProviderType::OrcaRouter => {
+                // OrcaRouter serves the same embedding model ids as the curated
+                // registry (text-embedding-3-small/large, ada-002, gemini-embedding),
+                // so the lookup resolves authoritative widths; 1536 matches the
+                // vector schema default.
+                openrouter::models::get_embedding_dimension(&self.orcarouter_embedding_model)
+                    .unwrap_or(1536)
             }
             ProviderType::Ollama => ollama::get_embedding_dimension(&self.ollama_embedding_model),
             ProviderType::OpenAICompat => self.openai_compat_embedding_dimension,
@@ -433,6 +542,7 @@ impl ProviderConfig {
                     .get(&self.openrouter_llm_model)
                     .copied()
             }
+            ProviderType::OrcaRouter => Some(self.orcarouter_context_length),
             ProviderType::Ollama => Some(self.ollama_context_length),
             ProviderType::OpenAICompat => Some(self.openai_compat_context_length),
         }
@@ -468,6 +578,16 @@ pub fn create_embedding_provider(
                 config.openrouter_base_url.clone(),
             )))
         }
+        ProviderType::OrcaRouter => {
+            let api_key = config.orcarouter_api_key.clone().ok_or_else(|| {
+                ProviderError::Configuration("OrcaRouter API key not configured".to_string())
+            })?;
+            Ok(Arc::new(OpenAICompatProvider::new(
+                ORCAROUTER_DEFAULT_BASE_URL.to_string(),
+                Some(api_key),
+                Some(config.orcarouter_timeout_secs),
+            )))
+        }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
             Some(config.ollama_host.clone()),
             Some(config.ollama_timeout_secs),
@@ -497,6 +617,16 @@ pub fn create_llm_provider(config: &ProviderConfig) -> Result<Arc<dyn LlmProvide
             Ok(Arc::new(OpenRouterProvider::with_base_url(
                 api_key,
                 config.openrouter_base_url.clone(),
+            )))
+        }
+        ProviderType::OrcaRouter => {
+            let api_key = config.orcarouter_api_key.clone().ok_or_else(|| {
+                ProviderError::Configuration("OrcaRouter API key not configured".to_string())
+            })?;
+            Ok(Arc::new(OpenAICompatProvider::new(
+                ORCAROUTER_DEFAULT_BASE_URL.to_string(),
+                Some(api_key),
+                Some(config.orcarouter_timeout_secs),
             )))
         }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
@@ -530,6 +660,16 @@ pub fn create_streaming_llm_provider(
             Ok(Arc::new(OpenRouterProvider::with_base_url(
                 api_key,
                 config.openrouter_base_url.clone(),
+            )))
+        }
+        ProviderType::OrcaRouter => {
+            let api_key = config.orcarouter_api_key.clone().ok_or_else(|| {
+                ProviderError::Configuration("OrcaRouter API key not configured".to_string())
+            })?;
+            Ok(Arc::new(OpenAICompatProvider::new(
+                ORCAROUTER_DEFAULT_BASE_URL.to_string(),
+                Some(api_key),
+                Some(config.orcarouter_timeout_secs),
             )))
         }
         ProviderType::Ollama => Ok(Arc::new(OllamaProvider::new(
@@ -806,6 +946,10 @@ mod tests {
             "compat-super-secret".to_string(),
         );
         settings.insert(
+            "orcarouter_api_key".to_string(),
+            "sk-orca-super-secret".to_string(),
+        );
+        settings.insert(
             "embedding_model".to_string(),
             "openai/text-embedding-3-small".to_string(),
         );
@@ -821,6 +965,10 @@ mod tests {
             assert!(
                 !rendered.contains("compat-super-secret"),
                 "Debug output leaked the OpenAI-compat key: {rendered}"
+            );
+            assert!(
+                !rendered.contains("sk-orca-super-secret"),
+                "Debug output leaked the OrcaRouter key: {rendered}"
             );
             assert!(
                 rendered.contains("[redacted]"),
@@ -865,6 +1013,12 @@ mod tests {
         config.openai_compat_embedding_dimension = 768;
         config.openai_compat_context_length = 4321;
         config.openai_compat_timeout_secs = 99;
+        config.orcarouter_api_key = Some("key-orca".to_string());
+        config.orcarouter_embedding_model = "orca-embed".to_string();
+        config.orcarouter_llm_model = "orca-llm".to_string();
+        config.orcarouter_agentic_model = "orca-agentic".to_string();
+        config.orcarouter_context_length = 2468;
+        config.orcarouter_timeout_secs = 42;
 
         let mut settings: HashMap<String, String> = HashMap::new();
         settings.insert("provider".to_string(), "ollama".to_string());
@@ -928,5 +1082,83 @@ mod tests {
         assert_eq!(config.provider_type, ProviderType::OpenRouter); // Default
         assert_eq!(config.openrouter_embedding_model, DEFAULT_EMBEDDING_MODEL);
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn test_provider_config_from_settings_orcarouter() {
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("provider".to_string(), "orcarouter".to_string());
+        settings.insert("orcarouter_api_key".to_string(), "sk-orca-test".to_string());
+        settings.insert(
+            "orcarouter_embedding_model".to_string(),
+            "openai/text-embedding-3-large".to_string(),
+        );
+        settings.insert("orcarouter_llm_model".to_string(), "anthropic/claude-sonnet-5".to_string());
+        settings.insert("orcarouter_agentic_model".to_string(), "anthropic/claude-sonnet-5".to_string());
+
+        let config = ProviderConfig::from_settings(&settings);
+
+        assert_eq!(config.provider_type, ProviderType::OrcaRouter);
+        assert_eq!(config.orcarouter_api_key, Some("sk-orca-test".to_string()));
+        assert_eq!(
+            config.embedding_model(),
+            "openai/text-embedding-3-large"
+        );
+        assert_eq!(config.llm_model(), "anthropic/claude-sonnet-5");
+        assert_eq!(config.agentic_model(), "anthropic/claude-sonnet-5");
+        // text-embedding-3-large is registered at 3072 dims in the curated
+        // embedding registry, and OrcaRouter serves the same model id.
+        assert_eq!(config.embedding_dimension(), 3072);
+    }
+
+    #[test]
+    fn test_orcarouter_defaults() {
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("provider".to_string(), "orcarouter".to_string());
+        let config = ProviderConfig::from_settings(&settings);
+
+        assert_eq!(config.provider_type, ProviderType::OrcaRouter);
+        assert_eq!(config.orcarouter_api_key, None);
+        assert_eq!(
+            config.embedding_model(),
+            ORCAROUTER_DEFAULT_EMBEDDING_MODEL
+        );
+        assert_eq!(config.llm_model(), ORCAROUTER_DEFAULT_LLM_MODEL);
+        assert_eq!(config.embedding_dimension(), 1536);
+        assert_eq!(config.orcarouter_context_length, 65536);
+    }
+
+    #[test]
+    fn test_orcarouter_from_string() {
+        assert_eq!(ProviderType::from_string("orcarouter"), ProviderType::OrcaRouter);
+        assert_eq!(ProviderType::from_string("OrcaRouter"), ProviderType::OrcaRouter);
+    }
+
+    #[test]
+    fn test_orcarouter_factory_targets_orca_base_url() {
+        // The OrcaRouter provider is the shared OpenAI-compatible transport
+        // pinned to OrcaRouter's endpoint — same normalization, fixed base URL.
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("provider".to_string(), "orcarouter".to_string());
+        settings.insert("orcarouter_api_key".to_string(), "sk-orca-test".to_string());
+        let config = ProviderConfig::from_settings(&settings);
+
+        assert!(create_llm_provider(&config).is_ok());
+        assert!(create_embedding_provider(&config).is_ok());
+        assert!(create_streaming_llm_provider(&config).is_ok());
+
+        // Missing key fails with a clear message, mirroring OpenRouter.
+        let no_key = ProviderConfig::from_settings(&HashMap::new());
+        assert!(create_llm_provider(&no_key).is_err());
+
+        // The transport is the OpenAI-compatible client against the fixed
+        // OrcaRouter base URL (normalization keeps an explicit `/v1` verbatim).
+        let provider = OpenAICompatProvider::new(
+            ORCAROUTER_DEFAULT_BASE_URL.to_string(),
+            Some("sk-orca-test".to_string()),
+            None,
+        );
+        assert_eq!(provider.base_url(), ORCAROUTER_DEFAULT_BASE_URL);
+        assert_eq!(provider.api_key(), Some("sk-orca-test"));
     }
 }

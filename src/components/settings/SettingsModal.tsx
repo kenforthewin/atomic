@@ -35,6 +35,7 @@ import {
   getOpenRouterEmbeddingModels,
   testOllamaConnection,
   testOpenAICompatConnection,
+  testOrcaRouterConnection,
   getOllamaModels,
   getMcpStdioConfig,
   getMcpHttpConfig,
@@ -918,7 +919,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const supportedTimeZones = useMemo(() => getSupportedTimeZones(), []);
 
   // Provider selection
-  const [provider, setProvider] = useState<'openrouter' | 'ollama' | 'openai_compat'>('openrouter');
+  const [provider, setProvider] = useState<'openrouter' | 'ollama' | 'openai_compat' | 'orcarouter'>('openrouter');
 
   // OpenRouter settings
   const [apiKey, setApiKey] = useState('');
@@ -940,6 +941,16 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const [openaiCompatTimeoutSecs, setOpenaiCompatTimeoutSecs] = useState('300');
   const [openaiCompatStatus, setOpenaiCompatStatus] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
   const [openaiCompatError, setOpenaiCompatError] = useState<string | null>(null);
+
+  // OrcaRouter settings
+  const [orcaRouterApiKey, setOrcaRouterApiKey] = useState('');
+  const [orcaRouterShowApiKey, setOrcaRouterShowApiKey] = useState(false);
+  const [orcaRouterEmbeddingModel, setOrcaRouterEmbeddingModel] = useState('openai/text-embedding-3-small');
+  const [orcaRouterLlmModel, setOrcaRouterLlmModel] = useState('openai/gpt-5-nano');
+  const [orcaRouterContextLength, setOrcaRouterContextLength] = useState('65536');
+  const [orcaRouterTimeoutSecs, setOrcaRouterTimeoutSecs] = useState('300');
+  const [orcaRouterStatus, setOrcaRouterStatus] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
+  const [orcaRouterError, setOrcaRouterError] = useState<string | null>(null);
 
   // Ollama settings
   const [ollamaHost, setOllamaHost] = useState('http://127.0.0.1:11434');
@@ -1412,7 +1423,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
 
   // Load settings into state
   useEffect(() => {
-    const p = settings.provider as 'openrouter' | 'ollama' | 'openai_compat' | undefined;
+    const p = settings.provider as 'openrouter' | 'ollama' | 'openai_compat' | 'orcarouter' | undefined;
     setTheme((settings.theme as Theme) || 'obsidian');
     setFont((settings.font as Font) || 'ibm-plex-sans');
     setTimezone(settings.timezone || getBrowserTimeZone());
@@ -1441,6 +1452,11 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     setOpenaiCompatLlmModel(settings.openai_compat_llm_model || '');
     setOpenaiCompatContextLength(settings.openai_compat_context_length || '65536');
     setOpenaiCompatTimeoutSecs(settings.openai_compat_timeout_secs || '300');
+    setOrcaRouterApiKey(settings.orcarouter_api_key || '');
+    setOrcaRouterEmbeddingModel(settings.orcarouter_embedding_model || 'openai/text-embedding-3-small');
+    setOrcaRouterLlmModel(settings.orcarouter_llm_model || 'openai/gpt-5-nano');
+    setOrcaRouterContextLength(settings.orcarouter_context_length || '65536');
+    setOrcaRouterTimeoutSecs(settings.orcarouter_timeout_secs || '300');
   }, [settings]);
 
   // Check Ollama connection when provider is ollama or host changes.
@@ -1504,6 +1520,10 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     setPendingEmbeddingChange({ key: 'openai_compat_embedding_dimension', value, label: `${value} dimensions` });
   };
 
+  const handleOrcaRouterEmbeddingModelChange = (value: string) => {
+    setPendingEmbeddingChange({ key: 'orcarouter_embedding_model', value, label: value });
+  };
+
   const confirmEmbeddingChange = async () => {
     if (!pendingEmbeddingChange) return;
     const { key, value } = pendingEmbeddingChange;
@@ -1511,6 +1531,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     if (key === 'ollama_embedding_model') setOllamaEmbeddingModel(value);
     if (key === 'openai_compat_embedding_model') setOpenaiCompatEmbeddingModel(value);
     if (key === 'openai_compat_embedding_dimension') setOpenaiCompatEmbeddingDimension(value);
+    if (key === 'orcarouter_embedding_model') setOrcaRouterEmbeddingModel(value);
     await autoSave(key, value);
     setPendingEmbeddingChange(null);
   };
@@ -1533,8 +1554,22 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     }
   }, []);
 
+  // Test OrcaRouter connection
+  const checkOrcaRouterConnection = useCallback(async (apiKey: string) => {
+    if (!apiKey.trim()) return;
+    setOrcaRouterStatus('checking');
+    setOrcaRouterError(null);
+    try {
+      await testOrcaRouterConnection(apiKey);
+      setOrcaRouterStatus('connected');
+    } catch (e) {
+      setOrcaRouterStatus('error');
+      setOrcaRouterError(String(e));
+    }
+  }, []);
+
   // Handle provider change — test connection automatically
-  const handleProviderChange = async (value: 'openrouter' | 'ollama' | 'openai_compat') => {
+  const handleProviderChange = async (value: 'openrouter' | 'ollama' | 'openai_compat' | 'orcarouter') => {
     setProvider(value);
     await autoSave('provider', value);
     // Test connection for new provider
@@ -1553,6 +1588,8 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
       }
     } else if (value === 'openai_compat' && openaiCompatBaseUrl.trim()) {
       checkOpenaiCompatConnection(openaiCompatBaseUrl, openaiCompatApiKey || undefined);
+    } else if (value === 'orcarouter' && orcaRouterApiKey.trim()) {
+      checkOrcaRouterConnection(orcaRouterApiKey);
     }
   };
 
@@ -2024,11 +2061,12 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     </p>
                     <CustomSelect
                       value={provider}
-                      onChange={(v) => handleProviderChange(v as 'openrouter' | 'ollama' | 'openai_compat')}
+                      onChange={(v) => handleProviderChange(v as 'openrouter' | 'ollama' | 'openai_compat' | 'orcarouter')}
                       options={[
                         { value: 'openrouter', label: 'OpenRouter' },
                         { value: 'ollama', label: 'Ollama' },
                         { value: 'openai_compat', label: 'OpenAI Compatible' },
+                        { value: 'orcarouter', label: 'OrcaRouter' },
                       ]}
                     />
                     {/* Connection status — shown inline after provider */}
@@ -2544,6 +2582,161 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                             ]}
                           />
                           <OverrideControls settingKey="openai_compat_timeout_secs" />
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {/* OrcaRouter Settings */}
+                  {provider === 'orcarouter' && (
+                    <>
+                      <div className="space-y-2">
+                        <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                          OrcaRouter API Key
+                        </label>
+                        <p className="text-xs text-[var(--color-text-secondary)]">
+                          Required for AI features. Get your key at orcarouter.ai
+                        </p>
+                        <div className="relative">
+                          <input
+                            type={orcaRouterShowApiKey ? 'text' : 'password'}
+                            value={orcaRouterApiKey}
+                            onChange={(e) => setOrcaRouterApiKey(e.target.value)}
+                            onBlur={() => {
+                              if (!orcaRouterApiKey.trim()) return;
+                              autoSave('orcarouter_api_key', orcaRouterApiKey);
+                              checkOrcaRouterConnection(orcaRouterApiKey);
+                            }}
+                            placeholder="sk-orca-..."
+                            className="w-full px-3 py-2 pr-10 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setOrcaRouterShowApiKey(!orcaRouterShowApiKey)}
+                            className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
+                          >
+                            {orcaRouterShowApiKey ? (
+                              <EyeOff className="w-5 h-5" strokeWidth={2} />
+                            ) : (
+                              <Eye className="w-5 h-5" strokeWidth={2} />
+                            )}
+                          </button>
+                        </div>
+                        {orcaRouterStatus === 'checking' && (
+                          <div className="flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
+                            <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
+                            Testing connection...
+                          </div>
+                        )}
+                        {orcaRouterStatus === 'connected' && (
+                          <div className="flex items-center gap-2 text-sm text-green-500">
+                            <div className="w-2 h-2 rounded-full bg-green-500" />
+                            Connected
+                          </div>
+                        )}
+                        {orcaRouterStatus === 'error' && (
+                          <div className="flex items-center gap-2 text-sm text-red-500">
+                            <div className="w-2 h-2 rounded-full bg-red-500" />
+                            {orcaRouterError || 'Connection failed'}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-4 pt-2">
+                        <div className="text-sm font-medium text-[var(--color-text-primary)]">Model Configuration</div>
+                        <p className="text-xs text-[var(--color-text-secondary)]">
+                          Enter the exact model names OrcaRouter expects (e.g. openai/gpt-5-nano).
+                        </p>
+
+                        {/* Embedding Model */}
+                        <div className="space-y-1">
+                          <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                            Embedding Model
+                          </label>
+                          <p className="text-xs text-[var(--color-text-secondary)]">
+                            Must match the vector dimension your database was embedded at
+                          </p>
+                          <input
+                            type="text"
+                            value={orcaRouterEmbeddingModel}
+                            onChange={(e) => setOrcaRouterEmbeddingModel(e.target.value)}
+                            onBlur={() => {
+                              if (orcaRouterEmbeddingModel !== (settings.orcarouter_embedding_model || 'openai/text-embedding-3-small')) {
+                                handleOrcaRouterEmbeddingModelChange(orcaRouterEmbeddingModel);
+                              }
+                            }}
+                            placeholder="openai/text-embedding-3-small"
+                            className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150"
+                          />
+                          <OverrideControls settingKey="orcarouter_embedding_model" />
+                        </div>
+
+                        {/* LLM Model */}
+                        <div className="space-y-1">
+                          <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                            LLM Model
+                          </label>
+                          <p className="text-xs text-[var(--color-text-secondary)]">
+                            Used for tagging, wiki generation, and chat
+                          </p>
+                          <input
+                            type="text"
+                            value={orcaRouterLlmModel}
+                            onChange={(e) => setOrcaRouterLlmModel(e.target.value)}
+                            onBlur={() => autoSave('orcarouter_llm_model', orcaRouterLlmModel)}
+                            placeholder="openai/gpt-5-nano"
+                            className="w-full px-3 py-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-md text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-colors duration-150"
+                          />
+                          <OverrideControls settingKey="orcarouter_llm_model" />
+                        </div>
+
+                        {/* Context Length */}
+                        <div className="space-y-1">
+                          <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                            Context Length
+                          </label>
+                          <p className="text-xs text-[var(--color-text-secondary)]">
+                            Max context window of your LLM model (used to truncate prompts)
+                          </p>
+                          <CustomSelect
+                            value={orcaRouterContextLength}
+                            onChange={(v) => { setOrcaRouterContextLength(v); autoSave('orcarouter_context_length', v); }}
+                            options={[
+                              { value: '2048', label: '2K' },
+                              { value: '4096', label: '4K' },
+                              { value: '8192', label: '8K' },
+                              { value: '16384', label: '16K' },
+                              { value: '32768', label: '32K' },
+                              { value: '65536', label: '64K' },
+                              { value: '131072', label: '128K' },
+                              { value: '262144', label: '256K' },
+                              { value: '1000000', label: '1M' },
+                            ]}
+                          />
+                          <OverrideControls settingKey="orcarouter_context_length" />
+                        </div>
+
+                        {/* Timeout */}
+                        <div className="space-y-1">
+                          <label className="block text-sm font-medium text-[var(--color-text-primary)]">
+                            Request Timeout
+                          </label>
+                          <p className="text-xs text-[var(--color-text-secondary)]">
+                            Maximum time to wait for the gateway to respond
+                          </p>
+                          <CustomSelect
+                            value={orcaRouterTimeoutSecs}
+                            onChange={(v) => { setOrcaRouterTimeoutSecs(v); autoSave('orcarouter_timeout_secs', v); }}
+                            options={[
+                              { value: '30', label: '30 seconds' },
+                              { value: '60', label: '60 seconds' },
+                              { value: '120', label: '2 minutes' },
+                              { value: '180', label: '3 minutes' },
+                              { value: '300', label: '5 minutes' },
+                              { value: '600', label: '10 minutes' },
+                            ]}
+                          />
+                          <OverrideControls settingKey="orcarouter_timeout_secs" />
                         </div>
                       </div>
                     </>

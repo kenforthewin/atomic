@@ -433,6 +433,13 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     transformArgs: (a) => ({ api_key: a.apiKey }),
     transformResponse: (d: any) => d.success as boolean,
   },
+  test_orcarouter_connection: {
+    method: 'POST',
+    path: '/api/settings/test-orcarouter',
+    argsMode: 'body',
+    transformArgs: (a) => ({ api_key: a.apiKey }),
+    transformResponse: (d: any) => d.success as boolean,
+  },
   get_available_llm_models: {
     method: 'GET',
     path: '/api/settings/models',

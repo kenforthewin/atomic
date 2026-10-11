@@ -526,6 +526,7 @@ async fn resolve_model(core: &AtomicCore) -> Result<(ProviderConfig, String), At
     let model = match config.provider_type {
         ProviderType::Ollama => config.llm_model().to_string(),
         ProviderType::OpenAICompat => config.llm_model().to_string(),
+        ProviderType::OrcaRouter => config.llm_model().to_string(),
         ProviderType::OpenRouter => settings
             .get("wiki_model")
             .cloned()

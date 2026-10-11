@@ -180,6 +180,45 @@ pub async fn test_openrouter_connection(body: web::Json<TestOpenRouterBody>) -> 
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
+pub struct TestOrcaRouterBody {
+    /// OrcaRouter API key to test
+    pub api_key: String,
+}
+
+#[utoipa::path(post, path = "/api/settings/test-orcarouter", request_body = TestOrcaRouterBody, responses((status = 200, description = "Connection successful"), (status = 400, description = "API error", body = ApiErrorResponse)), tag = "settings")]
+pub async fn test_orcarouter_connection(body: web::Json<TestOrcaRouterBody>) -> HttpResponse {
+    // Validate the key against OrcaRouter's `/v1/models` endpoint rather than a
+    // real chat completion. This avoids spending credits and exercising a
+    // specific model just to confirm the key is valid: the gateway returns 401
+    // for a bad key and 200 for a good one.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let response = client
+        .get("https://api.orcarouter.ai/v1/models")
+        .header("Authorization", format!("Bearer {}", body.api_key))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            HttpResponse::Ok().json(serde_json::json!({"success": true}))
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("API error ({}): {}", status, body)
+            }))
+        }
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("Network error: {}", e)
+        })),
+    }
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct TestOpenAICompatBody {
     /// Base URL of the OpenAI-compatible API
     pub base_url: String,

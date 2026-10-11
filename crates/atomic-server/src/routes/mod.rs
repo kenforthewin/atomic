@@ -190,6 +190,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::post().to(settings::test_openrouter_connection),
     );
     cfg.route(
+        "/settings/test-orcarouter",
+        web::post().to(settings::test_orcarouter_connection),
+    );
+    cfg.route(
         "/settings/models",
         web::get().to(settings::get_available_llm_models),
     );
