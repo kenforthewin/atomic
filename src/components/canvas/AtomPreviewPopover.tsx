@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from 'react';
-import { ArrowRight, ChevronDown, ChevronUp, Loader2, X } from 'lucide-react';
+import { ArrowRight, ChevronDown, ChevronUp, ExternalLink, Loader2, X } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -9,6 +9,8 @@ import { chunkMarkdown } from '../../lib/markdown';
 import type { AtomWithTags } from '../../stores/atoms';
 import { TagChip } from '../tags/TagChip';
 import { formatDate } from '../../lib/date';
+import { accountNetworkCategory } from './accountNetworkCategories';
+import { parseCanvasImage, parseCompanyProfile, parseExecutiveProfile, type CompanyProfile, type ExecutiveProfile } from './accountNetworkProfile';
 
 interface AtomPreviewPopoverProps {
   atomId: string;
@@ -27,11 +29,115 @@ const remarkPluginsStable = [remarkGfm];
 
 const MemoizedChunk = memo(function MemoizedChunk({ content }: { content: string }) {
   return (
-    <ReactMarkdown remarkPlugins={remarkPluginsStable}>
+    <ReactMarkdown
+      remarkPlugins={remarkPluginsStable}
+      components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a> }}
+    >
       {content}
     </ReactMarkdown>
   );
 });
+
+function SourceLink({ href, label = 'Source' }: { href: string; label?: string }) {
+  return <a href={href} target="_blank" rel="noopener noreferrer" className="text-[11px] text-[var(--color-text-tertiary)] hover:text-[var(--color-accent)] underline underline-offset-2">{label}</a>;
+}
+
+function CompanyProfileCard({ profile, name }: { profile: CompanyProfile; name: string }) {
+  const host = new URL(profile.website).hostname.replace(/^www\./, '');
+  return (
+    <section data-testid="company-profile" aria-label="Company profile" className="px-4 py-4 border-b border-[var(--color-border)]">
+      <div className="flex items-center gap-4">
+        {profile.logo && (
+          <div className="w-[176px] h-14 shrink-0 rounded-md border border-[var(--color-border)] bg-[var(--color-bg-main)] flex items-center justify-center px-2">
+            <img src={profile.logo.url} alt={`${name} logo`} className="max-w-full max-h-10 object-contain" />
+          </div>
+        )}
+        <div className="min-w-0">
+          <h4 className="text-xs font-semibold text-[var(--color-text-primary)]">Company profile</h4>
+          <p className="text-[11px] leading-4 text-[var(--color-text-tertiary)] mt-1">Public company information{profile.checkedAt ? ` · checked ${profile.checkedAt}` : ''}</p>
+          {profile.logo && <SourceLink href={profile.logo.source} label="Logo source" />}
+        </div>
+      </div>
+      <dl className="grid grid-cols-2 gap-x-5 gap-y-3 mt-4 text-xs">
+        <div className="min-w-0">
+          <dt className="text-[11px] text-[var(--color-text-tertiary)]">Website</dt>
+          <dd className="mt-0.5 truncate"><a href={profile.website} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[var(--color-accent)] hover:underline">{host}<ExternalLink className="w-3 h-3 shrink-0" /></a></dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[11px] text-[var(--color-text-tertiary)]">LinkedIn</dt>
+          <dd className="mt-0.5">{profile.linkedIn ? <a href={profile.linkedIn} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[var(--color-accent)] hover:underline">Company page<ExternalLink className="w-3 h-3" /></a> : <span className="text-[var(--color-text-tertiary)]">Not recorded</span>}</dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[11px] text-[var(--color-text-tertiary)]">Annual originations</dt>
+          <dd className="mt-0.5 text-[var(--color-text-primary)] leading-4">{profile.annualOriginations?.value ?? 'Not recorded'}</dd>
+          {profile.annualOriginations && <SourceLink href={profile.annualOriginations.source} />}
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[11px] text-[var(--color-text-tertiary)]">Headcount</dt>
+          <dd className="mt-0.5 text-[var(--color-text-primary)] leading-4">{profile.headcount?.value ?? 'Not recorded'}</dd>
+          {profile.headcount && <SourceLink href={profile.headcount.source} />}
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[11px] text-[var(--color-text-tertiary)]">HQ</dt>
+          <dd className="mt-0.5 text-[var(--color-text-primary)]">{profile.hq?.value ?? 'Not recorded'}</dd>
+          {profile.hq && <SourceLink href={profile.hq.source} />}
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+function ExecutiveProfileCard({ profile }: { profile: ExecutiveProfile }) {
+  const linkedInDisplay = profile.linkedIn
+    ? new URL(profile.linkedIn).hostname + new URL(profile.linkedIn).pathname.replace(/\/$/, '')
+    : null;
+
+  return (
+    <section data-testid="executive-profile" aria-label="Executive profile" className="px-4 py-3 border-b border-[var(--color-border)]">
+      <p className="text-sm text-[var(--color-text-primary)]">{profile.title}</p>
+      <div className="mt-1"><SourceLink href={profile.officialBio} label="Official bio" /></div>
+
+      <dl className="mt-2 divide-y divide-[var(--color-border)]">
+        <div className="grid grid-cols-[104px_minmax(0,1fr)] gap-3 py-2 text-xs leading-5">
+          <dt className="text-[var(--color-text-tertiary)]">LinkedIn URL</dt>
+          <dd className="min-w-0 truncate">{profile.linkedIn ? <a href={profile.linkedIn} target="_blank" rel="noopener noreferrer" className="text-[var(--color-accent)] hover:underline" title={profile.linkedIn}>{linkedInDisplay}</a> : 'Not verified'}</dd>
+        </div>
+        <div className="grid grid-cols-[104px_minmax(0,1fr)] gap-3 py-2 text-xs leading-5">
+          <dt className="text-[var(--color-text-tertiary)]">College</dt>
+          <dd className="text-[var(--color-text-primary)]">
+            <div><span className="text-[var(--color-text-tertiary)]">Undergrad</span> · {profile.college.undergraduate.join(' · ') || 'Not verified'}</div>
+            <div><span className="text-[var(--color-text-tertiary)]">Graduate</span> · {profile.college.graduate.join(' · ') || 'Not verified'}</div>
+            {profile.college.other.length > 0 && <div><span className="text-[var(--color-text-tertiary)]">Level unknown</span> · {profile.college.other.join(' · ')}</div>}
+          </dd>
+        </div>
+        <div className="grid grid-cols-[104px_minmax(0,1fr)] gap-3 py-2 text-xs leading-5">
+          <dt className="text-[var(--color-text-tertiary)]">Associations</dt>
+          <dd className="text-[var(--color-text-primary)]">{profile.affiliations.join(' · ') || 'Not documented'}</dd>
+        </div>
+        {([
+          ['LinkedIn About', profile.linkedInAbout],
+          ['Email', profile.email],
+          ['Phone', profile.phone],
+        ] as const).map(([label, value]) => (
+          <div key={label} className="grid grid-cols-[104px_minmax(0,1fr)] gap-3 py-2 text-xs leading-5">
+            <dt className="text-[var(--color-text-tertiary)]">{label}</dt>
+            <dd className="text-[var(--color-text-primary)]">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="mt-2 px-3 py-2 rounded-md bg-[var(--color-bg-main)]">
+        <p className="text-[11px] text-[var(--color-text-tertiary)]">Mutuals with Mark</p>
+        <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-primary)]">{profile.mutuals}</p>
+        {profile.linkedInMutualsEvidence && <p className="text-[11px] leading-4 text-[var(--color-text-tertiary)]">{profile.linkedInMutualsEvidence}</p>}
+        <p className="text-[11px] leading-4 text-[var(--color-text-tertiary)]">
+          {profile.networkCheck ? <>{profile.linkedInMutualsEvidence ? 'Happenstance found no named mutual in connected sources' : 'Happenstance check'} · {profile.networkCheck.checkedAt} · <SourceLink href={profile.networkCheck.source} label="Source" /></> : 'Network check pending'}
+          {' · School, work, and community overlap unverified'}
+        </p>
+      </div>
+      {profile.priorWork.length > 0 && <p className="mt-3 text-xs leading-5 text-[var(--color-text-primary)]"><span className="text-[var(--color-text-tertiary)]">Prior work</span> · {profile.priorWork.join(' · ')}</p>}
+    </section>
+  );
+}
 
 function calculatePosition(
   anchorRect: { top: number; left: number; bottom: number; width: number },
@@ -61,6 +167,12 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
   const [atom, setAtom] = useState<AtomWithTags | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const category = accountNetworkCategory(atom?.source_url);
+  const companyProfile = useMemo(() => category?.key === 'account' && atom ? parseCompanyProfile(atom.content) : null, [atom, category?.key]);
+  const executiveProfile = useMemo(() => category?.key === 'executive' && atom ? parseExecutiveProfile(atom.content) : null, [atom, category?.key]);
+  const nodeImage = useMemo(() => category && category.key !== 'account' && atom ? parseCanvasImage(atom.content) : undefined, [atom, category]);
+  const hasStructuredProfile = !!(companyProfile || executiveProfile);
 
   const initialPosition = calculatePosition(anchorRect, POPOVER_MAX_HEIGHT, POPOVER_WIDTH);
   const [position, setPosition] = useState(initialPosition);
@@ -68,6 +180,7 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
   const hasBeenDraggedRef = useRef(false);
   // When the atom switches (user clicked a different node), allow re-anchoring once.
   useEffect(() => { hasBeenDraggedRef.current = false; }, [atomId]);
+  useEffect(() => { setNotesOpen(false); }, [atomId]);
 
   useKeyboard('Escape', onClose, true);
 
@@ -121,7 +234,7 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
     if (!popoverRef.current) return;
     const rect = popoverRef.current.getBoundingClientRect();
     setPosition(calculatePosition(anchorRect, rect.height, rect.width));
-  }, [anchorRect, atom, isLoading, isCollapsed]);
+  }, [anchorRect, atom, isLoading, isCollapsed, notesOpen]);
 
   // Drag handle on the header — mousedown starts drag, window mousemove updates,
   // mouseup ends. Clamps to viewport so the popover can't be dragged off-screen.
@@ -158,8 +271,8 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
 
   // Progressive rendering: chunk content, render first chunk immediately, load rest incrementally
   const chunks = useMemo(
-    () => (atom ? chunkMarkdown(atom.content, CHUNK_SIZE) : []),
-    [atom]
+    () => (atom ? chunkMarkdown(companyProfile?.researchContent ?? executiveProfile?.researchContent ?? atom.content, CHUNK_SIZE) : []),
+    [atom, companyProfile, executiveProfile]
   );
   const [renderedChunkCount, setRenderedChunkCount] = useState(INITIAL_CHUNKS);
   const isFullyRendered = renderedChunkCount >= chunks.length;
@@ -188,7 +301,7 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
       ref={popoverRef}
       data-modal="true"
       className="fixed z-[100] bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg shadow-xl"
-      style={{ top: position.top, left: position.left, width: POPOVER_WIDTH, maxWidth: 'calc(100vw - 16px)' }}
+      style={{ top: position.top, left: position.left, width: POPOVER_WIDTH, maxWidth: 'calc(100vw - 16px)', maxHeight: 'calc(100vh - 16px)', overflowY: 'auto' }}
     >
       {isLoading ? (
         <div className="flex items-center justify-center py-8">
@@ -208,18 +321,23 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
             onMouseDown={handleDragStart}
             className={`px-4 py-3 flex items-start gap-2 select-none cursor-grab active:cursor-grabbing ${isCollapsed ? '' : 'border-b border-[var(--color-border)]'}`}
           >
+            {nodeImage && !isCollapsed && (
+              <div className="w-10 h-10 rounded-md border border-[var(--color-border)] bg-[var(--color-bg-main)] overflow-hidden shrink-0 flex items-center justify-center">
+                <img src={nodeImage} alt="" className={`w-full h-full ${category?.key === 'executive' ? 'object-cover' : 'object-contain p-1'}`} />
+              </div>
+            )}
             <div className="flex-1 min-w-0">
               <h3 className={`text-sm font-medium text-[var(--color-text-primary)] ${isCollapsed ? 'truncate' : 'line-clamp-2'}`}>
                 {atom.title || 'Untitled'}
               </h3>
               {!isCollapsed && (
                 <div className="flex items-center gap-2 mt-1">
-                  {atom.source_url && (
-                    <span className="text-[10px] text-[var(--color-text-tertiary)] bg-[var(--color-bg-main)] px-1.5 py-0.5 rounded-full truncate max-w-[200px]">
+                  {atom.source_url && !atom.source_url.startsWith('atomic://') && (
+                    <span className="text-[11px] text-[var(--color-text-tertiary)] bg-[var(--color-bg-main)] px-2 py-1 rounded truncate max-w-[200px]">
                       {atom.source || (() => { try { return new URL(atom.source_url!).hostname.replace(/^www\./, ''); } catch { return atom.source_url; } })()}
                     </span>
                   )}
-                  <span className="text-[10px] text-[var(--color-text-tertiary)]">
+                  <span className="text-[11px] text-[var(--color-text-tertiary)]">
                     {formatDate(atom.updated_at)}
                   </span>
                 </div>
@@ -247,12 +365,27 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
 
           {!isCollapsed && (
             <>
+              {companyProfile && <CompanyProfileCard profile={companyProfile} name={atom.title || 'Company'} />}
+              {executiveProfile && <ExecutiveProfileCard profile={executiveProfile} />}
               {/* Content preview */}
-              <div className="px-4 py-3 prose prose-invert prose-sm max-w-none [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-xs [&_h4]:text-xs [&_h1]:m-0 [&_h2]:m-0 [&_h3]:m-0 [&_h4]:m-0 [&_p]:text-xs [&_li]:text-xs [&_pre]:text-[10px] [&_code]:text-[10px] [&_blockquote]:text-xs max-h-[200px] overflow-y-auto">
-                {chunks.slice(0, renderedChunkCount).map((chunk, i) => (
-                  <MemoizedChunk key={i} content={chunk} />
-                ))}
-              </div>
+              {hasStructuredProfile && (
+                <button
+                  type="button"
+                  onClick={() => setNotesOpen((open) => !open)}
+                  aria-expanded={notesOpen}
+                  className="w-full px-4 py-2 flex items-center justify-between text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-accent)]"
+                >
+                  Research notes
+                  {notesOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                </button>
+              )}
+              {(!hasStructuredProfile || notesOpen) && (
+                <div className="px-4 py-3 prose prose-invert prose-sm max-w-none [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-xs [&_h4]:text-xs [&_h1]:m-0 [&_h2]:m-0 [&_h3]:m-0 [&_h4]:m-0 [&_p]:text-xs [&_li]:text-xs [&_pre]:text-[11px] [&_code]:text-[11px] [&_blockquote]:text-xs max-h-[200px] overflow-y-auto">
+                  {chunks.slice(0, renderedChunkCount).map((chunk, i) => (
+                    <MemoizedChunk key={i} content={chunk} />
+                  ))}
+                </div>
+              )}
 
               {/* Tags */}
               {atom.tags.length > 0 && (
@@ -261,7 +394,7 @@ export function AtomPreviewPopover({ atomId, anchorRect, onClose, onViewAtom }: 
                     <TagChip key={tag.id} name={tag.name} size="xs" />
                   ))}
                   {atom.tags.length > 5 && (
-                    <span className="text-[10px] text-[var(--color-text-tertiary)] self-center">
+                    <span className="text-[11px] text-[var(--color-text-tertiary)] self-center">
                       +{atom.tags.length - 5} more
                     </span>
                   )}

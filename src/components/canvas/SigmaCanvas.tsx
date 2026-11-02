@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { Loader2 } from 'lucide-react';
+import { useEffect, useId, useRef, useState, useCallback, useMemo, type KeyboardEvent } from 'react';
+import { Check, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
 import { useUIStore } from '../../stores/ui';
 import { useDatabasesStore } from '../../stores/databases';
-import { getGlobalCanvas, type GlobalCanvasData } from '../../lib/api';
+import { getAtomLinks, getAtomPositions, getGlobalCanvas, saveAtomPositions, type AtomLink, type GlobalCanvasData } from '../../lib/api';
 import { getTransport } from '../../lib/transport';
 import Graph from 'graphology';
 import Sigma from 'sigma';
+import { EdgeRectangleProgram, NodeCircleProgram } from 'sigma/rendering';
+import type { CameraState } from 'sigma/types';
 import EdgeCurveProgram from '@sigma/edge-curve';
 import {
   CANVAS_THEMES,
@@ -16,6 +19,28 @@ import {
 } from './sigma/themes';
 import { AtomPreviewPopover } from './AtomPreviewPopover';
 import { useCanvasStore } from '../../stores/canvas';
+import { ACCOUNT_NETWORK_CATEGORIES, accountNetworkCategory, accountNetworkSlug } from './accountNetworkCategories';
+import type { AccountNetworkCategory } from './accountNetworkCategories';
+import { accountNetworkEdges, type AccountNetworkEdge } from './accountNetworkEdges';
+import {
+  computeAccountChartLayout,
+  emptyAccountLayoutSettings,
+  readAccountLayoutSettings,
+  writeAccountLayoutSettings,
+  type AccountLayoutMode,
+  type AccountLayoutSettings,
+} from './accountNetworkLayout';
+import { categoryCameraTarget, toggleCategory } from './categoryFocus';
+import StarNodeProgram from './sigma/StarNodeProgram';
+import { parseCanvasImage } from './accountNetworkProfile';
+import type { AtomWithTags } from '../../stores/atoms';
+import { accountResearchChecks, enrichedCategoryKeys, verifiedEntryPoints, type AccountResearchNote } from './accountNetworkEnrichment';
+import { AccountResearchPanel } from './AccountResearchPanel';
+
+type CategoryKey = AccountNetworkCategory['key'];
+type AccountControlTab = 'categories' | 'research';
+const EMPTY_RESEARCH_NOTES: AccountResearchNote[] = [];
+const EMPTY_ATOM_LINKS: AtomLink[] = [];
 
 function truncLabel(str: string, max: number): string {
   return str.length > max ? str.substring(0, max - 1) + '\u2026' : str;
@@ -73,15 +98,160 @@ export function SigmaCanvas({
   const sigmaRef = useRef<Sigma | null>(null);
   const graphRef = useRef<Graph | null>(null);
   const [data, setData] = useState<GlobalCanvasData | null>(null);
+  const [recordedEdges, setRecordedEdges] = useState<{ rootId: string; edges: AccountNetworkEdge[]; links: AtomLink[] } | null>(null);
+  const [linksLoading, setLinksLoading] = useState(false);
+  const [linksError, setLinksError] = useState(false);
+  const [linkRetry, setLinkRetry] = useState(0);
+  const [researchNotes, setResearchNotes] = useState<{ rootId: string; notes: AccountResearchNote[] } | null>(null);
+  const [researchLoading, setResearchLoading] = useState(false);
+  const [researchError, setResearchError] = useState(false);
+  const [researchRetry, setResearchRetry] = useState(0);
+  const [canvasReload, setCanvasReload] = useState(0);
+  const [animateEntryPaths, setAnimateEntryPaths] = useState(() => !window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const [reduceMotion, setReduceMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  useEffect(() => {
+    const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => setReduceMotion(preference.matches);
+    preference.addEventListener('change', update);
+    return () => preference.removeEventListener('change', update);
+  }, []);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<CanvasTheme>(DEFAULT_THEME);
   const [themePickerOpen, setThemePickerOpen] = useState(false);
+  const [controlTab, setControlTab] = useState<AccountControlTab>('research');
+  const controlTabsId = useId();
+  const controlsRef = useRef<HTMLElement>(null);
+  const categoryTabRef = useRef<HTMLButtonElement>(null);
+  const researchTabRef = useRef<HTMLButtonElement>(null);
+  const [selectedCategories, setSelectedCategories] = useState<Set<CategoryKey>>(new Set());
+  const selectedCategoriesRef = useRef<ReadonlySet<CategoryKey>>(selectedCategories);
+  const savedCategoryCameraRef = useRef<CameraState | null>(null);
+  const focusCategoriesRef = useRef<(selected: ReadonlySet<CategoryKey>) => void>(() => {});
   const [edgeThreshold, setEdgeThreshold] = useState(0);
   const edgeThresholdRef = useRef(0);
   const edgeAnimProgress = useRef(0); // 0 = invisible, 1 = fully visible
   const themeRef = useRef(theme);
   themeRef.current = theme;
+  const savedPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
+  const [layoutSettings, setLayoutSettings] = useState<AccountLayoutSettings>(emptyAccountLayoutSettings);
+  const layoutSettingsRef = useRef(layoutSettings);
+  const applyLayoutRef = useRef<(mode: AccountLayoutMode, edges: AccountNetworkEdge[], force?: boolean) => void>(() => {});
+  const refitLayoutRef = useRef<() => void>(() => {});
+
+  const accountRoots = !isPreview && selectedTagId
+    ? (data?.atoms ?? []).filter(atom => atom.tag_ids.includes(selectedTagId)
+      && accountNetworkCategory(atom.source_url)?.key === 'account')
+    : [];
+  const accountRoot = accountRoots.length === 1 ? accountRoots[0] : null;
+  const accountRootId = accountRoot?.atom_id ?? null;
+  const accountSlug = accountNetworkSlug(accountRoot?.source_url);
+  const accountTagFilterId = accountRoot && accountSlug ? selectedTagId : null;
+  useEffect(() => setControlTab('research'), [accountTagFilterId, activeDbId]);
+  const selectControlTab = (tab: AccountControlTab) => {
+    setControlTab(tab);
+    controlsRef.current?.scrollTo({ top: 0 });
+  };
+  const handleControlTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next: AccountControlTab = event.key === 'Home' ? 'categories'
+      : event.key === 'End' ? 'research'
+        : controlTab === 'categories' ? 'research' : 'categories';
+    selectControlTab(next);
+    (next === 'categories' ? categoryTabRef : researchTabRef).current?.focus();
+  };
+  const accountAtoms = useMemo(() => !accountTagFilterId ? [] : (data?.atoms ?? []).filter(atom =>
+    atom.tag_ids.includes(accountTagFilterId)
+    && accountNetworkSlug(atom.source_url) === accountSlug
+    && accountNetworkCategory(atom.source_url),
+  ), [data, accountTagFilterId, accountSlug]);
+  const activeNotes = researchNotes?.rootId === accountRootId ? researchNotes.notes : EMPTY_RESEARCH_NOTES;
+  const activeLinks = recordedEdges?.rootId === accountRootId ? recordedEdges.links : EMPTY_ATOM_LINKS;
+  const entryPoints = useMemo(() => verifiedEntryPoints(accountAtoms, activeNotes, activeLinks), [accountAtoms, activeNotes, activeLinks]);
+  const researchChecks = useMemo(() => accountResearchChecks(accountAtoms, activeNotes, entryPoints), [accountAtoms, activeNotes, entryPoints]);
+  const enrichedCategories = useMemo(() => enrichedCategoryKeys(accountAtoms, researchChecks), [accountAtoms, researchChecks]);
+  const entryPointRows = useMemo(() => {
+    const titles = new Map(accountAtoms.map(atom => [atom.atom_id, atom.title]));
+    return entryPoints.map(entry => ({
+      ...entry,
+      sourceTitle: titles.get(entry.source) ?? 'Source note',
+      targetTitle: titles.get(entry.target) ?? 'Target note',
+    }));
+  }, [accountAtoms, entryPoints]);
+  const documentedEdges = useMemo(() => {
+    if (recordedEdges?.rootId !== accountRootId) return [];
+    const edges = recordedEdges.edges.map(edge => ({ ...edge }));
+    for (const entry of entryPoints) {
+      const existing = edges.find(edge => edge.source === entry.source && edge.target === entry.target
+        || edge.source === entry.target && edge.target === entry.source);
+      if (existing) { existing.relation = 'entry-point'; existing.weight = 1; }
+      else edges.push({ source: entry.source, target: entry.target, weight: 1, relation: 'entry-point' });
+    }
+    return edges;
+  }, [recordedEdges, accountRootId, entryPoints]);
+  const effectiveLayoutMode: AccountLayoutMode = accountRootId && recordedEdges?.rootId === accountRootId
+    ? layoutSettings.mode : 'freeform';
+  const layoutModeRef = useRef<AccountLayoutMode>(effectiveLayoutMode);
+  layoutModeRef.current = effectiveLayoutMode;
+  const categoryCounts = new Map<CategoryKey, number>();
+  if (accountTagFilterId) {
+    for (const atom of data?.atoms ?? []) {
+      if (!atom.tag_ids.includes(accountTagFilterId)
+        || accountNetworkSlug(atom.source_url) !== accountSlug) continue;
+      const category = accountNetworkCategory(atom.source_url);
+      if (category) categoryCounts.set(category.key, (categoryCounts.get(category.key) ?? 0) + 1);
+    }
+  }
+
+  useEffect(() => {
+    const next = accountRootId
+      ? readAccountLayoutSettings(localStorage, activeDbId ?? 'default', accountRootId)
+      : emptyAccountLayoutSettings();
+    layoutSettingsRef.current = next;
+    setLayoutSettings(next);
+  }, [accountRootId, activeDbId]);
+
+  useEffect(() => {
+    applyLayoutRef.current(effectiveLayoutMode, documentedEdges);
+  }, [effectiveLayoutMode, documentedEdges]);
+
+  useEffect(() => {
+    if (!accountRootId || !containerRef.current) return;
+    let timer: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => refitLayoutRef.current(), 160);
+    });
+    observer.observe(containerRef.current);
+    return () => {
+      observer.disconnect();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [accountRootId]);
+
+  useEffect(() => {
+    const empty = new Set<CategoryKey>();
+    selectedCategoriesRef.current = empty;
+    savedCategoryCameraRef.current = null;
+    setSelectedCategories(empty);
+    sigmaRef.current?.refresh();
+  }, [accountTagFilterId, activeDbId]);
+
+  useEffect(() => {
+    if (!accountSlug) return;
+    const transport = getTransport();
+    const belongsToAccount = (atom: { source_url?: string | null }) => accountNetworkSlug(atom.source_url) === accountSlug;
+    const updated = transport.subscribe<{ source_url?: string | null }>('atom-updated', atom => {
+      if (!belongsToAccount(atom)) return;
+      setResearchRetry(count => count + 1);
+      setLinkRetry(count => count + 1);
+    });
+    const created = transport.subscribe<{ source_url?: string | null }>('atom-created', atom => {
+      if (belongsToAccount(atom)) setCanvasReload(count => count + 1);
+    });
+    return () => { updated(); created(); };
+  }, [accountSlug]);
 
   // Hover emphasis: when a node is hovered, dim everything outside its neighborhood.
   // neighborsRef lets the edge/node reducers answer "is X a neighbor of hovered?" in O(1).
@@ -111,6 +281,53 @@ export function SigmaCanvas({
     sigmaRef.current?.refresh();
   }, []);
 
+  const persistLayoutSettings = (next: AccountLayoutSettings) => {
+    if (!accountRootId) return;
+    layoutSettingsRef.current = next;
+    setLayoutSettings(next);
+    if (!writeAccountLayoutSettings(localStorage, activeDbId ?? 'default', accountRootId, next)) {
+      toast.error('Could not save this layout on this device');
+    }
+  };
+
+  const changeLayout = (mode: AccountLayoutMode) => {
+    if (mode !== 'freeform' && recordedEdges?.rootId !== accountRootId) return;
+    if (layoutSettingsRef.current.mode === mode) return;
+    closePreview();
+    persistLayoutSettings({ ...layoutSettingsRef.current, mode });
+  };
+
+  const resetChartLayout = () => {
+    const mode = layoutSettingsRef.current.mode;
+    if (mode === 'freeform' || !recordedEdges) return;
+    const next: AccountLayoutSettings = {
+      ...layoutSettingsRef.current,
+      positions: { ...layoutSettingsRef.current.positions, [mode]: {} },
+    };
+    persistLayoutSettings(next);
+    applyLayoutRef.current(mode, documentedEdges, true);
+  };
+
+  const toggleAccountCategory = (key: CategoryKey) => {
+    if (!categoryCounts.get(key)) return;
+    const sigma = sigmaRef.current;
+    if (!sigma) return;
+    const next = toggleCategory(selectedCategoriesRef.current, key);
+    if (selectedCategoriesRef.current.size === 0 && next.size > 0) {
+      savedCategoryCameraRef.current = sigma.getCamera().getState();
+    }
+    selectedCategoriesRef.current = next;
+    setSelectedCategories(next);
+    closePreview();
+    sigma.refresh();
+    if (next.size) {
+      focusCategoriesRef.current(next);
+    } else if (savedCategoryCameraRef.current) {
+      void sigma.getCamera().animate(savedCategoryCameraRef.current, { duration: 600 });
+      savedCategoryCameraRef.current = null;
+    }
+  };
+
   // Build a set of atom IDs that match the selected tag
   const selectedTagRef = useRef(selectedTagId);
   selectedTagRef.current = selectedTagId;
@@ -121,9 +338,13 @@ export function SigmaCanvas({
     setIsLoading(true);
     setError(null);
 
-    getGlobalCanvas()
-      .then((result) => {
+    Promise.all([getGlobalCanvas(), getAtomPositions()])
+      .then(([result, positions]) => {
         if (!cancelled) {
+          savedPositionsRef.current = Object.fromEntries(
+            positions.filter(pos => Number.isFinite(pos.x) && Number.isFinite(pos.y))
+              .map(pos => [pos.atom_id, { x: pos.x, y: pos.y }]),
+          );
           setData(result);
           setIsLoading(false);
         }
@@ -136,7 +357,81 @@ export function SigmaCanvas({
       });
 
     return () => { cancelled = true; };
-  }, [activeDbId]);
+  }, [activeDbId, canvasReload]);
+
+  // Load documented links for the chart views. Freeform keeps semantic edges.
+  useEffect(() => {
+    if (!data || !accountTagFilterId || !accountRootId || !accountSlug) {
+      setRecordedEdges(null);
+      setLinksLoading(false);
+      setLinksError(false);
+      return;
+    }
+    let cancelled = false;
+    setRecordedEdges(current => current?.rootId === accountRootId ? current : null);
+    setLinksLoading(true);
+    setLinksError(false);
+    const atoms = accountAtoms;
+    const linkSources = atoms;
+    let nextIndex = 0;
+    const allLinks: Awaited<ReturnType<typeof getAtomLinks>> = [];
+    const worker = async () => {
+      while (nextIndex < linkSources.length) {
+        const atom = linkSources[nextIndex++];
+        allLinks.push(...await getAtomLinks(atom.atom_id));
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(6, linkSources.length) }, worker))
+      .then(() => {
+        if (cancelled) return;
+        setRecordedEdges({ rootId: accountRootId, edges: accountNetworkEdges(atoms, allLinks), links: allLinks });
+        setLinksLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRecordedEdges(null);
+        setLinksLoading(false);
+        setLinksError(true);
+      });
+    return () => { cancelled = true; };
+  }, [data, accountTagFilterId, accountRootId, accountSlug, accountAtoms, activeDbId, linkRetry]);
+
+  // Read the recorded enrichment and research outcomes from account notes.
+  useEffect(() => {
+    if (!accountTagFilterId || !accountRootId) {
+      setResearchNotes(null);
+      setResearchLoading(false);
+      setResearchError(false);
+      return;
+    }
+    let cancelled = false;
+    setResearchNotes(current => current?.rootId === accountRootId ? current : null);
+    setResearchLoading(true);
+    setResearchError(false);
+    const sources = accountAtoms;
+    let nextIndex = 0;
+    const notes: AccountResearchNote[] = [];
+    const worker = async () => {
+      while (nextIndex < sources.length) {
+        const atom = sources[nextIndex++];
+        const result = await getTransport().invoke<AtomWithTags | null>('get_atom_by_id', { id: atom.atom_id });
+        if (result) notes.push({ atomId: atom.atom_id, content: result.content });
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(6, sources.length) }, worker))
+      .then(() => {
+        if (cancelled) return;
+        setResearchNotes({ rootId: accountRootId, notes });
+        setResearchLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setResearchNotes(null);
+        setResearchLoading(false);
+        setResearchError(true);
+      });
+    return () => { cancelled = true; };
+  }, [accountTagFilterId, accountRootId, accountAtoms, activeDbId, researchRetry]);
 
   // Precomputed data for the graph
   const graphDataRef = useRef<{
@@ -148,6 +443,12 @@ export function SigmaCanvas({
   useEffect(() => {
     const container = containerRef.current;
     if (!container || !data || data.atoms.length === 0) return;
+    pinnedNodeRef.current = null;
+    hoveredNodeRef.current = null;
+    hoverAnimRef.current = 0;
+    hoverTargetRef.current = 0;
+    setPreviewAtomId(null);
+    setPreviewAnchorRect(null);
 
     // For an interactive preview, narrow the graph to the seed atoms plus
     // their 1-hop neighbors from the existing edge set. We reuse the global
@@ -156,6 +457,16 @@ export function SigmaCanvas({
     // fits-to-bbox over just those nodes.
     let atoms = data.atoms;
     let edges = data.edges;
+    const accountNetworkMode = accountTagFilterId !== null;
+    if (accountTagFilterId) {
+      atoms = data.atoms.filter(atom =>
+        atom.tag_ids.includes(accountTagFilterId)
+        && accountNetworkSlug(atom.source_url) === accountSlug
+        && accountNetworkCategory(atom.source_url),
+      );
+      const included = new Set(atoms.map(atom => atom.atom_id));
+      edges = data.edges.filter(edge => included.has(edge.source) && included.has(edge.target));
+    }
     if (filterAtomIds && filterAtomIds.length > 0) {
       const seeds = new Set(filterAtomIds);
       const included = new Set(seeds);
@@ -199,43 +510,50 @@ export function SigmaCanvas({
     for (const atom of atoms) {
       const connectivity = (edgeCounts.get(atom.atom_id) || 0) / maxEdges;
       const clusterIdx = atomCluster.get(atom.atom_id);
-      targetPositions[atom.atom_id] = { x: atom.x * scale, y: atom.y * scale };
+      const category = accountNetworkMode ? accountNetworkCategory(atom.source_url) : null;
+      targetPositions[atom.atom_id] = savedPositionsRef.current[atom.atom_id]
+        ?? { x: atom.x * scale, y: atom.y * scale };
       graph.addNode(atom.atom_id, {
         x: 0,
         y: 0,
-        size: 2.5 + connectivity * 5,
-        color: nodeColor(theme, connectivity, clusterIdx),
+        size: category?.key === 'account' ? 20 : category?.key === 'executive' ? 17 : category?.key === 'alumni' ? 15 : 2.5 + connectivity * 5,
+        color: category?.color ?? nodeColor(theme, connectivity, clusterIdx),
         label: truncLabel(atom.title || atom.atom_id.substring(0, 8), 30),
         fullLabel: atom.title || atom.atom_id.substring(0, 8),
         connectivity,
         clusterIndex: clusterIdx,
         tagIds: atom.tag_ids,
+        sourceUrl: atom.source_url,
+        categoryKey: category?.key,
+        type: category?.key === 'account' ? 'star' : 'circle',
       });
     }
 
-    // Add edges
-    let minW = 1, maxW = 0;
-    for (const edge of edges) {
-      if (edge.weight < minW) minW = edge.weight;
-      if (edge.weight > maxW) maxW = edge.weight;
-    }
-    const wRange = Math.max(maxW - minW, 0.001);
-
-    const neighbors = new Map<string, Set<string>>();
-    for (const edge of edges) {
-      if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue;
-      if (graph.hasEdge(edge.source, edge.target) || graph.hasEdge(edge.target, edge.source)) continue;
-      const w = (edge.weight - minW) / wRange;
-      graph.addEdge(edge.source, edge.target, {
-        weight: w,
-        type: 'curved',
-      });
-      if (!neighbors.has(edge.source)) neighbors.set(edge.source, new Set());
-      if (!neighbors.has(edge.target)) neighbors.set(edge.target, new Set());
-      neighbors.get(edge.source)!.add(edge.target);
-      neighbors.get(edge.target)!.add(edge.source);
-    }
-    neighborsRef.current = neighbors;
+    const setGraphEdges = (nextEdges: typeof edges, documented: boolean) => {
+      graph.clearEdges();
+      let minW = 1, maxW = 0;
+      for (const edge of nextEdges) {
+        if (edge.weight < minW) minW = edge.weight;
+        if (edge.weight > maxW) maxW = edge.weight;
+      }
+      const wRange = Math.max(maxW - minW, 0.001);
+      const neighbors = new Map<string, Set<string>>();
+      for (const edge of nextEdges) {
+        if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue;
+        if (graph.hasEdge(edge.source, edge.target) || graph.hasEdge(edge.target, edge.source)) continue;
+        graph.addEdge(edge.source, edge.target, {
+          weight: documented ? edge.weight : (edge.weight - minW) / wRange,
+          type: documented ? 'line' : 'curved',
+          relation: documented ? (edge as AccountNetworkEdge).relation : undefined,
+        });
+        if (!neighbors.has(edge.source)) neighbors.set(edge.source, new Set());
+        if (!neighbors.has(edge.target)) neighbors.set(edge.target, new Set());
+        neighbors.get(edge.source)!.add(edge.target);
+        neighbors.get(edge.target)!.add(edge.source);
+      }
+      neighborsRef.current = neighbors;
+    };
+    setGraphEdges(edges, false);
 
     const sigma = new Sigma(graph, container, {
       // Atom labels are drawn manually on the overlay canvas (drawLabels) with
@@ -250,6 +568,11 @@ export function SigmaCanvas({
       zIndex: true,
       edgeProgramClasses: {
         curved: EdgeCurveProgram,
+        line: EdgeRectangleProgram,
+      },
+      nodeProgramClasses: {
+        circle: NodeCircleProgram,
+        star: StarNodeProgram,
       },
       minCameraRatio: 0.01,
       maxCameraRatio: 10,
@@ -259,15 +582,24 @@ export function SigmaCanvas({
       // labelCanvas, so drawing the hover pill here would render it behind.
       defaultDrawNodeHover: () => {},
       nodeReducer: (node, attrs) => {
+        const selected = selectedCategoriesRef.current;
+        const categoryKey = (attrs as { categoryKey?: CategoryKey }).categoryKey;
+        const matchesCategory = categoryKey === 'account' || (!!categoryKey && selected.has(categoryKey));
+        const focusedAttrs = selected.size
+          ? matchesCategory
+            ? { ...attrs, size: Math.max(12, (attrs.size || 4) * 1.8), zIndex: 2 }
+            : { ...attrs, color: 'rgba(70, 70, 70, 0.22)', size: (attrs.size || 4) * 0.7, label: '' }
+          : attrs;
         const hovered = hoveredNodeRef.current;
         const pinned = pinnedNodeRef.current;
         if (hovered || pinned) {
-          if (hovered && node === hovered) return { ...attrs, zIndex: 2 };
-          if (pinned && node === pinned) return { ...attrs, zIndex: 2 };
+          if (hovered && node === hovered) return { ...focusedAttrs, color: attrs.color, size: Math.max(focusedAttrs.size || 4, attrs.size || 4), zIndex: 3 };
+          if (pinned && node === pinned) return { ...focusedAttrs, color: attrs.color, size: Math.max(focusedAttrs.size || 4, attrs.size || 4), zIndex: 3 };
           const isNeighbor =
             (hovered && neighborsRef.current.get(hovered)?.has(node)) ||
             (pinned && neighborsRef.current.get(pinned)?.has(node));
-          if (isNeighbor) return { ...attrs, zIndex: 1 };
+          if (isNeighbor) return { ...focusedAttrs, zIndex: 1 };
+          if (selected.size) return focusedAttrs;
           // Non-neighbors dim. Hover fades in/out via hoverAnim; pin holds
           // the dim at full strength so edges/nodes stay faded after the
           // cursor moves off the pinned node.
@@ -283,6 +615,7 @@ export function SigmaCanvas({
             label: dim > 0.5 ? '' : (attrs.label as string),
           };
         }
+        if (selected.size) return focusedAttrs;
         const tagId = selectedTagRef.current;
         if (!tagId) return attrs;
         const tagIds = (attrs as any).tagIds as string[] | undefined;
@@ -301,6 +634,21 @@ export function SigmaCanvas({
         const pinned = pinnedNodeRef.current;
         const t = themeRef.current;
         const anim = edgeAnimProgress.current;
+        const selected = selectedCategoriesRef.current;
+        if (selected.size) {
+          if (layoutModeRef.current === 'freeform' && w < edgeThresholdRef.current) return { ...attrs, hidden: true };
+          const g = graphRef.current!;
+          const sourceCategory = g.getNodeAttribute(g.source(edge), 'categoryKey') as CategoryKey | undefined;
+          const targetCategory = g.getNodeAttribute(g.target(edge), 'categoryKey') as CategoryKey | undefined;
+          const connectsSelected = !!sourceCategory && !!targetCategory
+            && (selected.has(sourceCategory) || selected.has(targetCategory));
+          return {
+            ...attrs,
+            color: edgeColor(t, w * anim * (connectsSelected ? 1 : 0.12)),
+            size: (0.2 + w * 0.7) * anim * (connectsSelected ? 1 : 0.35),
+            zIndex: connectsSelected ? 1 : 0,
+          };
+        }
         if (hovered || pinned) {
           const g = graphRef.current!;
           const src = g.source(edge);
@@ -337,7 +685,7 @@ export function SigmaCanvas({
             size: (0.2 + w * 0.7) * anim * (1 - dim),
           };
         }
-        if (w < edgeThresholdRef.current) {
+        if (layoutModeRef.current === 'freeform' && w < edgeThresholdRef.current) {
           return { ...attrs, hidden: true };
         }
         return {
@@ -357,6 +705,29 @@ export function SigmaCanvas({
     labelCanvas.style.pointerEvents = 'none';
     labelCanvas.style.zIndex = '10';
     container.appendChild(labelCanvas);
+    const nodeImages = new Map<string, HTMLImageElement>();
+    let cancelledMedia = false;
+
+    if (accountNetworkMode) {
+      for (const atom of atoms) {
+        const category = accountNetworkCategory(atom.source_url)?.key;
+        if (category !== 'executive' && category !== 'alumni') continue;
+        void getTransport().invoke<AtomWithTags | null>('get_atom_by_id', { id: atom.atom_id })
+          .then((detail) => {
+            if (cancelledMedia) return;
+            const url = parseCanvasImage(detail?.content ?? '');
+            if (!url) return;
+            const image = new Image();
+            image.onload = () => {
+              if (cancelledMedia) return;
+              nodeImages.set(atom.atom_id, image);
+              drawLabels();
+            };
+            image.src = url;
+          })
+          .catch(() => { /* Keep the category-colored node when a portrait or logo cannot load. */ });
+      }
+    }
 
 
     function drawLabels() {
@@ -397,7 +768,7 @@ export function SigmaCanvas({
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
 
-      const sortedClusters = isInteractivePreview
+      const sortedClusters = isInteractivePreview || accountNetworkMode
         ? []
         : [...data!.clusters].sort((a, b) => b.atom_count - a.atom_count);
       const maxClusterLabels = Math.max(4, Math.floor((width * height) / 40000));
@@ -447,6 +818,54 @@ export function SigmaCanvas({
         ctx.fillText(cluster.label, pos.x, labelY);
       }
 
+      // Portraits and school marks sit above Sigma's colored circles. The
+      // circles remain the pointer targets, and the image pass follows the
+      // same category and hover emphasis as the node reducer.
+      if (accountNetworkMode) {
+        graph!.forEachNode((id, attrs) => {
+          const image = nodeImages.get(id);
+          if (!image) return;
+          const category = (attrs as { categoryKey?: CategoryKey }).categoryKey;
+          const display = sigma!.getNodeDisplayData(id);
+          if (!display || (category !== 'executive' && category !== 'alumni')) return;
+          const pos = sigma!.graphToViewport({ x: attrs.x as number, y: attrs.y as number });
+          const radius = sigma!.scaleSize(display.size);
+          if (pos.x < -radius || pos.x > width + radius || pos.y < -radius || pos.y > height + radius) return;
+          const selected = selectedCategoriesRef.current;
+          const isActive = id === hoveredNodeRef.current || id === pinnedNodeRef.current;
+          const isNeighbor = !!hoveredNodeRef.current && !!neighborsRef.current.get(hoveredNodeRef.current)?.has(id)
+            || !!pinnedNodeRef.current && !!neighborsRef.current.get(pinnedNodeRef.current)?.has(id);
+          let opacity = 1;
+          if (selected.size && !selected.has(category) && !isActive) {
+            opacity = 0.22;
+          } else if (!selected.size && (hoveredNodeRef.current || pinnedNodeRef.current) && !isActive && !isNeighbor) {
+            opacity = 1 - 0.7 * (pinnedNodeRef.current ? 1 : hoverAnimRef.current);
+          }
+          ctx.save();
+          ctx.globalAlpha = opacity;
+          if (category === 'executive') {
+            const innerRadius = Math.max(2, radius - 2);
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, innerRadius, 0, Math.PI * 2);
+            ctx.clip();
+            const side = Math.min(image.naturalWidth, image.naturalHeight);
+            ctx.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side,
+              pos.x - innerRadius, pos.y - innerRadius, innerRadius * 2, innerRadius * 2);
+          } else {
+            const side = Math.max(4, radius * 1.65);
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.roundRect(pos.x - side / 2, pos.y - side / 2, side, side, Math.min(5, side * 0.2));
+            ctx.fill();
+            const scale = Math.min(side / image.naturalWidth, side / image.naturalHeight);
+            const imageWidth = image.naturalWidth * scale;
+            const imageHeight = image.naturalHeight * scale;
+            ctx.drawImage(image, pos.x - imageWidth / 2, pos.y - imageHeight / 2, imageWidth, imageHeight);
+          }
+          ctx.restore();
+        });
+      }
+
       // === Atom labels (collision-checked against everything already placed) ===
       // Interactive preview (briefing mini-canvas) keeps only a couple of
       // labels at rest — top-connected nodes win, the rest stay quiet until
@@ -461,6 +880,7 @@ export function SigmaCanvas({
       // neighbors so the highlighted subgraph is the only thing named.
       const pinnedId = pinnedNodeRef.current;
       const pinnedNeighbors = pinnedId ? neighborsRef.current.get(pinnedId) : null;
+      const selectedCategories = selectedCategoriesRef.current;
       const minRenderedSize = 4;
       const atomLabelPad = isInteractivePreview ? 40 : 20;
       const maxAtomLabels = isInteractivePreview ? 2 : Infinity;
@@ -468,12 +888,17 @@ export function SigmaCanvas({
       type Cand = { vx: number; vy: number; rsize: number; label: string };
       const candidates: Cand[] = [];
       graph!.forEachNode((id, attrs) => {
-        if (pinnedId && id !== pinnedId && !pinnedNeighbors?.has(id)) return;
+        if (!selectedCategories.size && pinnedId && id !== pinnedId && !pinnedNeighbors?.has(id)) return;
+        if (selectedCategories.size) {
+          const categoryKey = (attrs as { categoryKey?: CategoryKey }).categoryKey;
+          if (!categoryKey || !selectedCategories.has(categoryKey)
+            && categoryKey !== 'account' && id !== hoveredNodeRef.current && id !== pinnedId) return;
+        }
         if (tagFilter) {
           const tagIds = (attrs as any).tagIds as string[] | undefined;
           if (!tagIds?.includes(tagFilter)) return;
         }
-        const rsize = sigma!.scaleSize(attrs.size as number);
+        const rsize = sigma!.scaleSize(sigma!.getNodeDisplayData(id)?.size ?? (attrs.size as number));
         if (rsize < minRenderedSize) return;
         const pos = sigma!.graphToViewport({ x: attrs.x as number, y: attrs.y as number });
         // Cull off-screen — generous horizontal margin so labels near the edge still render
@@ -521,7 +946,7 @@ export function SigmaCanvas({
       if (pinnedId && graph!.hasNode(pinnedId)) {
         const pAttrs = graph!.getNodeAttributes(pinnedId);
         const pPos = sigma!.graphToViewport({ x: pAttrs.x as number, y: pAttrs.y as number });
-        const pSize = sigma!.scaleSize(pAttrs.size as number);
+        const pSize = sigma!.scaleSize(sigma!.getNodeDisplayData(pinnedId)?.size ?? (pAttrs.size as number));
         ctx.beginPath();
         ctx.arc(pPos.x, pPos.y, pSize + 3, 0, Math.PI * 2);
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
@@ -532,7 +957,7 @@ export function SigmaCanvas({
         // The popover ignores these updates after the user manually drags it,
         // so this doesn't fight with intentional repositioning.
         const cRect = container!.getBoundingClientRect();
-        const aSize = (pAttrs.size as number) || 4;
+        const aSize = pSize;
         const newAnchor = {
           top: cRect.top + pPos.y - aSize,
           left: cRect.left + pPos.x - aSize,
@@ -558,7 +983,7 @@ export function SigmaCanvas({
       if (hoveredId && hoveredId !== pinnedId && hAnim > 0.01 && graph!.hasNode(hoveredId)) {
         const hAttrs = graph!.getNodeAttributes(hoveredId);
         const hPos = sigma!.graphToViewport({ x: hAttrs.x as number, y: hAttrs.y as number });
-        const hSize = sigma!.scaleSize(hAttrs.size as number);
+        const hSize = sigma!.scaleSize(sigma!.getNodeDisplayData(hoveredId)?.size ?? (hAttrs.size as number));
         const hLabel = ((hAttrs as any).fullLabel as string) || (hAttrs.label as string) || '';
 
         ctx.globalAlpha = hAnim;
@@ -597,7 +1022,7 @@ export function SigmaCanvas({
     }
 
     sigma.on('afterRender', drawLabels);
-    requestAnimationFrame(drawLabels);
+    const initialLabelsRaf = requestAnimationFrame(drawLabels);
 
     // Lock the bounding box to the final layout so Sigma doesn't
     // recompute normalization as nodes move from center outward
@@ -617,6 +1042,8 @@ export function SigmaCanvas({
     // user came from clicking the dashboard preview, and we want to land on the
     // chosen framing/atom without the layout-builds-up flourish.
     let cancelledAnim = false;
+    let layoutFinished = false;
+    const manuallyPositionedNodes = new Set<string>();
     const pendingCamera = !isPreview ? useCanvasStore.getState().pendingCamera : null;
     const pendingFocus = !isPreview ? useCanvasStore.getState().pendingFocusAtomId : null;
     if (isPreview || pendingCamera || pendingFocus) {
@@ -626,6 +1053,7 @@ export function SigmaCanvas({
         graph.setNodeAttribute(id, 'y', target.y);
       }
       edgeAnimProgress.current = 1;
+      layoutFinished = true;
       if (pendingCamera) {
         sigma.getCamera().setState(pendingCamera);
         useCanvasStore.getState().setPendingCamera(null);
@@ -641,7 +1069,7 @@ export function SigmaCanvas({
         const nt = Math.min(1, elapsed / 2000);
         const ne = 1 - (1 - nt) ** 3;
         for (const [id, target] of Object.entries(targetPositions)) {
-          if (!graph.hasNode(id)) continue;
+          if (!graph.hasNode(id) || manuallyPositionedNodes.has(id)) continue;
           graph.setNodeAttribute(id, 'x', target.x * ne);
           graph.setNodeAttribute(id, 'y', target.y * ne);
         }
@@ -657,11 +1085,121 @@ export function SigmaCanvas({
 
         if (nt < 1 || et < 1) {
           requestAnimationFrame(animateTick);
+        } else {
+          layoutFinished = true;
         }
       }
       requestAnimationFrame(animateTick);
     }
     const cancelAnim = () => { cancelledAnim = true; };
+    const cameraTargetForNodes = (ids: string[], focused = false) => {
+      const points = ids.map(id => sigma.getNodeDisplayData(id))
+        .filter((point): point is NonNullable<typeof point> => !!point)
+        .map(point => ({ x: point.x, y: point.y }));
+      const ratioOneCamera = { x: 0.5, y: 0.5, ratio: 1, angle: 0 };
+      const origin = sigma.framedGraphToViewport({ x: 0, y: 0 }, { cameraState: ratioOneCamera });
+      const unit = sigma.framedGraphToViewport({ x: 1, y: 0 }, { cameraState: ratioOneCamera });
+      const pixelsPerUnit = Math.max(1, Math.abs(unit.x - origin.x));
+      const dimensions = sigma.getDimensions();
+      // Leave room for the controls and labels to the right of selected nodes.
+      const reservedRight = accountNetworkMode && dimensions.width >= 640
+        ? Math.min(focused ? 536 : 336, dimensions.width * 0.45) : 0;
+      // On narrow screens, keep the chart's first row below the compact controls.
+      const reservedTop = accountNetworkMode && dimensions.width < 640
+        ? Math.min(180, dimensions.height * 0.26) : 0;
+      const target = categoryCameraTarget(points, {
+        width: dimensions.width - reservedRight,
+        height: dimensions.height - reservedTop,
+      }, pixelsPerUnit);
+      if (!target) return null;
+      return {
+        ...target,
+        x: target.x + reservedRight * target.ratio / (2 * pixelsPerUnit),
+        y: target.y + reservedTop * target.ratio / (2 * pixelsPerUnit),
+        angle: 0,
+      };
+    };
+    let appliedMode: AccountLayoutMode = 'freeform';
+    refitLayoutRef.current = () => {
+      if (appliedMode === 'freeform') return;
+      sigma.refresh();
+      const fullView = cameraTargetForNodes(graph.nodes());
+      const selected = selectedCategoriesRef.current;
+      if (selected.size) {
+        if (fullView) savedCategoryCameraRef.current = fullView;
+        const ids = graph.nodes().filter(id => {
+          const category = graph.getNodeAttribute(id, 'categoryKey') as CategoryKey | undefined;
+          return !!category && selected.has(category);
+        });
+        const target = cameraTargetForNodes(ids, true);
+        if (target) void sigma.getCamera().animate(target, { duration: 250 });
+      } else if (fullView) {
+        void sigma.getCamera().animate(fullView, { duration: 250 });
+      }
+    };
+    applyLayoutRef.current = (mode, documentedEdges, force = false) => {
+      if (!accountNetworkMode || !accountRootId || !force && mode === 'freeform' && appliedMode === 'freeform') return;
+      cancelAnim();
+      layoutFinished = true;
+      edgeAnimProgress.current = 1;
+      appliedMode = mode;
+      const chartPositions = mode === 'freeform' ? null : computeAccountChartLayout(
+        atoms.map(atom => ({
+          id: atom.atom_id,
+          title: atom.title,
+          category: accountNetworkCategory(atom.source_url)!.key,
+        })),
+        documentedEdges,
+        accountRootId,
+        mode,
+      );
+      const overrides = mode === 'freeform' ? {} : layoutSettingsRef.current.positions[mode];
+      const nextPositions = mode === 'freeform'
+        ? Object.fromEntries(atoms.map(atom => [atom.atom_id,
+          savedPositionsRef.current[atom.atom_id] ?? targetPositions[atom.atom_id]]))
+        : { ...chartPositions, ...Object.fromEntries(Object.entries(overrides)
+          .filter(([id]) => graph.hasNode(id))) };
+      setGraphEdges(mode === 'freeform' ? edges : documentedEdges, mode !== 'freeform');
+      xMin = Infinity; xMax = -Infinity; yMin = Infinity; yMax = -Infinity;
+      for (const [id, point] of Object.entries(nextPositions)) {
+        if (!graph.hasNode(id)) continue;
+        graph.mergeNodeAttributes(id, point);
+        xMin = Math.min(xMin, point.x); xMax = Math.max(xMax, point.x);
+        yMin = Math.min(yMin, point.y); yMax = Math.max(yMax, point.y);
+      }
+      if (xMin === xMax) { xMin -= 1; xMax += 1; }
+      if (yMin === yMax) { yMin -= 1; yMax += 1; }
+      sigma.setCustomBBox({ x: [xMin, xMax], y: [yMin, yMax] });
+      sigma.refresh();
+      const fullView = cameraTargetForNodes(graph.nodes());
+      if (!fullView) return;
+      if (selectedCategoriesRef.current.size) {
+        savedCategoryCameraRef.current = fullView;
+        focusCategoriesRef.current(selectedCategoriesRef.current);
+      } else {
+        void sigma.getCamera().animate(fullView, { duration: 350 });
+      }
+    };
+    focusCategoriesRef.current = (selected) => {
+      if (!layoutFinished) {
+        cancelAnim();
+        for (const [id, target] of Object.entries(targetPositions)) {
+          if (!graph.hasNode(id) || manuallyPositionedNodes.has(id)) continue;
+          graph.mergeNodeAttributes(id, target);
+        }
+        edgeAnimProgress.current = 1;
+        layoutFinished = true;
+      }
+      sigma.refresh();
+      const ids: string[] = [];
+      graph.forEachNode((id, attrs) => {
+        const key = (attrs as { categoryKey?: CategoryKey }).categoryKey;
+        if (!key || !selected.has(key)) return;
+        ids.push(id);
+      });
+      const target = cameraTargetForNodes(ids, true);
+      if (target) void sigma.getCamera().animate(target, { duration: 600 });
+    };
 
     // Helper to show atom preview popover at a node's screen position.
     // Pinning is handled by clickNode / focusAtom so this stays purely positional.
@@ -670,7 +1208,7 @@ export function SigmaCanvas({
       const nodeAttrs = graph.getNodeAttributes(atomId);
       const viewportPos = sigma.graphToViewport({ x: nodeAttrs.x as number, y: nodeAttrs.y as number });
       const containerRect = container!.getBoundingClientRect();
-      const nodeSize = (nodeAttrs.size as number) || 4;
+      const nodeSize = sigma.scaleSize(sigma.getNodeDisplayData(atomId)?.size ?? ((nodeAttrs.size as number) || 4));
       const screenX = containerRect.left + viewportPos.x;
       const screenY = containerRect.top + viewportPos.y;
       setPreviewAnchorRect({
@@ -695,11 +1233,9 @@ export function SigmaCanvas({
     // `controller` slot (driven by the chat agent). Preview mode registers it
     // in the separate `previewController` slot so dashboard widgets can drive
     // thumbnail focus without touching the chat agent's target.
-    const bboxW = xMax - xMin || 1;
-    const bboxH = yMax - yMin || 1;
     const graphToCamera = (gx: number, gy: number) => ({
-      x: (gx - xMin) / bboxW,
-      y: (gy - yMin) / bboxH,
+      x: (gx - xMin) / (xMax - xMin || 1),
+      y: (gy - yMin) / (yMax - yMin || 1),
     });
 
     const controller = {
@@ -745,6 +1281,8 @@ export function SigmaCanvas({
     // In interactive preview, clicks bubble up to the parent (which opens the
     // main canvas focused on the chosen atom) instead of opening a popover.
     const isInteractive = !isPreview || isInteractivePreview;
+    let cleanupDrag = () => {};
+    let cleanupHover = () => {};
     if (isInteractive) {
       // Hover animation: exponential ease toward target (0 or 1).
       // Loop stops itself when target is reached, so idle cost is zero.
@@ -767,7 +1305,89 @@ export function SigmaCanvas({
         hoverRaf = requestAnimationFrame(tickHover);
       };
       startHoverAnimRef.current = startHoverAnim;
+      cleanupHover = () => {
+        if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+        startHoverAnimRef.current = () => {};
+      };
+      let draggedNode: string | null = null;
+      let dragMoved = false;
+      let lastDragEnd = 0;
+      let dragStart = { x: 0, y: 0 };
+      let dragOffset = { x: 0, y: 0 };
+      const finishDrag = () => {
+        if (!draggedNode) return;
+        if (dragMoved && graph.hasNode(draggedNode)) {
+          const node = draggedNode;
+          const point = {
+            x: graph.getNodeAttribute(node, 'x') as number,
+            y: graph.getNodeAttribute(node, 'y') as number,
+          };
+          lastDragEnd = Date.now();
+          const mode = layoutModeRef.current;
+          if (mode === 'freeform' || !accountRootId) {
+            savedPositionsRef.current[node] = point;
+            void saveAtomPositions([{ atom_id: node, ...point }]).catch(() => {
+              toast.error('Could not save node position');
+            });
+          } else {
+            const next: AccountLayoutSettings = {
+              ...layoutSettingsRef.current,
+              positions: {
+                ...layoutSettingsRef.current.positions,
+                [mode]: { ...layoutSettingsRef.current.positions[mode], [node]: point },
+              },
+            };
+            layoutSettingsRef.current = next;
+            setLayoutSettings(next);
+            if (!writeAccountLayoutSettings(localStorage, activeDbId ?? 'default', accountRootId, next)) {
+              toast.error('Could not save this layout on this device');
+            }
+          }
+        }
+        draggedNode = null;
+        sigma.getCamera().enable();
+        container.style.cursor = hoveredNodeRef.current ? 'grab' : '';
+      };
+      if (!isPreview) {
+        sigma.on('downNode', ({ node, event }) => {
+          if (event.original instanceof MouseEvent && event.original.button !== 0) return;
+          draggedNode = node;
+          dragMoved = false;
+          dragStart = { x: event.x, y: event.y };
+          sigma.getCamera().disable();
+          container.style.cursor = 'grabbing';
+        });
+        sigma.on('moveBody', ({ event, preventSigmaDefault }) => {
+          if (!draggedNode) return;
+          preventSigmaDefault();
+          if (!dragMoved && Math.hypot(event.x - dragStart.x, event.y - dragStart.y) < 4) return;
+          const point = sigma.viewportToGraph({ x: event.x, y: event.y });
+          if (!dragMoved) {
+            dragMoved = true;
+            manuallyPositionedNodes.add(draggedNode);
+            dragOffset = {
+              x: (graph.getNodeAttribute(draggedNode, 'x') as number) - point.x,
+              y: (graph.getNodeAttribute(draggedNode, 'y') as number) - point.y,
+            };
+          }
+          graph.mergeNodeAttributes(draggedNode, {
+            x: point.x + dragOffset.x,
+            y: point.y + dragOffset.y,
+          });
+          sigma.refresh();
+        });
+        sigma.on('upNode', finishDrag);
+        sigma.on('upStage', finishDrag);
+        window.addEventListener('mouseup', finishDrag);
+        window.addEventListener('touchend', finishDrag);
+        cleanupDrag = () => {
+          window.removeEventListener('mouseup', finishDrag);
+          window.removeEventListener('touchend', finishDrag);
+          sigma.getCamera().enable();
+        };
+      }
       sigma.on('clickNode', ({ node }) => {
+        if (Date.now() - lastDragEnd < 400) return;
         if (isInteractivePreview) {
           onPreviewNodeClickRef.current?.(node);
           return;
@@ -780,10 +1400,12 @@ export function SigmaCanvas({
         hoveredNodeRef.current = node;
         hoverTargetRef.current = 1;
         startHoverAnim();
+        if (!isPreview && !draggedNode) container.style.cursor = 'grab';
       });
       sigma.on('leaveNode', () => {
         hoverTargetRef.current = 0;
         startHoverAnim();
+        if (!isPreview && !draggedNode) container.style.cursor = '';
       });
     }
 
@@ -809,7 +1431,14 @@ export function SigmaCanvas({
     }
 
     return () => {
+      cancelledMedia = true;
       cancelAnim();
+      focusCategoriesRef.current = () => {};
+      applyLayoutRef.current = () => {};
+      refitLayoutRef.current = () => {};
+      cancelAnimationFrame(initialLabelsRaf);
+      cleanupHover();
+      cleanupDrag();
       const store = useCanvasStore.getState();
       if (isPreview) {
         store.unregisterPreviewController();
@@ -821,7 +1450,106 @@ export function SigmaCanvas({
       sigmaRef.current = null;
       graphRef.current = null;
     };
-  }, [data, isPreview, filterKey]); // intentionally exclude theme — handled below
+  }, [data, isPreview, filterKey, accountTagFilterId, accountSlug, activeDbId]); // theme is handled below
+
+  // A verified entry path is the one deliberate motion on this view. It is
+  // drawn over the current graph positions, so dragging and camera moves keep
+  // the signal attached to the actual notes it connects.
+  useEffect(() => {
+    if (!accountTagFilterId || !entryPoints.length) return;
+    const container = containerRef.current;
+    const sigma = sigmaRef.current;
+    const graph = graphRef.current;
+    if (!container || !sigma || !graph) return;
+    const canvas = document.createElement('canvas');
+    canvas.setAttribute('aria-hidden', 'true');
+    canvas.dataset.testid = 'entry-path-overlay';
+    canvas.style.position = 'absolute';
+    canvas.style.inset = '0';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.zIndex = '9';
+    container.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) { canvas.remove(); return; }
+    const moving = animateEntryPaths && !reduceMotion;
+    let frameId: number | null = null;
+    let lastFrame = 0;
+
+    const draw = (now: number) => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (!width || !height) return;
+      const ratio = window.devicePixelRatio || 1;
+      if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+        canvas.width = Math.round(width * ratio);
+        canvas.height = Math.round(height * ratio);
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${height}px`;
+      }
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      entryPoints.forEach((entry, index) => {
+        if (!graph.hasNode(entry.source) || !graph.hasNode(entry.target)) return;
+        const selected = selectedCategoriesRef.current;
+        const sourceCategory = graph.getNodeAttribute(entry.source, 'categoryKey') as CategoryKey | undefined;
+        const targetCategory = graph.getNodeAttribute(entry.target, 'categoryKey') as CategoryKey | undefined;
+        const categoryRelevant = !selected.size
+          || (!!sourceCategory && selected.has(sourceCategory))
+          || (!!targetCategory && selected.has(targetCategory));
+        const activeNode = pinnedNodeRef.current || hoveredNodeRef.current;
+        const relevant = categoryRelevant && (!activeNode || activeNode === entry.source || activeNode === entry.target);
+        const source = sigma.graphToViewport(graph.getNodeAttributes(entry.source) as { x: number; y: number });
+        const target = sigma.graphToViewport(graph.getNodeAttributes(entry.target) as { x: number; y: number });
+        const dx = target.x - source.x;
+        const dy = target.y - source.y;
+        const length = Math.hypot(dx, dy);
+        if (length < 1) return;
+        ctx.beginPath();
+        ctx.moveTo(source.x, source.y);
+        ctx.lineTo(target.x, target.y);
+        ctx.strokeStyle = relevant ? 'rgba(250, 204, 21, 0.8)' : 'rgba(250, 204, 21, 0.14)';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        if (!moving || !relevant) return;
+        const phase = (now + index * 670) % 3400;
+        if (phase > 1100) return;
+        const progress = 1 - (1 - phase / 1100) ** 3;
+        const steps = Math.max(4, Math.ceil(length / 26));
+        const normalX = -dy / length;
+        const normalY = dx / length;
+        ctx.beginPath();
+        for (let step = 0; step <= steps; step++) {
+          const along = progress * step / steps;
+          const offset = step === 0 || step === steps ? 0 : (step % 2 ? 1 : -1) * 4 * Math.sin(Math.PI * along);
+          const x = source.x + dx * along + normalX * offset;
+          const y = source.y + dy * along + normalY * offset;
+          if (step === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = '#fef08a';
+        ctx.lineWidth = 2.4;
+        ctx.stroke();
+      });
+    };
+    const tick = (now: number) => {
+      if (now - lastFrame >= 1000 / 30 && document.visibilityState === 'visible') {
+        draw(now);
+        lastFrame = now;
+      }
+      frameId = requestAnimationFrame(tick);
+    };
+    const drawStatic = () => draw(performance.now());
+    if (moving) frameId = requestAnimationFrame(tick);
+    else {
+      sigma.on('afterRender', drawStatic);
+      frameId = requestAnimationFrame(drawStatic);
+    }
+    return () => {
+      if (frameId !== null) cancelAnimationFrame(frameId);
+      if (!moving) sigma.off('afterRender', drawStatic);
+      canvas.remove();
+    };
+  }, [accountTagFilterId, entryPoints, animateEntryPaths, reduceMotion, data]);
 
   // Update colors when theme changes (without recreating graph)
   useEffect(() => {
@@ -834,13 +1562,16 @@ export function SigmaCanvas({
     // Update node colors
     graph.forEachNode((node, attrs) => {
       const connectivity = (edgeCounts.get(node) || 0) / maxEdges;
-      graph.setNodeAttribute(node, 'color', nodeColor(theme, connectivity, (attrs as any).clusterIndex));
+      const category = accountTagFilterId
+        ? accountNetworkCategory((attrs as { sourceUrl?: string }).sourceUrl)
+        : null;
+      graph.setNodeAttribute(node, 'color', category?.color ?? nodeColor(theme, connectivity, (attrs as any).clusterIndex));
     });
 
     // Atom label color comes from themeRef inside drawLabels — just trigger a refresh.
     // Edges update via edgeReducer (also reads themeRef.current).
     sigma.refresh();
-  }, [theme]);
+  }, [theme, accountTagFilterId]);
 
   // Refresh when selected tag changes (nodeReducer reads selectedTagRef)
   useEffect(() => {
@@ -961,6 +1692,7 @@ export function SigmaCanvas({
 
         <div
           ref={containerRef}
+          data-testid={isPreview ? 'canvas-preview' : 'canvas-main'}
           className={`w-full h-full ${isPreview && !isInteractivePreview ? 'pointer-events-none' : ''}`}
           style={isPreview ? undefined : { minHeight: 200 }}
         />
@@ -974,6 +1706,141 @@ export function SigmaCanvas({
             className="absolute inset-0 z-20 cursor-pointer bg-transparent hover:bg-white/[0.03] transition-colors"
             aria-label="Open canvas view"
           />
+        )}
+
+        {!isPreview && accountTagFilterId && !isLoading && (
+          <aside
+            ref={controlsRef}
+            aria-label="Account network controls"
+            className="absolute right-4 top-4 z-20 max-h-[calc(100%-32px)] w-[min(320px,calc(100%-32px))] overflow-y-auto rounded-lg border border-white/15 bg-[#242428] max-sm:right-2 max-sm:top-2 max-sm:w-[min(320px,calc(100%-16px))]"
+          >
+            <div className="px-3 pb-3 pt-3">
+              <div className="mb-2 text-sm font-semibold text-white">Account network</div>
+              <div role="group" aria-label="Account network layout" className="grid grid-cols-3 gap-1 rounded-md bg-black/20 p-1">
+                {([
+                  ['freeform', 'Freeform'],
+                  ['top-down', 'Top-down'],
+                  ['left-to-right', 'Left-to-right'],
+                ] as const).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    data-testid={`account-layout-${mode}`}
+                    aria-pressed={effectiveLayoutMode === mode}
+                    disabled={mode !== 'freeform' && recordedEdges?.rootId !== accountRootId}
+                    onClick={() => changeLayout(mode)}
+                    className={`min-h-8 rounded px-1 text-[11px] font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white/80 disabled:cursor-not-allowed disabled:opacity-35 ${
+                      effectiveLayoutMode === mode ? 'bg-white/15 text-white' : 'text-white/70 hover:bg-white/10 hover:text-white'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {effectiveLayoutMode !== 'freeform' && (
+                <button type="button" onClick={resetChartLayout}
+                  className="mt-2 text-xs text-white/70 underline decoration-white/25 underline-offset-2 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/80">
+                  Reset layout
+                </button>
+              )}
+              {linksLoading && <p className="mt-2 text-xs text-white/65" role="status">Loading recorded links…</p>}
+              {linksError && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-white/75" role="alert">
+                  <span>Recorded links unavailable</span>
+                  <button type="button" onClick={() => setLinkRetry(count => count + 1)}
+                    className="rounded border border-white/25 px-2 py-1 text-white hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/80">
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+            <div role="tablist" aria-label="Account network panels" className="grid grid-cols-2 border-y border-white/10 px-2">
+              <button ref={categoryTabRef} id={`${controlTabsId}-categories-tab`} type="button" role="tab"
+                aria-selected={controlTab === 'categories'} aria-controls={`${controlTabsId}-categories-panel`}
+                tabIndex={controlTab === 'categories' ? 0 : -1}
+                onClick={() => selectControlTab('categories')} onKeyDown={handleControlTabKeyDown}
+                className={`min-h-10 border-b-2 px-1 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-white/80 ${controlTab === 'categories' ? 'border-white/80 text-white' : 'border-transparent text-white/60 hover:text-white'}`}>
+                Categories
+              </button>
+              <button ref={researchTabRef} id={`${controlTabsId}-research-tab`} type="button" role="tab"
+                aria-selected={controlTab === 'research'} aria-controls={`${controlTabsId}-research-panel`}
+                tabIndex={controlTab === 'research' ? 0 : -1}
+                onClick={() => selectControlTab('research')} onKeyDown={handleControlTabKeyDown}
+                className={`min-h-10 border-b-2 px-1 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-white/80 ${controlTab === 'research' ? 'border-white/80 text-white' : 'border-transparent text-white/60 hover:text-white'}`}>
+                Research checks <span className="ml-1 font-normal tabular-nums text-white/50">{researchLoading ? '…' : researchChecks.length}</span>
+              </button>
+            </div>
+            <div id={`${controlTabsId}-categories-panel`} role="tabpanel" aria-labelledby={`${controlTabsId}-categories-tab`}
+              hidden={controlTab !== 'categories'} tabIndex={0}>
+              <div className="border-t border-white/10 px-3 pb-3 pt-2">
+                <div className="grid grid-cols-2 gap-x-2 gap-y-2">
+                  {ACCOUNT_NETWORK_CATEGORIES.map(category => {
+                    const selected = selectedCategories.has(category.key);
+                    const available = (categoryCounts.get(category.key) ?? 0) > 0;
+                    const enriched = available && !researchLoading && !researchError && enrichedCategories.has(category.key);
+                    const enrichedDescriptionId = `${controlTabsId}-${category.key}-enriched`;
+                    return (
+                      <button
+                        key={category.key}
+                        type="button"
+                        aria-pressed={selected}
+                        aria-describedby={enriched ? enrichedDescriptionId : undefined}
+                        disabled={!available}
+                        onClick={() => toggleAccountCategory(category.key)}
+                        title={available ? undefined : 'No nodes in this category'}
+                        className={`flex min-h-8 items-center gap-1.5 rounded-md border px-1.5 py-1 text-left text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white/80 ${
+                          selected
+                            ? 'border-white/30 bg-white/15 text-white'
+                            : 'border-transparent text-white/75 hover:bg-white/10'
+                        } ${available ? 'cursor-pointer' : 'cursor-not-allowed opacity-35'}`}
+                      >
+                        {category.key === 'account' ? (
+                          <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5 shrink-0">
+                            <polygon points="12,1.5 14.9,8.4 22.4,9 16.7,13.8 18.5,21 12,17.1 5.5,21 7.3,13.8 1.6,9 9.1,8.4" fill={category.color} />
+                          </svg>
+                        ) : (
+                          <span
+                            aria-hidden="true"
+                            className="h-2.5 w-2.5 shrink-0 rounded-full"
+                            style={{ backgroundColor: category.color }}
+                          />
+                        )}
+                        <span>{category.label}</span>
+                        {enriched && <>
+                          <Check aria-hidden="true" className="ml-auto h-4 w-4 shrink-0 text-emerald-400" strokeWidth={2.5} />
+                          <span id={enrichedDescriptionId} className="sr-only">Enrichment recorded</span>
+                        </>}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-[11px] text-white/60">Green check = recorded enrichment or sourced findings</p>
+                <p className="mt-3 border-t border-white/10 pt-2 text-xs text-white/60">
+                  {effectiveLayoutMode === 'freeform'
+                    ? 'Freeform lines show similar notes. Dragged positions save to Atomic.'
+                    : 'Chart lines are links recorded in notes, not reporting relationships. Dragged positions save on this device.'}
+                </p>
+              </div>
+            </div>
+            <div id={`${controlTabsId}-research-panel`} role="tabpanel" aria-labelledby={`${controlTabsId}-research-tab`}
+              hidden={controlTab !== 'research'} tabIndex={0}>
+              <AccountResearchPanel
+                atoms={accountAtoms}
+                checks={researchChecks}
+                entryPoints={entryPointRows}
+                linkState={recordedEdges?.rootId === accountRootId ? 'ready' : linksError ? 'error' : 'loading'}
+                loading={researchLoading || !researchError && researchNotes?.rootId !== accountRootId}
+                error={researchError}
+                onRetry={() => setResearchRetry(count => count + 1)}
+                onRetryLinks={() => setLinkRetry(count => count + 1)}
+                onRefresh={() => setCanvasReload(count => count + 1)}
+                onFocus={atomId => useCanvasStore.getState().controller?.focusAtom(atomId)}
+                animatePaths={animateEntryPaths && !reduceMotion}
+                motionAvailable={!reduceMotion}
+                onAnimatePathsChange={setAnimateEntryPaths}
+              />
+            </div>
+          </aside>
         )}
 
         {/* Theme picker + edge slider — main view only */}
@@ -1006,7 +1873,7 @@ export function SigmaCanvas({
                 ))}
               </div>
             </div>
-            <div className="flex items-center gap-1.5">
+            {(!accountTagFilterId || effectiveLayoutMode === 'freeform') && <div className="flex items-center gap-1.5">
               <input
                 type="range"
                 min={0}
@@ -1021,7 +1888,7 @@ export function SigmaCanvas({
               <span className="text-[9px] text-white/30">
                 {Math.round((1 - edgeThreshold) * 100)}%
               </span>
-            </div>
+            </div>}
           </div>
         )}
 
@@ -1046,6 +1913,7 @@ export function SigmaCanvas({
           its position, content, and opacity each frame. */}
       <div
         ref={hoverPillRef}
+        data-testid="canvas-hover-label"
         className="absolute pointer-events-none whitespace-nowrap z-30
                    px-1.5 py-1 rounded text-[13px] leading-none
                    bg-[rgba(20,20,20,0.92)] text-[#e8e8e8]

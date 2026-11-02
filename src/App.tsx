@@ -22,6 +22,13 @@ const TocHarnessPage = lazy(async () => {
   return { default: mod.TocHarnessPage };
 });
 
+const AgentationToolbar = import.meta.env.DEV
+  ? lazy(async () => {
+      const mod = await import('agentation');
+      return { default: mod.Agentation };
+    })
+  : null;
+
 function App() {
   // Initialize embedding event listener
   useEmbeddingEvents();
@@ -59,6 +66,11 @@ function App() {
         <Route path="*" element={<Layout />} />
       </Routes>
       <EmbeddingProgressBanner />
+      {AgentationToolbar && (
+        <Suspense fallback={null}>
+          <AgentationToolbar />
+        </Suspense>
+      )}
     </>
   );
 }

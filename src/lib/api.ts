@@ -362,6 +362,16 @@ export async function getAtomsWithEmbeddings(): Promise<AtomWithEmbedding[]> {
   return getTransport().invoke('get_atoms_with_embeddings');
 }
 
+export interface AtomLink {
+  source_atom_id: string;
+  target_atom_id: string | null;
+  status: string;
+}
+
+export async function getAtomLinks(atomId: string): Promise<AtomLink[]> {
+  return getTransport().invoke('get_atom_links', { id: atomId });
+}
+
 // Global canvas (PCA-projected positions)
 export interface CanvasAtomPosition {
   atom_id: string;
@@ -371,6 +381,7 @@ export interface CanvasAtomPosition {
   primary_tag: string | null;
   tag_count: number;
   tag_ids: string[];
+  source_url: string | null;
 }
 
 export interface CanvasEdgeData {
