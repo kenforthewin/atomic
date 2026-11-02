@@ -101,5 +101,13 @@ External affiliations (do not confuse with Peachtree board membership):
       mutuals: 'Unipile shows 1 shared LinkedIn connection with Mark; name unresolved',
       linkedInMutualsEvidence: 'Unipile API · 2026-11-01 · exact profile · count only · name unresolved',
     });
+    const namedMutual = content.replace(
+      '- Mutuals: No direct connection or named mutual found in checked Happenstance sources',
+      "- Mutuals: Andy Chopra — first-degree with Mark and listed among Mitul Patel's LinkedIn relations; introduction unconfirmed\n- LinkedIn mutuals evidence: Unipile v2 API; 2026-11-01; Mitul relation plus Mark first-degree; introduction unconfirmed",
+    );
+    expect(parseExecutiveProfile(namedMutual)).toMatchObject({
+      mutuals: "Andy Chopra — first-degree with Mark and listed among Mitul Patel's LinkedIn relations; introduction unconfirmed",
+      linkedInMutualsEvidence: 'Unipile v2 API · 2026-11-01 · Mitul relation plus Mark first-degree · introduction unconfirmed',
+    });
   });
 });
