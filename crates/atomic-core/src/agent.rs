@@ -34,6 +34,14 @@ pub(crate) type ChatEventCallback = Arc<dyn Fn(ChatEvent) + Send + Sync + 'stati
 /// (see `atomic-server`'s cancellation registry); the loop only reads it.
 pub type ChatCancel = crate::agent_runtime::CancelFlag;
 
+/// User-loaded instructions applied to one chat turn, without persisting the
+/// instruction body in conversation history.
+#[derive(Debug, Clone)]
+pub struct ChatSkill {
+    pub name: String,
+    pub instructions: String,
+}
+
 // ==================== Chat Events ====================
 
 /// Events emitted during the chat agent loop.
@@ -261,6 +269,45 @@ struct TurnContext {
     page: Option<PageContext>,
     canvas: Option<CanvasContext>,
     canvas_cache: Option<crate::CanvasCache>,
+    skills: Vec<ChatSkill>,
+}
+
+pub fn validate_chat_skills(skills: &[ChatSkill]) -> Result<(), String> {
+    if skills.len() > 3 {
+        return Err("Use up to 3 skills in one question.".to_string());
+    }
+    for skill in skills {
+        if skill.name.len() > 64
+            || !skill.name.starts_with(|c: char| c.is_ascii_lowercase())
+            || !skill
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            || skill.instructions.trim().is_empty()
+            || skill.instructions.len() > 24_000
+        {
+            return Err("Invalid skill name or instructions.".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn apply_turn_skills(messages: &mut [Message], skills: &[ChatSkill]) -> Result<(), String> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    let mut prompt = String::from("Apply these user-loaded skills to this turn. Keep the conversation's existing scope and citation rules. Linked files and scripts are not available unless their contents appear below.\n");
+    for skill in skills {
+        prompt.push_str(&format!("\n## ${}\n{}\n", skill.name, skill.instructions));
+    }
+    let user = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .ok_or_else(|| "Cannot apply skills without a user message.".to_string())?;
+    let question = user.content.take().unwrap_or_default();
+    user.content = Some(format!("{prompt}\nQuestion:\n{question}"));
+    Ok(())
 }
 
 /// Provider config and model for a chat turn. OpenRouter has a dedicated
@@ -401,6 +448,7 @@ async fn send_turn(
             .map_err(|e| e.to_string())?,
     };
     let (provider_config, model) = resolve_chat_model(&settings_map)?;
+    validate_chat_skills(&ui.skills)?;
 
     // Save user message
     storage
@@ -451,6 +499,7 @@ async fn send_turn(
     }
     let mut api_messages = vec![Message::system(system_prompt)];
     api_messages.extend(messages);
+    apply_turn_skills(&mut api_messages, &ui.skills)?;
 
     // Truncate to fit context window for providers with limited context
     let context_length = provider_config.context_length_for_model(&model);
@@ -673,6 +722,40 @@ pub async fn send_chat_message_with_canvas<F>(
 where
     F: Fn(ChatEvent) + Send + Sync + 'static,
 {
+    send_chat_message_with_canvas_and_skills(
+        storage,
+        conversation_id,
+        content,
+        on_event,
+        external_settings,
+        inline_pipeline,
+        canvas_context,
+        page_context,
+        canvas_cache,
+        Vec::new(),
+        cancel,
+    )
+    .await
+}
+
+/// Send one chat turn with UI context and user-loaded skills.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_chat_message_with_canvas_and_skills<F>(
+    storage: StorageBackend,
+    conversation_id: &str,
+    content: &str,
+    on_event: F,
+    external_settings: Option<HashMap<String, String>>,
+    inline_pipeline: bool,
+    canvas_context: Option<CanvasContext>,
+    page_context: Option<PageContext>,
+    canvas_cache: Option<crate::CanvasCache>,
+    skills: Vec<ChatSkill>,
+    cancel: Option<ChatCancel>,
+) -> Result<ChatMessageWithContext, String>
+where
+    F: Fn(ChatEvent) + Send + Sync + 'static,
+{
     send_turn(
         storage,
         conversation_id,
@@ -684,8 +767,47 @@ where
             page: page_context,
             canvas: canvas_context,
             canvas_cache,
+            skills,
         },
         cancel,
     )
     .await
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+
+    #[test]
+    fn skills_apply_to_the_current_user_turn_only() {
+        let mut messages = vec![
+            Message::system("Keep citations"),
+            Message::user("Earlier question"),
+            Message::assistant("Earlier answer"),
+            Message::user("Check this claim with $source-check"),
+        ];
+        apply_turn_skills(
+            &mut messages,
+            &[ChatSkill {
+                name: "source-check".into(),
+                instructions: "Prefer primary sources.".into(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(messages[1].content.as_deref(), Some("Earlier question"));
+        assert_eq!(messages[0].content.as_deref(), Some("Keep citations"));
+        let current = messages[3].content.as_deref().unwrap();
+        assert!(current.contains("## $source-check\nPrefer primary sources."));
+        assert!(current.ends_with("Question:\nCheck this claim with $source-check"));
+    }
+
+    #[test]
+    fn invalid_skill_is_rejected_before_the_turn_is_saved() {
+        assert!(validate_chat_skills(&[ChatSkill {
+            name: "bad name".into(),
+            instructions: "Instructions".into(),
+        }])
+        .is_err());
+    }
 }

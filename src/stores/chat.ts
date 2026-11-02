@@ -3,6 +3,7 @@ import { getTransport, isDemoInstance } from '../lib/transport';
 import { saveAnswerAsAtom } from '../components/chat/saveAnswerAsAtom';
 import { useUIStore } from './ui';
 import { useCanvasStore } from './canvas';
+import type { ChatSkill } from '../lib/chatSkills';
 
 // ==================== Types ====================
 
@@ -231,7 +232,7 @@ interface ChatStore {
   removeTagFromScope: (tagId: string) => Promise<void>;
 
   // Actions - Messaging
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, skills?: ChatSkill[]) => Promise<void>;
   cancelResponse: () => Promise<void>;
 
   // Actions - Streaming updates (called from event handlers).
@@ -556,7 +557,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   // Messaging
-  sendMessage: async (content: string) => {
+  sendMessage: async (content: string, skills: ChatSkill[] = []) => {
     const { currentConversation, messages, openConversation } = get();
     if (!currentConversation) {
       set({ error: 'No conversation selected' });
@@ -602,6 +603,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       await getTransport().invoke<ChatMessageWithContext>('send_chat_message', {
         conversationId,
         content,
+        skills: skills.map(({ name, instructions }) => ({ name, instructions })),
         canvasContext,
         // Built here rather than earlier so it describes where the user is at
         // the moment they send, not where they were when the turn began.

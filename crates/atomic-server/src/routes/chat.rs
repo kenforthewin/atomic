@@ -148,6 +148,12 @@ pub async fn remove_tag_from_scope(db: Db, path: web::Path<(String, String)>) ->
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
+pub struct ChatSkillBody {
+    pub name: String,
+    pub instructions: String,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct SendMessageBody {
     /// Message content
     pub content: String,
@@ -157,9 +163,12 @@ pub struct SendMessageBody {
     /// Optional current UI context for page-aware chat tools
     #[serde(default)]
     pub page_context: Option<atomic_core::PageContext>,
+    /// User-loaded skills applied to this turn only
+    #[serde(default)]
+    pub skills: Vec<ChatSkillBody>,
 }
 
-#[utoipa::path(post, path = "/api/conversations/{id}/messages", params(("id" = String, Path, description = "Conversation ID")), request_body = SendMessageBody, responses((status = 200, description = "Assistant response (streaming events via WebSocket)", body = atomic_core::ChatMessageWithContext)), tag = "chat")]
+#[utoipa::path(post, path = "/api/conversations/{id}/messages", params(("id" = String, Path, description = "Conversation ID")), request_body = SendMessageBody, responses((status = 200, description = "Assistant response (streaming events via WebSocket)", body = atomic_core::ChatMessageWithContext), (status = 400, description = "Invalid skill", body = ApiErrorResponse)), tag = "chat")]
 pub async fn send_chat_message(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -178,20 +187,33 @@ pub async fn send_chat_message(
         .chat_cancellations
         .begin(job_scope(&req), &conversation_id);
 
-    let result = if body.canvas_context.is_some() || body.page_context.is_some() {
-        db.0.send_chat_message_with_canvas(
-            &conversation_id,
-            &body.content,
-            on_event,
-            body.canvas_context,
-            body.page_context,
-            Some(turn.flag()),
-        )
-        .await
-    } else {
-        db.0.send_chat_message(&conversation_id, &body.content, on_event, Some(turn.flag()))
+    let skills = body
+        .skills
+        .into_iter()
+        .map(|skill| atomic_core::ChatSkill {
+            name: skill.name,
+            instructions: skill.instructions,
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = atomic_core::agent::validate_chat_skills(&skills) {
+        return HttpResponse::BadRequest().json(ApiErrorResponse { error });
+    }
+    let result =
+        if body.canvas_context.is_some() || body.page_context.is_some() || !skills.is_empty() {
+            db.0.send_chat_message_with_canvas_and_skills(
+                &conversation_id,
+                &body.content,
+                on_event,
+                body.canvas_context,
+                body.page_context,
+                skills,
+                Some(turn.flag()),
+            )
             .await
-    };
+        } else {
+            db.0.send_chat_message(&conversation_id, &body.content, on_event, Some(turn.flag()))
+                .await
+        };
 
     match result {
         Ok(message) => HttpResponse::Ok().json(message),

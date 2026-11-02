@@ -262,6 +262,7 @@ use utoipa::OpenApi;
         routes::chat::UpdateConversationBody,
         routes::chat::SetScopeBody,
         routes::chat::AddTagBody,
+        routes::chat::ChatSkillBody,
         routes::chat::SendMessageBody,
         routes::ollama::TestOllamaBody,
         routes::auth::CreateTokenBody,

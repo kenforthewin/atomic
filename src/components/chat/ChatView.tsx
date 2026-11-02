@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { MessageSquare } from 'lucide-react';
 import { useChatStore, scopeModeOf } from '../../stores/chat';
+import { useDatabasesStore } from '../../stores/databases';
 import { useUIStore } from '../../stores/ui';
+import { loadChatSkills, parseChatSkill, saveChatSkills, skillsForTurn, type ChatSkill } from '../../lib/chatSkills';
 import { useContentSearch } from '../../hooks';
 import { ChatHeader } from './ChatHeader';
 import { ChatMessage } from './ChatMessage';
@@ -30,8 +32,15 @@ export function ChatView() {
     streamingConversationId === currentConversation?.id;
 
   const openReader = useUIStore(s => s.openReader);
+  const databaseId = useDatabasesStore(s => s.activeId);
 
   const [inputValue, setInputValue] = useState('');
+  const [skills, setSkills] = useState<ChatSkill[]>(() => loadChatSkills(databaseId));
+  const [skillError, setSkillError] = useState<string | null>(null);
+  useEffect(() => {
+    setSkills(loadChatSkills(databaseId));
+    setSkillError(null);
+  }, [databaseId]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -100,9 +109,47 @@ export function ChatView() {
     if (!inputValue.trim() || isStreamingHere) return;
 
     const content = inputValue.trim();
+    let selectedSkills: ChatSkill[];
+    try {
+      selectedSkills = skillsForTurn(content, skills);
+    } catch (error) {
+      setSkillError(String(error instanceof Error ? error.message : error));
+      return;
+    }
+    setSkillError(null);
     setInputValue('');
     scrollToBottom(); // Scroll to bottom when user sends a message
-    await sendMessage(content);
+    await sendMessage(content, selectedSkills);
+  };
+
+  const handleImportSkill = async (file: File) => {
+    try {
+      if (file.name.toLowerCase() !== 'skill.md') {
+        throw new Error('Choose a SKILL.md file.');
+      }
+      if (file.size > 100_000) {
+        throw new Error('This skill file is too large to import.');
+      }
+      const skill = parseChatSkill(await file.text());
+      const next = [...skills.filter((item) => item.name !== skill.name), skill]
+        .sort((a, b) => a.name.localeCompare(b.name));
+      saveChatSkills(databaseId, next);
+      setSkills(next);
+      setSkillError(null);
+    } catch (error) {
+      setSkillError(String(error instanceof Error ? error.message : error));
+    }
+  };
+
+  const handleRemoveSkill = (name: string) => {
+    try {
+      const next = skills.filter((skill) => skill.name !== name);
+      saveChatSkills(databaseId, next);
+      setSkills(next);
+      setSkillError(null);
+    } catch (error) {
+      setSkillError(String(error instanceof Error ? error.message : error));
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -221,6 +268,10 @@ export function ChatView() {
         isStreaming={isStreamingHere}
         isCancelling={isStreamingHere && isCancelling}
         onStop={cancelResponse}
+        skills={skills}
+        skillError={skillError}
+        onImportSkill={handleImportSkill}
+        onRemoveSkill={handleRemoveSkill}
         placeholder={
           // Excluded tags say what the conversation isn't about — naming them
           // here would read as the opposite of the scope.

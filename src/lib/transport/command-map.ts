@@ -572,6 +572,7 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     argsMode: 'body',
     transformArgs: (a) => ({
       content: a.content,
+      ...(a.skills ? { skills: a.skills } : {}),
       ...(a.canvasContext ? { canvas_context: a.canvasContext } : {}),
       ...(a.pageContext ? { page_context: a.pageContext } : {}),
     }),

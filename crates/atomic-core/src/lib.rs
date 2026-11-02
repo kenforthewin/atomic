@@ -64,7 +64,7 @@ pub mod tokens;
 pub mod wiki;
 
 // Re-exports for convenience
-pub use agent::{CanvasClusterSummary, CanvasContext, ChatCancel, ChatEvent, PageContext};
+pub use agent::{CanvasClusterSummary, CanvasContext, ChatCancel, ChatEvent, ChatSkill, PageContext};
 pub use atom_edit::{apply_atom_edits, AtomEditOperation};
 pub use db::Database;
 pub use embedding::{EmbeddingEvent, EmbeddingStrategy, TaggingStrategy};
@@ -3279,7 +3279,34 @@ impl AtomicCore {
     where
         F: Fn(ChatEvent) + Send + Sync + 'static,
     {
-        agent::send_chat_message_with_canvas(
+        self.send_chat_message_with_canvas_and_skills(
+            conversation_id,
+            content,
+            on_event,
+            canvas_context,
+            page_context,
+            Vec::new(),
+            cancel,
+        )
+        .await
+    }
+
+    /// Send a chat turn with UI context and user-loaded skills.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_chat_message_with_canvas_and_skills<F>(
+        &self,
+        conversation_id: &str,
+        content: &str,
+        on_event: F,
+        canvas_context: Option<CanvasContext>,
+        page_context: Option<PageContext>,
+        skills: Vec<ChatSkill>,
+        cancel: Option<ChatCancel>,
+    ) -> Result<ChatMessageWithContext, AtomicCoreError>
+    where
+        F: Fn(ChatEvent) + Send + Sync + 'static,
+    {
+        agent::send_chat_message_with_canvas_and_skills(
             self.storage.clone(),
             conversation_id,
             content,
@@ -3289,6 +3316,7 @@ impl AtomicCore {
             canvas_context,
             page_context,
             Some(self.canvas_cache.clone()),
+            skills,
             cancel,
         )
         .await
